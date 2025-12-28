@@ -34,11 +34,9 @@
 %% Revision identifier in format "N-HASH" where N is generation.
 
 -type doc() :: #{
-    <<"id">> := docid(),
-    <<"_rev">> => revid(),
     binary() => term()
 }.
-%% JSON document as an Erlang map.
+%% JSON document as an Erlang map with binary keys (<<"id">>, <<"_rev">>, etc.).
 
 -type doc_info() :: #{
     id := docid(),
@@ -54,11 +52,11 @@
 
 -type rev_info() :: #{
     id := revid(),
-    parent := revid() | <<>>,
+    parent := revid() | undefined,
     deleted := boolean(),
     attachments => #{binary() => att_info()}
 }.
-%% Information about a single revision.
+%% Information about a single revision. parent is undefined for root revisions.
 
 %% Attachment types
 -type att_info() :: #{
@@ -77,13 +75,7 @@
 %% Sequence number as a string for external use.
 
 %% Changes types
--type change() :: #{
-    <<"id">> := docid(),
-    <<"seq">> := seq_string(),
-    <<"changes">> := [#{<<"rev">> := revid()}],
-    <<"deleted">> => boolean(),
-    <<"doc">> => doc()
-}.
+-type change() :: map().
 %% A single change entry.
 
 %% View types
@@ -131,14 +123,5 @@
 %% Default configuration values
 -define(DEFAULT_DATA_DIR, "data/barrel_docdb").
 -define(DEFAULT_STORE_MODULE, barrel_store_rocksdb).
-
-%% Key prefixes for RocksDB storage
--define(PREFIX_DB_META, 16#01).
--define(PREFIX_DOC_INFO, 16#02).
--define(PREFIX_DOC_REV, 16#03).
--define(PREFIX_DOC_SEQ, 16#04).
--define(PREFIX_VIEW, 16#05).
--define(PREFIX_ATT, 16#06).
--define(PREFIX_LOCAL, 16#07).
 
 -endif. %% BARREL_DOCDB_HRL
