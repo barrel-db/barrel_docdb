@@ -21,6 +21,7 @@
     db_sup_starts/1,
     db_server_lifecycle/1,
     db_server_info/1,
+    db_server_store_refs/1,
     multiple_db_servers/1
 ]).
 
@@ -41,6 +42,7 @@ groups() ->
         {db_server, [sequence], [
             db_server_lifecycle,
             db_server_info,
+            db_server_store_refs,
             multiple_db_servers
         ]}
     ].
@@ -121,7 +123,8 @@ db_server_lifecycle(_Config) ->
 
     %% Start a database server
     DbName = <<"test_db">>,
-    Config = #{path => "/tmp/barrel_test"},
+    TestDir = "/tmp/barrel_lifecycle_test_" ++ integer_to_list(erlang:system_time(millisecond)),
+    Config = #{data_dir => TestDir},
     {ok, Pid} = barrel_db_sup:start_db(DbName, Config),
 
     ?assert(is_pid(Pid)),
@@ -134,6 +137,9 @@ db_server_lifecycle(_Config) ->
     timer:sleep(100),
     ?assertNot(is_process_alive(Pid)),
 
+    %% Cleanup
+    os:cmd("rm -rf " ++ TestDir),
+
     ok.
 
 %% @doc Test database server info
@@ -141,7 +147,8 @@ db_server_info(_Config) ->
     {ok, _} = application:ensure_all_started(barrel_docdb),
 
     DbName = <<"info_test_db">>,
-    Config = #{path => "/tmp/barrel_info_test"},
+    TestDir = "/tmp/barrel_info_test_" ++ integer_to_list(erlang:system_time(millisecond)),
+    Config = #{data_dir => TestDir},
     {ok, Pid} = barrel_db_sup:start_db(DbName, Config),
 
     %% Get info
@@ -150,9 +157,52 @@ db_server_info(_Config) ->
     ?assertEqual(DbName, maps:get(name, Info)),
     ?assertEqual(Config, maps:get(config, Info)),
     ?assertEqual(Pid, maps:get(pid, Info)),
+    ?assert(is_list(maps:get(db_path, Info))),
 
     %% Cleanup
     ok = barrel_db_server:stop(Pid),
+    os:cmd("rm -rf " ++ TestDir),
+
+    ok.
+
+%% @doc Test database server store references are accessible
+db_server_store_refs(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"store_refs_test_db">>,
+    TestDir = "/tmp/barrel_store_refs_test_" ++ integer_to_list(erlang:system_time(millisecond)),
+    Config = #{data_dir => TestDir},
+    {ok, Pid} = barrel_db_sup:start_db(DbName, Config),
+
+    %% Get document store ref
+    {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
+    ?assert(is_map(StoreRef)),
+    ?assert(maps:is_key(ref, StoreRef)),
+    ?assert(maps:is_key(path, StoreRef)),
+
+    %% Get attachment store ref
+    {ok, AttRef} = barrel_db_server:get_att_ref(Pid),
+    ?assert(is_map(AttRef)),
+    ?assert(maps:is_key(ref, AttRef)),
+    ?assert(maps:is_key(path, AttRef)),
+
+    %% Verify stores are in expected paths
+    DocPath = maps:get(path, StoreRef),
+    AttPath = maps:get(path, AttRef),
+    ?assert(string:find(DocPath, "docs") =/= nomatch),
+    ?assert(string:find(AttPath, "attachments") =/= nomatch),
+
+    %% Test document store works - write and read
+    ok = barrel_store_rocksdb:put(StoreRef, <<"test_key">>, <<"test_value">>),
+    {ok, <<"test_value">>} = barrel_store_rocksdb:get(StoreRef, <<"test_key">>),
+
+    %% Test attachment store works - write and read
+    {ok, _AttInfo} = barrel_att_store:put(AttRef, DbName, <<"doc1">>, <<"file.txt">>, <<"content">>),
+    {ok, <<"content">>} = barrel_att_store:get(AttRef, DbName, <<"doc1">>, <<"file.txt">>),
+
+    %% Cleanup
+    ok = barrel_db_server:stop(Pid),
+    os:cmd("rm -rf " ++ TestDir),
 
     ok.
 
@@ -160,11 +210,13 @@ db_server_info(_Config) ->
 multiple_db_servers(_Config) ->
     {ok, _} = application:ensure_all_started(barrel_docdb),
 
+    BaseDir = "/tmp/barrel_multi_" ++ integer_to_list(erlang:system_time(millisecond)),
+
     %% Start multiple databases
     Dbs = [
-        {<<"db1">>, #{path => "/tmp/barrel_db1"}},
-        {<<"db2">>, #{path => "/tmp/barrel_db2"}},
-        {<<"db3">>, #{path => "/tmp/barrel_db3"}}
+        {<<"db1">>, #{data_dir => BaseDir ++ "/db1"}},
+        {<<"db2">>, #{data_dir => BaseDir ++ "/db2"}},
+        {<<"db3">>, #{data_dir => BaseDir ++ "/db3"}}
     ],
 
     Pids = lists:map(
@@ -175,10 +227,14 @@ multiple_db_servers(_Config) ->
         Dbs
     ),
 
-    %% Verify all are running
+    %% Verify all are running and have both stores
     lists:foreach(
         fun({_Name, Pid}) ->
-            ?assert(is_process_alive(Pid))
+            ?assert(is_process_alive(Pid)),
+            {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
+            {ok, AttRef} = barrel_db_server:get_att_ref(Pid),
+            ?assert(is_map(StoreRef)),
+            ?assert(is_map(AttRef))
         end,
         Pids
     ),
@@ -201,5 +257,8 @@ multiple_db_servers(_Config) ->
         end,
         Pids
     ),
+
+    %% Cleanup
+    os:cmd("rm -rf " ++ BaseDir),
 
     ok.
