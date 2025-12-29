@@ -199,15 +199,21 @@ decode_change(Value, Seq) ->
         changes => AllRevs
     },
 
+    %% Include document body if present
+    Change1 = case maps:get(doc, DocInfo, undefined) of
+        undefined -> Change;
+        Doc -> Change#{doc => Doc}
+    end,
+
     case Deleted of
-        true -> Change#{deleted => true};
-        false -> Change
+        true -> Change1#{deleted => true};
+        false -> Change1
     end.
 
 get_conflict_revs(#{revtree := RevTree}) when is_map(RevTree) ->
     case barrel_revtree:conflicts(RevTree) of
         [] -> [];
-        Conflicts -> [maps:get(rev, C) || C <- Conflicts]
+        Conflicts -> [maps:get(id, C) || C <- Conflicts]
     end;
 get_conflict_revs(_) ->
     [].

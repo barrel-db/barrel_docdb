@@ -21,7 +21,9 @@
 -export([local_doc/2]).
 
 %% View keys
--export([view_meta/2, view_seq/2, view_index/3, view_index_prefix/2]).
+-export([view_meta/2, view_seq/2, view_index/3, view_index_prefix/2, view_index_end/2]).
+-export([view_by_docid/3, view_by_docid_prefix/3, view_by_docid_end/3]).
+-export([encode_view_key/1, decode_view_key/1]).
 
 %% Attachment keys
 -export([att_data/3, att_data_prefix/2]).
@@ -45,7 +47,8 @@
 -define(PREFIX_VIEW_META, 16#06).
 -define(PREFIX_VIEW_SEQ, 16#07).
 -define(PREFIX_VIEW_INDEX, 16#08).
--define(PREFIX_ATT, 16#09).
+-define(PREFIX_VIEW_BY_DOCID, 16#09).
+-define(PREFIX_ATT, 16#0A).
 
 %% Meta key suffixes
 -define(META_UID, <<"uid">>).
@@ -153,6 +156,37 @@ view_index(DbName, ViewId, IndexKey) ->
 -spec view_index_prefix(db_name(), binary()) -> binary().
 view_index_prefix(DbName, ViewId) ->
     <<?PREFIX_VIEW_INDEX, (encode_name(DbName))/binary, ViewId/binary, $:>>.
+
+%% @doc End marker for view index range scan
+-spec view_index_end(db_name(), binary()) -> binary().
+view_index_end(DbName, ViewId) ->
+    <<?PREFIX_VIEW_INDEX, (encode_name(DbName))/binary, ViewId/binary, $:, 16#FF>>.
+
+%% @doc View by docid key (tracks which index entries belong to each doc)
+-spec view_by_docid(db_name(), binary(), docid()) -> binary().
+view_by_docid(DbName, ViewId, DocId) ->
+    <<?PREFIX_VIEW_BY_DOCID, (encode_name(DbName))/binary, ViewId/binary, $:, DocId/binary>>.
+
+%% @doc Prefix for view by docid entries
+-spec view_by_docid_prefix(db_name(), binary(), docid()) -> binary().
+view_by_docid_prefix(DbName, ViewId, DocId) ->
+    <<?PREFIX_VIEW_BY_DOCID, (encode_name(DbName))/binary, ViewId/binary, $:, DocId/binary>>.
+
+%% @doc End marker for view by docid range scan
+-spec view_by_docid_end(db_name(), binary(), docid()) -> binary().
+view_by_docid_end(DbName, ViewId, DocId) ->
+    <<?PREFIX_VIEW_BY_DOCID, (encode_name(DbName))/binary, ViewId/binary, $:, DocId/binary, 16#FF>>.
+
+%% @doc Encode a view key for sorted storage
+%% Uses term_to_binary with ordered encoding to preserve Erlang term ordering
+-spec encode_view_key(term()) -> binary().
+encode_view_key(Key) ->
+    term_to_binary(Key, [{minor_version, 2}]).
+
+%% @doc Decode a view key
+-spec decode_view_key(binary()) -> term().
+decode_view_key(Bin) ->
+    binary_to_term(Bin).
 
 %%====================================================================
 %% Attachment Keys
