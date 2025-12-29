@@ -48,12 +48,20 @@
     path_index_atomicity/1
 ]).
 
+%% Test cases - query API
+-export([
+    api_find_simple/1,
+    api_find_with_options/1,
+    api_find_multiple_conditions/1,
+    api_explain/1
+]).
+
 %%====================================================================
 %% CT Callbacks
 %%====================================================================
 
 all() ->
-    [{group, application}, {group, db_server}, {group, public_api}, {group, path_indexing}].
+    [{group, application}, {group, db_server}, {group, public_api}, {group, path_indexing}, {group, query_api}].
 
 groups() ->
     [
@@ -86,6 +94,12 @@ groups() ->
             path_index_update_doc,
             path_index_delete_doc,
             path_index_atomicity
+        ]},
+        {query_api, [sequence], [
+            api_find_simple,
+            api_find_with_options,
+            api_find_multiple_conditions,
+            api_explain
         ]}
     ].
 
@@ -810,6 +824,173 @@ path_index_atomicity(_Config) ->
     %% Odd paths still there
     OddResults2 = fold_paths(StoreRef, DbName, [<<"type">>, <<"odd">>]),
     ?assertEqual(5, length(OddResults2)),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%%====================================================================
+%% Test Cases - Query API
+%%====================================================================
+
+%% @doc Test simple find query
+api_find_simple(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_find_simple_test">>,
+    TestDir = "/tmp/barrel_api_find_simple_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Create documents
+    {ok, _} = barrel_docdb:put_doc(DbName, #{<<"id">> => <<"user1">>, <<"type">> => <<"user">>, <<"name">> => <<"Alice">>}),
+    {ok, _} = barrel_docdb:put_doc(DbName, #{<<"id">> => <<"user2">>, <<"type">> => <<"user">>, <<"name">> => <<"Bob">>}),
+    {ok, _} = barrel_docdb:put_doc(DbName, #{<<"id">> => <<"post1">>, <<"type">> => <<"post">>, <<"title">> => <<"Hello">>}),
+
+    %% Find all users
+    {ok, Results} = barrel_docdb:find(DbName, #{
+        where => [{path, [<<"type">>], <<"user">>}]
+    }),
+
+    ?assertEqual(2, length(Results)),
+    Ids = [maps:get(<<"id">>, R) || R <- Results],
+    ?assert(lists:member(<<"user1">>, Ids)),
+    ?assert(lists:member(<<"user2">>, Ids)),
+
+    %% Find posts
+    {ok, PostResults} = barrel_docdb:find(DbName, #{
+        where => [{path, [<<"type">>], <<"post">>}]
+    }),
+    ?assertEqual(1, length(PostResults)),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test find with options
+api_find_with_options(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_find_opts_test">>,
+    TestDir = "/tmp/barrel_api_find_opts_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Create documents
+    lists:foreach(
+        fun(N) ->
+            {ok, _} = barrel_docdb:put_doc(DbName, #{
+                <<"id">> => <<"doc", (integer_to_binary(N))/binary>>,
+                <<"type">> => <<"item">>,
+                <<"n">> => N
+            })
+        end,
+        lists:seq(1, 10)
+    ),
+
+    %% Find with limit
+    {ok, LimitResults} = barrel_docdb:find(DbName,
+        #{where => [{path, [<<"type">>], <<"item">>}]},
+        #{limit => 3}
+    ),
+    ?assertEqual(3, length(LimitResults)),
+
+    %% Find without docs
+    {ok, NoDocs} = barrel_docdb:find(DbName,
+        #{where => [{path, [<<"type">>], <<"item">>}]},
+        #{include_docs => false, limit => 5}
+    ),
+    ?assertEqual(5, length(NoDocs)),
+    %% When include_docs is false, we still get results with id
+    lists:foreach(
+        fun(R) ->
+            ?assert(maps:is_key(<<"id">>, R))
+        end,
+        NoDocs
+    ),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test find with multiple conditions
+api_find_multiple_conditions(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_find_multi_test">>,
+    TestDir = "/tmp/barrel_api_find_multi_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Create documents
+    {ok, _} = barrel_docdb:put_doc(DbName, #{<<"id">> => <<"u1">>, <<"type">> => <<"user">>, <<"org">> => <<"acme">>, <<"status">> => <<"active">>}),
+    {ok, _} = barrel_docdb:put_doc(DbName, #{<<"id">> => <<"u2">>, <<"type">> => <<"user">>, <<"org">> => <<"acme">>, <<"status">> => <<"inactive">>}),
+    {ok, _} = barrel_docdb:put_doc(DbName, #{<<"id">> => <<"u3">>, <<"type">> => <<"user">>, <<"org">> => <<"other">>, <<"status">> => <<"active">>}),
+
+    %% Find active users in acme org
+    {ok, Results} = barrel_docdb:find(DbName, #{
+        where => [
+            {path, [<<"type">>], <<"user">>},
+            {path, [<<"org">>], <<"acme">>},
+            {path, [<<"status">>], <<"active">>}
+        ]
+    }),
+
+    ?assertEqual(1, length(Results)),
+    [#{<<"id">> := Id}] = Results,
+    ?assertEqual(<<"u1">>, Id),
+
+    %% Find all acme users
+    {ok, AcmeResults} = barrel_docdb:find(DbName, #{
+        where => [
+            {path, [<<"org">>], <<"acme">>}
+        ]
+    }),
+    ?assertEqual(2, length(AcmeResults)),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test explain
+api_explain(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_explain_test">>,
+    TestDir = "/tmp/barrel_api_explain_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Explain a simple query
+    {ok, Explanation} = barrel_docdb:explain(DbName, #{
+        where => [{path, [<<"type">>], <<"user">>}]
+    }),
+
+    ?assert(is_map(Explanation)),
+    ?assert(maps:is_key(strategy, Explanation)),
+    ?assert(maps:is_key(conditions, Explanation)),
+    Strategy = maps:get(strategy, Explanation),
+    ?assert(lists:member(Strategy, [index_seek, index_scan, multi_index, full_scan])),
+
+    %% Explain a multi-condition query
+    {ok, MultiExplanation} = barrel_docdb:explain(DbName, #{
+        where => [
+            {path, [<<"type">>], <<"user">>},
+            {path, [<<"status">>], <<"active">>}
+        ]
+    }),
+    MultiStrategy = maps:get(strategy, MultiExplanation),
+    ?assert(lists:member(MultiStrategy, [index_seek, index_scan, multi_index, full_scan])),
+
+    %% Explain with limit
+    {ok, LimitExplanation} = barrel_docdb:explain(DbName, #{
+        where => [{path, [<<"type">>], <<"user">>}],
+        limit => 10
+    }),
+    ?assertEqual(10, maps:get(limit, LimitExplanation, undefined)),
+
+    %% Invalid query returns error
+    {error, _} = barrel_docdb:explain(DbName, #{}),
 
     %% Cleanup
     ok = barrel_docdb:delete_db(DbName),
