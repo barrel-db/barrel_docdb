@@ -16,6 +16,14 @@
 -export([info/1, stop/1]).
 -export([get_store_ref/1, get_att_ref/1]).
 
+%% Document API
+-export([
+    put_doc/3,
+    get_doc/3,
+    delete_doc/3,
+    fold_docs/3
+]).
+
 %% View API
 -export([
     register_view/3,
@@ -66,6 +74,30 @@ get_att_ref(Pid) ->
 -spec stop(pid()) -> ok.
 stop(Pid) ->
     gen_server:stop(Pid).
+
+%%====================================================================
+%% Document API functions
+%%====================================================================
+
+%% @doc Put a document (create or update)
+-spec put_doc(pid(), map(), map()) -> {ok, map()} | {error, term()}.
+put_doc(Pid, Doc, Opts) ->
+    gen_server:call(Pid, {put_doc, Doc, Opts}).
+
+%% @doc Get a document
+-spec get_doc(pid(), binary(), map()) -> {ok, map()} | {error, not_found} | {error, term()}.
+get_doc(Pid, DocId, Opts) ->
+    gen_server:call(Pid, {get_doc, DocId, Opts}).
+
+%% @doc Delete a document
+-spec delete_doc(pid(), binary(), map()) -> {ok, map()} | {error, term()}.
+delete_doc(Pid, DocId, Opts) ->
+    gen_server:call(Pid, {delete_doc, DocId, Opts}).
+
+%% @doc Fold over all documents
+-spec fold_docs(pid(), fun(), term()) -> {ok, term()}.
+fold_docs(Pid, Fun, Acc) ->
+    gen_server:call(Pid, {fold_docs, Fun, Acc}, infinity).
 
 %%====================================================================
 %% View API functions
@@ -155,6 +187,27 @@ handle_call(get_store_ref, _From, #state{store_ref = StoreRef} = State) ->
 
 handle_call(get_att_ref, _From, #state{att_ref = AttRef} = State) ->
     {reply, {ok, AttRef}, State};
+
+%% Document operations
+handle_call({put_doc, Doc, Opts}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_put_doc(StoreRef, DbName, Doc, Opts),
+    {reply, Result, State};
+
+handle_call({get_doc, DocId, Opts}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_get_doc(StoreRef, DbName, DocId, Opts),
+    {reply, Result, State};
+
+handle_call({delete_doc, DocId, Opts}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_delete_doc(StoreRef, DbName, DocId, Opts),
+    {reply, Result, State};
+
+handle_call({fold_docs, Fun, Acc}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_fold_docs(StoreRef, DbName, Fun, Acc),
+    {reply, Result, State};
 
 %% View operations
 handle_call({register_view, ViewId, Config}, _From,
@@ -281,3 +334,213 @@ find_view_by_pid(Pid, Views) ->
         {found, ViewId} -> {ok, ViewId};
         not_found -> not_found
     end.
+
+%%====================================================================
+%% Document Operations
+%%====================================================================
+
+%% @doc Put a document (create or update)
+do_put_doc(StoreRef, DbName, Doc, _Opts) ->
+    %% Build document record from input
+    DocRecord = barrel_doc:make_doc_record(Doc),
+    #{id := DocId, revs := Revs, deleted := Deleted, doc := DocBody} = DocRecord,
+    [NewRev | _] = Revs,
+
+    %% Check for existing document
+    DocInfoKey = barrel_store_keys:doc_info(DbName, DocId),
+    OldSeq = case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
+        {ok, ExistingBin} ->
+            ExistingDocInfo = binary_to_term(ExistingBin),
+            maps:get(seq, ExistingDocInfo, undefined);
+        not_found ->
+            undefined
+    end,
+
+    %% Build revision tree
+    RevTree = case length(Revs) of
+        1 ->
+            %% New document
+            #{NewRev => #{id => NewRev, parent => undefined, deleted => Deleted}};
+        _ ->
+            %% Update - build tree with history
+            [CurRev, ParentRev | _] = Revs,
+            #{
+                ParentRev => #{id => ParentRev, parent => undefined, deleted => false},
+                CurRev => #{id => CurRev, parent => ParentRev, deleted => Deleted}
+            }
+    end,
+
+    %% Get next sequence
+    CurrentSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+    NextSeq = barrel_sequence:inc(case CurrentSeq of first -> barrel_sequence:min_seq(); S -> S end),
+
+    %% Build doc_info
+    DocInfo = #{
+        id => DocId,
+        rev => NewRev,
+        deleted => Deleted,
+        revtree => RevTree,
+        seq => NextSeq
+    },
+
+    %% Prepare batch operations
+    Operations = [
+        %% Write doc_info
+        {put, DocInfoKey, term_to_binary(DocInfo)},
+        %% Write doc body for revision
+        {put, barrel_store_keys:doc_rev(DbName, DocId, NewRev), term_to_binary(DocBody)}
+    ],
+
+    %% Delete old sequence entry if exists
+    DeleteOps = case OldSeq of
+        undefined -> [];
+        _ -> [{delete, barrel_store_keys:doc_seq(DbName, OldSeq)}]
+    end,
+
+    %% Write batch atomically
+    ok = barrel_store_rocksdb:write_batch(StoreRef, Operations ++ DeleteOps),
+
+    %% Write change (includes doc for views)
+    ChangeInfo = DocInfo#{doc => DocBody},
+    ok = barrel_changes:write_change(StoreRef, DbName, NextSeq, ChangeInfo),
+
+    %% Return result
+    Result = #{
+        <<"id">> => DocId,
+        <<"ok">> => true,
+        <<"rev">> => NewRev
+    },
+    {ok, Result}.
+
+%% @doc Get a document by ID
+do_get_doc(StoreRef, DbName, DocId, Opts) ->
+    DocInfoKey = barrel_store_keys:doc_info(DbName, DocId),
+    case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
+        {ok, DocInfoBin} ->
+            DocInfo = binary_to_term(DocInfoBin),
+            Rev = maps:get(rev, DocInfo),
+            Deleted = maps:get(deleted, DocInfo, false),
+            IncludeDeleted = maps:get(include_deleted, Opts, false),
+
+            case {Deleted, IncludeDeleted} of
+                {true, false} ->
+                    {error, not_found};
+                _ ->
+                    %% Get document body
+                    DocRevKey = barrel_store_keys:doc_rev(DbName, DocId, Rev),
+                    case barrel_store_rocksdb:get(StoreRef, DocRevKey) of
+                        {ok, DocBin} ->
+                            DocBody = binary_to_term(DocBin),
+                            %% Add metadata
+                            Result = DocBody#{
+                                <<"id">> => DocId,
+                                <<"_rev">> => Rev
+                            },
+                            Result2 = case Deleted of
+                                true -> Result#{<<"_deleted">> => true};
+                                false -> Result
+                            end,
+                            {ok, Result2};
+                        not_found ->
+                            {error, not_found}
+                    end
+            end;
+        not_found ->
+            {error, not_found}
+    end.
+
+%% @doc Delete a document
+do_delete_doc(StoreRef, DbName, DocId, Opts) ->
+    %% Get current doc info
+    DocInfoKey = barrel_store_keys:doc_info(DbName, DocId),
+    case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
+        {ok, DocInfoBin} ->
+            DocInfo = binary_to_term(DocInfoBin),
+            CurrentRev = maps:get(rev, DocInfo),
+
+            %% Verify revision if provided
+            ExpectedRev = maps:get(rev, Opts, undefined),
+            case ExpectedRev of
+                undefined -> ok;
+                CurrentRev -> ok;
+                _ -> throw({error, {conflict, CurrentRev}})
+            end,
+
+            %% Create delete revision
+            {Gen, _Hash} = barrel_doc:parse_revision(CurrentRev),
+            DeleteHash = barrel_doc:revision_hash(#{}, CurrentRev, true),
+            NewRev = barrel_doc:make_revision(Gen + 1, DeleteHash),
+
+            %% Get sequences
+            OldSeq = maps:get(seq, DocInfo, undefined),
+            CurrentSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+            NextSeq = barrel_sequence:inc(case CurrentSeq of first -> barrel_sequence:min_seq(); S -> S end),
+
+            %% Update revision tree
+            RevTree = maps:get(revtree, DocInfo, #{}),
+            NewRevTree = RevTree#{NewRev => #{id => NewRev, parent => CurrentRev, deleted => true}},
+
+            %% Build new doc_info
+            NewDocInfo = DocInfo#{
+                rev => NewRev,
+                deleted => true,
+                revtree => NewRevTree,
+                seq => NextSeq
+            },
+
+            %% Prepare operations
+            Operations = [
+                {put, DocInfoKey, term_to_binary(NewDocInfo)}
+            ],
+
+            DeleteOps = case OldSeq of
+                undefined -> [];
+                _ -> [{delete, barrel_store_keys:doc_seq(DbName, OldSeq)}]
+            end,
+
+            ok = barrel_store_rocksdb:write_batch(StoreRef, Operations ++ DeleteOps),
+
+            %% Write change
+            ok = barrel_changes:write_change(StoreRef, DbName, NextSeq, NewDocInfo),
+
+            {ok, #{<<"id">> => DocId, <<"ok">> => true, <<"rev">> => NewRev}};
+
+        not_found ->
+            {error, not_found}
+    end.
+
+%% @doc Fold over all documents
+do_fold_docs(StoreRef, DbName, Fun, Acc) ->
+    StartKey = barrel_store_keys:doc_info_prefix(DbName),
+    EndKey = barrel_store_keys:doc_info_end(DbName),
+
+    FoldFun = fun(_Key, Value, AccIn) ->
+        DocInfo = binary_to_term(Value),
+        Deleted = maps:get(deleted, DocInfo, false),
+        case Deleted of
+            true ->
+                %% Skip deleted documents
+                {ok, AccIn};
+            false ->
+                DocId = maps:get(id, DocInfo),
+                Rev = maps:get(rev, DocInfo),
+                %% Get document body
+                DocRevKey = barrel_store_keys:doc_rev(DbName, DocId, Rev),
+                DocBody = case barrel_store_rocksdb:get(StoreRef, DocRevKey) of
+                    {ok, DocBin} -> binary_to_term(DocBin);
+                    not_found -> #{}
+                end,
+                Doc = DocBody#{
+                    <<"id">> => DocId,
+                    <<"_rev">> => Rev
+                },
+                case Fun(Doc, AccIn) of
+                    {ok, AccOut} -> {ok, AccOut};
+                    {stop, AccOut} -> {stop, AccOut};
+                    stop -> {stop, AccIn}
+                end
+        end
+    end,
+
+    FinalAcc = barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, Acc),
+    {ok, FinalAcc}.

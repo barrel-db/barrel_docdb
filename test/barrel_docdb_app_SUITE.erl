@@ -1,8 +1,8 @@
 %%%-------------------------------------------------------------------
-%%% @doc Test suite for barrel_docdb application scaffold
+%%% @doc Test suite for barrel_docdb application and public API
 %%%
-%%% Tests the basic application startup, supervision tree, and
-%%% database server lifecycle.
+%%% Tests the basic application startup, supervision tree,
+%%% database server lifecycle, and the public API.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_docdb_app_SUITE).
@@ -14,7 +14,7 @@
 -export([all/0, groups/0, init_per_suite/1, end_per_suite/1,
          init_per_testcase/2, end_per_testcase/2]).
 
-%% Test cases
+%% Test cases - application
 -export([
     app_starts_and_stops/1,
     supervisor_starts/1,
@@ -25,12 +25,27 @@
     multiple_db_servers/1
 ]).
 
+%% Test cases - public API
+-export([
+    api_create_db/1,
+    api_open_close_db/1,
+    api_delete_db/1,
+    api_list_dbs/1,
+    api_put_get_doc/1,
+    api_update_doc/1,
+    api_delete_doc/1,
+    api_fold_docs/1,
+    api_attachments/1,
+    api_views/1,
+    api_changes/1
+]).
+
 %%====================================================================
 %% CT Callbacks
 %%====================================================================
 
 all() ->
-    [{group, application}, {group, db_server}].
+    [{group, application}, {group, db_server}, {group, public_api}].
 
 groups() ->
     [
@@ -44,6 +59,19 @@ groups() ->
             db_server_info,
             db_server_store_refs,
             multiple_db_servers
+        ]},
+        {public_api, [sequence], [
+            api_create_db,
+            api_open_close_db,
+            api_delete_db,
+            api_list_dbs,
+            api_put_get_doc,
+            api_update_doc,
+            api_delete_doc,
+            api_fold_docs,
+            api_attachments,
+            api_views,
+            api_changes
         ]}
     ].
 
@@ -261,4 +289,331 @@ multiple_db_servers(_Config) ->
     %% Cleanup
     os:cmd("rm -rf " ++ BaseDir),
 
+    ok.
+
+%%====================================================================
+%% Test Cases - Public API
+%%====================================================================
+
+%% @doc Test database creation via public API
+api_create_db(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_create_test">>,
+    TestDir = "/tmp/barrel_api_create_" ++ integer_to_list(erlang:system_time(millisecond)),
+
+    %% Create database
+    {ok, Pid} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+    ?assert(is_pid(Pid)),
+
+    %% Cannot create same db twice
+    {error, already_exists} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Cleanup
+    ok = barrel_docdb:close_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test database open/close via public API
+api_open_close_db(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_open_test">>,
+    TestDir = "/tmp/barrel_api_open_" ++ integer_to_list(erlang:system_time(millisecond)),
+
+    %% Open non-existent db fails
+    {error, not_found} = barrel_docdb:open_db(DbName),
+
+    %% Create and open
+    {ok, Pid1} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+    {ok, Pid2} = barrel_docdb:open_db(DbName),
+    ?assertEqual(Pid1, Pid2),
+
+    %% Close
+    ok = barrel_docdb:close_db(DbName),
+
+    %% Open after close fails (db stopped)
+    {error, not_found} = barrel_docdb:open_db(DbName),
+
+    %% Cleanup
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test database deletion via public API
+api_delete_db(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_delete_test">>,
+    TestDir = "/tmp/barrel_api_delete_" ++ integer_to_list(erlang:system_time(millisecond)),
+
+    %% Create database
+    {ok, _Pid} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Delete database
+    ok = barrel_docdb:delete_db(DbName),
+
+    %% Database no longer exists
+    {error, not_found} = barrel_docdb:open_db(DbName),
+
+    %% Delete non-existent is ok
+    ok = barrel_docdb:delete_db(DbName),
+
+    ok.
+
+%% @doc Test listing databases
+api_list_dbs(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    TestDir = "/tmp/barrel_api_list_" ++ integer_to_list(erlang:system_time(millisecond)),
+
+    %% Create multiple databases
+    {ok, _} = barrel_docdb:create_db(<<"list_db1">>, #{data_dir => TestDir ++ "/1"}),
+    {ok, _} = barrel_docdb:create_db(<<"list_db2">>, #{data_dir => TestDir ++ "/2"}),
+    {ok, _} = barrel_docdb:create_db(<<"list_db3">>, #{data_dir => TestDir ++ "/3"}),
+
+    %% List databases
+    Dbs = barrel_docdb:list_dbs(),
+    ?assert(lists:member(<<"list_db1">>, Dbs)),
+    ?assert(lists:member(<<"list_db2">>, Dbs)),
+    ?assert(lists:member(<<"list_db3">>, Dbs)),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(<<"list_db1">>),
+    ok = barrel_docdb:delete_db(<<"list_db2">>),
+    ok = barrel_docdb:delete_db(<<"list_db3">>),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test put and get document
+api_put_get_doc(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_doc_test">>,
+    TestDir = "/tmp/barrel_api_doc_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Put a document
+    Doc = #{<<"id">> => <<"doc1">>, <<"name">> => <<"test">>, <<"value">> => 42},
+    {ok, Result} = barrel_docdb:put_doc(DbName, Doc),
+
+    ?assertEqual(<<"doc1">>, maps:get(<<"id">>, Result)),
+    ?assertEqual(true, maps:get(<<"ok">>, Result)),
+    Rev = maps:get(<<"rev">>, Result),
+    ?assert(is_binary(Rev)),
+
+    %% Get the document
+    {ok, Retrieved} = barrel_docdb:get_doc(DbName, <<"doc1">>),
+    ?assertEqual(<<"doc1">>, maps:get(<<"id">>, Retrieved)),
+    ?assertEqual(<<"test">>, maps:get(<<"name">>, Retrieved)),
+    ?assertEqual(42, maps:get(<<"value">>, Retrieved)),
+    ?assertEqual(Rev, maps:get(<<"_rev">>, Retrieved)),
+
+    %% Get non-existent document
+    {error, not_found} = barrel_docdb:get_doc(DbName, <<"nonexistent">>),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test document update
+api_update_doc(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_update_test">>,
+    TestDir = "/tmp/barrel_api_update_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Create document
+    Doc1 = #{<<"id">> => <<"doc1">>, <<"value">> => 1},
+    {ok, #{<<"rev">> := Rev1}} = barrel_docdb:put_doc(DbName, Doc1),
+
+    %% Update document
+    Doc2 = #{<<"id">> => <<"doc1">>, <<"_rev">> => Rev1, <<"value">> => 2},
+    {ok, #{<<"rev">> := Rev2}} = barrel_docdb:put_doc(DbName, Doc2),
+
+    ?assertNotEqual(Rev1, Rev2),
+
+    %% Verify update
+    {ok, Retrieved} = barrel_docdb:get_doc(DbName, <<"doc1">>),
+    ?assertEqual(2, maps:get(<<"value">>, Retrieved)),
+    ?assertEqual(Rev2, maps:get(<<"_rev">>, Retrieved)),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test document deletion
+api_delete_doc(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_deldoc_test">>,
+    TestDir = "/tmp/barrel_api_deldoc_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Create document
+    {ok, _} = barrel_docdb:put_doc(DbName, #{<<"id">> => <<"doc1">>, <<"value">> => 1}),
+
+    %% Delete document
+    {ok, DeleteResult} = barrel_docdb:delete_doc(DbName, <<"doc1">>),
+    ?assertEqual(<<"doc1">>, maps:get(<<"id">>, DeleteResult)),
+    ?assertEqual(true, maps:get(<<"ok">>, DeleteResult)),
+
+    %% Document no longer accessible
+    {error, not_found} = barrel_docdb:get_doc(DbName, <<"doc1">>),
+
+    %% Delete non-existent document
+    {error, not_found} = barrel_docdb:delete_doc(DbName, <<"nonexistent">>),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test fold over documents
+api_fold_docs(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_fold_test">>,
+    TestDir = "/tmp/barrel_api_fold_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Create multiple documents
+    lists:foreach(
+        fun(N) ->
+            Id = <<"doc", (integer_to_binary(N))/binary>>,
+            {ok, _} = barrel_docdb:put_doc(DbName, #{<<"id">> => Id, <<"n">> => N})
+        end,
+        lists:seq(1, 5)
+    ),
+
+    %% Fold over all documents
+    {ok, Docs} = barrel_docdb:fold_docs(DbName,
+        fun(Doc, Acc) -> {ok, [Doc | Acc]} end,
+        []
+    ),
+    ?assertEqual(5, length(Docs)),
+
+    %% Verify all documents are present
+    Ids = [maps:get(<<"id">>, D) || D <- Docs],
+    lists:foreach(
+        fun(N) ->
+            Id = <<"doc", (integer_to_binary(N))/binary>>,
+            ?assert(lists:member(Id, Ids))
+        end,
+        lists:seq(1, 5)
+    ),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test attachment API
+api_attachments(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_att_test">>,
+    TestDir = "/tmp/barrel_api_att_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Create a document
+    {ok, _} = barrel_docdb:put_doc(DbName, #{<<"id">> => <<"doc1">>}),
+
+    %% Put attachment
+    {ok, AttInfo} = barrel_docdb:put_attachment(DbName, <<"doc1">>, <<"file.txt">>, <<"hello world">>),
+    ?assertEqual(<<"file.txt">>, maps:get(name, AttInfo)),
+    ?assertEqual(11, maps:get(length, AttInfo)),
+
+    %% Get attachment
+    {ok, Data} = barrel_docdb:get_attachment(DbName, <<"doc1">>, <<"file.txt">>),
+    ?assertEqual(<<"hello world">>, Data),
+
+    %% List attachments
+    Atts = barrel_docdb:list_attachments(DbName, <<"doc1">>),
+    ?assert(lists:member(<<"file.txt">>, Atts)),
+
+    %% Delete attachment
+    ok = barrel_docdb:delete_attachment(DbName, <<"doc1">>, <<"file.txt">>),
+
+    %% Attachment no longer accessible
+    {error, not_found} = barrel_docdb:get_attachment(DbName, <<"doc1">>, <<"file.txt">>),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test view API
+api_views(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_view_test">>,
+    TestDir = "/tmp/barrel_api_view_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Create documents
+    lists:foreach(
+        fun(N) ->
+            Type = case N rem 2 of 0 -> <<"even">>; 1 -> <<"odd">> end,
+            {ok, _} = barrel_docdb:put_doc(DbName, #{
+                <<"id">> => <<"doc", (integer_to_binary(N))/binary>>,
+                <<"_id">> => <<"doc", (integer_to_binary(N))/binary>>,
+                <<"type">> => Type,
+                <<"value">> => N
+            })
+        end,
+        lists:seq(1, 6)
+    ),
+
+    %% Register view
+    ok = barrel_docdb:register_view(DbName, <<"by_type">>, #{module => barrel_view_SUITE}),
+
+    %% Refresh view
+    {ok, _Seq} = barrel_docdb:refresh_view(DbName, <<"by_type">>),
+
+    %% Query view
+    {ok, Results} = barrel_docdb:query_view(DbName, <<"by_type">>, #{reduce => false}),
+    ?assertEqual(6, length(Results)),
+
+    %% List views
+    {ok, Views} = barrel_docdb:list_views(DbName),
+    ViewIds = [maps:get(id, V) || V <- Views],
+    ?assert(lists:member(<<"by_type">>, ViewIds)),
+
+    %% Unregister view
+    ok = barrel_docdb:unregister_view(DbName, <<"by_type">>),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test changes API
+api_changes(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_changes_test">>,
+    TestDir = "/tmp/barrel_api_changes_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Create documents
+    lists:foreach(
+        fun(N) ->
+            {ok, _} = barrel_docdb:put_doc(DbName, #{
+                <<"id">> => <<"doc", (integer_to_binary(N))/binary>>,
+                <<"n">> => N
+            })
+        end,
+        lists:seq(1, 5)
+    ),
+
+    %% Get all changes
+    {ok, Changes, _LastSeq} = barrel_docdb:get_changes(DbName, first),
+    ?assertEqual(5, length(Changes)),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
     ok.

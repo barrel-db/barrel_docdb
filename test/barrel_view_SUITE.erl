@@ -46,9 +46,9 @@
 
 version() -> 1.
 
-map(#{<<"_id">> := _Id, <<"type">> := Type, <<"value">> := Value}) ->
+map(#{<<"type">> := Type, <<"value">> := Value}) ->
     [{Type, Value}];
-map(#{<<"_id">> := _Id, <<"type">> := Type}) ->
+map(#{<<"type">> := Type}) ->
     [{Type, 1}];
 map(_) ->
     [].
