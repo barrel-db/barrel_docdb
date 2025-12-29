@@ -37,7 +37,7 @@
 -export([encode_seq/1, decode_seq/1]).
 
 %% Key decoding
--export([decode_doc_id/2, decode_seq_key/2]).
+-export([decode_doc_id/2, decode_seq_key/2, decode_doc_info_key/2]).
 
 %%====================================================================
 %% Key Prefixes - single byte for efficiency
@@ -254,6 +254,11 @@ decode_seq_key(DbName, Key) ->
     PrefixLen = byte_size(Prefix),
     <<Prefix:PrefixLen/binary, SeqBin/binary>> = Key,
     decode_seq(SeqBin).
+
+%% @doc Extract DocId from a doc_info key
+-spec decode_doc_info_key(db_name(), binary()) -> docid().
+decode_doc_info_key(DbName, Key) ->
+    decode_doc_id(DbName, Key).
 
 %%====================================================================
 %% Path Index Keys
