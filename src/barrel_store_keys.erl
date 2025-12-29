@@ -16,6 +16,7 @@
 -export([doc_info/2, doc_info_prefix/1, doc_info_end/1]).
 -export([doc_rev/3, doc_rev_prefix/2]).
 -export([doc_seq/2, doc_seq_prefix/1, doc_seq_end/1]).
+-export([doc_hlc/2, doc_hlc_prefix/1, doc_hlc_end/1]).
 
 %% Local document keys
 -export([local_doc/2]).
@@ -35,6 +36,9 @@
 
 %% Sequence encoding/decoding
 -export([encode_seq/1, decode_seq/1]).
+
+%% HLC encoding/decoding
+-export([encode_hlc/1, decode_hlc/1, decode_hlc_key/2]).
 
 %% Key decoding
 -export([decode_doc_id/2, decode_seq_key/2, decode_doc_info_key/2]).
@@ -56,6 +60,7 @@
 -define(PREFIX_ATT, 16#0A).
 -define(PREFIX_PATH_INDEX, 16#0B).
 -define(PREFIX_DOC_PATHS, 16#0C).
+-define(PREFIX_DOC_HLC, 16#0D).
 
 %% Path component type tags (for ordered encoding)
 -define(PATH_TYPE_NULL, 16#01).
@@ -139,6 +144,25 @@ doc_seq_prefix(DbName) ->
 -spec doc_seq_end(db_name()) -> binary().
 doc_seq_end(DbName) ->
     <<?PREFIX_DOC_SEQ, (encode_name(DbName))/binary, 16#FF, 16#FF, 16#FF, 16#FF,
+      16#FF, 16#FF, 16#FF, 16#FF>>.
+
+%% @doc Document HLC key (for changes feed with HLC ordering)
+%% HLC timestamps are 12 bytes (8 wall_time + 4 logical)
+-spec doc_hlc(db_name(), barrel_hlc:timestamp()) -> binary().
+doc_hlc(DbName, HlcTS) ->
+    <<?PREFIX_DOC_HLC, (encode_name(DbName))/binary, (encode_hlc(HlcTS))/binary>>.
+
+%% @doc Prefix for all HLC keys
+-spec doc_hlc_prefix(db_name()) -> binary().
+doc_hlc_prefix(DbName) ->
+    <<?PREFIX_DOC_HLC, (encode_name(DbName))/binary>>.
+
+%% @doc End marker for HLC range scan
+-spec doc_hlc_end(db_name()) -> binary().
+doc_hlc_end(DbName) ->
+    %% 12 bytes of 0xFF for max HLC
+    <<?PREFIX_DOC_HLC, (encode_name(DbName))/binary,
+      16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF,
       16#FF, 16#FF, 16#FF, 16#FF>>.
 
 %%====================================================================
@@ -239,6 +263,17 @@ encode_seq({Epoch, Counter}) when is_integer(Epoch), is_integer(Counter) ->
 decode_seq(<<Epoch:32/big-unsigned, Counter:32/big-unsigned>>) ->
     {Epoch, Counter}.
 
+%% @doc Encode HLC timestamp to binary (big-endian for sort order)
+%% Uses barrel_hlc:encode/1 which produces 12 bytes
+-spec encode_hlc(barrel_hlc:timestamp()) -> binary().
+encode_hlc(HlcTS) ->
+    barrel_hlc:encode(HlcTS).
+
+%% @doc Decode binary to HLC timestamp
+-spec decode_hlc(binary()) -> barrel_hlc:timestamp().
+decode_hlc(Bin) ->
+    barrel_hlc:decode(Bin).
+
 %% @doc Extract doc_id from a doc_info key
 -spec decode_doc_id(db_name(), binary()) -> docid().
 decode_doc_id(DbName, Key) ->
@@ -254,6 +289,14 @@ decode_seq_key(DbName, Key) ->
     PrefixLen = byte_size(Prefix),
     <<Prefix:PrefixLen/binary, SeqBin/binary>> = Key,
     decode_seq(SeqBin).
+
+%% @doc Extract HLC from a doc_hlc key
+-spec decode_hlc_key(db_name(), binary()) -> barrel_hlc:timestamp().
+decode_hlc_key(DbName, Key) ->
+    Prefix = doc_hlc_prefix(DbName),
+    PrefixLen = byte_size(Prefix),
+    <<Prefix:PrefixLen/binary, HlcBin/binary>> = Key,
+    decode_hlc(HlcBin).
 
 %% @doc Extract DocId from a doc_info key
 -spec decode_doc_info_key(db_name(), binary()) -> docid().

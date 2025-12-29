@@ -1,20 +1,21 @@
 %%%-------------------------------------------------------------------
 %%% @doc Test suite for barrel_docdb changes feed
 %%%
-%%% Tests sequence handling, changes API, and streaming.
+%%% Tests HLC-based changes API and streaming.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_changes_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("hlc/include/hlc.hrl").
 
 %% CT callbacks
 -export([all/0, groups/0, init_per_suite/1, end_per_suite/1,
          init_per_group/2, end_per_group/2,
          init_per_testcase/2, end_per_testcase/2]).
 
-%% Test cases - barrel_sequence
+%% Test cases - barrel_sequence (legacy, kept for internal use)
 -export([
     seq_new/1,
     seq_inc/1,
@@ -74,6 +75,8 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
+    %% Start the HLC clock for tests
+    {ok, _} = application:ensure_all_started(barrel_docdb),
     Config.
 
 end_per_suite(_Config) ->
@@ -95,7 +98,7 @@ end_per_testcase(_TestCase, _Config) ->
     ok.
 
 %%====================================================================
-%% Test Cases - barrel_sequence
+%% Test Cases - barrel_sequence (legacy internal module)
 %%====================================================================
 
 seq_new(_Config) ->
@@ -159,8 +162,12 @@ seq_to_from_string(_Config) ->
     ok.
 
 %%====================================================================
-%% Test Cases - barrel_changes
+%% Test Cases - barrel_changes (HLC-based)
 %%====================================================================
+
+%% Helper to create HLC timestamps for testing
+make_test_hlc(WallTime, Logical) ->
+    #timestamp{wall_time = WallTime, logical = Logical}.
 
 changes_write_read(Config) ->
     TestDir = proplists:get_value(test_dir, Config),
@@ -169,17 +176,17 @@ changes_write_read(Config) ->
     {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
     DbName = <<"testdb">>,
 
-    %% Write a change
-    Seq = {0, 1},
+    %% Write a change with HLC
+    Hlc = make_test_hlc(1000, 1),
     DocInfo = #{
         id => <<"doc1">>,
         rev => <<"1-abc">>,
         deleted => false
     },
-    ok = barrel_changes:write_change(StoreRef, DbName, Seq, DocInfo),
+    ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo),
 
     %% Read it back via fold
-    {ok, Changes, LastSeq} = barrel_changes:fold_changes(
+    {ok, Changes, LastHlc} = barrel_changes:fold_changes(
         StoreRef, DbName, first,
         fun(Change, Acc) -> {ok, [Change | Acc]} end,
         []
@@ -188,8 +195,8 @@ changes_write_read(Config) ->
     ?assertEqual(1, length(Changes)),
     [Change] = Changes,
     ?assertEqual(<<"doc1">>, maps:get(id, Change)),
-    ?assertEqual(Seq, maps:get(seq, Change)),
-    ?assertEqual(Seq, LastSeq),
+    ?assertEqual(Hlc, maps:get(hlc, Change)),
+    ?assertEqual(Hlc, LastHlc),
 
     barrel_store_rocksdb:close(StoreRef),
     ok.
@@ -201,16 +208,16 @@ changes_fold(Config) ->
     {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
     DbName = <<"testdb">>,
 
-    %% Write multiple changes
+    %% Write multiple changes with HLC
     Changes = [
-        {<<"doc1">>, {0, 1}},
-        {<<"doc2">>, {0, 2}},
-        {<<"doc3">>, {0, 3}}
+        {<<"doc1">>, make_test_hlc(1000, 1)},
+        {<<"doc2">>, make_test_hlc(1000, 2)},
+        {<<"doc3">>, make_test_hlc(1000, 3)}
     ],
     lists:foreach(
-        fun({DocId, Seq}) ->
+        fun({DocId, Hlc}) ->
             DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false},
-            ok = barrel_changes:write_change(StoreRef, DbName, Seq, DocInfo)
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
         end,
         Changes
     ),
@@ -223,9 +230,9 @@ changes_fold(Config) ->
     ),
     ?assertEqual([<<"doc3">>, <<"doc2">>, <<"doc1">>], AllChanges),
 
-    %% Fold from specific sequence
+    %% Fold from specific HLC (exclusive)
     {ok, PartialChanges, _} = barrel_changes:fold_changes(
-        StoreRef, DbName, {0, 1},
+        StoreRef, DbName, make_test_hlc(1000, 1),
         fun(Change, Acc) -> {ok, [maps:get(id, Change) | Acc]} end,
         []
     ),
@@ -254,21 +261,21 @@ changes_get_list(Config) ->
     {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
     DbName = <<"testdb">>,
 
-    %% Write changes
+    %% Write changes with HLC
     lists:foreach(
         fun(N) ->
             DocId = iolist_to_binary(["doc", integer_to_list(N)]),
-            Seq = {0, N},
+            Hlc = make_test_hlc(1000, N),
             DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false},
-            ok = barrel_changes:write_change(StoreRef, DbName, Seq, DocInfo)
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
         end,
         lists:seq(1, 5)
     ),
 
     %% Get all changes
-    {ok, Changes, LastSeq} = barrel_changes:get_changes(StoreRef, DbName, first, #{}),
+    {ok, Changes, LastHlc} = barrel_changes:get_changes(StoreRef, DbName, first, #{}),
     ?assertEqual(5, length(Changes)),
-    ?assertEqual({0, 5}, LastSeq),
+    ?assertEqual(make_test_hlc(1000, 5), LastHlc),
 
     %% Verify order (ascending by default)
     Ids = [maps:get(id, C) || C <- Changes],
@@ -288,17 +295,17 @@ changes_limit(Config) ->
     lists:foreach(
         fun(N) ->
             DocId = iolist_to_binary(["doc", integer_to_list(N)]),
-            Seq = {0, N},
+            Hlc = make_test_hlc(1000, N),
             DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false},
-            ok = barrel_changes:write_change(StoreRef, DbName, Seq, DocInfo)
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
         end,
         lists:seq(1, 10)
     ),
 
     %% Get with limit
-    {ok, Changes, LastSeq} = barrel_changes:get_changes(StoreRef, DbName, first, #{limit => 3}),
+    {ok, Changes, LastHlc} = barrel_changes:get_changes(StoreRef, DbName, first, #{limit => 3}),
     ?assertEqual(3, length(Changes)),
-    ?assertEqual({0, 3}, LastSeq),
+    ?assertEqual(make_test_hlc(1000, 3), LastHlc),
 
     Ids = [maps:get(id, C) || C <- Changes],
     ?assertEqual([<<"doc1">>, <<"doc2">>, <<"doc3">>], Ids),
@@ -317,9 +324,9 @@ changes_doc_ids_filter(Config) ->
     lists:foreach(
         fun(N) ->
             DocId = iolist_to_binary(["doc", integer_to_list(N)]),
-            Seq = {0, N},
+            Hlc = make_test_hlc(1000, N),
             DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false},
-            ok = barrel_changes:write_change(StoreRef, DbName, Seq, DocInfo)
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
         end,
         lists:seq(1, 5)
     ),
@@ -345,14 +352,14 @@ changes_style(Config) ->
     DbName = <<"testdb">>,
 
     %% Write a change with multiple revisions (simulating conflicts)
-    Seq = {0, 1},
+    Hlc = make_test_hlc(1000, 1),
     DocInfo = #{
         id => <<"doc1">>,
         rev => <<"2-winner">>,
         deleted => false,
         revtree => #{} %% Empty revtree means no conflicts in current impl
     },
-    ok = barrel_changes:write_change(StoreRef, DbName, Seq, DocInfo),
+    ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo),
 
     %% With main_only style
     {ok, [Change], _} = barrel_changes:get_changes(
@@ -378,21 +385,34 @@ changes_last_seq(Config) ->
     {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
     DbName = <<"testdb">>,
 
-    %% Empty database
-    ?assertEqual({0, 0}, barrel_changes:get_last_seq(StoreRef, DbName)),
+    %% Empty database - last_seq returns encoded min HLC
+    LastSeq1 = barrel_changes:get_last_seq(StoreRef, DbName),
+    ?assert(is_binary(LastSeq1)),
+    ?assertEqual(12, byte_size(LastSeq1)),  %% HLC encoded is 12 bytes
+
+    %% Decode it to verify it's min HLC
+    LastHlc1 = barrel_changes:get_last_hlc(StoreRef, DbName),
+    ?assertEqual(barrel_hlc:min(), LastHlc1),
 
     %% After adding changes
     lists:foreach(
         fun(N) ->
             DocId = iolist_to_binary(["doc", integer_to_list(N)]),
-            Seq = {0, N},
+            Hlc = make_test_hlc(1000, N),
             DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false},
-            ok = barrel_changes:write_change(StoreRef, DbName, Seq, DocInfo)
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
         end,
         lists:seq(1, 5)
     ),
 
-    ?assertEqual({0, 5}, barrel_changes:get_last_seq(StoreRef, DbName)),
+    LastSeq2 = barrel_changes:get_last_seq(StoreRef, DbName),
+    ?assert(is_binary(LastSeq2)),
+
+    LastHlc2 = barrel_changes:get_last_hlc(StoreRef, DbName),
+    ?assertEqual(make_test_hlc(1000, 5), LastHlc2),
+
+    %% Verify encoding roundtrip
+    ?assertEqual(LastSeq2, barrel_hlc:encode(LastHlc2)),
 
     barrel_store_rocksdb:close(StoreRef),
     ok.
@@ -408,21 +428,21 @@ changes_count_since(Config) ->
     lists:foreach(
         fun(N) ->
             DocId = iolist_to_binary(["doc", integer_to_list(N)]),
-            Seq = {0, N},
+            Hlc = make_test_hlc(1000, N),
             DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false},
-            ok = barrel_changes:write_change(StoreRef, DbName, Seq, DocInfo)
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
         end,
         lists:seq(1, 10)
     ),
 
-    %% Count from beginning
-    ?assertEqual(10, barrel_changes:count_changes_since(StoreRef, DbName, {0, 0})),
+    %% Count from beginning (min HLC)
+    ?assertEqual(10, barrel_changes:count_changes_since(StoreRef, DbName, barrel_hlc:min())),
 
     %% Count from middle
-    ?assertEqual(5, barrel_changes:count_changes_since(StoreRef, DbName, {0, 5})),
+    ?assertEqual(5, barrel_changes:count_changes_since(StoreRef, DbName, make_test_hlc(1000, 5))),
 
     %% Count from end
-    ?assertEqual(0, barrel_changes:count_changes_since(StoreRef, DbName, {0, 10})),
+    ?assertEqual(0, barrel_changes:count_changes_since(StoreRef, DbName, make_test_hlc(1000, 10))),
 
     barrel_store_rocksdb:close(StoreRef),
     ok.
@@ -438,13 +458,13 @@ stream_iterate_mode(Config) ->
     {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
     DbName = <<"testdb">>,
 
-    %% Write some changes
+    %% Write some changes with HLC
     lists:foreach(
         fun(N) ->
             DocId = iolist_to_binary(["doc", integer_to_list(N)]),
-            Seq = {0, N},
+            Hlc = make_test_hlc(1000, N),
             DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false},
-            ok = barrel_changes:write_change(StoreRef, DbName, Seq, DocInfo)
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
         end,
         lists:seq(1, 3)
     ),
@@ -478,13 +498,13 @@ stream_push_mode(Config) ->
     {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
     DbName = <<"testdb">>,
 
-    %% Write some changes
+    %% Write some changes with HLC
     lists:foreach(
         fun(N) ->
             DocId = iolist_to_binary(["doc", integer_to_list(N)]),
-            Seq = {0, N},
+            Hlc = make_test_hlc(1000, N),
             DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false},
-            ok = barrel_changes:write_change(StoreRef, DbName, Seq, DocInfo)
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
         end,
         lists:seq(1, 3)
     ),

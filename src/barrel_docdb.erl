@@ -122,6 +122,13 @@
     delete_local_doc/2
 ]).
 
+%% HLC (Hybrid Logical Clock) for distributed time synchronization
+-export([
+    get_hlc/0,
+    sync_hlc/1,
+    new_hlc/0
+]).
+
 %%====================================================================
 %% Database Lifecycle
 %%====================================================================
@@ -672,12 +679,12 @@ list_views(Db) ->
 %% @doc Refresh a view and wait for it to be up-to-date.
 %%
 %% Triggers index update and waits for it to complete. Returns the
-%% sequence number up to which the view is indexed.
+%% HLC timestamp up to which the view is indexed.
 %%
 %% @param Db Database name or pid
 %% @param ViewId View identifier
-%% @returns `{ok, Sequence}' or `{error, Reason}'
--spec refresh_view(binary() | pid(), binary()) -> {ok, seq()} | {error, term()}.
+%% @returns `{ok, HlcTimestamp}' or `{error, Reason}'
+-spec refresh_view(binary() | pid(), binary()) -> {ok, barrel_hlc:timestamp()} | {error, term()}.
 refresh_view(Db, ViewId) ->
     with_db(Db, fun(Pid) ->
         barrel_view:refresh(Pid, ViewId)
@@ -805,25 +812,26 @@ explain(_Db, QuerySpec) ->
 %% Changes
 %%====================================================================
 
-%% @doc Get changes since a sequence number.
+%% @doc Get changes since an HLC timestamp.
 %%
-%% Returns all document changes since the given sequence. Use `first'
+%% Returns all document changes since the given HLC timestamp. Use `first'
 %% to get all changes from the beginning.
 %%
 %% == Example ==
 %% ```
 %% %% Get all changes
-%% {ok, Changes, LastSeq} = barrel_docdb:get_changes(<<"mydb">>, first),
+%% {ok, Changes, LastHlc} = barrel_docdb:get_changes(<<"mydb">>, first),
 %%
 %% %% Get incremental changes
-%% {ok, NewChanges, NewSeq} = barrel_docdb:get_changes(<<"mydb">>, LastSeq).
+%% {ok, NewChanges, NewHlc} = barrel_docdb:get_changes(<<"mydb">>, LastHlc).
 %% '''
 %%
 %% @param Db Database name or pid
-%% @param Since Sequence number or `first'
-%% @returns `{ok, [Change], LastSeq}' where each change has id, seq, rev, changes
+%% @param Since HLC timestamp or `first'
+%% @returns `{ok, [Change], LastHlc}' where each change has id, hlc, rev, changes
 %% @see get_changes/3
--spec get_changes(binary() | pid(), seq() | first) -> {ok, [map()], seq()}.
+-spec get_changes(binary() | pid(), barrel_hlc:timestamp() | first) ->
+    {ok, [map()], barrel_hlc:timestamp()}.
 get_changes(Db, Since) ->
     get_changes(Db, Since, #{}).
 
@@ -838,10 +846,11 @@ get_changes(Db, Since) ->
 %% </ul>
 %%
 %% @param Db Database name or pid
-%% @param Since Sequence number or `first'
+%% @param Since HLC timestamp or `first'
 %% @param Opts Query options
-%% @returns `{ok, [Change], LastSeq}'
--spec get_changes(binary() | pid(), seq() | first, map()) -> {ok, [map()], seq()}.
+%% @returns `{ok, [Change], LastHlc}'
+-spec get_changes(binary() | pid(), barrel_hlc:timestamp() | first, map()) ->
+    {ok, [map()], barrel_hlc:timestamp()}.
 get_changes(Db, Since, Opts) ->
     with_db(Db, fun(Pid) ->
         {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
@@ -862,20 +871,22 @@ get_changes(Db, Since, Opts) ->
 %% '''
 %%
 %% @param Db Database name or pid
-%% @param Since Starting sequence
+%% @param Since Starting HLC timestamp
 %% @returns `{ok, StreamPid}'
 %% @see subscribe_changes/3
--spec subscribe_changes(binary() | pid(), seq() | first) -> {ok, pid()} | {error, term()}.
+-spec subscribe_changes(binary() | pid(), barrel_hlc:timestamp() | first) ->
+    {ok, pid()} | {error, term()}.
 subscribe_changes(Db, Since) ->
     subscribe_changes(Db, Since, #{}).
 
 %% @doc Subscribe to a changes stream with options.
 %%
 %% @param Db Database name or pid
-%% @param Since Starting sequence
+%% @param Since Starting HLC timestamp
 %% @param Opts Stream options
 %% @returns `{ok, StreamPid}'
--spec subscribe_changes(binary() | pid(), seq() | first, map()) -> {ok, pid()} | {error, term()}.
+-spec subscribe_changes(binary() | pid(), barrel_hlc:timestamp() | first, map()) ->
+    {ok, pid()} | {error, term()}.
 subscribe_changes(Db, Since, Opts) ->
     with_db(Db, fun(Pid) ->
         {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
@@ -991,6 +1002,62 @@ delete_local_doc(Db, DocId) ->
     with_db(Db, fun(Pid) ->
         barrel_db_server:delete_local_doc(Pid, DocId)
     end).
+
+%%====================================================================
+%% HLC (Hybrid Logical Clock)
+%%====================================================================
+
+%% @doc Get the current global HLC timestamp.
+%%
+%% Returns the current Hybrid Logical Clock timestamp without advancing
+%% the clock. The HLC is node-global and used for ordering events across
+%% distributed machines.
+%%
+%% == Example ==
+%% ```
+%% TS = barrel_docdb:get_hlc().
+%% %% TS is a #timestamp{wall_time, logical} record
+%% '''
+%%
+%% @returns The current HLC timestamp
+-spec get_hlc() -> barrel_hlc:timestamp().
+get_hlc() ->
+    barrel_hlc:get_hlc().
+
+%% @doc Synchronize with a remote HLC timestamp.
+%%
+%% Call this when receiving data from another node to maintain causality.
+%% The local clock is updated to reflect the remote timestamp, ensuring
+%% that subsequent events are ordered after the received data.
+%%
+%% == Example ==
+%% ```
+%% %% When receiving data from another node:
+%% RemoteHlc = ... %% HLC from remote node
+%% {ok, NewHlc} = barrel_docdb:sync_hlc(RemoteHlc).
+%% '''
+%%
+%% @param RemoteHlc The HLC timestamp from the remote node
+%% @returns `{ok, UpdatedHlc}' or `{error, clock_skew}'
+-spec sync_hlc(barrel_hlc:timestamp()) -> {ok, barrel_hlc:timestamp()} | {error, clock_skew}.
+sync_hlc(RemoteHlc) ->
+    barrel_hlc:sync_hlc(RemoteHlc).
+
+%% @doc Generate a new HLC timestamp.
+%%
+%% Creates a new timestamp and advances the clock. Use this when creating
+%% events that will be sent to other nodes or need to be ordered.
+%%
+%% == Example ==
+%% ```
+%% TS = barrel_docdb:new_hlc().
+%% %% Use TS for ordering the event
+%% '''
+%%
+%% @returns A new HLC timestamp
+-spec new_hlc() -> barrel_hlc:timestamp().
+new_hlc() ->
+    barrel_hlc:new_hlc().
 
 %%====================================================================
 %% Internal Functions

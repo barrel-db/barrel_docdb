@@ -422,7 +422,7 @@ do_put_doc(StoreRef, DbName, Doc, _Opts) ->
 
     %% Check for existing document and get old doc body for path index update
     DocInfoKey = barrel_store_keys:doc_info(DbName, DocId),
-    {OldSeq, OldDocBody} = case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
+    {OldHlc, OldDocBody} = case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
         {ok, ExistingBin} ->
             ExistingDocInfo = binary_to_term(ExistingBin),
             ExistingRev = maps:get(rev, ExistingDocInfo),
@@ -432,7 +432,7 @@ do_put_doc(StoreRef, DbName, Doc, _Opts) ->
                 {ok, OldBodyBin} -> binary_to_term(OldBodyBin);
                 not_found -> #{}
             end,
-            {maps:get(seq, ExistingDocInfo, undefined), OldBody};
+            {maps:get(hlc, ExistingDocInfo, undefined), OldBody};
         not_found ->
             {undefined, undefined}
     end,
@@ -451,9 +451,8 @@ do_put_doc(StoreRef, DbName, Doc, _Opts) ->
             }
     end,
 
-    %% Get next sequence
-    CurrentSeq = barrel_changes:get_last_seq(StoreRef, DbName),
-    NextSeq = barrel_sequence:inc(case CurrentSeq of first -> barrel_sequence:min_seq(); S -> S end),
+    %% Generate new HLC timestamp for this change
+    NextHlc = barrel_hlc:new_hlc(),
 
     %% Build doc_info
     DocInfo = #{
@@ -461,7 +460,7 @@ do_put_doc(StoreRef, DbName, Doc, _Opts) ->
         rev => NewRev,
         deleted => Deleted,
         revtree => RevTree,
-        seq => NextSeq
+        hlc => NextHlc
     },
 
     %% Prepare batch operations for document
@@ -472,10 +471,10 @@ do_put_doc(StoreRef, DbName, Doc, _Opts) ->
         {put, barrel_store_keys:doc_rev(DbName, DocId, NewRev), term_to_binary(DocBody)}
     ],
 
-    %% Delete old sequence entry if exists
-    SeqDeleteOps = case OldSeq of
+    %% Delete old HLC entry if exists
+    HlcDeleteOps = case OldHlc of
         undefined -> [];
-        _ -> [{delete, barrel_store_keys:doc_seq(DbName, OldSeq)}]
+        _ -> [{delete, barrel_store_keys:doc_hlc(DbName, OldHlc)}]
     end,
 
     %% Path index operations (if not deleted)
@@ -499,10 +498,10 @@ do_put_doc(StoreRef, DbName, Doc, _Opts) ->
 
     %% Change entry operations
     ChangeInfo = DocInfo#{doc => DocBody},
-    ChangeOps = barrel_changes:write_change_ops(DbName, NextSeq, ChangeInfo),
+    ChangeOps = barrel_changes:write_change_ops(DbName, NextHlc, ChangeInfo),
 
     %% Write batch atomically (doc + path index + change in single batch)
-    AllOps = DocOps ++ SeqDeleteOps ++ PathIndexOps ++ ChangeOps,
+    AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps,
     ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps),
 
     %% Return result
@@ -572,10 +571,9 @@ do_delete_doc(StoreRef, DbName, DocId, Opts) ->
             DeleteHash = barrel_doc:revision_hash(#{}, CurrentRev, true),
             NewRev = barrel_doc:make_revision(Gen + 1, DeleteHash),
 
-            %% Get sequences
-            OldSeq = maps:get(seq, DocInfo, undefined),
-            CurrentSeq = barrel_changes:get_last_seq(StoreRef, DbName),
-            NextSeq = barrel_sequence:inc(case CurrentSeq of first -> barrel_sequence:min_seq(); S -> S end),
+            %% Get old HLC and generate new one
+            OldHlc = maps:get(hlc, DocInfo, undefined),
+            NextHlc = barrel_hlc:new_hlc(),
 
             %% Update revision tree
             RevTree = maps:get(revtree, DocInfo, #{}),
@@ -586,7 +584,7 @@ do_delete_doc(StoreRef, DbName, DocId, Opts) ->
                 rev => NewRev,
                 deleted => true,
                 revtree => NewRevTree,
-                seq => NextSeq
+                hlc => NextHlc
             },
 
             %% Prepare doc operations
@@ -594,9 +592,9 @@ do_delete_doc(StoreRef, DbName, DocId, Opts) ->
                 {put, DocInfoKey, term_to_binary(NewDocInfo)}
             ],
 
-            SeqDeleteOps = case OldSeq of
+            HlcDeleteOps = case OldHlc of
                 undefined -> [];
-                _ -> [{delete, barrel_store_keys:doc_seq(DbName, OldSeq)}]
+                _ -> [{delete, barrel_store_keys:doc_hlc(DbName, OldHlc)}]
             end,
 
             %% Path index removal operations
@@ -606,10 +604,10 @@ do_delete_doc(StoreRef, DbName, DocId, Opts) ->
             end,
 
             %% Change entry operations
-            ChangeOps = barrel_changes:write_change_ops(DbName, NextSeq, NewDocInfo),
+            ChangeOps = barrel_changes:write_change_ops(DbName, NextHlc, NewDocInfo),
 
             %% Write batch atomically (doc + path index + change in single batch)
-            AllOps = DocOps ++ SeqDeleteOps ++ PathIndexOps ++ ChangeOps,
+            AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps,
             ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps),
 
             {ok, #{<<"id">> => DocId, <<"ok">> => true, <<"rev">> => NewRev}};
@@ -666,7 +664,7 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
 
     %% Check for existing document and get old doc body for path index update
     DocInfoKey = barrel_store_keys:doc_info(DbName, DocId),
-    {ExistingRevTree, OldSeq, OldDocBody} = case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
+    {ExistingRevTree, OldHlc, OldDocBody} = case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
         {ok, ExistingBin} ->
             ExistingDocInfo = binary_to_term(ExistingBin),
             ExistingRev = maps:get(rev, ExistingDocInfo),
@@ -677,7 +675,7 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
                 not_found -> #{}
             end,
             {maps:get(revtree, ExistingDocInfo, #{}),
-             maps:get(seq, ExistingDocInfo, undefined),
+             maps:get(hlc, ExistingDocInfo, undefined),
              OldBody};
         not_found ->
             {#{}, undefined, undefined}
@@ -686,9 +684,8 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
     %% Build revision tree from history
     NewRevTree = build_revtree_from_history(History, Deleted, ExistingRevTree),
 
-    %% Get next sequence
-    CurrentSeq = barrel_changes:get_last_seq(StoreRef, DbName),
-    NextSeq = barrel_sequence:inc(case CurrentSeq of first -> barrel_sequence:min_seq(); S -> S end),
+    %% Generate new HLC timestamp for this change
+    NextHlc = barrel_hlc:new_hlc(),
 
     %% Build doc_info
     DocInfo = #{
@@ -696,7 +693,7 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
         rev => NewRev,
         deleted => Deleted,
         revtree => NewRevTree,
-        seq => NextSeq
+        hlc => NextHlc
     },
 
     %% Prepare doc operations
@@ -705,10 +702,10 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
         {put, barrel_store_keys:doc_rev(DbName, DocId, NewRev), term_to_binary(DocBody)}
     ],
 
-    %% Delete old sequence entry if exists
-    SeqDeleteOps = case OldSeq of
+    %% Delete old HLC entry if exists
+    HlcDeleteOps = case OldHlc of
         undefined -> [];
-        _ -> [{delete, barrel_store_keys:doc_seq(DbName, OldSeq)}]
+        _ -> [{delete, barrel_store_keys:doc_hlc(DbName, OldHlc)}]
     end,
 
     %% Path index operations
@@ -732,10 +729,10 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
 
     %% Change entry operations
     ChangeInfo = DocInfo#{doc => DocBody},
-    ChangeOps = barrel_changes:write_change_ops(DbName, NextSeq, ChangeInfo),
+    ChangeOps = barrel_changes:write_change_ops(DbName, NextHlc, ChangeInfo),
 
     %% Write batch atomically (doc + path index + change in single batch)
-    AllOps = DocOps ++ SeqDeleteOps ++ PathIndexOps ++ ChangeOps,
+    AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps,
     ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps),
 
     {ok, DocId, NewRev}.

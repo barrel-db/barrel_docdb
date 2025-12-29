@@ -59,23 +59,23 @@
 %% API
 %%====================================================================
 
-%% @doc Get the last indexed sequence for a view
+%% @doc Get the last indexed HLC for a view
 -spec get_indexed_seq(barrel_store_rocksdb:db_ref(), db_name(), binary()) ->
-    seq() | first.
+    barrel_hlc:timestamp() | first.
 get_indexed_seq(StoreRef, DbName, ViewId) ->
     Key = barrel_store_keys:view_seq(DbName, ViewId),
     case barrel_store_rocksdb:get(StoreRef, Key) of
         {ok, Bin} ->
-            barrel_sequence:decode(Bin);
+            barrel_hlc:decode(Bin);
         not_found ->
             first
     end.
 
-%% @doc Set the indexed sequence for a view
--spec set_indexed_seq(barrel_store_rocksdb:db_ref(), db_name(), binary(), seq()) -> ok.
-set_indexed_seq(StoreRef, DbName, ViewId, Seq) ->
+%% @doc Set the indexed HLC for a view
+-spec set_indexed_seq(barrel_store_rocksdb:db_ref(), db_name(), binary(), barrel_hlc:timestamp()) -> ok.
+set_indexed_seq(StoreRef, DbName, ViewId, Hlc) ->
     Key = barrel_store_keys:view_seq(DbName, ViewId),
-    Value = barrel_sequence:encode(Seq),
+    Value = barrel_hlc:encode(Hlc),
     barrel_store_rocksdb:put(StoreRef, Key, Value).
 
 %% @doc Update view entries for a document

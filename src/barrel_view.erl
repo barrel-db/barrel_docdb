@@ -111,8 +111,8 @@ query(DbServer, ViewId, Opts) ->
             Error
     end.
 
-%% @doc Wait for view to be up-to-date with current database sequence
--spec refresh(pid(), binary()) -> {ok, seq()} | {error, term()}.
+%% @doc Wait for view to be up-to-date with current database HLC
+-spec refresh(pid(), binary()) -> {ok, barrel_hlc:timestamp()} | {error, term()}.
 refresh(DbServer, ViewId) ->
     case barrel_db_server:get_view_pid(DbServer, ViewId) of
         {ok, Pid} ->
@@ -121,12 +121,12 @@ refresh(DbServer, ViewId) ->
             Error
     end.
 
-%% @doc Wait for view to be up-to-date with given sequence
--spec refresh(pid(), binary(), seq()) -> {ok, seq()} | {error, term()}.
-refresh(DbServer, ViewId, Seq) ->
+%% @doc Wait for view to be up-to-date with given HLC
+-spec refresh(pid(), binary(), barrel_hlc:timestamp()) -> {ok, barrel_hlc:timestamp()} | {error, term()}.
+refresh(DbServer, ViewId, Hlc) ->
     case barrel_db_server:get_view_pid(DbServer, ViewId) of
         {ok, Pid} ->
-            gen_statem:call(Pid, {refresh, Seq}, infinity);
+            gen_statem:call(Pid, {refresh, Hlc}, infinity);
         {error, _} = Error ->
             Error
     end.
@@ -255,31 +255,31 @@ idle({call, From}, {query, Opts}, State) ->
     {keep_state, State, [{reply, From, Result}]};
 
 idle({call, From}, refresh, #{store_ref := StoreRef, db_name := DbName, since := Since} = State) ->
-    %% Get current database sequence
-    CurrentSeq = barrel_changes:get_last_seq(StoreRef, DbName),
-    case needs_update(Since, CurrentSeq) of
+    %% Get current database HLC
+    CurrentHlc = barrel_changes:get_last_hlc(StoreRef, DbName),
+    case needs_update(Since, CurrentHlc) of
         false ->
             {keep_state, State, [{reply, From, {ok, Since}}]};
         true ->
             %% Start indexing and add to waiters
-            Waiters = [{From, CurrentSeq}],
+            Waiters = [{From, CurrentHlc}],
             NewState = State#{waiters => Waiters},
             start_indexing(NewState)
     end;
 
-idle({call, From}, {refresh, TargetSeq}, #{since := Since} = State) ->
-    case needs_update(Since, TargetSeq) of
+idle({call, From}, {refresh, TargetHlc}, #{since := Since} = State) ->
+    case needs_update(Since, TargetHlc) of
         false ->
             {keep_state, State, [{reply, From, {ok, Since}}]};
         true ->
-            Waiters = [{From, TargetSeq}],
+            Waiters = [{From, TargetHlc}],
             NewState = State#{waiters => Waiters},
             start_indexing(NewState)
     end;
 
 idle(state_timeout, check_updates, #{store_ref := StoreRef, db_name := DbName, since := Since} = State) ->
-    CurrentSeq = barrel_changes:get_last_seq(StoreRef, DbName),
-    case needs_update(Since, CurrentSeq) of
+    CurrentHlc = barrel_changes:get_last_hlc(StoreRef, DbName),
+    case needs_update(Since, CurrentHlc) of
         false ->
             {keep_state, State, [{state_timeout, ?CHECK_INTERVAL, check_updates}]};
         true ->
@@ -304,33 +304,33 @@ indexing({call, From}, {query, Opts}, State) ->
     {keep_state, State, [{reply, From, Result}]};
 
 indexing({call, From}, refresh, #{store_ref := StoreRef, db_name := DbName, waiters := Waiters} = State) ->
-    CurrentSeq = barrel_changes:get_last_seq(StoreRef, DbName),
-    NewWaiters = [{From, CurrentSeq} | Waiters],
+    CurrentHlc = barrel_changes:get_last_hlc(StoreRef, DbName),
+    NewWaiters = [{From, CurrentHlc} | Waiters],
     {keep_state, State#{waiters => NewWaiters}};
 
-indexing({call, From}, {refresh, TargetSeq}, #{waiters := Waiters} = State) ->
-    NewWaiters = [{From, TargetSeq} | Waiters],
+indexing({call, From}, {refresh, TargetHlc}, #{waiters := Waiters} = State) ->
+    NewWaiters = [{From, TargetHlc} | Waiters],
     {keep_state, State#{waiters => NewWaiters}};
 
-indexing(info, {index_updated, NewSeq}, #{waiters := Waiters} = State) ->
-    %% Notify waiters whose target seq has been reached
+indexing(info, {index_updated, NewHlc}, #{waiters := Waiters} = State) ->
+    %% Notify waiters whose target HLC has been reached
     {Satisfied, Remaining} = lists:partition(
-        fun({_From, TargetSeq}) -> not needs_update(NewSeq, TargetSeq) end,
+        fun({_From, TargetHlc}) -> not needs_update(NewHlc, TargetHlc) end,
         Waiters
     ),
     lists:foreach(
-        fun({From, _}) -> gen_statem:reply(From, {ok, NewSeq}) end,
+        fun({From, _}) -> gen_statem:reply(From, {ok, NewHlc}) end,
         Satisfied
     ),
-    {keep_state, State#{since => NewSeq, waiters => Remaining}};
+    {keep_state, State#{since => NewHlc, waiters => Remaining}};
 
-indexing(info, {index_complete, FinalSeq}, #{waiters := Waiters} = State) ->
+indexing(info, {index_complete, FinalHlc}, #{waiters := Waiters} = State) ->
     %% Pipeline finished - notify remaining waiters and go idle
     lists:foreach(
-        fun({From, _}) -> gen_statem:reply(From, {ok, FinalSeq}) end,
+        fun({From, _}) -> gen_statem:reply(From, {ok, FinalHlc}) end,
         Waiters
     ),
-    NewState = State#{since => FinalSeq, waiters => [], pipeline => undefined},
+    NewState = State#{since => FinalHlc, waiters => [], pipeline => undefined},
     {next_state, idle, NewState, [{state_timeout, ?CHECK_INTERVAL, check_updates}]};
 
 indexing(info, {'EXIT', Pid, Reason}, #{pipeline := #{reader := Pid}} = State) ->
@@ -413,9 +413,9 @@ stop_pipeline(#{reader := R, mapper := M, writer := W, snapshot := Snap}) ->
 handle_pipeline_exit(normal, State) ->
     %% Normal exit - wait for index_complete message
     {keep_state, State};
-handle_pipeline_exit({index_complete, Seq}, State) ->
+handle_pipeline_exit({index_complete, Hlc}, State) ->
     %% Pipeline completed successfully
-    indexing(info, {index_complete, Seq}, State);
+    indexing(info, {index_complete, Hlc}, State);
 handle_pipeline_exit(Reason, #{waiters := Waiters, pipeline := Pipeline} = State) ->
     %% Pipeline failed - notify waiters and go idle
     stop_pipeline(Pipeline),
@@ -433,39 +433,39 @@ handle_pipeline_exit(Reason, #{waiters := Waiters, pipeline := Pipeline} = State
 reader_loop(#{store_ref := StoreRef, db_name := DbName, snapshot := Snapshot,
               since := Since, mapper := Mapper}) ->
     %% Fold changes using snapshot
-    FoldFun = fun(Change, {Count, Batch, _LastSeq}) ->
+    FoldFun = fun(Change, {Count, Batch, _LastHlc}) ->
         NewBatch = [Change | Batch],
         NewCount = Count + 1,
-        ChangeSeq = maps:get(seq, Change),
+        ChangeHlc = maps:get(hlc, Change),
         case NewCount >= ?BATCH_SIZE of
             true ->
                 %% Send batch to mapper with backpressure
-                send_batch(Mapper, lists:reverse(NewBatch), ChangeSeq),
-                {ok, {0, [], ChangeSeq}};
+                send_batch(Mapper, lists:reverse(NewBatch), ChangeHlc),
+                {ok, {0, [], ChangeHlc}};
             false ->
-                {ok, {NewCount, NewBatch, ChangeSeq}}
+                {ok, {NewCount, NewBatch, ChangeHlc}}
         end
     end,
 
-    {ok, {_, FinalBatch, FinalSeq}, _} = barrel_changes:fold_changes(
+    {ok, {_, FinalBatch, FinalHlc}, _} = barrel_changes:fold_changes(
         StoreRef, DbName, Since, FoldFun, {0, [], Since}
     ),
 
     %% Send final batch if any
     case FinalBatch of
         [] -> ok;
-        _ -> send_batch(Mapper, lists:reverse(FinalBatch), FinalSeq)
+        _ -> send_batch(Mapper, lists:reverse(FinalBatch), FinalHlc)
     end,
 
     %% Signal end of changes
-    Mapper ! {done, FinalSeq},
+    Mapper ! {done, FinalHlc},
 
     %% Release snapshot and exit
     barrel_store_rocksdb:release_snapshot(Snapshot),
-    exit({index_complete, FinalSeq}).
+    exit({index_complete, FinalHlc}).
 
-send_batch(Mapper, Batch, Seq) ->
-    Mapper ! {batch, self(), Batch, Seq},
+send_batch(Mapper, Batch, Hlc) ->
+    Mapper ! {batch, self(), Batch, Hlc},
     receive
         {ack, Mapper} -> ok
     end.
@@ -476,7 +476,7 @@ send_batch(Mapper, Batch, Seq) ->
 
 mapper_loop(#{map_fun := MapFun, writer := Writer} = State) ->
     receive
-        {batch, Reader, Changes, Seq} ->
+        {batch, Reader, Changes, Hlc} ->
             %% Map each document using appropriate map function
             Mapped = lists:map(
                 fun(Change) ->
@@ -494,7 +494,7 @@ mapper_loop(#{map_fun := MapFun, writer := Writer} = State) ->
             ),
 
             %% Send to writer with backpressure
-            Writer ! {mapped, self(), Mapped, Seq},
+            Writer ! {mapped, self(), Mapped, Hlc},
             receive
                 {ack, Writer} -> ok
             end,
@@ -503,8 +503,8 @@ mapper_loop(#{map_fun := MapFun, writer := Writer} = State) ->
             Reader ! {ack, self()},
             mapper_loop(State);
 
-        {done, FinalSeq} ->
-            Writer ! {done, FinalSeq},
+        {done, FinalHlc} ->
+            Writer ! {done, FinalHlc},
             exit(normal)
     end.
 
@@ -710,7 +710,7 @@ extract_value(literal, _BoundVars) ->
 writer_loop(#{store_ref := StoreRef, db_name := DbName, view_id := ViewId,
               parent := Parent} = State) ->
     receive
-        {mapped, Mapper, Entries, Seq} ->
+        {mapped, Mapper, Entries, Hlc} ->
             %% Write entries to index
             lists:foreach(
                 fun({DocId, KVs, Deleted}) ->
@@ -724,19 +724,19 @@ writer_loop(#{store_ref := StoreRef, db_name := DbName, view_id := ViewId,
                 Entries
             ),
 
-            %% Update indexed sequence
-            barrel_view_index:set_indexed_seq(StoreRef, DbName, ViewId, Seq),
+            %% Update indexed HLC
+            barrel_view_index:set_indexed_seq(StoreRef, DbName, ViewId, Hlc),
 
             %% Notify parent of progress
-            Parent ! {index_updated, Seq},
+            Parent ! {index_updated, Hlc},
 
             %% Ack mapper
             Mapper ! {ack, self()},
             writer_loop(State);
 
-        {done, FinalSeq} ->
+        {done, FinalHlc} ->
             %% Notify parent of completion
-            Parent ! {index_complete, FinalSeq},
+            Parent ! {index_complete, FinalHlc},
             exit(normal)
     end.
 
@@ -971,6 +971,6 @@ update_stored_version(StoreRef, DbName, ViewId, Version) ->
             ok
     end.
 
-needs_update(first, _CurrentSeq) -> true;
-needs_update(Since, CurrentSeq) ->
-    barrel_sequence:compare(Since, CurrentSeq) < 0.
+needs_update(first, _CurrentHlc) -> true;
+needs_update(Since, CurrentHlc) ->
+    barrel_hlc:less(Since, CurrentHlc).

@@ -38,6 +38,18 @@ init([]) ->
         period => 60
     },
 
+    %% Global HLC clock for distributed time synchronization
+    %% Registered as 'barrel_hlc_clock' for node-wide access
+    HlcMaxOffset = application:get_env(barrel_docdb, hlc_max_offset, 0),
+    Hlc = #{
+        id => barrel_hlc_clock,
+        start => {hlc, start_link, [barrel_hlc_clock, fun hlc:physical_clock/0, HlcMaxOffset]},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [hlc]
+    },
+
     %% Database supervisor for managing individual database processes
     DbSup = #{
         id => barrel_db_sup,
@@ -48,6 +60,7 @@ init([]) ->
         modules => [barrel_db_sup]
     },
 
-    ChildSpecs = [DbSup],
+    %% HLC must start before databases
+    ChildSpecs = [Hlc, DbSup],
 
     {ok, {SupFlags, ChildSpecs}}.

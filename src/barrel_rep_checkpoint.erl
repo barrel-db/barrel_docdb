@@ -33,9 +33,9 @@
     target :: term(),
     source_transport :: module(),
     target_transport :: module(),
-    start_seq :: seq(),
-    last_seq :: seq(),
-    target_seq :: seq() | undefined,
+    start_seq :: barrel_hlc:timestamp() | first,
+    last_seq :: barrel_hlc:timestamp() | first,
+    docs_processed = 0 :: non_neg_integer(),
     options :: map()
 }).
 
@@ -65,7 +65,7 @@ new(RepConfig) ->
     %% Get start sequence from existing checkpoints
     StartSeq = checkpoint_start_seq(Source, Target, SourceTransport, TargetTransport, RepId),
 
-    Checkpoint = #checkpoint{
+    #checkpoint{
         rep_id = RepId,
         session_id = generate_session_id(),
         source = Source,
@@ -74,33 +74,36 @@ new(RepConfig) ->
         target_transport = TargetTransport,
         start_seq = StartSeq,
         last_seq = StartSeq,
+        docs_processed = 0,
         options = Options
-    },
-    set_next_target_seq(Checkpoint).
+    }.
 
-%% @doc Get the starting sequence for this replication session
--spec get_start_seq(checkpoint()) -> seq().
+%% @doc Get the starting HLC for this replication session
+-spec get_start_seq(checkpoint()) -> barrel_hlc:timestamp() | first.
 get_start_seq(#checkpoint{start_seq = Seq}) ->
     Seq.
 
-%% @doc Get the last processed sequence
--spec get_last_seq(checkpoint()) -> seq().
+%% @doc Get the last processed HLC
+-spec get_last_seq(checkpoint()) -> barrel_hlc:timestamp() | first.
 get_last_seq(#checkpoint{last_seq = Seq}) ->
     Seq.
 
-%% @doc Set the last processed sequence
--spec set_last_seq(seq(), checkpoint()) -> checkpoint().
-set_last_seq(Seq, Checkpoint) ->
-    Checkpoint#checkpoint{last_seq = Seq}.
+%% @doc Set the last processed sequence (HLC timestamp)
+-spec set_last_seq(barrel_hlc:timestamp() | first, checkpoint()) -> checkpoint().
+set_last_seq(Seq, #checkpoint{docs_processed = DocsProcessed} = Checkpoint) ->
+    Checkpoint#checkpoint{last_seq = Seq, docs_processed = DocsProcessed + 1}.
 
 %% @doc Check if checkpoint should be written and write it if needed
 -spec maybe_write_checkpoint(checkpoint()) -> checkpoint().
-maybe_write_checkpoint(#checkpoint{last_seq = LastSeq, target_seq = TargetSeq} = Checkpoint)
-  when LastSeq >= TargetSeq ->
-    ok = write_checkpoint(Checkpoint),
-    set_next_target_seq(Checkpoint);
-maybe_write_checkpoint(Checkpoint) ->
-    Checkpoint.
+maybe_write_checkpoint(#checkpoint{docs_processed = DocsProcessed, options = Options} = Checkpoint) ->
+    CheckpointSize = maps:get(checkpoint_size, Options, ?CHECKPOINT_SIZE),
+    case DocsProcessed >= CheckpointSize of
+        true ->
+            ok = write_checkpoint(Checkpoint),
+            Checkpoint#checkpoint{docs_processed = 0};
+        false ->
+            Checkpoint
+    end.
 
 %% @doc Write checkpoint to both source and target databases
 -spec write_checkpoint(checkpoint()) -> ok.
@@ -214,15 +217,6 @@ read_last_seq(Db, Transport, RepId) ->
 read_checkpoint_doc(Db, Transport, RepId) ->
     Transport:get_local_doc(Db, checkpoint_docid(RepId)).
 
-%% @doc Set next target sequence for checkpoint writing
-set_next_target_seq(#checkpoint{last_seq = LastSeq, options = Options} = Checkpoint) ->
-    CheckpointSize = maps:get(checkpoint_size, Options, ?CHECKPOINT_SIZE),
-    TargetSeq = case LastSeq of
-        first -> barrel_sequence:min_seq();
-        {Epoch, Counter} -> {Epoch, Counter + CheckpointSize}
-    end,
-    Checkpoint#checkpoint{target_seq = TargetSeq}.
-
 %% @doc Generate checkpoint document ID
 checkpoint_docid(RepId) ->
     <<"replication-checkpoint-", RepId/binary>>.
@@ -240,26 +234,28 @@ timestamp() ->
                       [Year, Month, Day, Hour, Min, Sec])
     ).
 
-%% @doc Encode sequence for storage
+%% @doc Encode HLC timestamp for storage in checkpoint
 encode_seq(first) -> <<"first">>;
-encode_seq({Epoch, Counter}) ->
-    iolist_to_binary(io_lib:format("~w:~w", [Epoch, Counter])).
+encode_seq(Hlc) ->
+    %% Store HLC as base64-encoded binary
+    base64:encode(barrel_hlc:encode(Hlc)).
 
-%% @doc Decode sequence from storage
+%% @doc Decode HLC timestamp from storage
 decode_seq(<<"first">>) -> first;
 decode_seq(Bin) when is_binary(Bin) ->
-    case binary:split(Bin, <<":">>) of
-        [EpochBin, CounterBin] ->
-            {binary_to_integer(EpochBin), binary_to_integer(CounterBin)};
-        _ ->
+    try
+        barrel_hlc:decode(base64:decode(Bin))
+    catch
+        _:_ ->
+            %% Handle legacy format or corrupted data
             first
     end.
 
-%% @doc Get minimum of two sequences
+%% @doc Get minimum of two HLC timestamps (earliest)
 min_seq(first, _) -> first;
 min_seq(_, first) -> first;
-min_seq({E1, C1} = S1, {E2, C2} = S2) ->
-    case {E1, C1} =< {E2, C2} of
-        true -> S1;
-        false -> S2
+min_seq(Hlc1, Hlc2) ->
+    case barrel_hlc:less(Hlc1, Hlc2) of
+        true -> Hlc1;
+        false -> Hlc2
     end.

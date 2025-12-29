@@ -498,15 +498,11 @@ write_test_docs(StoreRef, DbName, Docs) ->
             DocRevKey = barrel_store_keys:doc_rev(DbName, DocId, Rev),
             barrel_store_rocksdb:put(StoreRef, DocRevKey, term_to_binary(Doc)),
 
-            %% Get current seq and write change
-            CurrentSeq = barrel_changes:get_last_seq(StoreRef, DbName),
-            NextSeq = case CurrentSeq of
-                first -> {0, 1};
-                {E, C} -> {E, C + 1}
-            end,
+            %% Generate new HLC and write change
+            NextHlc = barrel_hlc:new_hlc(),
             %% Write change with doc included
-            ChangeInfo = DocInfo#{doc => Doc},
-            barrel_changes:write_change(StoreRef, DbName, NextSeq, ChangeInfo)
+            ChangeInfo = DocInfo#{doc => Doc, hlc => NextHlc},
+            barrel_changes:write_change(StoreRef, DbName, NextHlc, ChangeInfo)
         end,
         Docs
     ).
@@ -518,16 +514,12 @@ delete_test_doc(StoreRef, DbName, DocId) ->
         {ok, Bin} ->
             DocInfo = binary_to_term(Bin),
             %% Mark as deleted
-            DeletedInfo = DocInfo#{deleted => true},
+            NextHlc = barrel_hlc:new_hlc(),
+            DeletedInfo = DocInfo#{deleted => true, hlc => NextHlc},
             barrel_store_rocksdb:put(StoreRef, DocInfoKey, term_to_binary(DeletedInfo)),
 
             %% Write change
-            CurrentSeq = barrel_changes:get_last_seq(StoreRef, DbName),
-            NextSeq = case CurrentSeq of
-                first -> {0, 1};
-                {E, C} -> {E, C + 1}
-            end,
-            barrel_changes:write_change(StoreRef, DbName, NextSeq, DeletedInfo#{deleted => true});
+            barrel_changes:write_change(StoreRef, DbName, NextHlc, DeletedInfo#{deleted => true});
         not_found ->
             ok
     end.
