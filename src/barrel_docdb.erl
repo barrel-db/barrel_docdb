@@ -94,6 +94,13 @@
     refresh_view/2
 ]).
 
+%% Query (declarative queries using path index)
+-export([
+    find/2,
+    find/3,
+    explain/2
+]).
+
 %% Changes
 -export([
     get_changes/2,
@@ -545,9 +552,10 @@ list_attachments(Db, DocId) ->
 %% @doc Register a secondary index (view).
 %%
 %% Creates a view that maintains a secondary index over documents.
-%% The view module must implement the `barrel_view' behaviour.
+%% Views can be module-based or query-based.
 %%
-%% == View Module Example ==
+%% == Module-based View ==
+%% The view module must implement the `barrel_view' behaviour.
 %% ```
 %% -module(by_type_view).
 %% -behaviour(barrel_view).
@@ -557,18 +565,46 @@ list_attachments(Db, DocId) ->
 %%
 %% map(#{<<"type">> := Type}) -> [{Type, 1}];
 %% map(_) -> [].
-%% '''
 %%
-%% == Registration Example ==
-%% ```
+%% %% Registration:
 %% ok = barrel_docdb:register_view(<<"mydb">>, <<"by_type">>, #{
 %%     module => by_type_view
 %% }).
 %% '''
 %%
+%% == Query-based View ==
+%% Query-based views use declarative queries instead of module callbacks.
+%% They automatically index documents matching the query conditions.
+%% ```
+%% %% Create a materialized view from a query
+%% ok = barrel_docdb:register_view(<<"mydb">>, <<"users_by_org">>, #{
+%%     query => #{
+%%         where => [
+%%             {path, [<<"type">>], <<"user">>},
+%%             {path, [<<"org_id">>], '?Org'}
+%%         ],
+%%         key => '?Org'       %% Use org_id as the index key
+%%     },
+%%     reduce => '_count'      %% Optional: count users per org
+%% }).
+%%
+%% %% Query the materialized view
+%% {ok, Results} = barrel_docdb:query_view(<<"mydb">>, <<"users_by_org">>, #{
+%%     reduce => true          %% Apply reduce
+%% }).
+%% '''
+%%
+%% == Configuration Options ==
+%% <ul>
+%%   <li>`module' - Module implementing barrel_view behaviour (module-based)</li>
+%%   <li>`query' - Query specification with `where' and `key' (query-based)</li>
+%%   <li>`reduce' - Optional reduce: '_count', '_sum', '_stats' (both types)</li>
+%%   <li>`refresh' - Refresh mode: on_change (default) or manual</li>
+%% </ul>
+%%
 %% @param Db Database name or pid
 %% @param ViewId View identifier
-%% @param Config View configuration with `module' key
+%% @param Config View configuration
 %% @returns `ok' or `{error, Reason}'
 -spec register_view(binary() | pid(), binary(), map()) -> ok | {error, term()}.
 register_view(Db, ViewId, Config) ->
@@ -646,6 +682,124 @@ refresh_view(Db, ViewId) ->
     with_db(Db, fun(Pid) ->
         barrel_view:refresh(Pid, ViewId)
     end).
+
+%%====================================================================
+%% Query
+%%====================================================================
+
+%% @doc Find documents matching a query specification.
+%%
+%% Executes a declarative query against the path index. All document
+%% paths are automatically indexed, enabling ad-hoc queries without
+%% predefined views.
+%%
+%% == Query Specification ==
+%% <ul>
+%%   <li>`where' - List of conditions (required)</li>
+%%   <li>`select' - Fields to return (optional, defaults to full doc)</li>
+%%   <li>`order_by' - Field or variable to sort by (optional)</li>
+%%   <li>`limit' - Maximum results (optional)</li>
+%%   <li>`offset' - Skip first N results (optional)</li>
+%%   <li>`include_docs' - Include full documents (optional, default true)</li>
+%% </ul>
+%%
+%% == Conditions ==
+%% <ul>
+%%   <li>`{path, Path, Value}' - Equality match on path</li>
+%%   <li>`{compare, Path, Op, Value}' - Comparison (>, <, >=, =<, =/=)</li>
+%%   <li>`{'and', [Clauses]}' - All conditions must match</li>
+%%   <li>`{'or', [Clauses]}' - Any condition must match</li>
+%%   <li>`{'not', Clause}' - Negation</li>
+%%   <li>`{in, Path, Values}' - Value in list</li>
+%%   <li>`{contains, Path, Value}' - Array contains value</li>
+%%   <li>`{exists, Path}' - Path exists</li>
+%%   <li>`{missing, Path}' - Path does not exist</li>
+%%   <li>`{regex, Path, Pattern}' - Regex match</li>
+%%   <li>`{prefix, Path, Prefix}' - String prefix match</li>
+%% </ul>
+%%
+%% == Example ==
+%% ```
+%% %% Find all active users in org1
+%% {ok, Results} = barrel_docdb:find(<<"mydb">>, #{
+%%     where => [
+%%         {path, [<<"type">>], <<"user">>},
+%%         {path, [<<"org_id">>], <<"org1">>},
+%%         {path, [<<"status">>], <<"active">>}
+%%     ],
+%%     limit => 100
+%% }).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param QuerySpec Query specification map
+%% @returns `{ok, [Document]}' or `{error, Reason}'
+%% @see find/3
+%% @see explain/2
+-spec find(binary() | pid(), map()) -> {ok, [map()]} | {error, term()}.
+find(Db, QuerySpec) ->
+    find(Db, QuerySpec, #{}).
+
+%% @doc Find documents with additional options.
+%%
+%% Same as `find/2' but allows merging additional options into the query.
+%%
+%% == Example ==
+%% ```
+%% {ok, Results} = barrel_docdb:find(<<"mydb">>,
+%%     #{where => [{path, [<<"type">>], <<"user">>}]},
+%%     #{limit => 10, include_docs => false}
+%% ).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param QuerySpec Query specification map
+%% @param Opts Additional options to merge
+%% @returns `{ok, [Document]}' or `{error, Reason}'
+-spec find(binary() | pid(), map(), map()) -> {ok, [map()]} | {error, term()}.
+find(Db, QuerySpec, Opts) ->
+    with_db(Db, fun(Pid) ->
+        {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
+        {ok, Info} = barrel_db_server:info(Pid),
+        DbName = maps:get(name, Info),
+        %% Default include_docs to true for find API
+        DefaultOpts = #{include_docs => true},
+        MergedSpec = maps:merge(maps:merge(DefaultOpts, QuerySpec), Opts),
+        case barrel_query:compile(MergedSpec) of
+            {ok, Plan} ->
+                {ok, Results, _LastSeq} = barrel_query:execute(StoreRef, DbName, Plan),
+                {ok, Results};
+            {error, _} = Error ->
+                Error
+        end
+    end).
+
+%% @doc Explain a query execution plan.
+%%
+%% Returns information about how a query would be executed without
+%% actually running it. Useful for understanding query performance
+%% and optimization.
+%%
+%% == Example ==
+%% ```
+%% {ok, Explanation} = barrel_docdb:explain(<<"mydb">>, #{
+%%     where => [{path, [<<"type">>], <<"user">>}]
+%% }),
+%% Strategy = maps:get(strategy, Explanation).
+%% %% Returns: index_seek | index_scan | multi_index | full_scan
+%% '''
+%%
+%% @param Db Database name or pid (unused, for API consistency)
+%% @param QuerySpec Query specification map
+%% @returns `{ok, ExplanationMap}' or `{error, Reason}'
+-spec explain(binary() | pid(), map()) -> {ok, map()} | {error, term()}.
+explain(_Db, QuerySpec) ->
+    case barrel_query:compile(QuerySpec) of
+        {ok, Plan} ->
+            {ok, barrel_query:explain(Plan)};
+        {error, _} = Error ->
+            Error
+    end.
 
 %%====================================================================
 %% Changes

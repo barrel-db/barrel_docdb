@@ -14,12 +14,24 @@
 
 -include("barrel_docdb.hrl").
 
-%% Behaviour definition
+%% Behaviour definition for module-based views
 -callback version() -> pos_integer().
 -callback map(Doc :: map()) -> [{Key :: term(), Value :: term()}].
 -callback reduce(Keys :: [term()] | null, Values :: [term()], Rereduce :: boolean()) -> term().
 
 -optional_callbacks([reduce/3]).
+
+%% Query-based view types
+-type view_key_spec() :: barrel_query:logic_var() | [barrel_query:logic_var()].
+-type view_value_spec() :: barrel_query:logic_var() | literal | 1.
+-type view_query_spec() :: #{
+    where := [barrel_query:condition()],
+    key := view_key_spec(),
+    value => view_value_spec()
+}.
+-type refresh_mode() :: on_change | manual.
+
+-export_type([view_query_spec/0, refresh_mode/0]).
 
 %% API - View management
 -export([
@@ -145,52 +157,86 @@ get_view_id(Pid) ->
 
 callback_mode() -> state_functions.
 
-init([DbName, StoreRef, #{id := ViewId, module := Mod} = Config]) ->
+init([DbName, StoreRef, #{id := ViewId} = Config]) ->
     process_flag(trap_exit, true),
 
-    %% Get reduce function (module callback or built-in)
-    Reduce = get_reduce_fun(Config, Mod),
-
-    %% Check stored version vs current module version
-    StoredVersion = get_stored_version(StoreRef, DbName, ViewId),
-    CurrentVersion = Mod:version(),
-
-    Since = case {StoredVersion, CurrentVersion} of
-        {undefined, _} ->
-            %% New view - start from beginning
-            ok = barrel_view_index:set_view_meta(StoreRef, DbName, ViewId, #{
-                id => ViewId,
-                module => Mod,
-                version => CurrentVersion,
-                reduce => Reduce =/= undefined
-            }),
-            first;
-        {V, V} ->
-            %% Same version - resume from last indexed seq
-            barrel_view_index:get_indexed_seq(StoreRef, DbName, ViewId);
-        {Old, New} when New > Old ->
-            %% Version bumped - clear and rebuild
-            ok = barrel_view_index:clear_all(StoreRef, DbName, ViewId),
-            ok = update_stored_version(StoreRef, DbName, ViewId, New),
-            first;
-        _ ->
-            %% Version went backwards - error
-            {stop, {error, version_mismatch}}
+    %% Determine view type: module-based or query-based
+    InitResult = case Config of
+        #{module := Mod} ->
+            %% Module-based view
+            ReduceFun = get_reduce_fun(Config, Mod),
+            ModVersion = Mod:version(),
+            {ok, module, {module, Mod}, ReduceFun, ModVersion};
+        #{query := QuerySpec} ->
+            %% Query-based view
+            case compile_query_view(QuerySpec) of
+                {ok, CompiledQuery} ->
+                    ReduceFun = get_reduce_fun_from_config(Config),
+                    %% Query-based views use hash of query spec as version
+                    QueryVersion = erlang:phash2(QuerySpec),
+                    {ok, query, {query, CompiledQuery}, ReduceFun, QueryVersion};
+                {error, Reason} ->
+                    {error, {invalid_query, Reason}}
+            end
     end,
 
-    State = #{
-        db_name => DbName,
-        store_ref => StoreRef,
-        view_id => ViewId,
-        module => Mod,
-        reduce => Reduce,
-        since => Since,
-        waiters => [],
-        pipeline => undefined
-    },
+    case InitResult of
+        {error, _} = Error ->
+            {stop, Error};
+        {ok, ViewType, MapFun, Reduce, CurrentVersion} ->
+            %% Get refresh mode (defaults to on_change)
+            RefreshMode = maps:get(refresh, Config, on_change),
 
-    %% Schedule initial check for updates
-    {ok, idle, State, [{state_timeout, 0, check_updates}]}.
+            %% Check stored version vs current version
+            StoredVersion = get_stored_version(StoreRef, DbName, ViewId),
+
+            Since = case StoredVersion of
+                undefined ->
+                    %% New view - start from beginning
+                    ok = barrel_view_index:set_view_meta(StoreRef, DbName, ViewId, #{
+                        id => ViewId,
+                        type => ViewType,
+                        version => CurrentVersion,
+                        reduce => Reduce =/= undefined,
+                        refresh => RefreshMode
+                    }),
+                    first;
+                CurrentVersion ->
+                    %% Same version - resume from last indexed seq
+                    barrel_view_index:get_indexed_seq(StoreRef, DbName, ViewId);
+                OldVersion when OldVersion < CurrentVersion ->
+                    %% Version bumped - clear and rebuild
+                    ok = barrel_view_index:clear_all(StoreRef, DbName, ViewId),
+                    ok = update_stored_version(StoreRef, DbName, ViewId, CurrentVersion),
+                    first;
+                _ ->
+                    %% Version went backwards - clear and rebuild
+                    ok = barrel_view_index:clear_all(StoreRef, DbName, ViewId),
+                    ok = update_stored_version(StoreRef, DbName, ViewId, CurrentVersion),
+                    first
+            end,
+
+            State = #{
+                db_name => DbName,
+                store_ref => StoreRef,
+                view_id => ViewId,
+                view_type => ViewType,
+                map_fun => MapFun,
+                reduce => Reduce,
+                refresh_mode => RefreshMode,
+                since => Since,
+                waiters => [],
+                pipeline => undefined
+            },
+
+            %% Schedule initial check for updates (skip for manual refresh)
+            case RefreshMode of
+                manual ->
+                    {ok, idle, State};
+                on_change ->
+                    {ok, idle, State, [{state_timeout, 0, check_updates}]}
+            end
+    end.
 
 terminate(_Reason, _StateName, #{pipeline := Pipeline}) ->
     %% Stop pipeline processes if running
@@ -307,7 +353,7 @@ indexing(_EventType, _Event, State) ->
 %%====================================================================
 
 start_indexing(#{store_ref := StoreRef, db_name := DbName, view_id := ViewId,
-                 module := Mod, since := Since} = State) ->
+                 map_fun := MapFun, since := Since} = State) ->
     Parent = self(),
 
     %% Take a snapshot for consistent reads
@@ -327,7 +373,7 @@ start_indexing(#{store_ref := StoreRef, db_name := DbName, view_id := ViewId,
     MapperPid = spawn_link(fun() ->
         ?MODULE:mapper_loop(#{
             parent => Parent,
-            module => Mod,
+            map_fun => MapFun,
             writer => WriterPid,
             pending => 0
         })
@@ -428,10 +474,10 @@ send_batch(Mapper, Batch, Seq) ->
 %% Pipeline: Mapper Process
 %%====================================================================
 
-mapper_loop(#{module := Mod, writer := Writer} = State) ->
+mapper_loop(#{map_fun := MapFun, writer := Writer} = State) ->
     receive
         {batch, Reader, Changes, Seq} ->
-            %% Map each document
+            %% Map each document using appropriate map function
             Mapped = lists:map(
                 fun(Change) ->
                     DocId = maps:get(id, Change),
@@ -440,9 +486,7 @@ mapper_loop(#{module := Mod, writer := Writer} = State) ->
                     Entries = case Deleted of
                         true -> [];
                         false ->
-                            try Mod:map(Doc)
-                            catch _:_ -> []
-                            end
+                            apply_map_fun(MapFun, Doc)
                     end,
                     {DocId, Entries, Deleted}
                 end,
@@ -463,6 +507,201 @@ mapper_loop(#{module := Mod, writer := Writer} = State) ->
             Writer ! {done, FinalSeq},
             exit(normal)
     end.
+
+%% @doc Apply map function (module-based or query-based)
+apply_map_fun({module, Mod}, Doc) ->
+    try Mod:map(Doc)
+    catch _:_ -> []
+    end;
+apply_map_fun({query, CompiledQuery}, Doc) ->
+    query_map(Doc, CompiledQuery).
+
+%% @doc Map a document using a compiled query
+%% Returns [{Key, Value}] if document matches, [] otherwise
+query_map(Doc, #{conditions := Conditions, bindings := Bindings,
+                  key_spec := KeySpec, value_spec := ValueSpec}) ->
+    case matches_query_conditions(Doc, Conditions, Bindings) of
+        {true, BoundVars} ->
+            Key = extract_key(KeySpec, BoundVars),
+            Value = extract_value(ValueSpec, BoundVars),
+            [{Key, Value}];
+        false ->
+            []
+    end.
+
+%% @doc Check if document matches query conditions
+matches_query_conditions(Doc, Conditions, InitBindings) ->
+    matches_conditions_loop(Doc, Conditions, InitBindings, #{}).
+
+matches_conditions_loop(_Doc, [], _Bindings, BoundVars) ->
+    {true, BoundVars};
+matches_conditions_loop(Doc, [Condition | Rest], Bindings, BoundVars) ->
+    case match_query_condition(Doc, Condition, Bindings, BoundVars) of
+        {true, NewBoundVars} ->
+            matches_conditions_loop(Doc, Rest, Bindings, NewBoundVars);
+        false ->
+            false
+    end.
+
+match_query_condition(Doc, {path, Path, Value}, _Bindings, BoundVars) ->
+    case get_doc_path_value(Doc, Path) of
+        {ok, DocValue} ->
+            case barrel_query:is_logic_var(Value) of
+                true ->
+                    {true, BoundVars#{Value => DocValue}};
+                false ->
+                    case DocValue =:= Value of
+                        true -> {true, BoundVars};
+                        false -> false
+                    end
+            end;
+        not_found ->
+            false
+    end;
+
+match_query_condition(Doc, {compare, Path, Op, Value}, _Bindings, BoundVars) ->
+    case get_doc_path_value(Doc, Path) of
+        {ok, DocValue} ->
+            CompareValue = case barrel_query:is_logic_var(Value) of
+                true -> maps:get(Value, BoundVars, undefined);
+                false -> Value
+            end,
+            case compare_query_values(DocValue, Op, CompareValue) of
+                true -> {true, BoundVars};
+                false -> false
+            end;
+        not_found ->
+            false
+    end;
+
+match_query_condition(Doc, {'and', Conditions}, Bindings, BoundVars) ->
+    matches_conditions_loop(Doc, Conditions, Bindings, BoundVars);
+
+match_query_condition(Doc, {'or', Conditions}, Bindings, BoundVars) ->
+    match_query_any(Doc, Conditions, Bindings, BoundVars);
+
+match_query_condition(Doc, {'not', Condition}, Bindings, BoundVars) ->
+    case match_query_condition(Doc, Condition, Bindings, BoundVars) of
+        {true, _} -> false;
+        false -> {true, BoundVars}
+    end;
+
+match_query_condition(Doc, {in, Path, Values}, _Bindings, BoundVars) ->
+    case get_doc_path_value(Doc, Path) of
+        {ok, DocValue} ->
+            case lists:member(DocValue, Values) of
+                true -> {true, BoundVars};
+                false -> false
+            end;
+        not_found ->
+            false
+    end;
+
+match_query_condition(Doc, {contains, Path, Value}, _Bindings, BoundVars) ->
+    case get_doc_path_value(Doc, Path) of
+        {ok, DocValue} when is_list(DocValue) ->
+            case lists:member(Value, DocValue) of
+                true -> {true, BoundVars};
+                false -> false
+            end;
+        _ ->
+            false
+    end;
+
+match_query_condition(Doc, {exists, Path}, _Bindings, BoundVars) ->
+    case get_doc_path_value(Doc, Path) of
+        {ok, _} -> {true, BoundVars};
+        not_found -> false
+    end;
+
+match_query_condition(Doc, {missing, Path}, _Bindings, BoundVars) ->
+    case get_doc_path_value(Doc, Path) of
+        {ok, _} -> false;
+        not_found -> {true, BoundVars}
+    end;
+
+match_query_condition(Doc, {regex, Path, Pattern}, _Bindings, BoundVars) ->
+    case get_doc_path_value(Doc, Path) of
+        {ok, DocValue} when is_binary(DocValue) ->
+            case re:run(DocValue, Pattern) of
+                {match, _} -> {true, BoundVars};
+                nomatch -> false
+            end;
+        _ ->
+            false
+    end;
+
+match_query_condition(Doc, {prefix, Path, Prefix}, _Bindings, BoundVars) ->
+    case get_doc_path_value(Doc, Path) of
+        {ok, DocValue} when is_binary(DocValue) ->
+            PrefixLen = byte_size(Prefix),
+            case DocValue of
+                <<Prefix:PrefixLen/binary, _/binary>> -> {true, BoundVars};
+                _ -> false
+            end;
+        _ ->
+            false
+    end;
+
+match_query_condition(_Doc, _, _Bindings, _BoundVars) ->
+    false.
+
+match_query_any(_Doc, [], _Bindings, _BoundVars) ->
+    false;
+match_query_any(Doc, [Condition | Rest], Bindings, BoundVars) ->
+    case match_query_condition(Doc, Condition, Bindings, BoundVars) of
+        {true, NewBoundVars} -> {true, NewBoundVars};
+        false -> match_query_any(Doc, Rest, Bindings, BoundVars)
+    end.
+
+%% @doc Get a value from document at the given path
+get_doc_path_value(Doc, []) ->
+    {ok, Doc};
+get_doc_path_value(Doc, [Key | Rest]) when is_map(Doc), is_binary(Key) ->
+    case maps:find(Key, Doc) of
+        {ok, Value} -> get_doc_path_value(Value, Rest);
+        error -> not_found
+    end;
+get_doc_path_value(Doc, [Index | Rest]) when is_list(Doc), is_integer(Index) ->
+    case Index < length(Doc) of
+        true ->
+            Value = lists:nth(Index + 1, Doc),
+            get_doc_path_value(Value, Rest);
+        false ->
+            not_found
+    end;
+get_doc_path_value(_, _) ->
+    not_found.
+
+%% @doc Compare two values with an operator
+compare_query_values(A, '>', B) when is_number(A), is_number(B) -> A > B;
+compare_query_values(A, '<', B) when is_number(A), is_number(B) -> A < B;
+compare_query_values(A, '>=', B) when is_number(A), is_number(B) -> A >= B;
+compare_query_values(A, '=<', B) when is_number(A), is_number(B) -> A =< B;
+compare_query_values(A, '=/=', B) -> A =/= B;
+compare_query_values(A, '==', B) -> A =:= B;
+compare_query_values(A, '>', B) when is_binary(A), is_binary(B) -> A > B;
+compare_query_values(A, '<', B) when is_binary(A), is_binary(B) -> A < B;
+compare_query_values(A, '>=', B) when is_binary(A), is_binary(B) -> A >= B;
+compare_query_values(A, '=<', B) when is_binary(A), is_binary(B) -> A =< B;
+compare_query_values(_, _, _) -> false.
+
+%% @doc Extract key from bound variables
+extract_key(KeySpec, BoundVars) when is_atom(KeySpec) ->
+    maps:get(KeySpec, BoundVars, null);
+extract_key(KeySpec, BoundVars) when is_list(KeySpec) ->
+    [maps:get(K, BoundVars, null) || K <- KeySpec].
+
+%% @doc Extract value from bound variables
+extract_value(ValueSpec, BoundVars) when is_atom(ValueSpec) ->
+    case barrel_query:is_logic_var(ValueSpec) of
+        true -> maps:get(ValueSpec, BoundVars, null);
+        false -> 1  % Default value for counting
+    end;
+extract_value(1, _BoundVars) ->
+    1;
+extract_value(literal, _BoundVars) ->
+    1.
 
 %%====================================================================
 %% Pipeline: Writer Process
@@ -623,6 +862,100 @@ get_reduce_fun(_, Mod) ->
         true -> {module, Mod};
         false -> undefined
     end.
+
+%% @doc Get reduce function from config (for query-based views)
+get_reduce_fun_from_config(#{reduce := '_count'}) -> {builtin, '_count'};
+get_reduce_fun_from_config(#{reduce := '_sum'}) -> {builtin, '_sum'};
+get_reduce_fun_from_config(#{reduce := '_stats'}) -> {builtin, '_stats'};
+get_reduce_fun_from_config(_) -> undefined.
+
+%% @doc Compile a query spec for use in a view
+%% The query spec must include:
+%%   - where: list of conditions (same as barrel_query)
+%%   - key: variable or list of variables to use as index key
+%%   - value (optional): variable or 1 for counting
+compile_query_view(#{where := Where, key := KeySpec} = QuerySpec) ->
+    %% Validate the where clause
+    case barrel_query:validate_spec(#{where => Where}) of
+        ok ->
+            %% Normalize conditions
+            NormalizedConditions = [barrel_query:normalize_condition(C) || C <- Where],
+            %% Extract bindings (variable -> path mappings)
+            Bindings = extract_query_bindings(NormalizedConditions),
+            %% Get value spec
+            ValueSpec = maps:get(value, QuerySpec, 1),
+            %% Validate key spec references bound variables
+            case validate_key_spec(KeySpec, Bindings) of
+                ok ->
+                    {ok, #{
+                        conditions => NormalizedConditions,
+                        bindings => Bindings,
+                        key_spec => KeySpec,
+                        value_spec => ValueSpec
+                    }};
+                {error, _} = Error ->
+                    Error
+            end;
+        {error, _} = Error ->
+            Error
+    end;
+compile_query_view(#{where := _}) ->
+    {error, {missing_key_spec, "Query-based views require a 'key' specification"}};
+compile_query_view(_) ->
+    {error, {missing_where_clause, "Query-based views require a 'where' clause"}}.
+
+%% @doc Extract variable bindings from conditions
+extract_query_bindings(Conditions) ->
+    extract_query_bindings(Conditions, #{}).
+
+extract_query_bindings([], Acc) ->
+    Acc;
+extract_query_bindings([{path, Path, Value} | Rest], Acc) ->
+    case barrel_query:is_logic_var(Value) of
+        true ->
+            extract_query_bindings(Rest, Acc#{Value => Path});
+        false ->
+            extract_query_bindings(Rest, Acc)
+    end;
+extract_query_bindings([{compare, Path, _Op, Value} | Rest], Acc) ->
+    case barrel_query:is_logic_var(Value) of
+        true ->
+            extract_query_bindings(Rest, Acc#{Value => Path});
+        false ->
+            extract_query_bindings(Rest, Acc)
+    end;
+extract_query_bindings([{'and', Nested} | Rest], Acc) ->
+    NestedBindings = extract_query_bindings(Nested, Acc),
+    extract_query_bindings(Rest, NestedBindings);
+extract_query_bindings([{'or', _} | Rest], Acc) ->
+    %% OR bindings are tricky - skip for now
+    extract_query_bindings(Rest, Acc);
+extract_query_bindings([_ | Rest], Acc) ->
+    extract_query_bindings(Rest, Acc).
+
+%% @doc Validate that key spec references bound variables
+validate_key_spec(KeySpec, Bindings) when is_atom(KeySpec) ->
+    case barrel_query:is_logic_var(KeySpec) of
+        true ->
+            case maps:is_key(KeySpec, Bindings) of
+                true -> ok;
+                false -> {error, {unbound_variable, KeySpec}}
+            end;
+        false ->
+            {error, {invalid_key_spec, KeySpec}}
+    end;
+validate_key_spec(KeySpec, Bindings) when is_list(KeySpec) ->
+    case lists:all(
+        fun(K) ->
+            barrel_query:is_logic_var(K) andalso maps:is_key(K, Bindings)
+        end,
+        KeySpec
+    ) of
+        true -> ok;
+        false -> {error, {invalid_key_spec, KeySpec}}
+    end;
+validate_key_spec(KeySpec, _Bindings) ->
+    {error, {invalid_key_spec, KeySpec}}.
 
 get_stored_version(StoreRef, DbName, ViewId) ->
     case barrel_view_index:get_view_meta(StoreRef, DbName, ViewId) of
