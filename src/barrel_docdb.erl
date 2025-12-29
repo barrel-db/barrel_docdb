@@ -1,9 +1,54 @@
 %%%-------------------------------------------------------------------
+%%% @author Benoit Chesneau
+%%% @copyright (C) 2024, Benoit Chesneau
 %%% @doc barrel_docdb - Public API for barrel_docdb
 %%%
 %%% This module provides the main public API for interacting with
-%%% barrel_docdb databases. It wraps all lower-level operations into
-%%% a clean, user-friendly interface.
+%%% barrel_docdb databases. It supports:
+%%%
+%%% <ul>
+%%%   <li>Database lifecycle management (create, open, close, delete)</li>
+%%%   <li>Document CRUD operations with MVCC revision control</li>
+%%%   <li>Binary attachments stored efficiently with BlobDB</li>
+%%%   <li>Secondary indexes (views) with automatic updates</li>
+%%%   <li>Changes feed for tracking document modifications</li>
+%%%   <li>Replication primitives for syncing databases</li>
+%%% </ul>
+%%%
+%%% == Quick Start ==
+%%%
+%%% ```
+%%% %% Create a database
+%%% {ok, _} = barrel_docdb:create_db(<<"mydb">>),
+%%%
+%%% %% Store a document
+%%% {ok, #{<<"id">> := DocId, <<"rev">> := Rev}} =
+%%%     barrel_docdb:put_doc(<<"mydb">>, #{
+%%%         <<"id">> => <<"doc1">>,
+%%%         <<"type">> => <<"user">>,
+%%%         <<"name">> => <<"Alice">>
+%%%     }),
+%%%
+%%% %% Retrieve the document
+%%% {ok, Doc} = barrel_docdb:get_doc(<<"mydb">>, <<"doc1">>),
+%%%
+%%% %% Update the document (must include _rev)
+%%% {ok, _} = barrel_docdb:put_doc(<<"mydb">>, Doc#{<<"name">> => <<"Bob">>}),
+%%%
+%%% %% Delete the document
+%%% {ok, _} = barrel_docdb:delete_doc(<<"mydb">>, DocId).
+%%% '''
+%%%
+%%% == Document Structure ==
+%%%
+%%% Documents are Erlang maps with the following special keys:
+%%%
+%%% <ul>
+%%%   <li>`<<"id">>' - Document identifier (auto-generated if not provided)</li>
+%%%   <li>`<<"_rev">>' - Revision identifier (managed by the system)</li>
+%%%   <li>`<<"_deleted">>' - Set to `true' for deleted documents</li>
+%%% </ul>
+%%%
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_docdb).
@@ -74,12 +119,44 @@
 %% Database Lifecycle
 %%====================================================================
 
-%% @doc Create a new database with default options
+%% @doc Create a new database with default options.
+%%
+%% Creates a new database with the given name using default settings.
+%% The database will be stored in the default data directory.
+%%
+%% == Example ==
+%% ```
+%% {ok, Pid} = barrel_docdb:create_db(<<"mydb">>).
+%% '''
+%%
+%% @param Name The database name as a binary
+%% @returns `{ok, Pid}' on success, `{error, already_exists}' if database exists
+%% @see create_db/2
 -spec create_db(binary()) -> {ok, pid()} | {error, term()}.
 create_db(Name) ->
     create_db(Name, #{}).
 
-%% @doc Create a new database with options
+%% @doc Create a new database with options.
+%%
+%% Creates a new database with custom configuration options.
+%%
+%% == Options ==
+%% <ul>
+%%   <li>`data_dir' - Directory to store database files (default: `/tmp/barrel_data')</li>
+%%   <li>`store_opts' - RocksDB options for document store</li>
+%%   <li>`att_opts' - RocksDB options for attachment store</li>
+%% </ul>
+%%
+%% == Example ==
+%% ```
+%% {ok, Pid} = barrel_docdb:create_db(<<"mydb">>, #{
+%%     data_dir => "/var/lib/barrel"
+%% }).
+%% '''
+%%
+%% @param Name The database name as a binary
+%% @param Opts Configuration options map
+%% @returns `{ok, Pid}' on success, `{error, already_exists}' if database exists
 -spec create_db(binary(), map()) -> {ok, pid()} | {error, term()}.
 create_db(Name, Opts) when is_binary(Name) ->
     case get_db(Name) of
@@ -89,12 +166,35 @@ create_db(Name, Opts) when is_binary(Name) ->
             barrel_db_sup:start_db(Name, Opts)
     end.
 
-%% @doc Open an existing database
+%% @doc Open an existing database.
+%%
+%% Returns the pid of an already running database. Databases are
+%% automatically opened when created and remain open until explicitly
+%% closed or the application stops.
+%%
+%% == Example ==
+%% ```
+%% {ok, Pid} = barrel_docdb:open_db(<<"mydb">>).
+%% '''
+%%
+%% @param Name The database name as a binary
+%% @returns `{ok, Pid}' if database is open, `{error, not_found}' otherwise
 -spec open_db(binary()) -> {ok, pid()} | {error, term()}.
 open_db(Name) when is_binary(Name) ->
     get_db(Name).
 
-%% @doc Close a database
+%% @doc Close a database.
+%%
+%% Stops the database process and releases resources. The database
+%% can be reopened by calling `create_db/1' again.
+%%
+%% == Example ==
+%% ```
+%% ok = barrel_docdb:close_db(<<"mydb">>).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @returns `ok' on success, `{error, not_found}' if database doesn't exist
 -spec close_db(binary() | pid()) -> ok | {error, term()}.
 close_db(Name) when is_binary(Name) ->
     case get_db(Name) of
@@ -108,7 +208,18 @@ close_db(Pid) when is_pid(Pid) ->
     barrel_db_server:stop(Pid),
     ok.
 
-%% @doc Delete a database
+%% @doc Delete a database and all its data.
+%%
+%% Permanently removes the database, including all documents, attachments,
+%% and indexes. This operation cannot be undone.
+%%
+%% == Example ==
+%% ```
+%% ok = barrel_docdb:delete_db(<<"mydb">>).
+%% '''
+%%
+%% @param Name The database name as a binary
+%% @returns `ok' on success (also returns `ok' if database doesn't exist)
 -spec delete_db(binary()) -> ok | {error, term()}.
 delete_db(Name) when is_binary(Name) ->
     case get_db(Name) of
@@ -123,7 +234,18 @@ delete_db(Name) when is_binary(Name) ->
             ok
     end.
 
-%% @doc Get database info
+%% @doc Get database information.
+%%
+%% Returns metadata about the database including its name, path, and pid.
+%%
+%% == Example ==
+%% ```
+%% {ok, Info} = barrel_docdb:db_info(<<"mydb">>),
+%% Name = maps:get(name, Info).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @returns `{ok, InfoMap}' with database metadata
 -spec db_info(binary() | pid()) -> {ok, map()} | {error, term()}.
 db_info(Name) when is_binary(Name) ->
     case get_db(Name) of
@@ -135,10 +257,19 @@ db_info(Name) when is_binary(Name) ->
 db_info(Pid) when is_pid(Pid) ->
     barrel_db_server:info(Pid).
 
-%% @doc List all open databases
+%% @doc List all open databases.
+%%
+%% Returns the names of all currently open databases.
+%%
+%% == Example ==
+%% ```
+%% DbNames = barrel_docdb:list_dbs().
+%% %% Returns [<<"db1">>, <<"db2">>, ...]
+%% '''
+%%
+%% @returns List of database names
 -spec list_dbs() -> [binary()].
 list_dbs() ->
-    %% Get all database names from persistent_term
     lists:filtermap(
         fun({Key, Value}) ->
             case Key of
@@ -157,43 +288,154 @@ list_dbs() ->
 %% Document CRUD
 %%====================================================================
 
-%% @doc Put a document (create or update)
+%% @doc Create or update a document.
+%%
+%% Stores a document in the database. If the document has an `<<"id">>'
+%% key, that ID is used; otherwise, a unique ID is generated.
+%%
+%% For updates, the document must include the current `<<"_rev">>' value.
+%% This ensures optimistic concurrency control.
+%%
+%% == Example ==
+%% ```
+%% %% Create a new document
+%% {ok, Result} = barrel_docdb:put_doc(<<"mydb">>, #{
+%%     <<"type">> => <<"user">>,
+%%     <<"name">> => <<"Alice">>
+%% }),
+%% DocId = maps:get(<<"id">>, Result),
+%% Rev = maps:get(<<"rev">>, Result).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param Doc Document map to store
+%% @returns `{ok, #{<<"id">> => DocId, <<"rev">> => Rev, <<"ok">> => true}}'
+%% @see put_doc/3
 -spec put_doc(binary() | pid(), map()) -> {ok, map()} | {error, term()}.
 put_doc(Db, Doc) ->
     put_doc(Db, Doc, #{}).
 
-%% @doc Put a document with options
+%% @doc Create or update a document with options.
+%%
+%% Same as `put_doc/2' but accepts additional options.
+%%
+%% @param Db Database name or pid
+%% @param Doc Document map to store
+%% @param Opts Options map (currently unused, reserved for future use)
+%% @returns `{ok, #{<<"id">> => DocId, <<"rev">> => Rev, <<"ok">> => true}}'
 -spec put_doc(binary() | pid(), map(), map()) -> {ok, map()} | {error, term()}.
 put_doc(Db, Doc, Opts) ->
     with_db(Db, fun(Pid) ->
         barrel_db_server:put_doc(Pid, Doc, Opts)
     end).
 
-%% @doc Get a document by ID
+%% @doc Get a document by ID.
+%%
+%% Retrieves a document from the database. Returns `{error, not_found}'
+%% if the document doesn't exist or has been deleted.
+%%
+%% == Example ==
+%% ```
+%% {ok, Doc} = barrel_docdb:get_doc(<<"mydb">>, <<"doc1">>),
+%% Name = maps:get(<<"name">>, Doc).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param DocId Document ID
+%% @returns `{ok, Document}' or `{error, not_found}'
+%% @see get_doc/3
 -spec get_doc(binary() | pid(), binary()) -> {ok, map()} | {error, term()}.
 get_doc(Db, DocId) ->
     get_doc(Db, DocId, #{}).
 
-%% @doc Get a document with options
+%% @doc Get a document with options.
+%%
+%% Retrieves a document with additional options.
+%%
+%% == Options ==
+%% <ul>
+%%   <li>`include_deleted' - If `true', returns deleted documents</li>
+%%   <li>`rev' - Specific revision to retrieve</li>
+%% </ul>
+%%
+%% == Example ==
+%% ```
+%% %% Get a deleted document
+%% {ok, Doc} = barrel_docdb:get_doc(<<"mydb">>, <<"doc1">>, #{
+%%     include_deleted => true
+%% }).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param DocId Document ID
+%% @param Opts Options map
+%% @returns `{ok, Document}' or `{error, not_found}'
 -spec get_doc(binary() | pid(), binary(), map()) -> {ok, map()} | {error, term()}.
 get_doc(Db, DocId, Opts) ->
     with_db(Db, fun(Pid) ->
         barrel_db_server:get_doc(Pid, DocId, Opts)
     end).
 
-%% @doc Delete a document
+%% @doc Delete a document.
+%%
+%% Marks a document as deleted. The document's revision history is
+%% preserved for conflict resolution and replication.
+%%
+%% == Example ==
+%% ```
+%% {ok, Result} = barrel_docdb:delete_doc(<<"mydb">>, <<"doc1">>).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param DocId Document ID
+%% @returns `{ok, #{<<"id">> => DocId, <<"rev">> => NewRev, <<"ok">> => true}}'
+%% @see delete_doc/3
 -spec delete_doc(binary() | pid(), binary()) -> {ok, map()} | {error, term()}.
 delete_doc(Db, DocId) ->
     delete_doc(Db, DocId, #{}).
 
-%% @doc Delete a document with options
+%% @doc Delete a document with options.
+%%
+%% == Options ==
+%% <ul>
+%%   <li>`rev' - Expected current revision (for conflict detection)</li>
+%% </ul>
+%%
+%% @param Db Database name or pid
+%% @param DocId Document ID
+%% @param Opts Options map
+%% @returns `{ok, #{<<"id">> => DocId, <<"rev">> => NewRev, <<"ok">> => true}}'
 -spec delete_doc(binary() | pid(), binary(), map()) -> {ok, map()} | {error, term()}.
 delete_doc(Db, DocId, Opts) ->
     with_db(Db, fun(Pid) ->
         barrel_db_server:delete_doc(Pid, DocId, Opts)
     end).
 
-%% @doc Fold over all documents
+%% @doc Fold over all documents in the database.
+%%
+%% Iterates over all non-deleted documents, calling the provided function
+%% for each document. The function receives the document and an accumulator.
+%%
+%% == Callback Return Values ==
+%% <ul>
+%%   <li>`{ok, NewAcc}' - Continue with new accumulator</li>
+%%   <li>`{stop, FinalAcc}' - Stop iteration with final accumulator</li>
+%%   <li>`stop' - Stop iteration with current accumulator</li>
+%% </ul>
+%%
+%% == Example ==
+%% ```
+%% %% Count all documents
+%% {ok, Count} = barrel_docdb:fold_docs(<<"mydb">>,
+%%     fun(_Doc, Acc) -> {ok, Acc + 1} end,
+%%     0
+%% ).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param Fun Callback function `fun((Doc, Acc) -> {ok, Acc} | {stop, Acc} | stop)'
+%% @param Acc Initial accumulator value
+%% @returns `{ok, FinalAcc}'
 -spec fold_docs(binary() | pid(), fun((map(), term()) -> {ok, term()} | {stop, term()} | stop), term()) ->
     {ok, term()}.
 fold_docs(Db, Fun, Acc) ->
@@ -205,7 +447,24 @@ fold_docs(Db, Fun, Acc) ->
 %% Attachments
 %%====================================================================
 
-%% @doc Put an attachment
+%% @doc Attach binary data to a document.
+%%
+%% Stores a binary attachment associated with a document. Attachments
+%% are stored in a separate BlobDB-enabled RocksDB instance optimized
+%% for large binary data.
+%%
+%% == Example ==
+%% ```
+%% Data = <<"Hello, World!">>,
+%% {ok, Info} = barrel_docdb:put_attachment(<<"mydb">>, <<"doc1">>,
+%%     <<"greeting.txt">>, Data).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param DocId Document ID
+%% @param AttName Attachment name
+%% @param Data Binary data to store
+%% @returns `{ok, AttachmentInfo}'
 -spec put_attachment(binary() | pid(), binary(), binary(), binary()) ->
     {ok, map()} | {error, term()}.
 put_attachment(Db, DocId, AttName, Data) ->
@@ -216,7 +475,20 @@ put_attachment(Db, DocId, AttName, Data) ->
         barrel_att:put_attachment(AttRef, DbName, DocId, AttName, Data)
     end).
 
-%% @doc Get an attachment
+%% @doc Retrieve an attachment.
+%%
+%% Gets the binary data of an attachment.
+%%
+%% == Example ==
+%% ```
+%% {ok, Data} = barrel_docdb:get_attachment(<<"mydb">>, <<"doc1">>,
+%%     <<"greeting.txt">>).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param DocId Document ID
+%% @param AttName Attachment name
+%% @returns `{ok, BinaryData}' or `{error, not_found}'
 -spec get_attachment(binary() | pid(), binary(), binary()) ->
     {ok, binary()} | {error, term()}.
 get_attachment(Db, DocId, AttName) ->
@@ -227,7 +499,14 @@ get_attachment(Db, DocId, AttName) ->
         barrel_att:get_attachment(AttRef, DbName, DocId, AttName)
     end).
 
-%% @doc Delete an attachment
+%% @doc Delete an attachment.
+%%
+%% Removes an attachment from a document.
+%%
+%% @param Db Database name or pid
+%% @param DocId Document ID
+%% @param AttName Attachment name
+%% @returns `ok' or `{error, not_found}'
 -spec delete_attachment(binary() | pid(), binary(), binary()) -> ok | {error, term()}.
 delete_attachment(Db, DocId, AttName) ->
     with_db(Db, fun(Pid) ->
@@ -237,7 +516,19 @@ delete_attachment(Db, DocId, AttName) ->
         barrel_att:delete_attachment(AttRef, DbName, DocId, AttName)
     end).
 
-%% @doc List attachments for a document
+%% @doc List all attachments for a document.
+%%
+%% Returns the names of all attachments associated with a document.
+%%
+%% == Example ==
+%% ```
+%% AttNames = barrel_docdb:list_attachments(<<"mydb">>, <<"doc1">>).
+%% %% Returns [<<"file1.txt">>, <<"image.png">>]
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param DocId Document ID
+%% @returns List of attachment names
 -spec list_attachments(binary() | pid(), binary()) -> [binary()].
 list_attachments(Db, DocId) ->
     with_db(Db, fun(Pid) ->
@@ -251,35 +542,105 @@ list_attachments(Db, DocId) ->
 %% Views
 %%====================================================================
 
-%% @doc Register a view
+%% @doc Register a secondary index (view).
+%%
+%% Creates a view that maintains a secondary index over documents.
+%% The view module must implement the `barrel_view' behaviour.
+%%
+%% == View Module Example ==
+%% ```
+%% -module(by_type_view).
+%% -behaviour(barrel_view).
+%% -export([version/0, map/1]).
+%%
+%% version() -> 1.
+%%
+%% map(#{<<"type">> := Type}) -> [{Type, 1}];
+%% map(_) -> [].
+%% '''
+%%
+%% == Registration Example ==
+%% ```
+%% ok = barrel_docdb:register_view(<<"mydb">>, <<"by_type">>, #{
+%%     module => by_type_view
+%% }).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param ViewId View identifier
+%% @param Config View configuration with `module' key
+%% @returns `ok' or `{error, Reason}'
 -spec register_view(binary() | pid(), binary(), map()) -> ok | {error, term()}.
 register_view(Db, ViewId, Config) ->
     with_db(Db, fun(Pid) ->
         barrel_view:register(Pid, ViewId, Config)
     end).
 
-%% @doc Unregister a view
+%% @doc Unregister a view.
+%%
+%% Removes a view and deletes its index data.
+%%
+%% @param Db Database name or pid
+%% @param ViewId View identifier
+%% @returns `ok' or `{error, not_found}'
 -spec unregister_view(binary() | pid(), binary()) -> ok | {error, term()}.
 unregister_view(Db, ViewId) ->
     with_db(Db, fun(Pid) ->
         barrel_view:unregister(Pid, ViewId)
     end).
 
-%% @doc Query a view
+%% @doc Query a view.
+%%
+%% Retrieves index entries from a view.
+%%
+%% == Options ==
+%% <ul>
+%%   <li>`start_key' - Start key for range query</li>
+%%   <li>`end_key' - End key for range query</li>
+%%   <li>`limit' - Maximum number of results</li>
+%%   <li>`include_docs' - Include full documents in results</li>
+%%   <li>`descending' - Reverse order</li>
+%% </ul>
+%%
+%% == Example ==
+%% ```
+%% {ok, Results} = barrel_docdb:query_view(<<"mydb">>, <<"by_type">>, #{
+%%     start_key => <<"user">>,
+%%     end_key => <<"user">>,
+%%     limit => 100
+%% }).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param ViewId View identifier
+%% @param Opts Query options
+%% @returns `{ok, [Result]}' where each result is a map with key, value, id
 -spec query_view(binary() | pid(), binary(), map()) -> {ok, [map()]} | {error, term()}.
 query_view(Db, ViewId, Opts) ->
     with_db(Db, fun(Pid) ->
         barrel_view:query(Pid, ViewId, Opts)
     end).
 
-%% @doc List all views
+%% @doc List all registered views.
+%%
+%% Returns metadata about all views in the database.
+%%
+%% @param Db Database name or pid
+%% @returns `{ok, [ViewInfo]}'
 -spec list_views(binary() | pid()) -> {ok, [map()]} | {error, term()}.
 list_views(Db) ->
     with_db(Db, fun(Pid) ->
         barrel_view:list(Pid)
     end).
 
-%% @doc Refresh a view (wait for it to be up-to-date)
+%% @doc Refresh a view and wait for it to be up-to-date.
+%%
+%% Triggers index update and waits for it to complete. Returns the
+%% sequence number up to which the view is indexed.
+%%
+%% @param Db Database name or pid
+%% @param ViewId View identifier
+%% @returns `{ok, Sequence}' or `{error, Reason}'
 -spec refresh_view(binary() | pid(), binary()) -> {ok, seq()} | {error, term()}.
 refresh_view(Db, ViewId) ->
     with_db(Db, fun(Pid) ->
@@ -290,12 +651,42 @@ refresh_view(Db, ViewId) ->
 %% Changes
 %%====================================================================
 
-%% @doc Get changes since a sequence
+%% @doc Get changes since a sequence number.
+%%
+%% Returns all document changes since the given sequence. Use `first'
+%% to get all changes from the beginning.
+%%
+%% == Example ==
+%% ```
+%% %% Get all changes
+%% {ok, Changes, LastSeq} = barrel_docdb:get_changes(<<"mydb">>, first),
+%%
+%% %% Get incremental changes
+%% {ok, NewChanges, NewSeq} = barrel_docdb:get_changes(<<"mydb">>, LastSeq).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param Since Sequence number or `first'
+%% @returns `{ok, [Change], LastSeq}' where each change has id, seq, rev, changes
+%% @see get_changes/3
 -spec get_changes(binary() | pid(), seq() | first) -> {ok, [map()], seq()}.
 get_changes(Db, Since) ->
     get_changes(Db, Since, #{}).
 
-%% @doc Get changes with options
+%% @doc Get changes with options.
+%%
+%% == Options ==
+%% <ul>
+%%   <li>`limit' - Maximum number of changes to return</li>
+%%   <li>`include_docs' - Include full documents in results</li>
+%%   <li>`descending' - Reverse order</li>
+%%   <li>`doc_ids' - Filter to specific document IDs</li>
+%% </ul>
+%%
+%% @param Db Database name or pid
+%% @param Since Sequence number or `first'
+%% @param Opts Query options
+%% @returns `{ok, [Change], LastSeq}'
 -spec get_changes(binary() | pid(), seq() | first, map()) -> {ok, [map()], seq()}.
 get_changes(Db, Since, Opts) ->
     with_db(Db, fun(Pid) ->
@@ -305,12 +696,31 @@ get_changes(Db, Since, Opts) ->
         barrel_changes:get_changes(StoreRef, DbName, Since, Opts)
     end).
 
-%% @doc Subscribe to changes stream (iterate mode)
+%% @doc Subscribe to a changes stream.
+%%
+%% Returns a stream pid that can be used to iterate over changes
+%% as they occur.
+%%
+%% == Example ==
+%% ```
+%% {ok, Stream} = barrel_docdb:subscribe_changes(<<"mydb">>, first),
+%% %% Use barrel_changes_stream:next/1 to get changes
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param Since Starting sequence
+%% @returns `{ok, StreamPid}'
+%% @see subscribe_changes/3
 -spec subscribe_changes(binary() | pid(), seq() | first) -> {ok, pid()} | {error, term()}.
 subscribe_changes(Db, Since) ->
     subscribe_changes(Db, Since, #{}).
 
-%% @doc Subscribe to changes stream with options
+%% @doc Subscribe to a changes stream with options.
+%%
+%% @param Db Database name or pid
+%% @param Since Starting sequence
+%% @param Opts Stream options
+%% @returns `{ok, StreamPid}'
 -spec subscribe_changes(binary() | pid(), seq() | first, map()) -> {ok, pid()} | {error, term()}.
 subscribe_changes(Db, Since, Opts) ->
     with_db(Db, fun(Pid) ->
@@ -319,6 +729,113 @@ subscribe_changes(Db, Since, Opts) ->
         DbName = maps:get(name, Info),
         StreamOpts = Opts#{since => Since},
         barrel_changes_stream:start_link(StoreRef, DbName, StreamOpts)
+    end).
+
+%%====================================================================
+%% Replication Primitives
+%%====================================================================
+
+%% @doc Put a document with explicit revision history.
+%%
+%% This function is used by replication to store documents with their
+%% full revision history. Unlike `put_doc/2', this allows specifying
+%% the exact revision chain.
+%%
+%% == Example ==
+%% ```
+%% Doc = #{<<"id">> => <<"doc1">>, <<"value">> => <<"replicated">>},
+%% History = [<<"2-abc123">>, <<"1-def456">>],
+%% {ok, DocId, Rev} = barrel_docdb:put_rev(<<"mydb">>, Doc, History, false).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param Doc Document map (must include `<<"id">>')
+%% @param History List of revision IDs, newest first
+%% @param Deleted Whether this is a deletion tombstone
+%% @returns `{ok, DocId, RevId}'
+%% @see barrel_rep
+-spec put_rev(binary() | pid(), map(), [binary()], boolean()) ->
+    {ok, binary(), binary()} | {error, term()}.
+put_rev(Db, Doc, History, Deleted) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:put_rev(Pid, Doc, History, Deleted)
+    end).
+
+%% @doc Find missing revisions for replication.
+%%
+%% Compares a list of revision IDs against those stored locally and
+%% returns which revisions are missing. Used by replication to determine
+%% what needs to be transferred.
+%%
+%% == Example ==
+%% ```
+%% {ok, Missing, Ancestors} = barrel_docdb:revsdiff(<<"mydb">>,
+%%     <<"doc1">>,
+%%     [<<"3-abc">>, <<"2-def">>, <<"1-ghi">>]
+%% ),
+%% %% Missing = revisions we don't have
+%% %% Ancestors = our revisions that could be ancestors
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param DocId Document ID
+%% @param RevIds List of revision IDs to check
+%% @returns `{ok, MissingRevs, PossibleAncestors}'
+%% @see barrel_rep
+-spec revsdiff(binary() | pid(), binary(), [binary()]) ->
+    {ok, [binary()], [binary()]} | {error, term()}.
+revsdiff(Db, DocId, RevIds) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:revsdiff(Pid, DocId, RevIds)
+    end).
+
+%%====================================================================
+%% Local Documents
+%%====================================================================
+
+%% @doc Store a local document.
+%%
+%% Local documents are stored in the database but are NOT replicated.
+%% They are typically used for storing replication checkpoints and
+%% other metadata.
+%%
+%% == Example ==
+%% ```
+%% ok = barrel_docdb:put_local_doc(<<"mydb">>, <<"_local/checkpoint">>, #{
+%%     <<"last_seq">> => <<"100">>
+%% }).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param DocId Local document ID
+%% @param Doc Document content
+%% @returns `ok'
+-spec put_local_doc(binary() | pid(), binary(), map()) -> ok | {error, term()}.
+put_local_doc(Db, DocId, Doc) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:put_local_doc(Pid, DocId, Doc)
+    end).
+
+%% @doc Get a local document.
+%%
+%% @param Db Database name or pid
+%% @param DocId Local document ID
+%% @returns `{ok, Document}' or `{error, not_found}'
+-spec get_local_doc(binary() | pid(), binary()) -> {ok, map()} | {error, not_found}.
+get_local_doc(Db, DocId) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:get_local_doc(Pid, DocId)
+    end).
+
+%% @doc Delete a local document.
+%%
+%% @param Db Database name or pid
+%% @param DocId Local document ID
+%% @returns `ok' or `{error, not_found}'
+-spec delete_local_doc(binary() | pid(), binary()) -> ok | {error, not_found}.
+delete_local_doc(Db, DocId) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:delete_local_doc(Pid, DocId)
     end).
 
 %%====================================================================
@@ -335,7 +852,6 @@ get_db(Name) when is_binary(Name) ->
             case is_process_alive(Pid) of
                 true -> {ok, Pid};
                 false ->
-                    %% Cleanup stale entry
                     persistent_term:erase({barrel_db, Name}),
                     {error, not_found}
             end
@@ -352,48 +868,3 @@ with_db(Name, Fun) when is_binary(Name) ->
         {error, _} = Error ->
             Error
     end.
-
-%%====================================================================
-%% Replication Primitives
-%%====================================================================
-
-%% @doc Put a document with explicit revision history (for replication)
--spec put_rev(binary() | pid(), map(), [binary()], boolean()) ->
-    {ok, binary(), binary()} | {error, term()}.
-put_rev(Db, Doc, History, Deleted) ->
-    with_db(Db, fun(Pid) ->
-        barrel_db_server:put_rev(Pid, Doc, History, Deleted)
-    end).
-
-%% @doc Get revisions difference (for replication)
--spec revsdiff(binary() | pid(), binary(), [binary()]) ->
-    {ok, [binary()], [binary()]} | {error, term()}.
-revsdiff(Db, DocId, RevIds) ->
-    with_db(Db, fun(Pid) ->
-        barrel_db_server:revsdiff(Pid, DocId, RevIds)
-    end).
-
-%%====================================================================
-%% Local Documents
-%%====================================================================
-
-%% @doc Put a local document (not replicated, used for checkpoints)
--spec put_local_doc(binary() | pid(), binary(), map()) -> ok | {error, term()}.
-put_local_doc(Db, DocId, Doc) ->
-    with_db(Db, fun(Pid) ->
-        barrel_db_server:put_local_doc(Pid, DocId, Doc)
-    end).
-
-%% @doc Get a local document
--spec get_local_doc(binary() | pid(), binary()) -> {ok, map()} | {error, not_found}.
-get_local_doc(Db, DocId) ->
-    with_db(Db, fun(Pid) ->
-        barrel_db_server:get_local_doc(Pid, DocId)
-    end).
-
-%% @doc Delete a local document
--spec delete_local_doc(binary() | pid(), binary()) -> ok | {error, not_found}.
-delete_local_doc(Db, DocId) ->
-    with_db(Db, fun(Pid) ->
-        barrel_db_server:delete_local_doc(Pid, DocId)
-    end).

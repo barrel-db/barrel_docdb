@@ -16,6 +16,10 @@ rebar.lock
 *.plt
 *.dump
 erl_crash.dump
+rebar3.crashdump
+
+# Generated documentation
+doc/
 
 # Coverage data
 *.coverdata

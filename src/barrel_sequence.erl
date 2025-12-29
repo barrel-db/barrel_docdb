@@ -58,8 +58,8 @@ new(Epoch) ->
 inc({Epoch, Counter}) ->
     {Epoch, Counter + 1}.
 
-%% @doc Compare two sequences
-%% Returns: -1 if Seq1 < Seq2, 0 if equal, 1 if Seq1 > Seq2
+%% @doc Compare two sequences.
+%% Returns -1 if Seq1 is less than Seq2, 0 if equal, 1 if Seq1 is greater.
 -spec compare(seq(), seq()) -> -1 | 0 | 1.
 compare({E1, _}, {E2, _}) when E1 < E2 -> -1;
 compare({E1, _}, {E2, _}) when E1 > E2 -> 1;

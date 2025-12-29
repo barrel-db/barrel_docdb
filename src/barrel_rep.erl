@@ -1,9 +1,57 @@
 %%%-------------------------------------------------------------------
+%%% @author Benoit Chesneau
+%%% @copyright (C) 2024, Benoit Chesneau
 %%% @doc barrel_rep - Replication API for barrel_docdb
 %%%
 %%% This module provides the public API for replicating documents
-%%% between barrel_docdb databases. Supports both one-shot and
-%%% continuous replication.
+%%% between barrel_docdb databases. It implements a CouchDB-style
+%%% replication protocol with:
+%%%
+%%% <ul>
+%%%   <li>Incremental replication using revision comparison</li>
+%%%   <li>Checkpoint-based resumption</li>
+%%%   <li>Pluggable transport layer for local or remote databases</li>
+%%%   <li>Conflict-aware document merging</li>
+%%% </ul>
+%%%
+%%% == Quick Start ==
+%%%
+%%% ```
+%%% %% Create source and target databases
+%%% {ok, _} = barrel_docdb:create_db(<<"source">>),
+%%% {ok, _} = barrel_docdb:create_db(<<"target">>),
+%%%
+%%% %% Add documents to source
+%%% {ok, _} = barrel_docdb:put_doc(<<"source">>, #{
+%%%     <<"id">> => <<"doc1">>,
+%%%     <<"value">> => <<"hello">>
+%%% }),
+%%%
+%%% %% Replicate source to target
+%%% {ok, Result} = barrel_rep:replicate(<<"source">>, <<"target">>),
+%%% io:format("Replicated ~p documents~n", [maps:get(docs_written, Result)]).
+%%% '''
+%%%
+%%% == How Replication Works ==
+%%%
+%%% Replication follows these steps:
+%%%
+%%% <ol>
+%%%   <li>Read checkpoint to find last replicated sequence</li>
+%%%   <li>Fetch changes from source since that sequence</li>
+%%%   <li>For each change, use revsdiff to find missing revisions</li>
+%%%   <li>Fetch and transfer missing revisions with history</li>
+%%%   <li>Write checkpoint after each batch</li>
+%%% </ol>
+%%%
+%%% == Transport Abstraction ==
+%%%
+%%% Replication uses a transport behaviour (`barrel_rep_transport') to
+%%% communicate with databases. The default `barrel_rep_transport_local'
+%%% works with databases in the same Erlang VM.
+%%%
+%%% Custom transports can be implemented for HTTP, TCP, or other protocols.
+%%%
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_rep).
@@ -44,13 +92,50 @@
 %% API
 %%====================================================================
 
-%% @doc Replicate from source to target (one-shot)
-%% Shorthand that uses local transport for both endpoints
+%% @doc Replicate from source to target database.
+%%
+%% Performs a one-shot replication from source to target, copying all
+%% documents that don't exist in the target or have newer revisions.
+%%
+%% Uses the local transport (`barrel_rep_transport_local') for both
+%% endpoints, suitable for replicating between databases in the same VM.
+%%
+%% == Example ==
+%% ```
+%% {ok, Result} = barrel_rep:replicate(<<"source">>, <<"target">>),
+%% DocsWritten = maps:get(docs_written, Result).
+%% '''
+%%
+%% @param Source Source database name
+%% @param Target Target database name
+%% @returns `{ok, rep_result()}' with replication statistics
+%% @see replicate/3
 -spec replicate(binary(), binary()) -> {ok, rep_result()} | {error, term()}.
 replicate(Source, Target) ->
     replicate(Source, Target, #{}).
 
-%% @doc Replicate from source to target with options (one-shot)
+%% @doc Replicate from source to target with options.
+%%
+%% == Options ==
+%% <ul>
+%%   <li>`batch_size' - Number of changes to process per batch (default: 100)</li>
+%%   <li>`checkpoint_size' - Write checkpoint after this many documents (default: 10)</li>
+%%   <li>`source_transport' - Transport module for source</li>
+%%   <li>`target_transport' - Transport module for target</li>
+%% </ul>
+%%
+%% == Example ==
+%% ```
+%% {ok, Result} = barrel_rep:replicate(<<"source">>, <<"target">>, #{
+%%     batch_size => 50,
+%%     checkpoint_size => 25
+%% }).
+%% '''
+%%
+%% @param Source Source database name
+%% @param Target Target database name
+%% @param Opts Replication options
+%% @returns `{ok, rep_result()}' with replication statistics
 -spec replicate(binary(), binary(), map()) -> {ok, rep_result()} | {error, term()}.
 replicate(Source, Target, Opts) ->
     Config = #{
@@ -61,7 +146,26 @@ replicate(Source, Target, Opts) ->
     },
     replicate_one_shot(Config, Opts).
 
-%% @doc One-shot replication with full config
+%% @doc Perform one-shot replication with full configuration.
+%%
+%% This is the lower-level API that accepts a complete configuration map.
+%% Use this when you need custom transports or advanced configuration.
+%%
+%% == Example ==
+%% ```
+%% Config = #{
+%%     source => <<"source_db">>,
+%%     target => <<"target_db">>,
+%%     source_transport => barrel_rep_transport_local,
+%%     target_transport => barrel_rep_transport_local
+%% },
+%% {ok, Result} = barrel_rep:replicate_one_shot(Config, #{}).
+%% '''
+%%
+%% @param Config Replication configuration map
+%% @param Opts Additional options
+%% @returns `{ok, rep_result()}' with replication statistics
+%% @see replicate/2
 -spec replicate_one_shot(rep_config(), map()) -> {ok, rep_result()} | {error, term()}.
 replicate_one_shot(Config, Opts) ->
     #{
@@ -105,7 +209,12 @@ replicate_one_shot(Config, Opts) ->
             Error
     end.
 
-%% @doc Replicate one-shot with config only (uses default options)
+%% @doc Perform one-shot replication with config only.
+%%
+%% Convenience function that uses default options.
+%%
+%% @param Config Replication configuration map
+%% @returns `{ok, rep_result()}' with replication statistics
 -spec replicate_one_shot(rep_config()) -> {ok, rep_result()} | {error, term()}.
 replicate_one_shot(Config) ->
     replicate_one_shot(Config, #{}).
@@ -114,7 +223,7 @@ replicate_one_shot(Config) ->
 %% Internal functions
 %%====================================================================
 
-%% @doc Run replication loop
+%% @private Run replication loop
 do_replicate(Source, Target, SourceTransport, TargetTransport, Since,
              BatchSize, CheckpointSize, Checkpoint) ->
     do_replicate(Source, Target, SourceTransport, TargetTransport, Since,
@@ -158,13 +267,13 @@ do_replicate(Source, Target, SourceTransport, TargetTransport, Since,
             {error, Reason}
     end.
 
-%% @doc Generate unique replication ID
+%% @private Generate unique replication ID
 generate_rep_id(Source, Target) ->
     Data = term_to_binary({Source, Target, erlang:monotonic_time()}),
     Hash = crypto:hash(md5, Data),
     binary:encode_hex(Hash, lowercase).
 
-%% @doc Create new stats map
+%% @private Create new stats map
 new_stats() ->
     #{
         docs_read => 0,
@@ -173,6 +282,6 @@ new_stats() ->
         doc_write_failures => 0
     }.
 
-%% @doc Merge two stats maps
+%% @private Merge two stats maps
 merge_stats(Stats1, Stats2) ->
     maps:merge_with(fun(_K, V1, V2) -> V1 + V2 end, Stats1, Stats2).

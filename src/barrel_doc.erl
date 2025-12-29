@@ -95,8 +95,8 @@ revision_hash(Doc, Rev, Deleted) ->
     Digest = crypto:hash(sha256, Data),
     to_hex(Digest).
 
-%% @doc Compare two revisions
-%% Returns 1 if RevA > RevB, -1 if RevA < RevB, 0 if equal
+%% @doc Compare two revisions.
+%% Returns 1 if RevA is greater, -1 if RevA is less, 0 if equal.
 -spec compare_revisions(revid(), revid()) -> -1 | 0 | 1.
 compare_revisions(RevA, RevB) ->
     TupleA = parse_revision(RevA),
