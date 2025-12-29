@@ -22,6 +22,14 @@
     key_doc_seq/1,
     key_encoding_order/1,
 
+    %% Path index key tests
+    path_encode_decode_roundtrip/1,
+    path_binary_ordering/1,
+    path_integer_ordering/1,
+    path_float_ordering/1,
+    path_mixed_types_ordering/1,
+    path_index_key_structure/1,
+
     %% RocksDB backend tests
     rocksdb_open_close/1,
     rocksdb_put_get/1,
@@ -37,7 +45,7 @@
 %%====================================================================
 
 all() ->
-    [{group, keys}, {group, rocksdb}].
+    [{group, keys}, {group, path_keys}, {group, rocksdb}].
 
 groups() ->
     [
@@ -46,6 +54,14 @@ groups() ->
             key_doc_info,
             key_doc_seq,
             key_encoding_order
+        ]},
+        {path_keys, [parallel], [
+            path_encode_decode_roundtrip,
+            path_binary_ordering,
+            path_integer_ordering,
+            path_float_ordering,
+            path_mixed_types_ordering,
+            path_index_key_structure
         ]},
         {rocksdb, [sequence], [
             rocksdb_open_close,
@@ -375,4 +391,148 @@ rocksdb_snapshot(Config) ->
     ok = barrel_store_rocksdb:release_snapshot(Snapshot),
 
     ok = barrel_store_rocksdb:close(DbRef),
+    ok.
+
+%%====================================================================
+%% Test Cases - Path Index Key Encoding
+%%====================================================================
+
+path_encode_decode_roundtrip(_Config) ->
+    %% Test various path types round-trip correctly
+    Paths = [
+        [<<"field">>, <<"value">>],
+        [<<"a">>, <<"b">>, <<"c">>],
+        [<<"items">>, 0, <<"sku">>, <<"ABC">>],
+        [<<"nested">>, 1, 2, 3],
+        [<<"bool">>, true],
+        [<<"bool">>, false],
+        [<<"null">>, null],
+        [<<"int">>, 42],
+        [<<"int">>, -42],
+        [<<"int">>, 0],
+        [<<"float">>, 3.14],
+        [<<"float">>, -2.718],
+        [<<"mixed">>, 1, <<"a">>, true, 3.14]
+    ],
+    lists:foreach(
+        fun(Path) ->
+            Encoded = barrel_store_keys:encode_path(Path),
+            Decoded = barrel_store_keys:decode_path(Encoded),
+            ?assertEqual(Path, Decoded, {roundtrip_failed, Path})
+        end,
+        Paths
+    ),
+    ok.
+
+path_binary_ordering(_Config) ->
+    %% Binary paths should sort lexicographically
+    Paths = [
+        [<<"a">>, <<"x">>],
+        [<<"a">>, <<"y">>],
+        [<<"b">>, <<"x">>],
+        [<<"aa">>, <<"x">>]
+    ],
+    Encoded = [barrel_store_keys:encode_path(P) || P <- Paths],
+    Sorted = lists:sort(Encoded),
+
+    %% Should be: a/x < a/y < aa/x < b/x
+    Expected = [
+        barrel_store_keys:encode_path([<<"a">>, <<"x">>]),
+        barrel_store_keys:encode_path([<<"a">>, <<"y">>]),
+        barrel_store_keys:encode_path([<<"aa">>, <<"x">>]),
+        barrel_store_keys:encode_path([<<"b">>, <<"x">>])
+    ],
+    ?assertEqual(Expected, Sorted),
+    ok.
+
+path_integer_ordering(_Config) ->
+    %% Integers should sort numerically, not lexicographically
+    Paths = [
+        [<<"n">>, -1000],
+        [<<"n">>, -100],
+        [<<"n">>, -10],
+        [<<"n">>, -1],
+        [<<"n">>, 0],
+        [<<"n">>, 1],
+        [<<"n">>, 10],
+        [<<"n">>, 100],
+        [<<"n">>, 1000]
+    ],
+    Encoded = [barrel_store_keys:encode_path(P) || P <- Paths],
+    Sorted = lists:sort(Encoded),
+
+    %% Should maintain numeric order
+    ExpectedOrder = Paths,
+    DecodedSorted = [barrel_store_keys:decode_path(E) || E <- Sorted],
+    ?assertEqual(ExpectedOrder, DecodedSorted),
+    ok.
+
+path_float_ordering(_Config) ->
+    %% Floats should sort numerically
+    Paths = [
+        [<<"f">>, -3.14],
+        [<<"f">>, -1.0],
+        [<<"f">>, 0.0],
+        [<<"f">>, 1.0],
+        [<<"f">>, 2.718],
+        [<<"f">>, 3.14]
+    ],
+    Encoded = [barrel_store_keys:encode_path(P) || P <- Paths],
+    Sorted = lists:sort(Encoded),
+
+    %% Should maintain numeric order
+    ExpectedOrder = Paths,
+    DecodedSorted = [barrel_store_keys:decode_path(E) || E <- Sorted],
+    ?assertEqual(ExpectedOrder, DecodedSorted),
+    ok.
+
+path_mixed_types_ordering(_Config) ->
+    %% Different types should have consistent ordering:
+    %% null < false < true < negative ints < 0 < positive ints < floats < binaries
+    Paths = [
+        [<<"v">>, null],
+        [<<"v">>, false],
+        [<<"v">>, true],
+        [<<"v">>, -1],
+        [<<"v">>, 0],
+        [<<"v">>, 1],
+        [<<"v">>, 1.5],
+        [<<"v">>, <<"a">>]
+    ],
+    Encoded = [barrel_store_keys:encode_path(P) || P <- Paths],
+    Sorted = lists:sort(Encoded),
+
+    %% Should maintain type order
+    ExpectedOrder = Paths,
+    DecodedSorted = [barrel_store_keys:decode_path(E) || E <- Sorted],
+    ?assertEqual(ExpectedOrder, DecodedSorted),
+    ok.
+
+path_index_key_structure(_Config) ->
+    DbName = <<"testdb">>,
+    Path = [<<"type">>, <<"user">>],
+    DocId = <<"doc123">>,
+
+    %% Test full key
+    Key = barrel_store_keys:path_index_key(DbName, Path, DocId),
+    ?assert(is_binary(Key)),
+
+    %% Test prefix
+    Prefix = barrel_store_keys:path_index_prefix(DbName, Path),
+    PrefixLen = byte_size(Prefix),
+    <<Prefix:PrefixLen/binary, _/binary>> = Key,
+
+    %% Test end marker
+    EndKey = barrel_store_keys:path_index_end(DbName, Path),
+    ?assert(Key < EndKey),
+
+    %% Keys with same path but different docids should sort
+    Key1 = barrel_store_keys:path_index_key(DbName, Path, <<"aaa">>),
+    Key2 = barrel_store_keys:path_index_key(DbName, Path, <<"bbb">>),
+    ?assert(Key1 < Key2),
+
+    %% Test doc_paths key
+    DocPathsKey = barrel_store_keys:doc_paths_key(DbName, DocId),
+    ?assert(is_binary(DocPathsKey)),
+
     ok.

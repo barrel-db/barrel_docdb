@@ -25,6 +25,11 @@
 -export([view_by_docid/3, view_by_docid_prefix/3, view_by_docid_end/3]).
 -export([encode_view_key/1, decode_view_key/1]).
 
+%% Path index keys
+-export([path_index_key/3, path_index_prefix/2, path_index_end/2]).
+-export([doc_paths_key/2, doc_paths_prefix/1]).
+-export([encode_path/1, decode_path/1]).
+
 %% Attachment keys
 -export([att_data/3, att_data_prefix/2]).
 
@@ -49,6 +54,18 @@
 -define(PREFIX_VIEW_INDEX, 16#08).
 -define(PREFIX_VIEW_BY_DOCID, 16#09).
 -define(PREFIX_ATT, 16#0A).
+-define(PREFIX_PATH_INDEX, 16#0B).
+-define(PREFIX_DOC_PATHS, 16#0C).
+
+%% Path component type tags (for ordered encoding)
+-define(PATH_TYPE_NULL, 16#01).
+-define(PATH_TYPE_FALSE, 16#02).
+-define(PATH_TYPE_TRUE, 16#03).
+-define(PATH_TYPE_NEG_INT, 16#10).  %% Negative integers
+-define(PATH_TYPE_ZERO, 16#20).     %% Zero
+-define(PATH_TYPE_POS_INT, 16#30).  %% Positive integers
+-define(PATH_TYPE_FLOAT, 16#40).    %% Floats
+-define(PATH_TYPE_BINARY, 16#50).   %% Binary strings
 
 %% Meta key suffixes
 -define(META_UID, <<"uid">>).
@@ -237,3 +254,160 @@ decode_seq_key(DbName, Key) ->
     PrefixLen = byte_size(Prefix),
     <<Prefix:PrefixLen/binary, SeqBin/binary>> = Key,
     decode_seq(SeqBin).
+
+%%====================================================================
+%% Path Index Keys
+%%====================================================================
+
+%% @doc Path index key for a document path.
+%% Key format: prefix | db_name | encoded_path | docid
+%% Path includes the value at the end: [field1, field2, value]
+-spec path_index_key(db_name(), [term()], docid()) -> binary().
+path_index_key(DbName, Path, DocId) ->
+    EncodedPath = encode_path(Path),
+    <<?PREFIX_PATH_INDEX, (encode_name(DbName))/binary, EncodedPath/binary, DocId/binary>>.
+
+%% @doc Prefix for scanning path index entries.
+%% Can be used with partial paths for prefix scans.
+-spec path_index_prefix(db_name(), [term()]) -> binary().
+path_index_prefix(DbName, Path) ->
+    EncodedPath = encode_path(Path),
+    <<?PREFIX_PATH_INDEX, (encode_name(DbName))/binary, EncodedPath/binary>>.
+
+%% @doc End marker for path index range scan.
+-spec path_index_end(db_name(), [term()]) -> binary().
+path_index_end(DbName, Path) ->
+    EncodedPath = encode_path(Path),
+    <<?PREFIX_PATH_INDEX, (encode_name(DbName))/binary, EncodedPath/binary, 16#FF>>.
+
+%% @doc Reverse index key: doc_id -> list of indexed paths.
+%% Used to remove old paths when updating a document.
+-spec doc_paths_key(db_name(), docid()) -> binary().
+doc_paths_key(DbName, DocId) ->
+    <<?PREFIX_DOC_PATHS, (encode_name(DbName))/binary, DocId/binary>>.
+
+%% @doc Prefix for doc_paths keys.
+-spec doc_paths_prefix(db_name()) -> binary().
+doc_paths_prefix(DbName) ->
+    <<?PREFIX_DOC_PATHS, (encode_name(DbName))/binary>>.
+
+%% @doc Encode a path for lexicographic ordering.
+%% Path components are encoded with length prefix and type tags.
+%% This ensures correct sort order across different types.
+-spec encode_path([term()]) -> binary().
+encode_path(Path) when is_list(Path) ->
+    iolist_to_binary([encode_path_component(C) || C <- Path]).
+
+%% @doc Decode a path from binary.
+-spec decode_path(binary()) -> [term()].
+decode_path(Bin) ->
+    decode_path_components(Bin, []).
+
+%%====================================================================
+%% Path Component Encoding
+%%====================================================================
+
+%% @private Encode a single path component with type tag for ordering
+encode_path_component(null) ->
+    <<?PATH_TYPE_NULL>>;
+encode_path_component(false) ->
+    <<?PATH_TYPE_FALSE>>;
+encode_path_component(true) ->
+    <<?PATH_TYPE_TRUE>>;
+encode_path_component(0) ->
+    <<?PATH_TYPE_ZERO>>;
+encode_path_component(N) when is_integer(N), N > 0 ->
+    %% Positive integers: encode with length prefix for proper ordering
+    Bin = integer_to_binary(N),
+    Len = byte_size(Bin),
+    <<?PATH_TYPE_POS_INT, Len:8, Bin/binary>>;
+encode_path_component(N) when is_integer(N), N < 0 ->
+    %% Negative integers: invert and encode for proper ordering
+    %% -1 should sort after -1000, so we use complement
+    Abs = abs(N),
+    Bin = integer_to_binary(Abs),
+    Len = byte_size(Bin),
+    %% Invert the length so larger negative numbers sort first
+    InvLen = 255 - Len,
+    %% Invert each byte so -1 > -2
+    InvBin = << <<(255 - B)>> || <<B>> <= Bin >>,
+    <<?PATH_TYPE_NEG_INT, InvLen:8, InvBin/binary>>;
+encode_path_component(F) when is_float(F) ->
+    %% Floats: use IEEE 754 encoding with sign adjustment
+    <<?PATH_TYPE_FLOAT, (encode_float(F))/binary>>;
+encode_path_component(Bin) when is_binary(Bin) ->
+    %% Binary: escape null bytes and terminate for lexicographic order
+    %% 0x00 -> 0x00 0xFF (escape), end with 0x00 0x00
+    Escaped = escape_binary(Bin),
+    <<?PATH_TYPE_BINARY, Escaped/binary, 0, 0>>.
+
+%% @private Encode float for lexicographic ordering
+encode_float(F) when F >= 0 ->
+    <<Bits:64/big-unsigned>> = <<F:64/float>>,
+    <<(Bits bxor 16#8000000000000000):64/big-unsigned>>;
+encode_float(F) ->
+    <<Bits:64/big-unsigned>> = <<F:64/float>>,
+    <<(bnot Bits):64/big-unsigned>>.
+
+%% @private Decode float from lexicographic encoding
+decode_float(<<Encoded:64/big-unsigned>>) ->
+    %% Check if sign bit is set (was positive)
+    Bits = case Encoded band 16#8000000000000000 of
+        0 -> bnot Encoded;  %% Was negative
+        _ -> Encoded bxor 16#8000000000000000  %% Was positive
+    end,
+    <<F:64/float>> = <<Bits:64/big-unsigned>>,
+    F.
+
+%% @private Escape null bytes in binary for lexicographic encoding
+%% 0x00 -> 0x00 0xFF
+escape_binary(Bin) ->
+    escape_binary(Bin, <<>>).
+
+escape_binary(<<>>, Acc) ->
+    Acc;
+escape_binary(<<0, Rest/binary>>, Acc) ->
+    escape_binary(Rest, <<Acc/binary, 0, 16#FF>>);
+escape_binary(<<B, Rest/binary>>, Acc) ->
+    escape_binary(Rest, <<Acc/binary, B>>).
+
+%% @private Unescape binary from lexicographic encoding
+%% 0x00 0xFF -> 0x00, 0x00 0x00 = end
+unescape_binary(Bin) ->
+    unescape_binary(Bin, <<>>).
+
+unescape_binary(<<0, 0, Rest/binary>>, Acc) ->
+    {Acc, Rest};
+unescape_binary(<<0, 16#FF, Rest/binary>>, Acc) ->
+    unescape_binary(Rest, <<Acc/binary, 0>>);
+unescape_binary(<<B, Rest/binary>>, Acc) ->
+    unescape_binary(Rest, <<Acc/binary, B>>);
+unescape_binary(<<>>, Acc) ->
+    {Acc, <<>>}.
+
+%% @private Decode path components from binary
+decode_path_components(<<>>, Acc) ->
+    lists:reverse(Acc);
+decode_path_components(<<?PATH_TYPE_NULL, Rest/binary>>, Acc) ->
+    decode_path_components(Rest, [null | Acc]);
+decode_path_components(<<?PATH_TYPE_FALSE, Rest/binary>>, Acc) ->
+    decode_path_components(Rest, [false | Acc]);
+decode_path_components(<<?PATH_TYPE_TRUE, Rest/binary>>, Acc) ->
+    decode_path_components(Rest, [true | Acc]);
+decode_path_components(<<?PATH_TYPE_ZERO, Rest/binary>>, Acc) ->
+    decode_path_components(Rest, [0 | Acc]);
+decode_path_components(<<?PATH_TYPE_POS_INT, Len:8, Bin:Len/binary, Rest/binary>>, Acc) ->
+    N = binary_to_integer(Bin),
+    decode_path_components(Rest, [N | Acc]);
+decode_path_components(<<?PATH_TYPE_NEG_INT, InvLen:8, InvBin/binary>>, Acc) ->
+    Len = 255 - InvLen,
+    <<InvBytes:Len/binary, Rest/binary>> = InvBin,
+    Bin = << <<(255 - B)>> || <<B>> <= InvBytes >>,
+    N = -binary_to_integer(Bin),
+    decode_path_components(Rest, [N | Acc]);
+decode_path_components(<<?PATH_TYPE_FLOAT, Encoded:8/binary, Rest/binary>>, Acc) ->
+    F = decode_float(Encoded),
+    decode_path_components(Rest, [F | Acc]);
+decode_path_components(<<?PATH_TYPE_BINARY, Rest/binary>>, Acc) ->
+    {Bin, Rest2} = unescape_binary(Rest),
+    decode_path_components(Rest2, [Bin | Acc]).
