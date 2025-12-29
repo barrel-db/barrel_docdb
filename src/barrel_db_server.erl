@@ -420,14 +420,21 @@ do_put_doc(StoreRef, DbName, Doc, _Opts) ->
     #{id := DocId, revs := Revs, deleted := Deleted, doc := DocBody} = DocRecord,
     [NewRev | _] = Revs,
 
-    %% Check for existing document
+    %% Check for existing document and get old doc body for path index update
     DocInfoKey = barrel_store_keys:doc_info(DbName, DocId),
-    OldSeq = case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
+    {OldSeq, OldDocBody} = case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
         {ok, ExistingBin} ->
             ExistingDocInfo = binary_to_term(ExistingBin),
-            maps:get(seq, ExistingDocInfo, undefined);
+            ExistingRev = maps:get(rev, ExistingDocInfo),
+            %% Get old doc body for path index diff
+            OldBody = case barrel_store_rocksdb:get(StoreRef,
+                            barrel_store_keys:doc_rev(DbName, DocId, ExistingRev)) of
+                {ok, OldBodyBin} -> binary_to_term(OldBodyBin);
+                not_found -> #{}
+            end,
+            {maps:get(seq, ExistingDocInfo, undefined), OldBody};
         not_found ->
-            undefined
+            {undefined, undefined}
     end,
 
     %% Build revision tree
@@ -457,8 +464,8 @@ do_put_doc(StoreRef, DbName, Doc, _Opts) ->
         seq => NextSeq
     },
 
-    %% Prepare batch operations
-    Operations = [
+    %% Prepare batch operations for document
+    DocOps = [
         %% Write doc_info
         {put, DocInfoKey, term_to_binary(DocInfo)},
         %% Write doc body for revision
@@ -466,17 +473,37 @@ do_put_doc(StoreRef, DbName, Doc, _Opts) ->
     ],
 
     %% Delete old sequence entry if exists
-    DeleteOps = case OldSeq of
+    SeqDeleteOps = case OldSeq of
         undefined -> [];
         _ -> [{delete, barrel_store_keys:doc_seq(DbName, OldSeq)}]
     end,
 
-    %% Write batch atomically
-    ok = barrel_store_rocksdb:write_batch(StoreRef, Operations ++ DeleteOps),
+    %% Path index operations (if not deleted)
+    PathIndexOps = case Deleted of
+        true when OldDocBody =/= undefined ->
+            %% Deleting a document - remove all paths
+            case barrel_ars_index:get_doc_paths(StoreRef, DbName, DocId) of
+                {ok, OldPaths} -> barrel_ars_index:remove_doc_ops(DbName, DocId, OldPaths);
+                not_found -> []
+            end;
+        true ->
+            %% New doc being created as deleted (edge case) - no paths to index
+            [];
+        false when OldDocBody =:= undefined ->
+            %% New document - index all paths
+            barrel_ars_index:index_doc_ops(DbName, DocId, DocBody);
+        false ->
+            %% Update document - compute diff and update paths
+            barrel_ars_index:update_doc_ops(DbName, DocId, OldDocBody, DocBody)
+    end,
 
-    %% Write change (includes doc for views)
+    %% Change entry operations
     ChangeInfo = DocInfo#{doc => DocBody},
-    ok = barrel_changes:write_change(StoreRef, DbName, NextSeq, ChangeInfo),
+    ChangeOps = barrel_changes:write_change_ops(DbName, NextSeq, ChangeInfo),
+
+    %% Write batch atomically (doc + path index + change in single batch)
+    AllOps = DocOps ++ SeqDeleteOps ++ PathIndexOps ++ ChangeOps,
+    ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps),
 
     %% Return result
     Result = #{
@@ -562,20 +589,28 @@ do_delete_doc(StoreRef, DbName, DocId, Opts) ->
                 seq => NextSeq
             },
 
-            %% Prepare operations
-            Operations = [
+            %% Prepare doc operations
+            DocOps = [
                 {put, DocInfoKey, term_to_binary(NewDocInfo)}
             ],
 
-            DeleteOps = case OldSeq of
+            SeqDeleteOps = case OldSeq of
                 undefined -> [];
                 _ -> [{delete, barrel_store_keys:doc_seq(DbName, OldSeq)}]
             end,
 
-            ok = barrel_store_rocksdb:write_batch(StoreRef, Operations ++ DeleteOps),
+            %% Path index removal operations
+            PathIndexOps = case barrel_ars_index:get_doc_paths(StoreRef, DbName, DocId) of
+                {ok, Paths} -> barrel_ars_index:remove_doc_ops(DbName, DocId, Paths);
+                not_found -> []
+            end,
 
-            %% Write change
-            ok = barrel_changes:write_change(StoreRef, DbName, NextSeq, NewDocInfo),
+            %% Change entry operations
+            ChangeOps = barrel_changes:write_change_ops(DbName, NextSeq, NewDocInfo),
+
+            %% Write batch atomically (doc + path index + change in single batch)
+            AllOps = DocOps ++ SeqDeleteOps ++ PathIndexOps ++ ChangeOps,
+            ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps),
 
             {ok, #{<<"id">> => DocId, <<"ok">> => true, <<"rev">> => NewRev}};
 
@@ -629,15 +664,23 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
     DocBody = barrel_doc:doc_without_meta(Doc),
     [NewRev | _] = History,
 
-    %% Check for existing document
+    %% Check for existing document and get old doc body for path index update
     DocInfoKey = barrel_store_keys:doc_info(DbName, DocId),
-    {ExistingRevTree, OldSeq} = case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
+    {ExistingRevTree, OldSeq, OldDocBody} = case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
         {ok, ExistingBin} ->
             ExistingDocInfo = binary_to_term(ExistingBin),
+            ExistingRev = maps:get(rev, ExistingDocInfo),
+            %% Get old doc body for path index diff
+            OldBody = case barrel_store_rocksdb:get(StoreRef,
+                            barrel_store_keys:doc_rev(DbName, DocId, ExistingRev)) of
+                {ok, OldBodyBin} -> binary_to_term(OldBodyBin);
+                not_found -> #{}
+            end,
             {maps:get(revtree, ExistingDocInfo, #{}),
-             maps:get(seq, ExistingDocInfo, undefined)};
+             maps:get(seq, ExistingDocInfo, undefined),
+             OldBody};
         not_found ->
-            {#{}, undefined}
+            {#{}, undefined, undefined}
     end,
 
     %% Build revision tree from history
@@ -656,24 +699,44 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
         seq => NextSeq
     },
 
-    %% Prepare batch operations
-    Operations = [
+    %% Prepare doc operations
+    DocOps = [
         {put, DocInfoKey, term_to_binary(DocInfo)},
         {put, barrel_store_keys:doc_rev(DbName, DocId, NewRev), term_to_binary(DocBody)}
     ],
 
     %% Delete old sequence entry if exists
-    DeleteOps = case OldSeq of
+    SeqDeleteOps = case OldSeq of
         undefined -> [];
         _ -> [{delete, barrel_store_keys:doc_seq(DbName, OldSeq)}]
     end,
 
-    %% Write batch atomically
-    ok = barrel_store_rocksdb:write_batch(StoreRef, Operations ++ DeleteOps),
+    %% Path index operations
+    PathIndexOps = case Deleted of
+        true when OldDocBody =/= undefined ->
+            %% Deleting a document - remove all paths
+            case barrel_ars_index:get_doc_paths(StoreRef, DbName, DocId) of
+                {ok, OldPaths} -> barrel_ars_index:remove_doc_ops(DbName, DocId, OldPaths);
+                not_found -> []
+            end;
+        true ->
+            %% New doc being created as deleted - no paths to index
+            [];
+        false when OldDocBody =:= undefined ->
+            %% New document - index all paths
+            barrel_ars_index:index_doc_ops(DbName, DocId, DocBody);
+        false ->
+            %% Update document - compute diff and update paths
+            barrel_ars_index:update_doc_ops(DbName, DocId, OldDocBody, DocBody)
+    end,
 
-    %% Write change (includes doc for views)
+    %% Change entry operations
     ChangeInfo = DocInfo#{doc => DocBody},
-    ok = barrel_changes:write_change(StoreRef, DbName, NextSeq, ChangeInfo),
+    ChangeOps = barrel_changes:write_change_ops(DbName, NextSeq, ChangeInfo),
+
+    %% Write batch atomically (doc + path index + change in single batch)
+    AllOps = DocOps ++ SeqDeleteOps ++ PathIndexOps ++ ChangeOps,
+    ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps),
 
     {ok, DocId, NewRev}.
 

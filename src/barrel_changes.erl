@@ -20,6 +20,7 @@
 %% Internal - for use by barrel_db_writer
 -export([
     write_change/4,
+    write_change_ops/3,
     delete_old_seq/4
 ]).
 
@@ -167,9 +168,16 @@ count_changes_since(StoreRef, DbName, Since) ->
 %% @doc Write a change entry for a document
 -spec write_change(barrel_store_rocksdb:db_ref(), db_name(), seq(), doc_info()) -> ok.
 write_change(StoreRef, DbName, Seq, DocInfo) ->
+    [{put, Key, Value}] = write_change_ops(DbName, Seq, DocInfo),
+    barrel_store_rocksdb:put(StoreRef, Key, Value).
+
+%% @doc Return batch operation to write a change entry.
+%% Use this to combine with other operations in a single write_batch.
+-spec write_change_ops(db_name(), seq(), doc_info()) -> [{put, binary(), binary()}].
+write_change_ops(DbName, Seq, DocInfo) ->
     Key = barrel_store_keys:doc_seq(DbName, Seq),
     Value = encode_change(DocInfo),
-    barrel_store_rocksdb:put(StoreRef, Key, Value).
+    [{put, Key, Value}].
 
 %% @doc Delete an old sequence entry (when document is updated)
 -spec delete_old_seq(barrel_store_rocksdb:db_ref(), db_name(), seq(), docid()) -> ok.

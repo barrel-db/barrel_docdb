@@ -40,12 +40,20 @@
     api_changes/1
 ]).
 
+%% Test cases - path indexing
+-export([
+    path_index_put_doc/1,
+    path_index_update_doc/1,
+    path_index_delete_doc/1,
+    path_index_atomicity/1
+]).
+
 %%====================================================================
 %% CT Callbacks
 %%====================================================================
 
 all() ->
-    [{group, application}, {group, db_server}, {group, public_api}].
+    [{group, application}, {group, db_server}, {group, public_api}, {group, path_indexing}].
 
 groups() ->
     [
@@ -72,6 +80,12 @@ groups() ->
             api_attachments,
             api_views,
             api_changes
+        ]},
+        {path_indexing, [sequence], [
+            path_index_put_doc,
+            path_index_update_doc,
+            path_index_delete_doc,
+            path_index_atomicity
         ]}
     ].
 
@@ -617,3 +631,198 @@ api_changes(_Config) ->
     ok = barrel_docdb:delete_db(DbName),
     os:cmd("rm -rf " ++ TestDir),
     ok.
+
+%%====================================================================
+%% Test Cases - Path Indexing
+%%====================================================================
+
+%% @doc Test that putting a document indexes its paths
+path_index_put_doc(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"path_idx_put_test">>,
+    TestDir = "/tmp/barrel_path_idx_put_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, Pid} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Get store ref for direct path index queries
+    {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
+
+    %% Put a document
+    Doc = #{
+        <<"id">> => <<"doc1">>,
+        <<"type">> => <<"user">>,
+        <<"name">> => <<"Alice">>,
+        <<"profile">> => #{
+            <<"city">> => <<"Paris">>
+        }
+    },
+    {ok, _} = barrel_docdb:put_doc(DbName, Doc),
+
+    %% Verify paths are indexed
+    TypeResults = fold_paths(StoreRef, DbName, [<<"type">>]),
+    ?assertEqual(1, length(TypeResults)),
+    [{TypePath, TypeDocId}] = TypeResults,
+    ?assertEqual([<<"type">>, <<"user">>], TypePath),
+    ?assertEqual(<<"doc1">>, TypeDocId),
+
+    %% Verify nested paths
+    CityResults = fold_paths(StoreRef, DbName, [<<"profile">>, <<"city">>]),
+    ?assertEqual(1, length(CityResults)),
+    [{CityPath, _}] = CityResults,
+    ?assertEqual([<<"profile">>, <<"city">>, <<"Paris">>], CityPath),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test that updating a document updates its paths
+path_index_update_doc(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"path_idx_update_test">>,
+    TestDir = "/tmp/barrel_path_idx_update_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, Pid} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+    {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
+
+    %% Put initial document
+    Doc1 = #{<<"id">> => <<"doc1">>, <<"status">> => <<"active">>, <<"count">> => 1},
+    {ok, #{<<"rev">> := Rev1}} = barrel_docdb:put_doc(DbName, Doc1),
+
+    %% Verify initial paths
+    ActiveResults = fold_paths(StoreRef, DbName, [<<"status">>, <<"active">>]),
+    ActiveDocs = [D || {_, D} <- ActiveResults, D =:= <<"doc1">>],
+    ?assertEqual(1, length(ActiveDocs)),
+
+    %% Update document (change status, remove count, add new field)
+    Doc2 = #{<<"id">> => <<"doc1">>, <<"_rev">> => Rev1, <<"status">> => <<"inactive">>, <<"tag">> => <<"new">>},
+    {ok, _} = barrel_docdb:put_doc(DbName, Doc2),
+
+    %% Verify old status path is gone
+    ActiveResults2 = fold_paths(StoreRef, DbName, [<<"status">>, <<"active">>]),
+    ActiveDocs2 = [D || {_, D} <- ActiveResults2, D =:= <<"doc1">>],
+    ?assertEqual(0, length(ActiveDocs2)),
+
+    %% Verify new status path exists
+    InactiveResults = fold_paths(StoreRef, DbName, [<<"status">>, <<"inactive">>]),
+    InactiveDocs = [D || {_, D} <- InactiveResults, D =:= <<"doc1">>],
+    ?assertEqual(1, length(InactiveDocs)),
+
+    %% Verify old count path is gone
+    CountResults = fold_paths(StoreRef, DbName, [<<"count">>]),
+    CountDocs = [D || {_, D} <- CountResults, D =:= <<"doc1">>],
+    ?assertEqual(0, length(CountDocs)),
+
+    %% Verify new tag path exists
+    TagResults = fold_paths(StoreRef, DbName, [<<"tag">>, <<"new">>]),
+    ?assertEqual(1, length(TagResults)),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test that deleting a document removes its paths
+path_index_delete_doc(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"path_idx_delete_test">>,
+    TestDir = "/tmp/barrel_path_idx_delete_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, Pid} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+    {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
+
+    %% Put document
+    Doc = #{<<"id">> => <<"doc1">>, <<"type">> => <<"temp">>, <<"data">> => <<"value">>},
+    {ok, _} = barrel_docdb:put_doc(DbName, Doc),
+
+    %% Verify paths are indexed
+    TypeResults1 = fold_paths(StoreRef, DbName, [<<"type">>, <<"temp">>]),
+    ?assertEqual(1, length(TypeResults1)),
+
+    %% Delete document
+    {ok, _} = barrel_docdb:delete_doc(DbName, <<"doc1">>),
+
+    %% Verify paths are removed
+    TypeResults2 = fold_paths(StoreRef, DbName, [<<"type">>, <<"temp">>]),
+    TypeDocs = [D || {_, D} <- TypeResults2, D =:= <<"doc1">>],
+    ?assertEqual(0, length(TypeDocs)),
+
+    DataResults = fold_paths(StoreRef, DbName, [<<"data">>]),
+    DataDocs = [D || {_, D} <- DataResults, D =:= <<"doc1">>],
+    ?assertEqual(0, length(DataDocs)),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test atomicity - path index and doc are consistent
+path_index_atomicity(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"path_idx_atomic_test">>,
+    TestDir = "/tmp/barrel_path_idx_atomic_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, Pid} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+    {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
+
+    %% Put multiple documents
+    lists:foreach(
+        fun(N) ->
+            Type = case N rem 2 of 0 -> <<"even">>; 1 -> <<"odd">> end,
+            {ok, _} = barrel_docdb:put_doc(DbName, #{
+                <<"id">> => <<"doc", (integer_to_binary(N))/binary>>,
+                <<"type">> => Type,
+                <<"n">> => N
+            })
+        end,
+        lists:seq(1, 10)
+    ),
+
+    %% Verify path index matches documents
+    EvenResults = fold_paths(StoreRef, DbName, [<<"type">>, <<"even">>]),
+    ?assertEqual(5, length(EvenResults)),
+
+    OddResults = fold_paths(StoreRef, DbName, [<<"type">>, <<"odd">>]),
+    ?assertEqual(5, length(OddResults)),
+
+    %% Verify each indexed doc exists
+    lists:foreach(
+        fun({_Path, DocId}) ->
+            {ok, _Doc} = barrel_docdb:get_doc(DbName, DocId),
+            ok
+        end,
+        EvenResults ++ OddResults
+    ),
+
+    %% Delete all even docs and verify
+    lists:foreach(
+        fun(N) ->
+            DocId = <<"doc", (integer_to_binary(N))/binary>>,
+            {ok, _} = barrel_docdb:delete_doc(DbName, DocId)
+        end,
+        [2, 4, 6, 8, 10]
+    ),
+
+    %% Even paths should be gone
+    EvenResults2 = fold_paths(StoreRef, DbName, [<<"type">>, <<"even">>]),
+    ?assertEqual(0, length(EvenResults2)),
+
+    %% Odd paths still there
+    OddResults2 = fold_paths(StoreRef, DbName, [<<"type">>, <<"odd">>]),
+    ?assertEqual(5, length(OddResults2)),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%%====================================================================
+%% Helper Functions
+%%====================================================================
+
+fold_paths(StoreRef, DbName, PathPrefix) ->
+    barrel_ars_index:fold_path(
+        StoreRef, DbName, PathPrefix,
+        fun({Path, DocId}, Acc) -> {ok, [{Path, DocId} | Acc]} end,
+        []
+    ).

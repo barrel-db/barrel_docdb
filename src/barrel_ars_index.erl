@@ -20,6 +20,18 @@
     fold_path_range/6
 ]).
 
+%% Operations-only variants (for batching with other ops)
+-export([
+    index_doc_ops/3,
+    update_doc_ops/4,
+    remove_doc_ops/3
+]).
+
+%% Utility for reading stored paths
+-export([
+    get_doc_paths/3
+]).
+
 -include("barrel_docdb.hrl").
 
 -type store_ref() :: barrel_store_rocksdb:db_ref().
@@ -34,14 +46,33 @@
 -spec index_doc(store_ref(), db_name(), docid(), doc()) ->
     ok | {error, term()}.
 index_doc(StoreRef, DbName, DocId, Doc) ->
+    Operations = index_doc_ops(DbName, DocId, Doc),
+    barrel_store_rocksdb:write_batch(StoreRef, Operations).
+
+%% @doc Return batch operations to index all paths from a document.
+%% Use this to combine with other operations in a single write_batch.
+-spec index_doc_ops(db_name(), docid(), doc()) -> [{put, binary(), binary()}].
+index_doc_ops(DbName, DocId, Doc) ->
     Paths = barrel_ars:analyze(Doc),
-    store_paths(StoreRef, DbName, DocId, Paths).
+    make_index_ops(DbName, DocId, Paths).
 
 %% @doc Update paths when a document changes.
 %% Computes the diff between old and new paths and applies changes.
 -spec update_doc(store_ref(), db_name(), docid(), doc(), doc()) ->
     ok | {error, term()}.
 update_doc(StoreRef, DbName, DocId, OldDoc, NewDoc) ->
+    case update_doc_ops(DbName, DocId, OldDoc, NewDoc) of
+        [] ->
+            ok;
+        Operations ->
+            barrel_store_rocksdb:write_batch(StoreRef, Operations)
+    end.
+
+%% @doc Return batch operations to update paths when a document changes.
+%% Use this to combine with other operations in a single write_batch.
+-spec update_doc_ops(db_name(), docid(), doc(), doc()) ->
+    [{put | delete, binary()} | {put, binary(), binary()}].
+update_doc_ops(DbName, DocId, OldDoc, NewDoc) ->
     OldPaths = barrel_ars:analyze(OldDoc),
     NewPaths = barrel_ars:analyze(NewDoc),
     {Added, Removed} = barrel_ars:diff(OldPaths, NewPaths),
@@ -49,7 +80,7 @@ update_doc(StoreRef, DbName, DocId, OldDoc, NewDoc) ->
     case {Added, Removed} of
         {[], []} ->
             %% No changes
-            ok;
+            [];
         _ ->
             %% Build batch operations
             RemoveOps = [{delete, barrel_store_keys:path_index_key(DbName, Path, DocId)}
@@ -62,8 +93,7 @@ update_doc(StoreRef, DbName, DocId, OldDoc, NewDoc) ->
                          barrel_store_keys:doc_paths_key(DbName, DocId),
                          term_to_binary(NewPaths)},
 
-            Operations = RemoveOps ++ AddOps ++ [ReverseOp],
-            barrel_store_rocksdb:write_batch(StoreRef, Operations)
+            RemoveOps ++ AddOps ++ [ReverseOp]
     end.
 
 %% @doc Remove all paths for a document.
@@ -76,15 +106,38 @@ remove_doc(StoreRef, DbName, DocId) ->
     case barrel_store_rocksdb:get(StoreRef, ReverseKey) of
         {ok, PathsBin} ->
             Paths = binary_to_term(PathsBin),
-            %% Delete all path index entries
-            DeleteOps = [{delete, barrel_store_keys:path_index_key(DbName, Path, DocId)}
-                         || {Path, _} <- Paths],
-            %% Delete reverse index
-            AllOps = DeleteOps ++ [{delete, ReverseKey}],
-            barrel_store_rocksdb:write_batch(StoreRef, AllOps);
+            Operations = remove_doc_ops(DbName, DocId, Paths),
+            barrel_store_rocksdb:write_batch(StoreRef, Operations);
         not_found ->
             %% No paths indexed
             ok;
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc Return batch operations to remove all paths for a document.
+%% Takes the stored paths (from reverse index) as parameter.
+%% Use this to combine with other operations in a single write_batch.
+-spec remove_doc_ops(db_name(), docid(), [{[term()], term()}]) -> [{delete, binary()}].
+remove_doc_ops(DbName, DocId, Paths) ->
+    %% Delete all path index entries
+    DeleteOps = [{delete, barrel_store_keys:path_index_key(DbName, Path, DocId)}
+                 || {Path, _} <- Paths],
+    %% Delete reverse index
+    ReverseKey = barrel_store_keys:doc_paths_key(DbName, DocId),
+    DeleteOps ++ [{delete, ReverseKey}].
+
+%% @doc Get stored paths for a document from the reverse index.
+%% Returns {ok, Paths} or not_found.
+-spec get_doc_paths(store_ref(), db_name(), docid()) ->
+    {ok, [{[term()], term()}]} | not_found | {error, term()}.
+get_doc_paths(StoreRef, DbName, DocId) ->
+    ReverseKey = barrel_store_keys:doc_paths_key(DbName, DocId),
+    case barrel_store_rocksdb:get(StoreRef, ReverseKey) of
+        {ok, PathsBin} ->
+            {ok, binary_to_term(PathsBin)};
+        not_found ->
+            not_found;
         {error, _} = Error ->
             Error
     end.
@@ -115,8 +168,8 @@ fold_path_range(StoreRef, _DbName, StartKey, EndKey, Fun, Acc0) ->
 %% Internal functions
 %%====================================================================
 
-%% @private Store paths for a document
-store_paths(StoreRef, DbName, DocId, Paths) ->
+%% @private Create batch operations for indexing paths
+make_index_ops(DbName, DocId, Paths) ->
     %% Create batch operations for all path entries
     PathOps = [{put, barrel_store_keys:path_index_key(DbName, Path, DocId), <<>>}
                || {Path, _} <- Paths],
@@ -126,8 +179,7 @@ store_paths(StoreRef, DbName, DocId, Paths) ->
                  barrel_store_keys:doc_paths_key(DbName, DocId),
                  term_to_binary(Paths)},
 
-    Operations = PathOps ++ [ReverseOp],
-    barrel_store_rocksdb:write_batch(StoreRef, Operations).
+    PathOps ++ [ReverseOp].
 
 %% @private Decode a path index key to extract path and docid
 %% Key format: 0x0B + len:16 + dbname + encoded_path + docid
