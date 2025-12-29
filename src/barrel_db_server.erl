@@ -24,6 +24,19 @@
     fold_docs/3
 ]).
 
+%% Replication API
+-export([
+    put_rev/4,
+    revsdiff/3
+]).
+
+%% Local document API (for checkpoints, not replicated)
+-export([
+    put_local_doc/3,
+    get_local_doc/2,
+    delete_local_doc/2
+]).
+
 %% View API
 -export([
     register_view/3,
@@ -98,6 +111,40 @@ delete_doc(Pid, DocId, Opts) ->
 -spec fold_docs(pid(), fun(), term()) -> {ok, term()}.
 fold_docs(Pid, Fun, Acc) ->
     gen_server:call(Pid, {fold_docs, Fun, Acc}, infinity).
+
+%%====================================================================
+%% Replication API functions
+%%====================================================================
+
+%% @doc Put a document with explicit revision history (for replication)
+-spec put_rev(pid(), map(), [binary()], boolean()) -> {ok, map()} | {error, term()}.
+put_rev(Pid, Doc, History, Deleted) ->
+    gen_server:call(Pid, {put_rev, Doc, History, Deleted}).
+
+%% @doc Get revisions difference (for replication)
+%% Returns {ok, Missing, PossibleAncestors}
+-spec revsdiff(pid(), binary(), [binary()]) -> {ok, [binary()], [binary()]}.
+revsdiff(Pid, DocId, RevIds) ->
+    gen_server:call(Pid, {revsdiff, DocId, RevIds}).
+
+%%====================================================================
+%% Local Document API functions
+%%====================================================================
+
+%% @doc Put a local document (not replicated)
+-spec put_local_doc(pid(), binary(), map()) -> ok | {error, term()}.
+put_local_doc(Pid, DocId, Doc) ->
+    gen_server:call(Pid, {put_local_doc, DocId, Doc}).
+
+%% @doc Get a local document
+-spec get_local_doc(pid(), binary()) -> {ok, map()} | {error, not_found}.
+get_local_doc(Pid, DocId) ->
+    gen_server:call(Pid, {get_local_doc, DocId}).
+
+%% @doc Delete a local document
+-spec delete_local_doc(pid(), binary()) -> ok | {error, not_found}.
+delete_local_doc(Pid, DocId) ->
+    gen_server:call(Pid, {delete_local_doc, DocId}).
 
 %%====================================================================
 %% View API functions
@@ -207,6 +254,33 @@ handle_call({delete_doc, DocId, Opts}, _From,
 handle_call({fold_docs, Fun, Acc}, _From,
             #state{name = DbName, store_ref = StoreRef} = State) ->
     Result = do_fold_docs(StoreRef, DbName, Fun, Acc),
+    {reply, Result, State};
+
+%% Replication operations
+handle_call({put_rev, Doc, History, Deleted}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_put_rev(StoreRef, DbName, Doc, History, Deleted),
+    {reply, Result, State};
+
+handle_call({revsdiff, DocId, RevIds}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_revsdiff(StoreRef, DbName, DocId, RevIds),
+    {reply, Result, State};
+
+%% Local document operations
+handle_call({put_local_doc, DocId, Doc}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_put_local_doc(StoreRef, DbName, DocId, Doc),
+    {reply, Result, State};
+
+handle_call({get_local_doc, DocId}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_get_local_doc(StoreRef, DbName, DocId),
+    {reply, Result, State};
+
+handle_call({delete_local_doc, DocId}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_delete_local_doc(StoreRef, DbName, DocId),
     {reply, Result, State};
 
 %% View operations
@@ -544,3 +618,151 @@ do_fold_docs(StoreRef, DbName, Fun, Acc) ->
 
     FinalAcc = barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, Acc),
     {ok, FinalAcc}.
+
+%%====================================================================
+%% Replication Operations
+%%====================================================================
+
+%% @doc Put a document with explicit revision history (for replication)
+do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
+    DocId = maps:get(<<"id">>, Doc),
+    DocBody = barrel_doc:doc_without_meta(Doc),
+    [NewRev | _] = History,
+
+    %% Check for existing document
+    DocInfoKey = barrel_store_keys:doc_info(DbName, DocId),
+    {ExistingRevTree, OldSeq} = case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
+        {ok, ExistingBin} ->
+            ExistingDocInfo = binary_to_term(ExistingBin),
+            {maps:get(revtree, ExistingDocInfo, #{}),
+             maps:get(seq, ExistingDocInfo, undefined)};
+        not_found ->
+            {#{}, undefined}
+    end,
+
+    %% Build revision tree from history
+    NewRevTree = build_revtree_from_history(History, Deleted, ExistingRevTree),
+
+    %% Get next sequence
+    CurrentSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+    NextSeq = barrel_sequence:inc(case CurrentSeq of first -> barrel_sequence:min_seq(); S -> S end),
+
+    %% Build doc_info
+    DocInfo = #{
+        id => DocId,
+        rev => NewRev,
+        deleted => Deleted,
+        revtree => NewRevTree,
+        seq => NextSeq
+    },
+
+    %% Prepare batch operations
+    Operations = [
+        {put, DocInfoKey, term_to_binary(DocInfo)},
+        {put, barrel_store_keys:doc_rev(DbName, DocId, NewRev), term_to_binary(DocBody)}
+    ],
+
+    %% Delete old sequence entry if exists
+    DeleteOps = case OldSeq of
+        undefined -> [];
+        _ -> [{delete, barrel_store_keys:doc_seq(DbName, OldSeq)}]
+    end,
+
+    %% Write batch atomically
+    ok = barrel_store_rocksdb:write_batch(StoreRef, Operations ++ DeleteOps),
+
+    %% Write change (includes doc for views)
+    ChangeInfo = DocInfo#{doc => DocBody},
+    ok = barrel_changes:write_change(StoreRef, DbName, NextSeq, ChangeInfo),
+
+    {ok, DocId, NewRev}.
+
+%% @doc Build revision tree from history
+build_revtree_from_history(History, Deleted, ExistingTree) ->
+    build_revtree_from_history(lists:reverse(History), Deleted, ExistingTree, undefined).
+
+build_revtree_from_history([], _Deleted, Tree, _Parent) ->
+    Tree;
+build_revtree_from_history([Rev], Deleted, Tree, Parent) ->
+    %% Last revision (the newest one)
+    Tree#{Rev => #{id => Rev, parent => Parent, deleted => Deleted}};
+build_revtree_from_history([Rev | Rest], Deleted, Tree, Parent) ->
+    %% Intermediate revisions (not deleted)
+    NewTree = Tree#{Rev => #{id => Rev, parent => Parent, deleted => false}},
+    build_revtree_from_history(Rest, Deleted, NewTree, Rev).
+
+%% @doc Get revisions difference
+do_revsdiff(StoreRef, DbName, DocId, RevIds) ->
+    DocInfoKey = barrel_store_keys:doc_info(DbName, DocId),
+    case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
+        {ok, DocInfoBin} ->
+            DocInfo = binary_to_term(DocInfoBin),
+            RevTree = maps:get(revtree, DocInfo, #{}),
+
+            %% Find missing revisions and possible ancestors
+            {Missing, PossibleAncestors} = lists:foldl(
+                fun(RevId, {M, A} = Acc) ->
+                    case maps:is_key(RevId, RevTree) of
+                        true ->
+                            %% Revision exists, not missing
+                            Acc;
+                        false ->
+                            %% Revision is missing
+                            M2 = [RevId | M],
+                            %% Find possible ancestors in our tree
+                            {Gen, _} = barrel_doc:parse_revision(RevId),
+                            A2 = maps:fold(
+                                fun(LocalRev, _RevInfo, AccA) ->
+                                    {LocalGen, _} = barrel_doc:parse_revision(LocalRev),
+                                    case LocalGen < Gen of
+                                        true -> [LocalRev | AccA];
+                                        false -> AccA
+                                    end
+                                end,
+                                A,
+                                RevTree
+                            ),
+                            {M2, A2}
+                    end
+                end,
+                {[], []},
+                RevIds
+            ),
+            {ok, lists:reverse(Missing), lists:usort(PossibleAncestors)};
+
+        not_found ->
+            %% Document doesn't exist - all revisions are missing
+            {ok, RevIds, []}
+    end.
+
+%%====================================================================
+%% Local Document Operations
+%%====================================================================
+
+%% @doc Put a local document
+do_put_local_doc(StoreRef, DbName, DocId, Doc) ->
+    Key = barrel_store_keys:local_doc(DbName, DocId),
+    Value = term_to_binary(Doc),
+    ok = barrel_store_rocksdb:put(StoreRef, Key, Value),
+    ok.
+
+%% @doc Get a local document
+do_get_local_doc(StoreRef, DbName, DocId) ->
+    Key = barrel_store_keys:local_doc(DbName, DocId),
+    case barrel_store_rocksdb:get(StoreRef, Key) of
+        {ok, Value} ->
+            {ok, binary_to_term(Value)};
+        not_found ->
+            {error, not_found}
+    end.
+
+%% @doc Delete a local document
+do_delete_local_doc(StoreRef, DbName, DocId) ->
+    Key = barrel_store_keys:local_doc(DbName, DocId),
+    case barrel_store_rocksdb:get(StoreRef, Key) of
+        {ok, _} ->
+            ok = barrel_store_rocksdb:delete(StoreRef, Key),
+            ok;
+        not_found ->
+            {error, not_found}
+    end.

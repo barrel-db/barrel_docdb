@@ -57,6 +57,19 @@
     subscribe_changes/3
 ]).
 
+%% Replication primitives
+-export([
+    put_rev/4,
+    revsdiff/3
+]).
+
+%% Local documents (for checkpoints, not replicated)
+-export([
+    put_local_doc/3,
+    get_local_doc/2,
+    delete_local_doc/2
+]).
+
 %%====================================================================
 %% Database Lifecycle
 %%====================================================================
@@ -339,3 +352,48 @@ with_db(Name, Fun) when is_binary(Name) ->
         {error, _} = Error ->
             Error
     end.
+
+%%====================================================================
+%% Replication Primitives
+%%====================================================================
+
+%% @doc Put a document with explicit revision history (for replication)
+-spec put_rev(binary() | pid(), map(), [binary()], boolean()) ->
+    {ok, binary(), binary()} | {error, term()}.
+put_rev(Db, Doc, History, Deleted) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:put_rev(Pid, Doc, History, Deleted)
+    end).
+
+%% @doc Get revisions difference (for replication)
+-spec revsdiff(binary() | pid(), binary(), [binary()]) ->
+    {ok, [binary()], [binary()]} | {error, term()}.
+revsdiff(Db, DocId, RevIds) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:revsdiff(Pid, DocId, RevIds)
+    end).
+
+%%====================================================================
+%% Local Documents
+%%====================================================================
+
+%% @doc Put a local document (not replicated, used for checkpoints)
+-spec put_local_doc(binary() | pid(), binary(), map()) -> ok | {error, term()}.
+put_local_doc(Db, DocId, Doc) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:put_local_doc(Pid, DocId, Doc)
+    end).
+
+%% @doc Get a local document
+-spec get_local_doc(binary() | pid(), binary()) -> {ok, map()} | {error, not_found}.
+get_local_doc(Db, DocId) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:get_local_doc(Pid, DocId)
+    end).
+
+%% @doc Delete a local document
+-spec delete_local_doc(binary() | pid(), binary()) -> ok | {error, not_found}.
+delete_local_doc(Db, DocId) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:delete_local_doc(Pid, DocId)
+    end).
