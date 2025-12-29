@@ -552,9 +552,10 @@ list_attachments(Db, DocId) ->
 %% @doc Register a secondary index (view).
 %%
 %% Creates a view that maintains a secondary index over documents.
-%% The view module must implement the `barrel_view' behaviour.
+%% Views can be module-based or query-based.
 %%
-%% == View Module Example ==
+%% == Module-based View ==
+%% The view module must implement the `barrel_view' behaviour.
 %% ```
 %% -module(by_type_view).
 %% -behaviour(barrel_view).
@@ -564,18 +565,46 @@ list_attachments(Db, DocId) ->
 %%
 %% map(#{<<"type">> := Type}) -> [{Type, 1}];
 %% map(_) -> [].
-%% '''
 %%
-%% == Registration Example ==
-%% ```
+%% %% Registration:
 %% ok = barrel_docdb:register_view(<<"mydb">>, <<"by_type">>, #{
 %%     module => by_type_view
 %% }).
 %% '''
 %%
+%% == Query-based View ==
+%% Query-based views use declarative queries instead of module callbacks.
+%% They automatically index documents matching the query conditions.
+%% ```
+%% %% Create a materialized view from a query
+%% ok = barrel_docdb:register_view(<<"mydb">>, <<"users_by_org">>, #{
+%%     query => #{
+%%         where => [
+%%             {path, [<<"type">>], <<"user">>},
+%%             {path, [<<"org_id">>], '?Org'}
+%%         ],
+%%         key => '?Org'       %% Use org_id as the index key
+%%     },
+%%     reduce => '_count'      %% Optional: count users per org
+%% }).
+%%
+%% %% Query the materialized view
+%% {ok, Results} = barrel_docdb:query_view(<<"mydb">>, <<"users_by_org">>, #{
+%%     reduce => true          %% Apply reduce
+%% }).
+%% '''
+%%
+%% == Configuration Options ==
+%% <ul>
+%%   <li>`module' - Module implementing barrel_view behaviour (module-based)</li>
+%%   <li>`query' - Query specification with `where' and `key' (query-based)</li>
+%%   <li>`reduce' - Optional reduce: '_count', '_sum', '_stats' (both types)</li>
+%%   <li>`refresh' - Refresh mode: on_change (default) or manual</li>
+%% </ul>
+%%
 %% @param Db Database name or pid
 %% @param ViewId View identifier
-%% @param Config View configuration with `module' key
+%% @param Config View configuration
 %% @returns `ok' or `{error, Reason}'
 -spec register_view(binary() | pid(), binary(), map()) -> ok | {error, term()}.
 register_view(Db, ViewId, Config) ->

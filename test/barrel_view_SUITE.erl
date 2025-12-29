@@ -34,7 +34,15 @@
     reduce_count/1,
     reduce_sum/1,
     reduce_group/1,
-    reduce_group_level/1
+    reduce_group_level/1,
+
+    %% Query-based views
+    query_view_register/1,
+    query_view_index/1,
+    query_view_query/1,
+    query_view_with_reduce/1,
+    query_view_compound_key/1,
+    query_view_manual_refresh/1
 ]).
 
 %% Test view module (for testing)
@@ -61,7 +69,7 @@ reduce(_Keys, Values, _Rereduce) ->
 %%====================================================================
 
 all() ->
-    [{group, registration}, {group, indexing}, {group, query}, {group, reduce}].
+    [{group, registration}, {group, indexing}, {group, query}, {group, reduce}, {group, query_views}].
 
 groups() ->
     [
@@ -85,6 +93,14 @@ groups() ->
             reduce_sum,
             reduce_group,
             reduce_group_level
+        ]},
+        {query_views, [sequence], [
+            query_view_register,
+            query_view_index,
+            query_view_query,
+            query_view_with_reduce,
+            query_view_compound_key,
+            query_view_manual_refresh
         ]}
     ].
 
@@ -515,3 +531,293 @@ delete_test_doc(StoreRef, DbName, DocId) ->
         not_found ->
             ok
     end.
+
+%%====================================================================
+%% Test Cases - Query-based Views
+%%====================================================================
+
+query_view_register(Config) ->
+    DbPid = ?config(db_pid, Config),
+
+    %% Register a query-based view
+    ViewConfig = #{
+        query => #{
+            where => [
+                {path, [<<"type">>], <<"user">>},
+                {path, [<<"org_id">>], '?Org'}
+            ],
+            key => '?Org'
+        }
+    },
+    ok = barrel_db_server:register_view(DbPid, <<"users_by_org">>, ViewConfig),
+
+    %% Verify view is registered
+    {ok, ViewPid} = barrel_db_server:get_view_pid(DbPid, <<"users_by_org">>),
+    ?assert(is_pid(ViewPid)),
+    ?assert(is_process_alive(ViewPid)),
+
+    %% Cannot register twice
+    {error, already_registered} = barrel_db_server:register_view(DbPid, <<"users_by_org">>, ViewConfig),
+
+    ok.
+
+query_view_index(Config) ->
+    DbPid = ?config(db_pid, Config),
+    DbName = ?config(db_name, Config),
+    StoreRef = ?config(store_ref, Config),
+
+    %% Write some documents
+    write_test_docs(StoreRef, DbName, [
+        #{<<"_id">> => <<"user1">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org1">>, <<"name">> => <<"Alice">>},
+        #{<<"_id">> => <<"user2">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org1">>, <<"name">> => <<"Bob">>},
+        #{<<"_id">> => <<"user3">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org2">>, <<"name">> => <<"Charlie">>},
+        #{<<"_id">> => <<"post1">>, <<"type">> => <<"post">>, <<"title">> => <<"Hello">>}  % Won't match
+    ]),
+
+    %% Register query-based view
+    ViewConfig = #{
+        query => #{
+            where => [
+                {path, [<<"type">>], <<"user">>},
+                {path, [<<"org_id">>], '?Org'}
+            ],
+            key => '?Org'
+        }
+    },
+    ok = barrel_db_server:register_view(DbPid, <<"users_by_org">>, ViewConfig),
+    {ok, _} = barrel_view:refresh(DbPid, <<"users_by_org">>),
+
+    %% Query - should only index users, not posts
+    {ok, Results} = barrel_view:query(DbPid, <<"users_by_org">>, #{reduce => false}),
+    ?assertEqual(3, length(Results)),
+
+    %% Verify all indexed documents are users
+    DocIds = [maps:get(id, R) || R <- Results],
+    ?assert(lists:member(<<"user1">>, DocIds)),
+    ?assert(lists:member(<<"user2">>, DocIds)),
+    ?assert(lists:member(<<"user3">>, DocIds)),
+    ?assertNot(lists:member(<<"post1">>, DocIds)),
+
+    %% Verify keys are org_ids
+    Keys = [maps:get(key, R) || R <- Results],
+    ?assert(lists:member(<<"org1">>, Keys)),
+    ?assert(lists:member(<<"org2">>, Keys)),
+
+    ok.
+
+query_view_query(Config) ->
+    DbPid = ?config(db_pid, Config),
+    DbName = ?config(db_name, Config),
+    StoreRef = ?config(store_ref, Config),
+
+    %% Write documents
+    write_test_docs(StoreRef, DbName, [
+        #{<<"_id">> => <<"user1">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org1">>},
+        #{<<"_id">> => <<"user2">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org1">>},
+        #{<<"_id">> => <<"user3">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org2">>}
+    ]),
+
+    %% Register view
+    ViewConfig = #{
+        query => #{
+            where => [
+                {path, [<<"type">>], <<"user">>},
+                {path, [<<"org_id">>], '?Org'}
+            ],
+            key => '?Org'
+        }
+    },
+    ok = barrel_db_server:register_view(DbPid, <<"users_by_org">>, ViewConfig),
+    {ok, _} = barrel_view:refresh(DbPid, <<"users_by_org">>),
+
+    %% Query by key range - should return only org1 users
+    {ok, Results1} = barrel_view:query(DbPid, <<"users_by_org">>, #{
+        start_key => <<"org1">>,
+        end_key => <<"org1">>,
+        reduce => false
+    }),
+    ?assertEqual(2, length(Results1)),
+
+    %% Verify results are org1 users only
+    Org1DocIds = [maps:get(id, R) || R <- Results1],
+    ?assert(lists:member(<<"user1">>, Org1DocIds)),
+    ?assert(lists:member(<<"user2">>, Org1DocIds)),
+    ?assertNot(lists:member(<<"user3">>, Org1DocIds)),
+
+    %% All results should have key "org1"
+    Org1Keys = [maps:get(key, R) || R <- Results1],
+    ?assert(lists:all(fun(K) -> K =:= <<"org1">> end, Org1Keys)),
+
+    %% Query all
+    {ok, Results2} = barrel_view:query(DbPid, <<"users_by_org">>, #{reduce => false}),
+    ?assertEqual(3, length(Results2)),
+
+    %% Verify all users are present
+    AllDocIds = [maps:get(id, R) || R <- Results2],
+    ?assert(lists:member(<<"user1">>, AllDocIds)),
+    ?assert(lists:member(<<"user2">>, AllDocIds)),
+    ?assert(lists:member(<<"user3">>, AllDocIds)),
+
+    ok.
+
+query_view_with_reduce(Config) ->
+    DbPid = ?config(db_pid, Config),
+    DbName = ?config(db_name, Config),
+    StoreRef = ?config(store_ref, Config),
+
+    %% Write documents
+    write_test_docs(StoreRef, DbName, [
+        #{<<"_id">> => <<"user1">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org1">>},
+        #{<<"_id">> => <<"user2">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org1">>},
+        #{<<"_id">> => <<"user3">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org2">>}
+    ]),
+
+    %% Register view with _count reduce
+    ViewConfig = #{
+        query => #{
+            where => [
+                {path, [<<"type">>], <<"user">>},
+                {path, [<<"org_id">>], '?Org'}
+            ],
+            key => '?Org'
+        },
+        reduce => '_count'
+    },
+    ok = barrel_db_server:register_view(DbPid, <<"users_count_by_org">>, ViewConfig),
+    {ok, _} = barrel_view:refresh(DbPid, <<"users_count_by_org">>),
+
+    %% Query with reduce and group
+    {ok, Results} = barrel_view:query(DbPid, <<"users_count_by_org">>, #{
+        reduce => true,
+        group => true
+    }),
+    ?assertEqual(2, length(Results)),
+
+    %% Check counts per org
+    ResultMap = maps:from_list([{maps:get(key, R), maps:get(value, R)} || R <- Results]),
+    ?assertEqual(2, maps:get(<<"org1">>, ResultMap)),
+    ?assertEqual(1, maps:get(<<"org2">>, ResultMap)),
+
+    ok.
+
+query_view_compound_key(Config) ->
+    DbPid = ?config(db_pid, Config),
+    DbName = ?config(db_name, Config),
+    StoreRef = ?config(store_ref, Config),
+
+    %% Write documents
+    write_test_docs(StoreRef, DbName, [
+        #{<<"_id">> => <<"user1">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org1">>, <<"status">> => <<"active">>},
+        #{<<"_id">> => <<"user2">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org1">>, <<"status">> => <<"inactive">>},
+        #{<<"_id">> => <<"user3">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org2">>, <<"status">> => <<"active">>}
+    ]),
+
+    %% Register view with compound key [org_id, status]
+    ViewConfig = #{
+        query => #{
+            where => [
+                {path, [<<"type">>], <<"user">>},
+                {path, [<<"org_id">>], '?Org'},
+                {path, [<<"status">>], '?Status'}
+            ],
+            key => ['?Org', '?Status']
+        }
+    },
+    ok = barrel_db_server:register_view(DbPid, <<"users_by_org_status">>, ViewConfig),
+    {ok, _} = barrel_view:refresh(DbPid, <<"users_by_org_status">>),
+
+    %% Query all
+    {ok, Results} = barrel_view:query(DbPid, <<"users_by_org_status">>, #{reduce => false}),
+    ?assertEqual(3, length(Results)),
+
+    %% Check that all keys are compound (lists of 2 elements)
+    lists:foreach(fun(R) ->
+        Key = maps:get(key, R),
+        ?assert(is_list(Key)),
+        ?assertEqual(2, length(Key)),
+        [Org, Status] = Key,
+        ?assert(is_binary(Org)),
+        ?assert(is_binary(Status))
+    end, Results),
+
+    %% Verify specific compound keys exist
+    Keys = [maps:get(key, R) || R <- Results],
+    ?assert(lists:member([<<"org1">>, <<"active">>], Keys)),
+    ?assert(lists:member([<<"org1">>, <<"inactive">>], Keys)),
+    ?assert(lists:member([<<"org2">>, <<"active">>], Keys)),
+
+    %% Verify doc ids match expected keys
+    KeyDocPairs = [{maps:get(key, R), maps:get(id, R)} || R <- Results],
+    ?assert(lists:member({[<<"org1">>, <<"active">>], <<"user1">>}, KeyDocPairs)),
+    ?assert(lists:member({[<<"org1">>, <<"inactive">>], <<"user2">>}, KeyDocPairs)),
+    ?assert(lists:member({[<<"org2">>, <<"active">>], <<"user3">>}, KeyDocPairs)),
+
+    ok.
+
+query_view_manual_refresh(Config) ->
+    DbPid = ?config(db_pid, Config),
+    DbName = ?config(db_name, Config),
+    StoreRef = ?config(store_ref, Config),
+
+    %% Register view with manual refresh mode
+    ViewConfig = #{
+        query => #{
+            where => [
+                {path, [<<"type">>], <<"user">>},
+                {path, [<<"org_id">>], '?Org'}
+            ],
+            key => '?Org'
+        },
+        refresh => manual
+    },
+    ok = barrel_db_server:register_view(DbPid, <<"manual_view">>, ViewConfig),
+
+    %% Write documents after registration (should not auto-index)
+    write_test_docs(StoreRef, DbName, [
+        #{<<"_id">> => <<"user1">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org1">>},
+        #{<<"_id">> => <<"user2">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org2">>}
+    ]),
+
+    %% Give time for auto-update to NOT happen
+    timer:sleep(100),
+
+    %% Query without refresh - should be empty
+    {ok, Results1} = barrel_view:query(DbPid, <<"manual_view">>, #{reduce => false}),
+    ?assertEqual(0, length(Results1)),
+
+    %% Manually refresh
+    {ok, _} = barrel_view:refresh(DbPid, <<"manual_view">>),
+
+    %% Now should have results
+    {ok, Results2} = barrel_view:query(DbPid, <<"manual_view">>, #{reduce => false}),
+    ?assertEqual(2, length(Results2)),
+
+    %% Verify content
+    DocIds = [maps:get(id, R) || R <- Results2],
+    ?assert(lists:member(<<"user1">>, DocIds)),
+    ?assert(lists:member(<<"user2">>, DocIds)),
+
+    Keys = [maps:get(key, R) || R <- Results2],
+    ?assert(lists:member(<<"org1">>, Keys)),
+    ?assert(lists:member(<<"org2">>, Keys)),
+
+    %% Write more documents - should not appear until refresh
+    write_test_docs(StoreRef, DbName, [
+        #{<<"_id">> => <<"user3">>, <<"type">> => <<"user">>, <<"org_id">> => <<"org3">>}
+    ]),
+
+    %% Query again - still only 2 results
+    {ok, Results3} = barrel_view:query(DbPid, <<"manual_view">>, #{reduce => false}),
+    ?assertEqual(2, length(Results3)),
+
+    %% Refresh again
+    {ok, _} = barrel_view:refresh(DbPid, <<"manual_view">>),
+
+    %% Now should have 3 results
+    {ok, Results4} = barrel_view:query(DbPid, <<"manual_view">>, #{reduce => false}),
+    ?assertEqual(3, length(Results4)),
+
+    DocIds4 = [maps:get(id, R) || R <- Results4],
+    ?assert(lists:member(<<"user3">>, DocIds4)),
+
+    ok.
