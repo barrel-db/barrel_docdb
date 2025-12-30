@@ -31,6 +31,10 @@
 -export([doc_paths_key/2, doc_paths_prefix/1]).
 -export([encode_path/1, decode_path/1]).
 
+%% Path-HLC keys (for path-indexed change feeds)
+-export([path_hlc/3, path_hlc_prefix/2, path_hlc_end/2]).
+-export([encode_topic/1, decode_path_hlc_key/2]).
+
 %% Attachment keys
 -export([att_data/3, att_data_prefix/2]).
 
@@ -61,6 +65,7 @@
 -define(PREFIX_PATH_INDEX, 16#0B).
 -define(PREFIX_DOC_PATHS, 16#0C).
 -define(PREFIX_DOC_HLC, 16#0D).
+-define(PREFIX_PATH_HLC, 16#0E).
 
 %% Path component type tags (for ordered encoding)
 -define(PATH_TYPE_NULL, 16#01).
@@ -164,6 +169,60 @@ doc_hlc_end(DbName) ->
     <<?PREFIX_DOC_HLC, (encode_name(DbName))/binary,
       16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF,
       16#FF, 16#FF, 16#FF, 16#FF>>.
+
+%%====================================================================
+%% Path-HLC Keys (Path-Indexed Change Feeds)
+%%====================================================================
+
+%% @doc Path-HLC key for indexing changes by topic path.
+%% Key format: prefix | db_name | topic (null-terminated) | hlc
+%% Topic is an MQTT-style path like "users/123/name"
+-spec path_hlc(db_name(), binary(), barrel_hlc:timestamp()) -> binary().
+path_hlc(DbName, Topic, Hlc) ->
+    <<?PREFIX_PATH_HLC, (encode_name(DbName))/binary,
+      (encode_topic(Topic))/binary, (encode_hlc(Hlc))/binary>>.
+
+%% @doc Prefix for scanning path_hlc entries for a specific topic.
+%% Returns all changes under this topic since the beginning of time.
+-spec path_hlc_prefix(db_name(), binary()) -> binary().
+path_hlc_prefix(DbName, Topic) ->
+    <<?PREFIX_PATH_HLC, (encode_name(DbName))/binary, (encode_topic(Topic))/binary>>.
+
+%% @doc End marker for path_hlc range scan.
+%% Use with path_hlc_prefix or path_hlc for bounded range scans.
+-spec path_hlc_end(db_name(), binary()) -> binary().
+path_hlc_end(DbName, Topic) ->
+    %% Topic followed by max HLC (12 bytes of 0xFF)
+    <<?PREFIX_PATH_HLC, (encode_name(DbName))/binary, (encode_topic(Topic))/binary,
+      16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF,
+      16#FF, 16#FF, 16#FF, 16#FF>>.
+
+%% @doc Encode topic for null-terminated storage.
+%% Topics are MQTT-style paths like "users/123/name"
+-spec encode_topic(binary()) -> binary().
+encode_topic(Topic) when is_binary(Topic) ->
+    <<Topic/binary, 0>>.
+
+%% @doc Decode path_hlc key to extract topic and HLC.
+%% Returns {Topic, Hlc} tuple.
+-spec decode_path_hlc_key(db_name(), binary()) -> {binary(), barrel_hlc:timestamp()}.
+decode_path_hlc_key(DbName, Key) ->
+    %% Skip prefix and db_name
+    NameLen = byte_size(DbName),
+    PrefixLen = 1 + 2 + NameLen, %% PREFIX + 16-bit length + name
+    <<_:PrefixLen/binary, Rest/binary>> = Key,
+    %% Find null terminator to extract topic
+    {Topic, HlcBin} = split_on_null(Rest),
+    {Topic, decode_hlc(HlcBin)}.
+
+%% @private Split binary on null byte
+split_on_null(Bin) ->
+    split_on_null(Bin, <<>>).
+
+split_on_null(<<0, Rest/binary>>, Acc) ->
+    {Acc, Rest};
+split_on_null(<<B, Rest/binary>>, Acc) ->
+    split_on_null(Rest, <<Acc/binary, B>>).
 
 %%====================================================================
 %% Local Document Keys

@@ -80,3 +80,7 @@
 %% Get database info
 -callback db_info(Endpoint :: term()) ->
     {ok, Info :: map()} | {error, term()}.
+
+%% Synchronize HLC with remote timestamp (optional - for distributed ordering)
+-callback sync_hlc(Endpoint :: term(), Hlc :: barrel_hlc:timestamp()) ->
+    {ok, barrel_hlc:timestamp()} | {error, term()}.

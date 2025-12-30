@@ -50,6 +50,26 @@ init([]) ->
         modules => [hlc]
     },
 
+    %% Subscription manager for path-based document subscriptions
+    Sub = #{
+        id => barrel_sub,
+        start => {barrel_sub, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [barrel_sub]
+    },
+
+    %% Query subscription manager for query-based document subscriptions
+    QuerySub = #{
+        id => barrel_query_sub,
+        start => {barrel_query_sub, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [barrel_query_sub]
+    },
+
     %% Database supervisor for managing individual database processes
     DbSup = #{
         id => barrel_db_sup,
@@ -60,7 +80,7 @@ init([]) ->
         modules => [barrel_db_sup]
     },
 
-    %% HLC must start before databases
-    ChildSpecs = [Hlc, DbSup],
+    %% HLC must start before databases, Sub and QuerySub before databases
+    ChildSpecs = [Hlc, Sub, QuerySub, DbSup],
 
     {ok, {SupFlags, ChildSpecs}}.

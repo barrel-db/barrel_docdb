@@ -31,6 +31,12 @@
     changes_get_list/1,
     changes_limit/1,
     changes_doc_ids_filter/1,
+    changes_path_filter/1,
+    changes_path_filter_wildcard/1,
+    changes_path_and_docid_filter/1,
+    changes_query_filter/1,
+    changes_query_filter_compare/1,
+    changes_query_and_path_filter/1,
     changes_style/1,
     changes_last_seq/1,
     changes_count_since/1
@@ -64,6 +70,12 @@ groups() ->
             changes_get_list,
             changes_limit,
             changes_doc_ids_filter,
+            changes_path_filter,
+            changes_path_filter_wildcard,
+            changes_path_and_docid_filter,
+            changes_query_filter,
+            changes_query_filter_compare,
+            changes_query_and_path_filter,
             changes_style,
             changes_last_seq,
             changes_count_since
@@ -340,6 +352,232 @@ changes_doc_ids_filter(Config) ->
     ?assertEqual(2, length(Changes)),
     Ids = [maps:get(id, C) || C <- Changes],
     ?assertEqual([<<"doc2">>, <<"doc4">>], Ids),
+
+    barrel_store_rocksdb:close(StoreRef),
+    ok.
+
+changes_path_filter(Config) ->
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/changes_path_filter",
+
+    {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
+    DbName = <<"testdb">>,
+
+    %% Write changes with documents of different types
+    DocInfos = [
+        {<<"user1">>, 1, #{<<"type">> => <<"user">>, <<"name">> => <<"Alice">>}},
+        {<<"order1">>, 2, #{<<"type">> => <<"order">>, <<"total">> => 100}},
+        {<<"user2">>, 3, #{<<"type">> => <<"user">>, <<"name">> => <<"Bob">>}},
+        {<<"product1">>, 4, #{<<"type">> => <<"product">>, <<"price">> => 50}}
+    ],
+    lists:foreach(
+        fun({DocId, N, Doc}) ->
+            Hlc = make_test_hlc(1000, N),
+            DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false, doc => Doc},
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
+        end,
+        DocInfos
+    ),
+
+    %% Filter to documents with type=user path
+    {ok, Changes, _} = barrel_changes:get_changes(
+        StoreRef, DbName, first,
+        #{paths => [<<"type/#">>]}
+    ),
+
+    %% All documents have a type field, so all should match type/#
+    ?assertEqual(4, length(Changes)),
+
+    barrel_store_rocksdb:close(StoreRef),
+    ok.
+
+changes_path_filter_wildcard(Config) ->
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/changes_path_wildcard",
+
+    {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
+    DbName = <<"testdb">>,
+
+    %% Write changes with nested document structures
+    DocInfos = [
+        {<<"u1">>, 1, #{<<"users">> => #{<<"123">> => #{<<"name">> => <<"Alice">>}}}},
+        {<<"u2">>, 2, #{<<"users">> => #{<<"456">> => #{<<"name">> => <<"Bob">>}}}},
+        {<<"o1">>, 3, #{<<"orders">> => #{<<"789">> => #{<<"total">> => 100}}}},
+        {<<"p1">>, 4, #{<<"products">> => #{<<"abc">> => #{<<"price">> => 50}}}}
+    ],
+    lists:foreach(
+        fun({DocId, N, Doc}) ->
+            Hlc = make_test_hlc(1000, N),
+            DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false, doc => Doc},
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
+        end,
+        DocInfos
+    ),
+
+    %% Filter to documents with users path (using # wildcard)
+    {ok, Changes, _} = barrel_changes:get_changes(
+        StoreRef, DbName, first,
+        #{paths => [<<"users/#">>]}
+    ),
+
+    %% Should match u1 and u2
+    ?assertEqual(2, length(Changes)),
+    Ids = lists:sort([maps:get(id, C) || C <- Changes]),
+    ?assertEqual([<<"u1">>, <<"u2">>], Ids),
+
+    barrel_store_rocksdb:close(StoreRef),
+    ok.
+
+changes_path_and_docid_filter(Config) ->
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/changes_path_docid",
+
+    {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
+    DbName = <<"testdb">>,
+
+    %% Write changes
+    DocInfos = [
+        {<<"user1">>, 1, #{<<"type">> => <<"user">>}},
+        {<<"user2">>, 2, #{<<"type">> => <<"user">>}},
+        {<<"order1">>, 3, #{<<"type">> => <<"order">>}},
+        {<<"order2">>, 4, #{<<"type">> => <<"order">>}}
+    ],
+    lists:foreach(
+        fun({DocId, N, Doc}) ->
+            Hlc = make_test_hlc(1000, N),
+            DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false, doc => Doc},
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
+        end,
+        DocInfos
+    ),
+
+    %% Filter to user1 with type path - both filters must match (AND)
+    {ok, Changes, _} = barrel_changes:get_changes(
+        StoreRef, DbName, first,
+        #{doc_ids => [<<"user1">>, <<"order1">>], paths => [<<"type/#">>]}
+    ),
+
+    %% Both filters: doc_ids AND paths must match
+    ?assertEqual(2, length(Changes)),
+    Ids = [maps:get(id, C) || C <- Changes],
+    ?assertEqual([<<"user1">>, <<"order1">>], Ids),
+
+    barrel_store_rocksdb:close(StoreRef),
+    ok.
+
+changes_query_filter(Config) ->
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/changes_query_filter",
+
+    {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
+    DbName = <<"testdb">>,
+
+    %% Write changes with documents of different types
+    DocInfos = [
+        {<<"user1">>, 1, #{<<"type">> => <<"user">>, <<"name">> => <<"Alice">>}},
+        {<<"order1">>, 2, #{<<"type">> => <<"order">>, <<"total">> => 100}},
+        {<<"user2">>, 3, #{<<"type">> => <<"user">>, <<"name">> => <<"Bob">>}},
+        {<<"product1">>, 4, #{<<"type">> => <<"product">>, <<"price">> => 50}}
+    ],
+    lists:foreach(
+        fun({DocId, N, Doc}) ->
+            Hlc = make_test_hlc(1000, N),
+            DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false, doc => Doc},
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
+        end,
+        DocInfos
+    ),
+
+    %% Query for type=user documents
+    Query = #{where => [{path, [<<"type">>], <<"user">>}]},
+    {ok, Changes, _} = barrel_changes:get_changes(
+        StoreRef, DbName, first,
+        #{query => Query}
+    ),
+
+    %% Should match user1 and user2
+    ?assertEqual(2, length(Changes)),
+    Ids = lists:sort([maps:get(id, C) || C <- Changes]),
+    ?assertEqual([<<"user1">>, <<"user2">>], Ids),
+
+    barrel_store_rocksdb:close(StoreRef),
+    ok.
+
+changes_query_filter_compare(Config) ->
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/changes_query_compare",
+
+    {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
+    DbName = <<"testdb">>,
+
+    %% Write changes with numeric values
+    DocInfos = [
+        {<<"order1">>, 1, #{<<"type">> => <<"order">>, <<"total">> => 50}},
+        {<<"order2">>, 2, #{<<"type">> => <<"order">>, <<"total">> => 100}},
+        {<<"order3">>, 3, #{<<"type">> => <<"order">>, <<"total">> => 150}},
+        {<<"order4">>, 4, #{<<"type">> => <<"order">>, <<"total">> => 200}}
+    ],
+    lists:foreach(
+        fun({DocId, N, Doc}) ->
+            Hlc = make_test_hlc(1000, N),
+            DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false, doc => Doc},
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
+        end,
+        DocInfos
+    ),
+
+    %% Query for orders with total > 100
+    Query = #{where => [{compare, [<<"total">>], '>', 100}]},
+    {ok, Changes, _} = barrel_changes:get_changes(
+        StoreRef, DbName, first,
+        #{query => Query}
+    ),
+
+    %% Should match order3 and order4
+    ?assertEqual(2, length(Changes)),
+    Ids = lists:sort([maps:get(id, C) || C <- Changes]),
+    ?assertEqual([<<"order3">>, <<"order4">>], Ids),
+
+    barrel_store_rocksdb:close(StoreRef),
+    ok.
+
+changes_query_and_path_filter(Config) ->
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/changes_query_path",
+
+    {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
+    DbName = <<"testdb">>,
+
+    %% Write changes with documents of different types
+    DocInfos = [
+        {<<"user1">>, 1, #{<<"type">> => <<"user">>, <<"status">> => <<"active">>}},
+        {<<"user2">>, 2, #{<<"type">> => <<"user">>, <<"status">> => <<"inactive">>}},
+        {<<"order1">>, 3, #{<<"type">> => <<"order">>, <<"status">> => <<"active">>}},
+        {<<"order2">>, 4, #{<<"type">> => <<"order">>, <<"status">> => <<"pending">>}}
+    ],
+    lists:foreach(
+        fun({DocId, N, Doc}) ->
+            Hlc = make_test_hlc(1000, N),
+            DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false, doc => Doc},
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
+        end,
+        DocInfos
+    ),
+
+    %% Query for active users - both path and query must match (AND logic)
+    Query = #{where => [{path, [<<"status">>], <<"active">>}]},
+    {ok, Changes, _} = barrel_changes:get_changes(
+        StoreRef, DbName, first,
+        #{
+            paths => [<<"type/#">>],
+            query => Query
+        }
+    ),
+
+    %% All have type path, but only user1 and order1 have status=active
+    ?assertEqual(2, length(Changes)),
+    Ids = lists:sort([maps:get(id, C) || C <- Changes]),
+    ?assertEqual([<<"order1">>, <<"user1">>], Ids),
 
     barrel_store_rocksdb:close(StoreRef),
     ok.

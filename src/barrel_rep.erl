@@ -67,13 +67,19 @@
 ]).
 
 %% Types
+-type filter_opts() :: #{
+    paths => [binary()],           % MQTT-style path patterns
+    query => barrel_query:query_spec()  % Query to filter by
+}.
+
 -type rep_config() :: #{
     source := term(),
     target := term(),
     source_transport => module(),
     target_transport => module(),
     batch_size => pos_integer(),
-    checkpoint_size => pos_integer()
+    checkpoint_size => pos_integer(),
+    filter => filter_opts()        % Optional filter for selective replication
 }.
 
 -type rep_result() :: #{
@@ -86,7 +92,7 @@
     last_seq := seq() | first
 }.
 
--export_type([rep_config/0, rep_result/0]).
+-export_type([rep_config/0, rep_result/0, filter_opts/0]).
 
 %%====================================================================
 %% API
@@ -122,13 +128,32 @@ replicate(Source, Target) ->
 %%   <li>`checkpoint_size' - Write checkpoint after this many documents (default: 10)</li>
 %%   <li>`source_transport' - Transport module for source</li>
 %%   <li>`target_transport' - Transport module for target</li>
+%%   <li>`filter' - Filter options for selective replication (see below)</li>
+%% </ul>
+%%
+%% == Filter Options ==
+%% The `filter' option allows selective replication. Both filters use AND logic:
+%% documents must match ALL specified filters to be replicated.
+%% <ul>
+%%   <li>`paths' - List of MQTT-style path patterns (e.g., `[<<"users/#">>]')</li>
+%%   <li>`query' - Query specification (e.g., `#{where => [{path, [<<"type">>], <<"user">>}]}')</li>
 %% </ul>
 %%
 %% == Example ==
 %% ```
+%% %% Replicate only user type documents
 %% {ok, Result} = barrel_rep:replicate(<<"source">>, <<"target">>, #{
-%%     batch_size => 50,
-%%     checkpoint_size => 25
+%%     filter => #{
+%%         query => #{where => [{path, [<<"type">>], <<"user">>}]}
+%%     }
+%% }),
+%%
+%% %% Replicate users with status=active (path AND query)
+%% {ok, Result} = barrel_rep:replicate(<<"source">>, <<"target">>, #{
+%%     filter => #{
+%%         paths => [<<"type/#">>],
+%%         query => #{where => [{path, [<<"status">>], <<"active">>}]}
+%%     }
 %% }).
 %% '''
 %%
@@ -191,9 +216,10 @@ replicate_one_shot(Config, Opts) ->
     %% Run replication
     BatchSize = maps:get(batch_size, Opts, 100),
     CheckpointSize = maps:get(checkpoint_size, Opts, 10),
+    Filter = maps:get(filter, Opts, #{}),
 
     case do_replicate(Source, Target, SourceTransport, TargetTransport,
-                      StartSeq, BatchSize, CheckpointSize, Checkpoint) of
+                      StartSeq, BatchSize, CheckpointSize, Checkpoint, Filter) of
         {ok, Stats, FinalCheckpoint} ->
             %% Write final checkpoint
             ok = barrel_rep_checkpoint:write_checkpoint(FinalCheckpoint),
@@ -225,14 +251,16 @@ replicate_one_shot(Config) ->
 
 %% @private Run replication loop
 do_replicate(Source, Target, SourceTransport, TargetTransport, Since,
-             BatchSize, CheckpointSize, Checkpoint) ->
+             BatchSize, CheckpointSize, Checkpoint, Filter) ->
     do_replicate(Source, Target, SourceTransport, TargetTransport, Since,
-                 BatchSize, CheckpointSize, Checkpoint, new_stats(), 0).
+                 BatchSize, CheckpointSize, Checkpoint, Filter, new_stats(), 0).
 
 do_replicate(Source, Target, SourceTransport, TargetTransport, Since,
-             BatchSize, CheckpointSize, Checkpoint, AccStats, DocsProcessed) ->
+             BatchSize, CheckpointSize, Checkpoint, Filter, AccStats, DocsProcessed) ->
+    %% Build changes options with limit and optional filters
+    ChangesOpts = build_changes_opts(BatchSize, Filter),
     %% Get next batch of changes
-    case SourceTransport:get_changes(Source, Since, #{limit => BatchSize}) of
+    case SourceTransport:get_changes(Source, Since, ChangesOpts) of
         {ok, [], _LastSeq} ->
             %% No more changes
             {ok, AccStats, Checkpoint};
@@ -260,16 +288,18 @@ do_replicate(Source, Target, SourceTransport, TargetTransport, Since,
 
             %% Continue with next batch
             do_replicate(Source, Target, SourceTransport, TargetTransport, LastSeq,
-                         BatchSize, CheckpointSize, Checkpoint3, MergedStats,
+                         BatchSize, CheckpointSize, Checkpoint3, Filter, MergedStats,
                          NewDocsProcessed rem CheckpointSize);
 
         {error, Reason} ->
             {error, Reason}
     end.
 
-%% @private Generate unique replication ID
+%% @private Generate deterministic replication ID based on source and target.
+%% The same source/target pair always produces the same replication ID,
+%% allowing checkpoints to be reused across replication sessions.
 generate_rep_id(Source, Target) ->
-    Data = term_to_binary({Source, Target, erlang:monotonic_time()}),
+    Data = term_to_binary({Source, Target}),
     Hash = crypto:hash(md5, Data),
     binary:encode_hex(Hash, lowercase).
 
@@ -285,3 +315,16 @@ new_stats() ->
 %% @private Merge two stats maps
 merge_stats(Stats1, Stats2) ->
     maps:merge_with(fun(_K, V1, V2) -> V1 + V2 end, Stats1, Stats2).
+
+%% @private Build changes options from batch size and filter
+%% Filter options are AND-ed: document must match both path pattern AND query
+build_changes_opts(BatchSize, Filter) ->
+    BaseOpts = #{limit => BatchSize},
+    Opts1 = case maps:get(paths, Filter, undefined) of
+        undefined -> BaseOpts;
+        Paths when is_list(Paths) -> BaseOpts#{paths => Paths}
+    end,
+    case maps:get(query, Filter, undefined) of
+        undefined -> Opts1;
+        Query when is_map(Query) -> Opts1#{query => Query}
+    end.

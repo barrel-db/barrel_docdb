@@ -19,7 +19,9 @@ all() ->
         {group, local_docs},
         {group, revsdiff},
         {group, put_rev},
-        {group, replication}
+        {group, replication},
+        {group, filtered_replication},
+        {group, hlc_replication}
     ].
 
 groups() ->
@@ -43,6 +45,16 @@ groups() ->
             replicate_with_updates,
             replicate_deleted_doc,
             replicate_checkpoint_persistence
+        ]},
+        {filtered_replication, [sequence], [
+            replicate_with_query_filter,
+            replicate_with_path_filter,
+            replicate_with_combined_filter,
+            replicate_filter_no_match
+        ]},
+        {hlc_replication, [sequence], [
+            replicate_hlc_checkpoint,
+            replicate_hlc_sync
         ]}
     ].
 
@@ -73,6 +85,12 @@ init_per_group(Group, Config) ->
         replication ->
             {ok, _} = barrel_docdb:create_db(<<"test_source">>, #{data_dir => DataDir ++ "_source"}),
             {ok, _} = barrel_docdb:create_db(<<"test_target">>, #{data_dir => DataDir ++ "_target"});
+        filtered_replication ->
+            {ok, _} = barrel_docdb:create_db(<<"test_source">>, #{data_dir => DataDir ++ "_source"}),
+            {ok, _} = barrel_docdb:create_db(<<"test_target">>, #{data_dir => DataDir ++ "_target"});
+        hlc_replication ->
+            {ok, _} = barrel_docdb:create_db(<<"test_source">>, #{data_dir => DataDir ++ "_source"}),
+            {ok, _} = barrel_docdb:create_db(<<"test_target">>, #{data_dir => DataDir ++ "_target"});
         _ ->
             ok
     end,
@@ -86,6 +104,12 @@ end_per_group(Group, Config) ->
 
     case Group of
         replication ->
+            barrel_docdb:delete_db(<<"test_source">>),
+            barrel_docdb:delete_db(<<"test_target">>);
+        filtered_replication ->
+            barrel_docdb:delete_db(<<"test_source">>),
+            barrel_docdb:delete_db(<<"test_target">>);
+        hlc_replication ->
             barrel_docdb:delete_db(<<"test_source">>),
             barrel_docdb:delete_db(<<"test_target">>);
         _ ->
@@ -362,5 +386,248 @@ replicate_checkpoint_persistence(_Config) ->
     {ok, TargetDocs, _} = barrel_docdb:get_changes(Target, first),
     ct:pal("Target has ~p changes", [length(TargetDocs)]),
     ?assert(length(TargetDocs) >= 8),
+
+    ok.
+
+%%====================================================================
+%% Filtered Replication Tests
+%%====================================================================
+
+replicate_with_query_filter(_Config) ->
+    Source = <<"test_source">>,
+    Target = <<"test_target">>,
+
+    %% Create documents of different types
+    {ok, _} = barrel_docdb:put_doc(Source, #{
+        <<"id">> => <<"user1">>,
+        <<"type">> => <<"user">>,
+        <<"name">> => <<"Alice">>
+    }),
+    {ok, _} = barrel_docdb:put_doc(Source, #{
+        <<"id">> => <<"user2">>,
+        <<"type">> => <<"user">>,
+        <<"name">> => <<"Bob">>
+    }),
+    {ok, _} = barrel_docdb:put_doc(Source, #{
+        <<"id">> => <<"order1">>,
+        <<"type">> => <<"order">>,
+        <<"total">> => 100
+    }),
+    {ok, _} = barrel_docdb:put_doc(Source, #{
+        <<"id">> => <<"order2">>,
+        <<"type">> => <<"order">>,
+        <<"total">> => 200
+    }),
+
+    %% Replicate only user documents
+    Filter = #{
+        query => #{where => [{path, [<<"type">>], <<"user">>}]}
+    },
+    {ok, Result} = barrel_rep:replicate(Source, Target, #{filter => Filter}),
+    ?assertEqual(true, maps:get(ok, Result)),
+
+    %% Verify only user documents were replicated
+    {ok, User1} = barrel_docdb:get_doc(Target, <<"user1">>),
+    ?assertEqual(<<"Alice">>, maps:get(<<"name">>, User1)),
+
+    {ok, User2} = barrel_docdb:get_doc(Target, <<"user2">>),
+    ?assertEqual(<<"Bob">>, maps:get(<<"name">>, User2)),
+
+    %% Order documents should NOT be in target
+    ?assertEqual({error, not_found}, barrel_docdb:get_doc(Target, <<"order1">>)),
+    ?assertEqual({error, not_found}, barrel_docdb:get_doc(Target, <<"order2">>)),
+
+    ok.
+
+replicate_with_path_filter(_Config) ->
+    Source = <<"test_source">>,
+    Target = <<"test_target">>,
+
+    %% Create documents with different structures
+    {ok, _} = barrel_docdb:put_doc(Source, #{
+        <<"id">> => <<"doc_with_users">>,
+        <<"users">> => #{<<"123">> => #{<<"name">> => <<"Alice">>}}
+    }),
+    {ok, _} = barrel_docdb:put_doc(Source, #{
+        <<"id">> => <<"doc_with_orders">>,
+        <<"orders">> => #{<<"456">> => #{<<"total">> => 100}}
+    }),
+    {ok, _} = barrel_docdb:put_doc(Source, #{
+        <<"id">> => <<"doc_with_products">>,
+        <<"products">> => #{<<"789">> => #{<<"price">> => 50}}
+    }),
+
+    %% Replicate only documents with users path
+    Filter = #{
+        paths => [<<"users/#">>]
+    },
+    {ok, Result} = barrel_rep:replicate(Source, Target, #{filter => Filter}),
+    ?assertEqual(true, maps:get(ok, Result)),
+
+    %% Verify only doc_with_users was replicated
+    {ok, UsersDoc} = barrel_docdb:get_doc(Target, <<"doc_with_users">>),
+    ?assert(maps:is_key(<<"users">>, UsersDoc)),
+
+    %% Other documents should NOT be in target
+    ?assertEqual({error, not_found}, barrel_docdb:get_doc(Target, <<"doc_with_orders">>)),
+    ?assertEqual({error, not_found}, barrel_docdb:get_doc(Target, <<"doc_with_products">>)),
+
+    ok.
+
+replicate_with_combined_filter(_Config) ->
+    Source = <<"test_source">>,
+    Target = <<"test_target">>,
+
+    %% Create documents
+    {ok, _} = barrel_docdb:put_doc(Source, #{
+        <<"id">> => <<"active_user">>,
+        <<"type">> => <<"user">>,
+        <<"status">> => <<"active">>
+    }),
+    {ok, _} = barrel_docdb:put_doc(Source, #{
+        <<"id">> => <<"inactive_user">>,
+        <<"type">> => <<"user">>,
+        <<"status">> => <<"inactive">>
+    }),
+    {ok, _} = barrel_docdb:put_doc(Source, #{
+        <<"id">> => <<"active_order">>,
+        <<"type">> => <<"order">>,
+        <<"status">> => <<"active">>
+    }),
+
+    %% Replicate only active documents (AND logic: path AND query)
+    Filter = #{
+        paths => [<<"type/#">>],  %% All docs have type, so this matches all
+        query => #{where => [{path, [<<"status">>], <<"active">>}]}
+    },
+    {ok, Result} = barrel_rep:replicate(Source, Target, #{filter => Filter}),
+    ?assertEqual(true, maps:get(ok, Result)),
+
+    %% Verify only active documents were replicated
+    {ok, ActiveUser} = barrel_docdb:get_doc(Target, <<"active_user">>),
+    ?assertEqual(<<"active">>, maps:get(<<"status">>, ActiveUser)),
+
+    {ok, ActiveOrder} = barrel_docdb:get_doc(Target, <<"active_order">>),
+    ?assertEqual(<<"active">>, maps:get(<<"status">>, ActiveOrder)),
+
+    %% Inactive user should NOT be in target
+    ?assertEqual({error, not_found}, barrel_docdb:get_doc(Target, <<"inactive_user">>)),
+
+    ok.
+
+replicate_filter_no_match(_Config) ->
+    Source = <<"test_source">>,
+    Target = <<"test_target">>,
+
+    %% Create documents
+    {ok, _} = barrel_docdb:put_doc(Source, #{
+        <<"id">> => <<"doc1">>,
+        <<"type">> => <<"order">>
+    }),
+    {ok, _} = barrel_docdb:put_doc(Source, #{
+        <<"id">> => <<"doc2">>,
+        <<"type">> => <<"product">>
+    }),
+
+    %% Replicate with filter that matches nothing
+    Filter = #{
+        query => #{where => [{path, [<<"type">>], <<"nonexistent">>}]}
+    },
+    {ok, Result} = barrel_rep:replicate(Source, Target, #{filter => Filter}),
+    ?assertEqual(true, maps:get(ok, Result)),
+    ?assertEqual(0, maps:get(docs_written, Result)),
+
+    %% Target should be empty (except for any pre-existing docs)
+    ?assertEqual({error, not_found}, barrel_docdb:get_doc(Target, <<"doc1">>)),
+    ?assertEqual({error, not_found}, barrel_docdb:get_doc(Target, <<"doc2">>)),
+
+    ok.
+
+%%====================================================================
+%% HLC Replication Tests
+%%====================================================================
+
+replicate_hlc_checkpoint(_Config) ->
+    Source = <<"test_source">>,
+    Target = <<"test_target">>,
+
+    %% Create documents in source
+    lists:foreach(fun(N) ->
+        DocId = iolist_to_binary([<<"hlc_doc_">>, integer_to_binary(N)]),
+        {ok, _} = barrel_docdb:put_doc(Source, #{<<"id">> => DocId, <<"n">> => N})
+    end, lists:seq(1, 5)),
+
+    %% First replication
+    {ok, Result1} = barrel_rep:replicate(Source, Target),
+    ?assertEqual(true, maps:get(ok, Result1)),
+    LastSeq1 = maps:get(last_seq, Result1),
+
+    %% Verify last_seq is an HLC timestamp (not 'first')
+    ?assertNotEqual(first, LastSeq1),
+
+    %% Add more documents
+    lists:foreach(fun(N) ->
+        DocId = iolist_to_binary([<<"hlc_doc_batch2_">>, integer_to_binary(N)]),
+        {ok, _} = barrel_docdb:put_doc(Source, #{<<"id">> => DocId, <<"batch">> => 2})
+    end, lists:seq(1, 3)),
+
+    %% Second replication should resume from HLC checkpoint
+    {ok, Result2} = barrel_rep:replicate(Source, Target),
+    ?assertEqual(true, maps:get(ok, Result2)),
+    StartSeq2 = maps:get(start_seq, Result2),
+    LastSeq2 = maps:get(last_seq, Result2),
+
+    %% Start should be at or after last_seq from first replication
+    ?assertNotEqual(first, StartSeq2),
+    ?assertNotEqual(first, LastSeq2),
+
+    %% Verify all documents exist in target
+    lists:foreach(fun(N) ->
+        DocId = iolist_to_binary([<<"hlc_doc_">>, integer_to_binary(N)]),
+        {ok, _} = barrel_docdb:get_doc(Target, DocId)
+    end, lists:seq(1, 5)),
+
+    lists:foreach(fun(N) ->
+        DocId = iolist_to_binary([<<"hlc_doc_batch2_">>, integer_to_binary(N)]),
+        {ok, _} = barrel_docdb:get_doc(Target, DocId)
+    end, lists:seq(1, 3)),
+
+    ok.
+
+replicate_hlc_sync(_Config) ->
+    Source = <<"test_source">>,
+    Target = <<"test_target">>,
+
+    %% Get initial global HLC
+    InitialHlc = barrel_docdb:new_hlc(),
+
+    %% Create documents in source (this advances global HLC)
+    lists:foreach(fun(N) ->
+        DocId = iolist_to_binary([<<"sync_doc_">>, integer_to_binary(N)]),
+        {ok, _} = barrel_docdb:put_doc(Source, #{<<"id">> => DocId, <<"n">> => N})
+    end, lists:seq(1, 5)),
+
+    %% Get HLC after writes
+    AfterWritesHlc = barrel_docdb:new_hlc(),
+
+    %% HLC should have advanced
+    ?assert(barrel_hlc:less(InitialHlc, AfterWritesHlc)),
+
+    %% Replicate - this exercises the HLC sync code path
+    {ok, Result} = barrel_rep:replicate(Source, Target),
+    ?assertEqual(true, maps:get(ok, Result)),
+    ?assert(maps:get(docs_written, Result) >= 5),
+
+    %% Get HLC after replication
+    FinalHlc = barrel_docdb:new_hlc(),
+
+    %% HLC should have advanced further (or at least not gone backwards)
+    ?assertNot(barrel_hlc:less(FinalHlc, AfterWritesHlc)),
+
+    %% Verify documents were replicated
+    lists:foreach(fun(N) ->
+        DocId = iolist_to_binary([<<"sync_doc_">>, integer_to_binary(N)]),
+        {ok, _} = barrel_docdb:get_doc(Target, DocId)
+    end, lists:seq(1, 5)),
 
     ok.

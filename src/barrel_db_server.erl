@@ -500,9 +500,23 @@ do_put_doc(StoreRef, DbName, Doc, _Opts) ->
     ChangeInfo = DocInfo#{doc => DocBody},
     ChangeOps = barrel_changes:write_change_ops(DbName, NextHlc, ChangeInfo),
 
-    %% Write batch atomically (doc + path index + change in single batch)
-    AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps,
+    %% Path-indexed change operations (for efficient filtered queries)
+    PathHlcOps = case OldHlc of
+        undefined ->
+            %% New document - create path index entries
+            barrel_changes:write_path_index_ops(DbName, NextHlc, ChangeInfo);
+        _ ->
+            %% Update - remove old path entries, add new ones
+            barrel_changes:update_path_index_ops(DbName, NextHlc, ChangeInfo,
+                                                  OldHlc, OldDocBody)
+    end,
+
+    %% Write batch atomically (doc + path index + change + path_hlc in single batch)
+    AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps,
     ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps),
+
+    %% Notify path subscribers
+    notify_subscribers(DbName, DocId, NewRev, NextHlc, Deleted, DocBody),
 
     %% Return result
     Result = #{
@@ -606,9 +620,22 @@ do_delete_doc(StoreRef, DbName, DocId, Opts) ->
             %% Change entry operations
             ChangeOps = barrel_changes:write_change_ops(DbName, NextHlc, NewDocInfo),
 
-            %% Write batch atomically (doc + path index + change in single batch)
-            AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps,
+            %% Path-indexed change operations for delete
+            %% Get old doc body to remove old path entries
+            OldDocBody = case barrel_store_rocksdb:get(StoreRef,
+                              barrel_store_keys:doc_rev(DbName, DocId, CurrentRev)) of
+                {ok, OldBodyBin} -> binary_to_term(OldBodyBin);
+                not_found -> undefined
+            end,
+            PathHlcOps = barrel_changes:update_path_index_ops(DbName, NextHlc, NewDocInfo,
+                                                               OldHlc, OldDocBody),
+
+            %% Write batch atomically (doc + path index + change + path_hlc in single batch)
+            AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps,
             ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps),
+
+            %% Notify path subscribers
+            notify_subscribers(DbName, DocId, NewRev, NextHlc, true, #{}),
 
             {ok, #{<<"id">> => DocId, <<"ok">> => true, <<"rev">> => NewRev}};
 
@@ -731,9 +758,23 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
     ChangeInfo = DocInfo#{doc => DocBody},
     ChangeOps = barrel_changes:write_change_ops(DbName, NextHlc, ChangeInfo),
 
-    %% Write batch atomically (doc + path index + change in single batch)
-    AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps,
+    %% Path-indexed change operations (for efficient filtered queries)
+    PathHlcOps = case OldHlc of
+        undefined ->
+            %% New document - create path index entries
+            barrel_changes:write_path_index_ops(DbName, NextHlc, ChangeInfo);
+        _ ->
+            %% Update - remove old path entries, add new ones
+            barrel_changes:update_path_index_ops(DbName, NextHlc, ChangeInfo,
+                                                  OldHlc, OldDocBody)
+    end,
+
+    %% Write batch atomically (doc + path index + change + path_hlc in single batch)
+    AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps,
     ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps),
+
+    %% Notify path subscribers
+    notify_subscribers(DbName, DocId, NewRev, NextHlc, Deleted, DocBody),
 
     {ok, DocId, NewRev}.
 
@@ -826,3 +867,45 @@ do_delete_local_doc(StoreRef, DbName, DocId) ->
         not_found ->
             {error, not_found}
     end.
+
+%%====================================================================
+%% Subscription Notifications
+%%====================================================================
+
+%% @doc Notify subscribers of document changes
+%% Extracts paths from document, matches against subscriptions,
+%% and sends notifications to matching subscribers.
+notify_subscribers(DbName, DocId, Rev, Hlc, Deleted, DocBody) ->
+    %% Extract paths from document body
+    Topics = case Deleted of
+        true ->
+            %% For deleted docs, just use the doc ID as a path
+            [DocId];
+        false ->
+            Paths = barrel_ars:analyze(DocBody),
+            barrel_ars:paths_to_topics(Paths)
+    end,
+
+    %% Find matching path subscribers
+    Pids = barrel_sub:match(DbName, Topics),
+
+    %% Build notification
+    Notification = {barrel_change, DbName, #{
+        id => DocId,
+        rev => Rev,
+        hlc => Hlc,
+        deleted => Deleted,
+        paths => Topics
+    }},
+
+    %% Send to each path subscriber
+    [Pid ! Notification || Pid <- Pids],
+
+    %% Notify query subscribers (only for non-deleted docs)
+    case Deleted of
+        true ->
+            ok;
+        false ->
+            barrel_query_sub:notify_change(DbName, DocId, Rev, DocBody)
+    end,
+    ok.

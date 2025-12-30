@@ -20,7 +20,8 @@
     get_local_doc/2,
     put_local_doc/3,
     delete_local_doc/2,
-    db_info/1
+    db_info/1,
+    sync_hlc/2
 ]).
 
 %%====================================================================
@@ -94,6 +95,14 @@ delete_local_doc(DbName, DocId) ->
 -spec db_info(db_name()) -> {ok, map()} | {error, term()}.
 db_info(DbName) ->
     barrel_docdb:db_info(DbName).
+
+%% @doc Synchronize local HLC with remote timestamp
+%% This ensures the local clock reflects causality with remote events.
+%% Note: HLC is global to the node, not per-database.
+-spec sync_hlc(db_name(), barrel_hlc:timestamp()) ->
+    {ok, barrel_hlc:timestamp()} | {error, term()}.
+sync_hlc(_DbName, RemoteHlc) ->
+    barrel_docdb:sync_hlc(RemoteHlc).
 
 %%====================================================================
 %% Internal functions

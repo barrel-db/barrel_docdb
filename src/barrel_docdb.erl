@@ -129,6 +129,20 @@
     new_hlc/0
 ]).
 
+%% Path Subscriptions (real-time document change notifications)
+-export([
+    subscribe/2,
+    subscribe/3,
+    unsubscribe/1
+]).
+
+%% Query Subscriptions (real-time query-based change notifications)
+-export([
+    subscribe_query/2,
+    subscribe_query/3,
+    unsubscribe_query/1
+]).
+
 %%====================================================================
 %% Database Lifecycle
 %%====================================================================
@@ -1058,6 +1072,165 @@ sync_hlc(RemoteHlc) ->
 -spec new_hlc() -> barrel_hlc:timestamp().
 new_hlc() ->
     barrel_hlc:new_hlc().
+
+%%====================================================================
+%% Path Subscriptions
+%%====================================================================
+
+%% @doc Subscribe to document changes matching a path pattern.
+%%
+%% Subscribes the calling process to receive notifications for document
+%% changes that match the given MQTT-style path pattern. Notifications
+%% are sent as messages of the form:
+%%
+%% `{barrel_change, DbName, #{id => DocId, rev => Rev, hlc => Hlc,
+%%                            deleted => boolean(), paths => [binary()]}}'
+%%
+%% == Pattern Syntax ==
+%%
+%% Patterns use MQTT-style wildcards:
+%% <ul>
+%%   <li>`+' matches exactly one path level (e.g., `<<"users/+/profile">>')</li>
+%%   <li>`#' matches zero or more levels (e.g., `<<"orders/#">>')</li>
+%% </ul>
+%%
+%% Paths are derived from document field structure:
+%% `#{<<"users">> => #{<<"123">> => #{<<"name">> => <<"Alice">>}}}'
+%% produces paths like `<<"users/123/name/Alice">>'.
+%%
+%% == Example ==
+%% ```
+%% %% Subscribe to all user profile changes
+%% {ok, SubRef} = barrel_docdb:subscribe(<<"mydb">>, <<"users/+/profile/#">>),
+%%
+%% %% Receive notifications
+%% receive
+%%     {barrel_change, <<"mydb">>, Change} ->
+%%         io:format("Document ~s changed~n", [maps:get(id, Change)])
+%% end,
+%%
+%% %% Unsubscribe when done
+%% ok = barrel_docdb:unsubscribe(SubRef).
+%% '''
+%%
+%% @param DbName The database name
+%% @param Pattern MQTT-style path pattern to match
+%% @returns `{ok, SubRef}' on success, `{error, invalid_pattern}' if pattern is invalid
+%% @see unsubscribe/1
+-spec subscribe(db_name(), binary()) -> {ok, reference()} | {error, term()}.
+subscribe(DbName, Pattern) ->
+    subscribe(DbName, Pattern, #{}).
+
+%% @doc Subscribe to document changes with options.
+%%
+%% Same as {@link subscribe/2} but with additional options.
+%%
+%% == Options ==
+%% Currently no options are supported (reserved for future use).
+%%
+%% @param DbName The database name
+%% @param Pattern MQTT-style path pattern to match
+%% @param Opts Options map (reserved for future use)
+%% @returns `{ok, SubRef}' on success, `{error, invalid_pattern}' if pattern is invalid
+%% @see subscribe/2
+%% @see unsubscribe/1
+-spec subscribe(db_name(), binary(), map()) -> {ok, reference()} | {error, term()}.
+subscribe(DbName, Pattern, _Opts) ->
+    barrel_sub:subscribe(DbName, Pattern, self()).
+
+%% @doc Unsubscribe from document change notifications.
+%%
+%% Removes a subscription previously created with {@link subscribe/2} or
+%% {@link subscribe/3}. After calling this function, no more notifications
+%% will be received for the given subscription.
+%%
+%% == Example ==
+%% ```
+%% {ok, SubRef} = barrel_docdb:subscribe(<<"mydb">>, <<"users/#">>),
+%% %% ... receive some notifications ...
+%% ok = barrel_docdb:unsubscribe(SubRef).
+%% '''
+%%
+%% @param SubRef The subscription reference returned by subscribe/2,3
+%% @returns `ok'
+%% @see subscribe/2
+-spec unsubscribe(reference()) -> ok.
+unsubscribe(SubRef) ->
+    barrel_sub:unsubscribe(SubRef, self()).
+
+%%====================================================================
+%% Query Subscriptions
+%%====================================================================
+
+%% @doc Subscribe to document changes matching a query.
+%%
+%% Subscribes to document change notifications for documents that match
+%% the specified query. Only documents that match the query conditions
+%% will trigger notifications.
+%%
+%% Query subscriptions are optimized using path extraction - the full
+%% query is only evaluated when a change affects paths referenced by
+%% the query.
+%%
+%% == Example ==
+%% ```
+%% %% Subscribe to changes for user documents
+%% Query = #{where => [{path, [<<"type">>], <<"user">>}]},
+%% {ok, SubRef} = barrel_docdb:subscribe_query(<<"mydb">>, Query),
+%%
+%% %% Receive notifications
+%% receive
+%%     {barrel_query_change, <<"mydb">>, #{id := DocId, rev := Rev}} ->
+%%         io:format("Document ~s changed~n", [DocId])
+%% end,
+%%
+%% %% Unsubscribe when done
+%% ok = barrel_docdb:unsubscribe_query(SubRef).
+%% '''
+%%
+%% @param DbName The database name
+%% @param Query Query specification (same format as barrel_query)
+%% @returns `{ok, SubRef}' on success, `{error, Reason}' on failure
+%% @see subscribe_query/3
+%% @see unsubscribe_query/1
+-spec subscribe_query(db_name(), barrel_query:query_spec()) ->
+    {ok, reference()} | {error, term()}.
+subscribe_query(DbName, Query) ->
+    subscribe_query(DbName, Query, #{}).
+
+%% @doc Subscribe to document changes matching a query with options.
+%%
+%% Same as {@link subscribe_query/2} but with additional options.
+%%
+%% @param DbName The database name
+%% @param Query Query specification
+%% @param Opts Options (reserved for future use)
+%% @returns `{ok, SubRef}' on success, `{error, Reason}' on failure
+%% @see subscribe_query/2
+%% @see unsubscribe_query/1
+-spec subscribe_query(db_name(), barrel_query:query_spec(), map()) ->
+    {ok, reference()} | {error, term()}.
+subscribe_query(DbName, Query, _Opts) ->
+    barrel_query_sub:subscribe(DbName, Query, self()).
+
+%% @doc Unsubscribe from query-based change notifications.
+%%
+%% Removes a query subscription previously created with
+%% {@link subscribe_query/2} or {@link subscribe_query/3}.
+%%
+%% == Example ==
+%% ```
+%% {ok, SubRef} = barrel_docdb:subscribe_query(<<"mydb">>, Query),
+%% %% ... receive some notifications ...
+%% ok = barrel_docdb:unsubscribe_query(SubRef).
+%% '''
+%%
+%% @param SubRef The subscription reference returned by subscribe_query/2,3
+%% @returns `ok'
+%% @see subscribe_query/2
+-spec unsubscribe_query(reference()) -> ok.
+unsubscribe_query(SubRef) ->
+    barrel_query_sub:unsubscribe(SubRef).
 
 %%====================================================================
 %% Internal Functions

@@ -47,6 +47,12 @@
     refresh/3
 ]).
 
+%% API - Subscriptions
+-export([
+    subscribe/2,
+    unsubscribe/2
+]).
+
 %% API - Process management
 -export([
     start_link/3,
@@ -129,6 +135,41 @@ refresh(DbServer, ViewId, Hlc) ->
             gen_statem:call(Pid, {refresh, Hlc}, infinity);
         {error, _} = Error ->
             Error
+    end.
+
+%%====================================================================
+%% API - Subscriptions
+%%====================================================================
+
+%% @doc Subscribe to view index change notifications
+%% Receives {barrel_view_change, DbName, ViewId, #{hlc := Hlc}} when view updates
+-spec subscribe(pid(), binary()) -> {ok, reference()} | {error, term()}.
+subscribe(DbServer, ViewId) ->
+    case barrel_db_server:get_view_pid(DbServer, ViewId) of
+        {ok, Pid} ->
+            gen_statem:call(Pid, {subscribe, self()});
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc Unsubscribe from view change notifications
+-spec unsubscribe(pid(), reference()) -> ok | {error, term()}.
+unsubscribe(DbServer, SubRef) ->
+    %% We need to find the view that has this subscription
+    %% For simplicity, broadcast to all views managed by this db server
+    case barrel_db_server:list_views(DbServer) of
+        {ok, Views} ->
+            lists:foreach(fun(#{id := ViewId}) ->
+                case barrel_db_server:get_view_pid(DbServer, ViewId) of
+                    {ok, Pid} ->
+                        gen_statem:cast(Pid, {unsubscribe, SubRef});
+                    _ ->
+                        ok
+                end
+            end, Views),
+            ok;
+        _ ->
+            ok
     end.
 
 %%====================================================================
@@ -226,7 +267,9 @@ init([DbName, StoreRef, #{id := ViewId} = Config]) ->
                 refresh_mode => RefreshMode,
                 since => Since,
                 waiters => [],
-                pipeline => undefined
+                pipeline => undefined,
+                subscribers => #{},  % SubRef -> {Pid, MonRef}
+                sub_monitors => #{}  % MonRef -> SubRef (for cleanup)
             },
 
             %% Schedule initial check for updates (skip for manual refresh)
@@ -253,6 +296,23 @@ idle({call, From}, get_view_id, #{view_id := ViewId} = State) ->
 idle({call, From}, {query, Opts}, State) ->
     Result = do_query(Opts, State),
     {keep_state, State, [{reply, From, Result}]};
+
+idle({call, From}, {subscribe, Pid}, State) ->
+    {Reply, NewState} = do_subscribe(Pid, State),
+    {keep_state, NewState, [{reply, From, Reply}]};
+
+idle(cast, {unsubscribe, SubRef}, State) ->
+    NewState = do_unsubscribe(SubRef, State),
+    {keep_state, NewState};
+
+idle(info, {'DOWN', MonRef, process, _Pid, _Reason}, #{sub_monitors := SubMons} = State) ->
+    case maps:get(MonRef, SubMons, undefined) of
+        undefined ->
+            {keep_state, State};
+        SubRef ->
+            NewState = do_unsubscribe(SubRef, State),
+            {keep_state, NewState}
+    end;
 
 idle({call, From}, refresh, #{store_ref := StoreRef, db_name := DbName, since := Since} = State) ->
     %% Get current database HLC
@@ -303,6 +363,23 @@ indexing({call, From}, {query, Opts}, State) ->
     Result = do_query(Opts, State),
     {keep_state, State, [{reply, From, Result}]};
 
+indexing({call, From}, {subscribe, Pid}, State) ->
+    {Reply, NewState} = do_subscribe(Pid, State),
+    {keep_state, NewState, [{reply, From, Reply}]};
+
+indexing(cast, {unsubscribe, SubRef}, State) ->
+    NewState = do_unsubscribe(SubRef, State),
+    {keep_state, NewState};
+
+indexing(info, {'DOWN', MonRef, process, _Pid, _Reason}, #{sub_monitors := SubMons} = State) ->
+    case maps:get(MonRef, SubMons, undefined) of
+        undefined ->
+            {keep_state, State};
+        SubRef ->
+            NewState = do_unsubscribe(SubRef, State),
+            {keep_state, NewState}
+    end;
+
 indexing({call, From}, refresh, #{store_ref := StoreRef, db_name := DbName, waiters := Waiters} = State) ->
     CurrentHlc = barrel_changes:get_last_hlc(StoreRef, DbName),
     NewWaiters = [{From, CurrentHlc} | Waiters],
@@ -322,6 +399,8 @@ indexing(info, {index_updated, NewHlc}, #{waiters := Waiters} = State) ->
         fun({From, _}) -> gen_statem:reply(From, {ok, NewHlc}) end,
         Satisfied
     ),
+    %% Notify view subscribers
+    notify_view_subscribers(NewHlc, State),
     {keep_state, State#{since => NewHlc, waiters => Remaining}};
 
 indexing(info, {index_complete, FinalHlc}, #{waiters := Waiters} = State) ->
@@ -330,6 +409,8 @@ indexing(info, {index_complete, FinalHlc}, #{waiters := Waiters} = State) ->
         fun({From, _}) -> gen_statem:reply(From, {ok, FinalHlc}) end,
         Waiters
     ),
+    %% Notify view subscribers
+    notify_view_subscribers(FinalHlc, State),
     NewState = State#{since => FinalHlc, waiters => [], pipeline => undefined},
     {next_state, idle, NewState, [{state_timeout, ?CHECK_INTERVAL, check_updates}]};
 
@@ -974,3 +1055,34 @@ update_stored_version(StoreRef, DbName, ViewId, Version) ->
 needs_update(first, _CurrentHlc) -> true;
 needs_update(Since, CurrentHlc) ->
     barrel_hlc:less(Since, CurrentHlc).
+
+%%====================================================================
+%% Internal - Subscriptions
+%%====================================================================
+
+%% @doc Subscribe a process to view change notifications
+do_subscribe(Pid, #{subscribers := Subs, sub_monitors := SubMons} = State) ->
+    SubRef = make_ref(),
+    MonRef = erlang:monitor(process, Pid),
+    NewSubs = maps:put(SubRef, {Pid, MonRef}, Subs),
+    NewSubMons = maps:put(MonRef, SubRef, SubMons),
+    {{ok, SubRef}, State#{subscribers => NewSubs, sub_monitors => NewSubMons}}.
+
+%% @doc Unsubscribe from view change notifications
+do_unsubscribe(SubRef, #{subscribers := Subs, sub_monitors := SubMons} = State) ->
+    case maps:get(SubRef, Subs, undefined) of
+        undefined ->
+            State;
+        {_Pid, MonRef} ->
+            erlang:demonitor(MonRef, [flush]),
+            NewSubs = maps:remove(SubRef, Subs),
+            NewSubMons = maps:remove(MonRef, SubMons),
+            State#{subscribers => NewSubs, sub_monitors => NewSubMons}
+    end.
+
+%% @doc Notify all view subscribers of an index update
+notify_view_subscribers(Hlc, #{db_name := DbName, view_id := ViewId, subscribers := Subs}) ->
+    Notification = {barrel_view_change, DbName, ViewId, #{hlc => Hlc}},
+    maps:foreach(fun(_SubRef, {Pid, _MonRef}) ->
+        Pid ! Notification
+    end, Subs).

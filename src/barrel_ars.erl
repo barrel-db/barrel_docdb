@@ -26,7 +26,9 @@
 -export([
     analyze/1,
     diff/2,
-    short/1
+    short/1,
+    paths_to_topics/1,
+    path_to_topic/1
 ]).
 
 -define(MAX_VALUE_LENGTH, 100).
@@ -107,3 +109,40 @@ analyze_list([Item | Rest], RevPath, Index, Acc) ->
     analyze_list(Rest, RevPath, Index + 1, Acc1);
 analyze_list([], _RevPath, _Index, Acc) ->
     Acc.
+
+%%====================================================================
+%% Path to Topic conversion (for subscriptions)
+%%====================================================================
+
+%% @doc Convert analyzed paths to MQTT-style topic strings.
+%% Each path [<<"field1">>, <<"field2">>, <<"value">>] becomes
+%% <<"field1/field2/value">>.
+%%
+%% This is used for subscription matching with barrel_sub.
+-spec paths_to_topics([{[term()], <<>>}]) -> [binary()].
+paths_to_topics(Paths) ->
+    [path_to_topic(Path) || {Path, _} <- Paths].
+
+%% @doc Convert a single path to an MQTT-style topic string.
+%% Handles various value types: binaries, integers, atoms, etc.
+-spec path_to_topic([term()]) -> binary().
+path_to_topic(Path) when is_list(Path) ->
+    Parts = [to_binary(Part) || Part <- Path],
+    join_with_slash(Parts).
+
+%% @private Join binary parts with slash separator
+join_with_slash([]) ->
+    <<>>;
+join_with_slash([H | T]) ->
+    lists:foldl(
+        fun(Part, Acc) -> <<Acc/binary, $/, Part/binary>> end,
+        H,
+        T
+    ).
+
+%% @private Convert any term to binary for topic path
+to_binary(B) when is_binary(B) -> B;
+to_binary(I) when is_integer(I) -> integer_to_binary(I);
+to_binary(A) when is_atom(A) -> atom_to_binary(A, utf8);
+to_binary(F) when is_float(F) -> float_to_binary(F, [{decimals, 10}, compact]);
+to_binary(T) -> iolist_to_binary(io_lib:format("~p", [T])).

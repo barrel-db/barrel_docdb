@@ -26,6 +26,8 @@ replicate(Source, Target, SourceTransport, TargetTransport, Changes) ->
     Stats = new_stats(),
     {ok, Stats2} = lists:foldl(
         fun(Change, {ok, Acc}) ->
+            %% Sync HLC from change to target (for distributed ordering)
+            _ = maybe_sync_hlc(Target, TargetTransport, Change),
             sync_change(Source, Target, SourceTransport, TargetTransport, Change, Acc)
         end,
         {ok, Stats},
@@ -186,4 +188,21 @@ get_value(Key, Map, Default) when is_atom(Key) ->
     case maps:get(Key, Map, undefined) of
         undefined -> maps:get(BinKey, Map, Default);
         Value -> Value
+    end.
+
+%% @doc Sync HLC from change to target if present
+%% This ensures the target database clock reflects causality with source events.
+maybe_sync_hlc(Target, TargetTransport, Change) ->
+    case get_value(hlc, Change) of
+        undefined ->
+            ok;
+        Hlc ->
+            %% Try to sync - ignore errors (transport may not support it)
+            try
+                _ = TargetTransport:sync_hlc(Target, Hlc),
+                ok
+            catch
+                error:undef -> ok;
+                _:_ -> ok
+            end
     end.

@@ -31,7 +31,9 @@
     compile/1,
     validate_spec/1,
     execute/3,
-    explain/1
+    match/2,
+    explain/1,
+    extract_paths/1
 ]).
 
 %% Internal exports for testing
@@ -150,6 +152,16 @@ execute(StoreRef, DbName, #query_plan{} = Plan) ->
             execute_full_scan(StoreRef, DbName, Plan)
     end.
 
+%% @doc Check if a document matches a compiled query plan.
+%% This is useful for filtering documents in-memory without index access.
+-spec match(query_plan(), map()) -> boolean().
+match(#query_plan{conditions = Conditions, bindings = Bindings}, Doc)
+  when is_map(Doc) ->
+    case matches_conditions(Doc, Conditions, Bindings) of
+        {true, _BoundVars} -> true;
+        false -> false
+    end.
+
 %% @doc Explain a query plan (for debugging/optimization).
 %% Returns a map describing the execution strategy.
 -spec explain(query_plan()) -> map().
@@ -164,6 +176,57 @@ explain(#query_plan{} = Plan) ->
         offset => Plan#query_plan.offset,
         include_docs => Plan#query_plan.include_docs
     }.
+
+%% @doc Extract all paths referenced in a query plan.
+%% Used for subscription optimization - only evaluate query when
+%% a change affects one of these paths.
+%% Returns MQTT-style path patterns for use with barrel_sub.
+-spec extract_paths(query_plan()) -> [binary()].
+extract_paths(#query_plan{conditions = Conditions}) ->
+    Paths = extract_paths_from_conditions(Conditions, []),
+    UniquePathPatterns = lists:usort([path_to_pattern(P) || P <- Paths]),
+    UniquePathPatterns.
+
+%% @private Extract paths from conditions recursively
+extract_paths_from_conditions([], Acc) ->
+    Acc;
+extract_paths_from_conditions([{path, Path, _} | Rest], Acc) ->
+    extract_paths_from_conditions(Rest, [Path | Acc]);
+extract_paths_from_conditions([{compare, Path, _, _} | Rest], Acc) ->
+    extract_paths_from_conditions(Rest, [Path | Acc]);
+extract_paths_from_conditions([{'and', Nested} | Rest], Acc) ->
+    NestedPaths = extract_paths_from_conditions(Nested, []),
+    extract_paths_from_conditions(Rest, NestedPaths ++ Acc);
+extract_paths_from_conditions([{'or', Nested} | Rest], Acc) ->
+    NestedPaths = extract_paths_from_conditions(Nested, []),
+    extract_paths_from_conditions(Rest, NestedPaths ++ Acc);
+extract_paths_from_conditions([{'not', Condition} | Rest], Acc) ->
+    NestedPaths = extract_paths_from_conditions([Condition], []),
+    extract_paths_from_conditions(Rest, NestedPaths ++ Acc);
+extract_paths_from_conditions([{in, Path, _} | Rest], Acc) ->
+    extract_paths_from_conditions(Rest, [Path | Acc]);
+extract_paths_from_conditions([{contains, Path, _} | Rest], Acc) ->
+    extract_paths_from_conditions(Rest, [Path | Acc]);
+extract_paths_from_conditions([{exists, Path} | Rest], Acc) ->
+    extract_paths_from_conditions(Rest, [Path | Acc]);
+extract_paths_from_conditions([{missing, Path} | Rest], Acc) ->
+    extract_paths_from_conditions(Rest, [Path | Acc]);
+extract_paths_from_conditions([{regex, Path, _} | Rest], Acc) ->
+    extract_paths_from_conditions(Rest, [Path | Acc]);
+extract_paths_from_conditions([{prefix, Path, _} | Rest], Acc) ->
+    extract_paths_from_conditions(Rest, [Path | Acc]);
+extract_paths_from_conditions([_ | Rest], Acc) ->
+    extract_paths_from_conditions(Rest, Acc).
+
+%% @private Convert a path list to an MQTT-style pattern with # wildcard.
+%% This allows matching any value at the path.
+%% Example: [<<"type">>] -> <<"type/#">>
+path_to_pattern([]) ->
+    <<"#">>;
+path_to_pattern(Path) ->
+    Parts = [to_bin(P) || P <- Path],
+    BasePath = iolist_to_binary(lists:join(<<"/">>, Parts)),
+    <<BasePath/binary, "/#">>.
 
 %%====================================================================
 %% Internal - Compilation
