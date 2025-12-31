@@ -133,9 +133,6 @@ handle_cast(_Msg, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{cache = Cache}) ->
-    case Cache of
-        undefined -> ok;
-        _ -> rocksdb:destroy_lru_cache(Cache)
-    end,
+terminate(_Reason, _State) ->
+    %% Cache is automatically released when process terminates
     ok.
