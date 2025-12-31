@@ -146,17 +146,55 @@ get_with_snapshot(#{ref := Ref}, Key, Snapshot) ->
 %% Build RocksDB options from config
 build_db_options(Options) ->
     WriteBufferSize = maps:get(write_buffer_size, Options, 64 * 1024 * 1024),
-    [
+    Schedulers = erlang:system_info(schedulers),
+
+    %% Block-based table options with shared cache and bloom filters
+    BlockOpts = barrel_cache:get_block_opts(#{
+        bloom_bits => maps:get(bloom_bits, Options, 10),
+        block_size => maps:get(block_size, Options, 4096)
+    }),
+
+    BaseOpts = [
         {create_if_missing, true},
         {max_open_files, maps:get(max_open_files, Options, 1000)},
+
+        %% Write buffer configuration
         {write_buffer_size, WriteBufferSize},
+        {max_write_buffer_number, maps:get(max_write_buffer_number, Options, 3)},
+        {min_write_buffer_number_to_merge, maps:get(min_write_buffer_number_to_merge, Options, 1)},
+
+        %% Compression - snappy for all levels (zstd optional if available)
         {compression, maps:get(compression, Options, snappy)},
+        {bottommost_compression, maps:get(bottommost_compression, Options, snappy)},
+
+        %% Concurrency
         {allow_concurrent_memtable_write, true},
         {enable_write_thread_adaptive_yield, true},
+
+        %% Compaction tuning
+        {level0_file_num_compaction_trigger, maps:get(l0_compaction_trigger, Options, 4)},
+        {level0_slowdown_writes_trigger, maps:get(l0_slowdown_trigger, Options, 20)},
+        {level0_stop_writes_trigger, maps:get(l0_stop_trigger, Options, 36)},
+        {max_background_jobs, maps:get(max_background_jobs, Options, Schedulers)},
+        {max_subcompactions, maps:get(max_subcompactions, Options, 4)},
+
         %% Use counter merge operator for atomic counters
         {merge_operator, counter_merge_operator},
-        {total_threads, erlang:max(4, erlang:system_info(schedulers))}
-    ].
+        {total_threads, erlang:max(4, Schedulers)},
+
+        %% Block-based table with bloom filters and shared cache
+        {block_based_table_options, BlockOpts}
+    ],
+
+    %% Optional rate limiter for production workloads
+    case maps:get(rate_limit_bytes_per_sec, Options, 0) of
+        0 -> BaseOpts;
+        RateLimit ->
+            case rocksdb:new_rate_limiter(RateLimit) of
+                {ok, Limiter} -> [{rate_limiter, Limiter} | BaseOpts];
+                _ -> BaseOpts
+            end
+    end.
 
 %% Compute the end of a prefix range (for iteration bounds)
 prefix_end(Prefix) ->

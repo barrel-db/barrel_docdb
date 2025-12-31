@@ -38,6 +38,17 @@ init([]) ->
         period => 60
     },
 
+    %% Shared RocksDB block cache for all databases
+    %% Must start before any database opens
+    Cache = #{
+        id => barrel_cache,
+        start => {barrel_cache, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [barrel_cache]
+    },
+
     %% Global HLC clock for distributed time synchronization
     %% Registered as 'barrel_hlc_clock' for node-wide access
     HlcMaxOffset = application:get_env(barrel_docdb, hlc_max_offset, 0),
@@ -80,7 +91,7 @@ init([]) ->
         modules => [barrel_db_sup]
     },
 
-    %% HLC must start before databases, Sub and QuerySub before databases
-    ChildSpecs = [Hlc, Sub, QuerySub, DbSup],
+    %% Cache must start first, then HLC, Sub, QuerySub, finally DbSup
+    ChildSpecs = [Cache, Hlc, Sub, QuerySub, DbSup],
 
     {ok, {SupFlags, ChildSpecs}}.

@@ -160,6 +160,65 @@ Keys are designed for efficient range scans and prefix matching.
 | LOCAL | 0x03 | Local documents |
 | VIEW_* | 0x04-0x08 | View storage |
 
+#### RocksDB Optimizations
+
+Both stores share a common LRU block cache managed by `barrel_cache`:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  Shared Block Cache (512MB)                      │
+├─────────────────────────────────────────────────────────────────┤
+│  Document Store          │  Attachment Store                    │
+│  ├── Data blocks         │  ├── Metadata blocks                 │
+│  ├── Index blocks        │  └── BlobDB index                    │
+│  └── Bloom filters       │                                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Document Store Optimizations:**
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `block_cache` | 512MB shared | LRU cache for data/index blocks |
+| `bloom_filter` | 10 bits/key | Reduce disk reads for point lookups |
+| `write_buffer_size` | 64MB | Memtable size before flush |
+| `max_write_buffer_number` | 3 | Concurrent memtables |
+| `compression` | snappy | Fast compression for all levels |
+| `bottommost_compression` | snappy | Configurable (zstd if available) |
+| `level0_file_num_compaction_trigger` | 4 | Trigger L0→L1 compaction |
+| `max_background_jobs` | schedulers | Parallel compaction threads |
+
+**Attachment Store Optimizations:**
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `enable_blob_files` | true | Store large values in blob files |
+| `min_blob_size` | 4KB | Threshold for blob storage |
+| `blob_file_size` | 256MB | Maximum blob file size |
+| `blob_compression_type` | snappy | Blob compression (zstd if available) |
+| `blob_garbage_collection_age_cutoff` | 0.25 | GC blobs older than 25% |
+| `blob_garbage_collection_force_threshold` | 0.5 | Force GC at 50% garbage |
+
+**Configuration:**
+```erlang
+%% Application environment (sys.config)
+{barrel_docdb, [
+    {block_cache_size, 536870912},  %% 512MB shared cache
+    {data_dir, "/var/lib/barrel"}
+]}
+
+%% Per-database options
+barrel_docdb:create_db(<<"mydb">>, #{
+    store_opts => #{
+        write_buffer_size => 128 * 1024 * 1024,  %% 128MB
+        max_open_files => 2000,
+        rate_limit_bytes_per_sec => 100 * 1024 * 1024  %% 100MB/s
+    },
+    att_opts => #{
+        blob_file_size => 512 * 1024 * 1024,  %% 512MB blobs
+        min_blob_size => 8192  %% 8KB threshold
+    }
+}).
+```
+
 ### 4. HLC (Hybrid Logical Clock)
 
 Every document modification is timestamped with an HLC:
@@ -553,7 +612,8 @@ src/
 ├── barrel_view_index.erl     # View index storage (HLC-tracked)
 ├── barrel_view_sup.erl       # View supervisor
 │
-├── barrel_store_rocksdb.erl  # RocksDB storage
+├── barrel_cache.erl          # Shared RocksDB block cache
+├── barrel_store_rocksdb.erl  # RocksDB storage (optimized)
 ├── barrel_store_keys.erl     # Key encoding (doc_hlc, path_hlc, ars)
 │
 ├── barrel_rep.erl            # Replication API (filtered)

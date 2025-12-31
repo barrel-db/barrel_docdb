@@ -118,18 +118,37 @@ fold(#{ref := Ref}, DbName, DocId, Fun, Acc) ->
 %% Build RocksDB options with BlobDB enabled
 build_blob_options(Options) ->
     BlobFileSize = maps:get(blob_file_size, Options, 256 * 1024 * 1024),  % 256MB
+    Schedulers = erlang:system_info(schedulers),
+
+    %% Block-based table options with shared cache (for metadata lookups)
+    BlockOpts = barrel_cache:get_block_opts(#{
+        bloom_bits => maps:get(bloom_bits, Options, 10),
+        block_size => maps:get(block_size, Options, 4096)
+    }),
+
     [
         {create_if_missing, true},
         {max_open_files, maps:get(max_open_files, Options, 256)},
         {compression, maps:get(compression, Options, snappy)},
-        %% BlobDB settings - all values go to blob files
+
+        %% BlobDB settings for large attachments
         {enable_blob_files, true},
-        {min_blob_size, 0},  % All values go to blobs
+        {min_blob_size, maps:get(min_blob_size, Options, 4096)},  % 4KB threshold
         {blob_file_size, BlobFileSize},
         {blob_compression_type, maps:get(blob_compression, Options, snappy)},
+
+        %% Blob garbage collection
         {enable_blob_garbage_collection, true},
-        {blob_garbage_collection_age_cutoff, 0.25},
-        {blob_garbage_collection_force_threshold, 0.5}
+        {blob_garbage_collection_age_cutoff,
+            maps:get(blob_gc_age_cutoff, Options, 0.25)},
+        {blob_garbage_collection_force_threshold,
+            maps:get(blob_gc_force_threshold, Options, 0.5)},
+
+        %% Background jobs for compaction/GC
+        {max_background_jobs, maps:get(max_background_jobs, Options, erlang:max(2, Schedulers div 2))},
+
+        %% Block-based table with bloom filters and shared cache
+        {block_based_table_options, BlockOpts}
     ].
 
 %% Create key for attachment: prefix + att_name
