@@ -167,14 +167,14 @@ end, Results).
 
 ## Tracking Changes
 
-The changes feed tracks all document modifications:
+The changes feed tracks all document modifications using HLC timestamps:
 
 ```erlang
 %% Get all changes since the beginning
-{ok, Changes, LastSeq} = barrel_docdb:get_changes(<<"mydb">>, first).
+{ok, Changes, LastHlc} = barrel_docdb:get_changes(<<"mydb">>, first).
 
 %% Get changes with options
-{ok, Changes2, _} = barrel_docdb:get_changes(<<"mydb">>, LastSeq, #{
+{ok, Changes2, _} = barrel_docdb:get_changes(<<"mydb">>, LastHlc, #{
     limit => 100,
     include_docs => true
 }).
@@ -182,12 +182,14 @@ The changes feed tracks all document modifications:
 %% Process each change
 lists:foreach(fun(Change) ->
     DocId = maps:get(id, Change),
-    Seq = maps:get(seq, Change),
+    Hlc = maps:get(hlc, Change),
     IsDeleted = maps:get(deleted, Change, false),
-    io:format("Change ~p: ~s (~s)~n",
-        [Seq, DocId, if IsDeleted -> "deleted"; true -> "updated" end])
+    io:format("Change at ~p: ~s (~s)~n",
+        [Hlc, DocId, if IsDeleted -> "deleted"; true -> "updated" end])
 end, Changes).
 ```
+
+See the [Changes & Subscriptions Guide](changes.md) for more details on real-time notifications.
 
 ## Database Management
 
@@ -207,5 +209,7 @@ ok = barrel_docdb:delete_db(<<"mydb">>).
 
 ## Next Steps
 
-- [Replication Guide](replication.md) - Learn how to sync databases
+- [Query Guide](query.md) - Declarative queries for finding documents
+- [Changes & Subscriptions](changes.md) - Real-time change notifications
+- [Replication Guide](replication.md) - Sync databases with filtering
 - [API Reference](barrel_docdb.html) - Complete API documentation

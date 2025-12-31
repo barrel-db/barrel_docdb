@@ -172,7 +172,7 @@ timestamp(Clock) ->
 
 %% @doc Encode timestamp to binary for storage.
 %% Uses big-endian encoding to maintain lexicographic sort order.
-%% Format: <<WallTime:64/big, Logical:32/big>>
+%% Format: 12-byte binary with WallTime (64-bit) and Logical (32-bit).
 -spec encode(timestamp()) -> binary().
 encode(#timestamp{wall_time = WallTime, logical = Logical}) ->
     <<WallTime:64/big-unsigned, Logical:32/big-unsigned>>.
@@ -225,7 +225,7 @@ from_string(_) ->
 %%====================================================================
 
 %% @doc Compare two timestamps.
-%% Returns lt if TS1 < TS2, eq if equal, gt if TS1 > TS2.
+%% Returns `lt' if TS1 is before TS2, `eq' if equal, `gt' if TS1 is after TS2.
 -spec compare(timestamp(), timestamp()) -> lt | eq | gt.
 compare(#timestamp{wall_time = W1, logical = L1},
         #timestamp{wall_time = W2, logical = L2}) ->

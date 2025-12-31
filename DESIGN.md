@@ -9,8 +9,10 @@ barrel_docdb is an embeddable document database for Erlang applications. It prov
 1. **Embeddable**: Run as part of your Erlang application, no external services
 2. **Reliable**: ACID transactions via RocksDB, crash-safe operations
 3. **Replication-ready**: CouchDB-compatible revision model for sync
-4. **Efficient**: Optimized storage for documents and large attachments
-5. **Simple API**: Clean, intuitive public interface
+4. **Distributed**: HLC-based ordering for decentralized deployments
+5. **Efficient**: Optimized storage for documents and large attachments
+6. **Reactive**: Real-time subscriptions for document changes
+7. **Simple API**: Clean, intuitive public interface
 
 ## Architecture
 
@@ -22,17 +24,24 @@ barrel_docdb is an embeddable document database for Erlang applications. It prov
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                     barrel_docdb (Public API)                   │
-│  create_db, put_doc, get_doc, query_view, replicate, ...       │
+│  put_doc, get_doc, find, subscribe, replicate, get_hlc, ...    │
 └─────────────────────────────────────────────────────────────────┘
                                │
-          ┌────────────────────┼────────────────────┐
-          ▼                    ▼                    ▼
-┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
-│  barrel_db_server │ │   barrel_view    │ │   barrel_rep     │
-│  (per-database)   │ │  (per-view)      │ │  (replication)   │
-└──────────────────┘ └──────────────────┘ └──────────────────┘
-          │                    │                    │
-          ▼                    ▼                    ▼
+    ┌──────────────┬───────────┼───────────┬──────────────┐
+    ▼              ▼           ▼           ▼              ▼
+┌────────┐  ┌────────────┐ ┌────────┐ ┌────────┐  ┌────────────┐
+│barrel  │  │barrel_view │ │barrel  │ │barrel  │  │barrel_     │
+│db_server│  │(per-view)  │ │_rep    │ │_sub    │  │query_sub   │
+└────────┘  └────────────┘ └────────┘ └────────┘  └────────────┘
+    │              │           │           │              │
+    │              │           │           └──────────────┘
+    │              │           │                  │
+    ▼              ▼           ▼                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      barrel_hlc (HLC Clock)                     │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                   barrel_store_rocksdb                          │
 │                   (storage abstraction)                         │
@@ -123,44 +132,165 @@ Each barrel database uses two separate RocksDB instances:
 
 ```
 Document Store Keys:
-├── doc_info/{db}/{docid}           → DocInfo (metadata + revtree)
-├── doc_rev/{db}/{docid}/{rev}      → Document body
-├── doc_seq/{db}/{seq}              → Change entry
-├── local/{db}/{docid}              → Local document (not replicated)
-├── view_meta/{db}/{viewid}         → View metadata
-├── view_seq/{db}/{viewid}          → View indexed sequence
+├── doc_info/{db}/{docid}              → DocInfo (metadata + revtree)
+├── doc_rev/{db}/{docid}/{rev}         → Document body
+├── doc_hlc/{db}/{hlc}                 → Change entry (HLC-ordered)
+├── path_hlc/{db}/{topic}/{hlc}        → Path-indexed change
+├── local/{db}/{docid}                 → Local document (not replicated)
+├── ars/{db}/{path}                    → Path index for queries
+├── view_meta/{db}/{viewid}            → View metadata
+├── view_hlc/{db}/{viewid}             → View indexed HLC
 ├── view_index/{db}/{viewid}:{key}:{docid} → View index entry
 └── view_by_docid/{db}/{viewid}:{docid}    → Reverse index
 
 Attachment Store Keys:
-└── att/{db}/{docid}/{attname}      → Attachment binary data
+└── att/{db}/{docid}/{attname}         → Attachment binary data
 ```
 
 Keys are designed for efficient range scans and prefix matching.
 
-### 4. Changes Feed
+**Key Prefixes:**
+| Prefix | Hex | Description |
+|--------|-----|-------------|
+| DOC_INFO | 0x01 | Document metadata |
+| DOC_REV | 0x02 | Document body by revision |
+| DOC_HLC | 0x0D | Changes ordered by HLC |
+| PATH_HLC | 0x0E | Path-indexed changes |
+| ARS | 0x09 | Path index for queries |
+| LOCAL | 0x03 | Local documents |
+| VIEW_* | 0x04-0x08 | View storage |
 
-Every document modification generates a sequence number and change entry:
+### 4. HLC (Hybrid Logical Clock)
+
+Every document modification is timestamped with an HLC:
 
 ```
-Sequence: {Epoch, Counter}
-├── Epoch   : Increments on database recovery/compaction
-└── Counter : Monotonically increasing within epoch
+HLC Timestamp: {WallTime, LogicalCounter, NodeId}
+├── WallTime       : Physical time in microseconds
+├── LogicalCounter : Logical extension for same-time events
+└── NodeId         : Unique node identifier
 ```
 
-Changes are stored by sequence for efficient streaming:
+**Properties:**
+- Causally consistent ordering across distributed nodes
+- Monotonically increasing within a node
+- No central coordinator required
+- Clock skew detection and handling
+
+**API:**
+```erlang
+%% Get current HLC
+Ts = barrel_docdb:get_hlc().
+
+%% Generate new timestamp (advances clock)
+NewTs = barrel_docdb:new_hlc().
+
+%% Sync with remote node
+{ok, SyncedTs} = barrel_docdb:sync_hlc(RemoteTs).
+```
+
+### 5. Changes Feed
+
+Every document modification generates an HLC-timestamped change entry:
 
 ```erlang
-%% Get changes since sequence 42
-barrel_changes:fold_changes(StoreRef, DbName, {0, 42}, Fun, Acc)
+%% Change entry structure
+#{
+    id => DocId,
+    hlc => HlcTimestamp,
+    rev => RevId,
+    deleted => boolean(),
+    changes => [RevId]
+}
+```
+
+Changes are stored by HLC for efficient streaming:
+
+```erlang
+%% Get changes since HLC timestamp
+barrel_changes:fold_changes(StoreRef, DbName, SinceHlc, Fun, Acc)
 ```
 
 **Use Cases:**
 - Real-time notifications
 - Incremental view updates
 - Replication source
+- Path-filtered change feeds
 
-### 5. Views (Secondary Indexes)
+### 6. Path Subscriptions
+
+Subscribe to document changes matching MQTT-style path patterns:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Path Subscription Flow                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. Client subscribes with pattern (e.g., "users/+/profile")    │
+│                         │                                        │
+│                         ▼                                        │
+│  2. barrel_sub registers pattern in match_trie                  │
+│                         │                                        │
+│                         ▼                                        │
+│  3. On document write, paths extracted from document            │
+│                         │                                        │
+│                         ▼                                        │
+│  4. Paths matched against registered patterns                   │
+│                         │                                        │
+│                         ▼                                        │
+│  5. Matching subscribers receive notification message           │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Pattern Syntax:**
+| Pattern | Description |
+|---------|-------------|
+| `users/alice` | Exact match |
+| `users/+` | Single segment wildcard |
+| `users/#` | Multi-segment wildcard |
+| `+/orders/#` | Mixed wildcards |
+
+### 7. Query Subscriptions
+
+Subscribe to changes for documents matching a query:
+
+```erlang
+Query = #{where => [{path, [<<"type">>], <<"user">>}]},
+{ok, SubRef} = barrel_docdb:subscribe_query(DbName, Query).
+```
+
+**Optimization:**
+- Query paths are extracted at subscription time
+- Changes are first filtered by path intersection
+- Full query evaluation only when paths overlap
+- Avoids evaluating query for every document change
+
+### 8. Path-Indexed Changes
+
+Changes are indexed by path at write time for efficient filtered queries:
+
+```
+Key: path_hlc/{db}/{topic}/{hlc} → {doc_id, rev, deleted}
+```
+
+Example document:
+```erlang
+#{<<"type">> => <<"user">>, <<"org">> => <<"acme">>}
+```
+
+Creates index entries:
+```
+path_hlc/mydb/type/user/{hlc1}
+path_hlc/mydb/org/acme/{hlc1}
+```
+
+**Benefits:**
+- O(k) query time where k = matching changes (vs O(n) full scan)
+- Efficient filtered replication
+- Real-time path subscriptions use same index
+
+### 9. Views (Secondary Indexes)
 
 Views are incremental map-reduce indexes:
 
@@ -181,33 +311,49 @@ Views are incremental map-reduce indexes:
 **Automatic Rebuild:**
 When `Module:version()` changes, the view clears and rebuilds from scratch.
 
-### 6. Replication
+### 10. Replication
 
-Replication follows the CouchDB protocol:
+Replication follows the CouchDB protocol with HLC-based ordering:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    Replication Flow                           │
 ├──────────────────────────────────────────────────────────────┤
 │                                                               │
-│  1. Read checkpoint (last_seq from local doc)                │
+│  1. Read checkpoint (last_hlc from local doc)                │
 │                     │                                         │
 │                     ▼                                         │
-│  2. Get changes from source since last_seq                   │
+│  2. Get changes from source since last_hlc                   │
+│     (optionally filtered by paths/query)                     │
 │                     │                                         │
 │                     ▼                                         │
-│  3. For each change:                                         │
+│  3. Sync target HLC with source timestamps                   │
+│                     │                                         │
+│                     ▼                                         │
+│  4. For each change:                                         │
 │     ├── Call revsdiff(target, docid, revs)                   │
 │     ├── Get missing revisions from source with history       │
 │     └── Put to target using put_rev(doc, history, deleted)   │
 │                     │                                         │
 │                     ▼                                         │
-│  4. Write checkpoint with new last_seq                       │
+│  5. Write checkpoint with new last_hlc                       │
 │                     │                                         │
 │                     ▼                                         │
-│  5. Repeat until no more changes                             │
+│  6. Repeat until no more changes                             │
 │                                                               │
 └──────────────────────────────────────────────────────────────┘
+```
+
+**Filtered Replication:**
+Replicate only documents matching filters:
+```erlang
+barrel_rep:replicate(Source, Target, #{
+    filter => #{
+        paths => [<<"users/#">>],           %% Path pattern filter
+        query => #{where => [...]}          %% Query filter
+    }
+}).
+%% Both filters use AND logic when combined
 ```
 
 **Transport Abstraction:**
@@ -219,7 +365,7 @@ The `barrel_rep_transport` behaviour allows pluggable transports:
 Stored as local documents (not replicated):
 ```erlang
 Key: <<"replication-checkpoint-{rep_id}">>
-Value: #{<<"history">> => [#{<<"source_last_seq">> => ...}]}
+Value: #{<<"history">> => [#{<<"source_last_hlc">> => ...}]}
 ```
 
 ## Design Decisions
@@ -388,23 +534,31 @@ src/
 ├── barrel_doc.erl            # Document utilities
 ├── barrel_revtree.erl        # Revision tree operations
 │
+├── barrel_hlc.erl            # HLC clock management
+│
 ├── barrel_att.erl            # Attachment API
 ├── barrel_att_store.erl      # Attachment storage
 │
-├── barrel_changes.erl        # Changes feed API
+├── barrel_changes.erl        # Changes feed API (HLC-based)
 ├── barrel_changes_stream.erl # Streaming changes
-├── barrel_sequence.erl       # Sequence number operations
+│
+├── barrel_sub.erl            # Path subscriptions manager
+├── barrel_sub_sup.erl        # Subscription supervisor
+├── barrel_query_sub.erl      # Query subscriptions manager
+│
+├── barrel_query.erl          # Declarative query compiler
+├── barrel_ars.erl            # Path index for queries
 │
 ├── barrel_view.erl           # View gen_statem
-├── barrel_view_index.erl     # View index storage
+├── barrel_view_index.erl     # View index storage (HLC-tracked)
 ├── barrel_view_sup.erl       # View supervisor
 │
 ├── barrel_store_rocksdb.erl  # RocksDB storage
-├── barrel_store_keys.erl     # Key encoding
+├── barrel_store_keys.erl     # Key encoding (doc_hlc, path_hlc, ars)
 │
-├── barrel_rep.erl            # Replication API
-├── barrel_rep_alg.erl        # Replication algorithm
-├── barrel_rep_checkpoint.erl # Checkpoint management
+├── barrel_rep.erl            # Replication API (filtered)
+├── barrel_rep_alg.erl        # Replication algorithm (HLC sync)
+├── barrel_rep_checkpoint.erl # Checkpoint management (HLC-based)
 ├── barrel_rep_transport.erl  # Transport behaviour
 └── barrel_rep_transport_local.erl  # Local transport
 ```
@@ -414,3 +568,6 @@ src/
 - [CouchDB Replication Protocol](https://docs.couchdb.org/en/stable/replication/protocol.html)
 - [RocksDB Documentation](https://rocksdb.org/docs/)
 - [RocksDB BlobDB](https://rocksdb.org/blog/2021/05/26/integrated-blob-db.html)
+- [Hybrid Logical Clocks](https://cse.buffalo.edu/tech-reports/2014-04.pdf)
+- [hlc library](https://gitlab.com/barrel-db/hlc)
+- [match_trie library](https://gitlab.com/barrel-db/match_trie)

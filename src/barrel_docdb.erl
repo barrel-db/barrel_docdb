@@ -727,7 +727,7 @@ refresh_view(Db, ViewId) ->
 %% == Conditions ==
 %% <ul>
 %%   <li>`{path, Path, Value}' - Equality match on path</li>
-%%   <li>`{compare, Path, Op, Value}' - Comparison (>, <, >=, =<, =/=)</li>
+%%   <li>`{compare, Path, Op, Value}' - Comparison (Op: '&gt;', '&lt;', '&gt;=', '=&lt;', '=/=')</li>
 %%   <li>`{'and', [Clauses]}' - All conditions must match</li>
 %%   <li>`{'or', [Clauses]}' - Any condition must match</li>
 %%   <li>`{'not', Clause}' - Negation</li>

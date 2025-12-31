@@ -3,8 +3,9 @@
 barrel_docdb supports CouchDB-style replication for synchronizing documents between databases. This guide covers:
 
 - Basic replication between local databases
+- Filtered replication (by path pattern or query)
 - Understanding the replication process
-- Checkpoints and incremental sync
+- HLC-based checkpoints and incremental sync
 - Custom transport implementations
 
 ## Basic Replication
@@ -58,21 +59,101 @@ The replication result includes detailed statistics:
     docs_written := 10,         %% Documents written to target
     doc_read_failures := 0,     %% Failed reads
     doc_write_failures := 0,    %% Failed writes
-    start_seq := first,         %% Starting sequence
-    last_seq := {0, 10}         %% Final sequence
+    start_seq := first,         %% Starting HLC timestamp
+    last_seq := #timestamp{}    %% Final HLC timestamp
 } = Result.
 ```
+
+## Filtered Replication
+
+Replicate only documents matching specific criteria using the `filter` option.
+
+### Filter by Path Pattern
+
+Use MQTT-style path patterns to select documents:
+
+```erlang
+%% Replicate only user documents
+{ok, Result} = barrel_rep:replicate(<<"source">>, <<"target">>, #{
+    filter => #{
+        paths => [<<"type/user/#">>]
+    }
+}).
+
+%% Replicate orders and invoices
+{ok, Result} = barrel_rep:replicate(<<"source">>, <<"target">>, #{
+    filter => #{
+        paths => [<<"type/order/#">>, <<"type/invoice/#">>]
+    }
+}).
+```
+
+### Filter by Query
+
+Use declarative queries for complex filtering:
+
+```erlang
+%% Replicate only active users
+{ok, Result} = barrel_rep:replicate(<<"source">>, <<"target">>, #{
+    filter => #{
+        query => #{
+            where => [
+                {path, [<<"type">>], <<"user">>},
+                {path, [<<"active">>], true}
+            ]
+        }
+    }
+}).
+
+%% Replicate orders over $100
+{ok, Result} = barrel_rep:replicate(<<"source">>, <<"target">>, #{
+    filter => #{
+        query => #{
+            where => [
+                {path, [<<"type">>], <<"order">>},
+                {compare, [<<"total">>], '>', 100}
+            ]
+        }
+    }
+}).
+```
+
+### Combined Filters (AND Logic)
+
+When both `paths` and `query` are specified, documents must match **both** filters:
+
+```erlang
+%% Replicate only active users (path AND query must match)
+{ok, Result} = barrel_rep:replicate(<<"source">>, <<"target">>, #{
+    filter => #{
+        paths => [<<"type/user/#">>],      %% Must match path pattern
+        query => #{                        %% AND must match query
+            where => [{path, [<<"active">>], true}]
+        }
+    }
+}).
+```
+
+### Path Pattern Syntax
+
+| Pattern | Matches |
+|---------|---------|
+| `type/user` | Exact path |
+| `type/+` | Single segment wildcard: `type/user`, `type/order` |
+| `type/#` | Multi-segment wildcard: `type/user`, `type/user/profile` |
+| `org/+/users/#` | Mixed: `org/acme/users/alice`, `org/corp/users/bob/profile` |
 
 ## How Replication Works
 
 ### The Replication Algorithm
 
-1. **Read checkpoint**: Find the last replicated sequence number
-2. **Fetch changes**: Get document changes from source since that sequence
-3. **Compare revisions**: Use `revsdiff` to find which revisions target is missing
-4. **Transfer documents**: Fetch missing revisions with their history
-5. **Write to target**: Store documents using `put_rev` to preserve history
-6. **Save checkpoint**: Record progress for incremental sync
+1. **Read checkpoint**: Find the last replicated HLC timestamp
+2. **Fetch changes**: Get document changes from source since that timestamp
+3. **Sync HLC**: Synchronize target clock with source timestamps (ensures causal ordering)
+4. **Compare revisions**: Use `revsdiff` to find which revisions target is missing
+5. **Transfer documents**: Fetch missing revisions with their history
+6. **Write to target**: Store documents using `put_rev` to preserve history
+7. **Save checkpoint**: Record progress with HLC for incremental sync
 
 ### Understanding Revisions
 
@@ -129,13 +210,21 @@ Checkpoints are stored as local documents (not replicated) in both databases:
 #{
     <<"history">> => [
         #{
-            <<"source_last_seq">> => <<"0:100">>,
+            <<"source_last_hlc">> => <<...>>,  %% Encoded HLC timestamp
             <<"session_id">> => <<"abc123">>,
             <<"end_time">> => <<"2024-01-15T10:30:00Z">>
         }
     ]
 }
 ```
+
+### HLC-Based Ordering
+
+Replication uses HLC (Hybrid Logical Clock) timestamps instead of sequence numbers:
+
+- **Distributed ordering**: HLC provides consistent ordering across nodes
+- **Causal consistency**: Events are ordered by cause-effect relationships
+- **Clock synchronization**: Target clock is synced with source during replication
 
 ### Incremental Sync
 

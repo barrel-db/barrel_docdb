@@ -38,9 +38,9 @@
 %%====================================================================
 
 %% @doc Extract all paths from a document.
-%% Returns a list of {Path, <<>>} tuples where Path is a list of
+%% Returns a list of `{Path, Value}' tuples where Path is a list of
 %% field names/indices ending with the value.
--spec analyze(map()) -> [{Path :: [term()], <<>>}].
+-spec analyze(map()) -> [{Path :: [term()], binary()}].
 analyze(Doc) when is_map(Doc) ->
     %% Build paths in reverse for O(n) complexity, then reverse each path
     analyze_doc(Doc, [], []);
@@ -115,11 +115,10 @@ analyze_list([], _RevPath, _Index, Acc) ->
 %%====================================================================
 
 %% @doc Convert analyzed paths to MQTT-style topic strings.
-%% Each path [<<"field1">>, <<"field2">>, <<"value">>] becomes
-%% <<"field1/field2/value">>.
+%% Each path `[field1, field2, value]' becomes `"field1/field2/value"'.
 %%
 %% This is used for subscription matching with barrel_sub.
--spec paths_to_topics([{[term()], <<>>}]) -> [binary()].
+-spec paths_to_topics([{[term()], binary()}]) -> [binary()].
 paths_to_topics(Paths) ->
     [path_to_topic(Path) || {Path, _} <- Paths].
 

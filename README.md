@@ -1,15 +1,18 @@
 # barrel_docdb
 
-An Erlang document database library with MVCC, views, and replication support.
+An embeddable document database for Erlang with MVCC, declarative queries, real-time subscriptions, and replication.
 
 ## Features
 
 - **Document CRUD**: Create, read, update, delete JSON documents
 - **MVCC**: Multi-Version Concurrency Control with revision trees
-- **Attachments**: Store binary attachments with documents
+- **Declarative Queries**: Ad-hoc queries with automatic path indexing
+- **Real-time Subscriptions**: MQTT-style path patterns and query subscriptions
+- **HLC Ordering**: Hybrid Logical Clocks for distributed event ordering
 - **Views**: Secondary indexes with map-reduce style queries
-- **Changes Feed**: Real-time change notifications for replication
-- **Replication**: Pluggable transport layer for data synchronization
+- **Changes Feed**: HLC-ordered change notifications
+- **Filtered Replication**: Sync by path patterns or queries
+- **Attachments**: Efficient binary storage with RocksDB BlobDB
 - **RocksDB Backend**: High-performance persistent storage
 
 ## Requirements
@@ -34,21 +37,31 @@ Add to your `rebar.config`:
 application:ensure_all_started(barrel_docdb).
 
 %% Create a database
-{ok, _} = barrel_docdb:create_db(<<"mydb">>, #{}).
+{ok, _} = barrel_docdb:create_db(<<"mydb">>).
 
 %% Save a document
-Doc = #{<<"id">> => <<"doc1">>, <<"name">> => <<"Hello">>},
-{ok, DocId, RevId} = barrel_docdb:save_doc(<<"mydb">>, Doc).
+{ok, #{<<"id">> := DocId, <<"rev">> := Rev}} = barrel_docdb:put_doc(<<"mydb">>, #{
+    <<"type">> => <<"user">>,
+    <<"name">> => <<"Alice">>
+}).
 
 %% Fetch the document
-{ok, Doc2} = barrel_docdb:fetch_doc(<<"mydb">>, <<"doc1">>, #{}).
+{ok, Doc} = barrel_docdb:get_doc(<<"mydb">>, DocId).
 
-%% Update the document
-Doc3 = Doc2#{<<"name">> => <<"World">>},
-{ok, _, NewRevId} = barrel_docdb:save_doc(<<"mydb">>, Doc3).
+%% Update the document (include _rev for optimistic concurrency)
+{ok, _} = barrel_docdb:put_doc(<<"mydb">>, Doc#{<<"name">> => <<"Bob">>}).
+
+%% Query documents
+{ok, Users} = barrel_docdb:find(<<"mydb">>, #{
+    where => [{path, [<<"type">>], <<"user">>}]
+}).
+
+%% Subscribe to changes
+{ok, SubRef} = barrel_docdb:subscribe(<<"mydb">>, <<"type/user/#">>),
+receive {barrel_change, _, Change} -> io:format("Change: ~p~n", [Change]) end.
 
 %% Delete the document
-ok = barrel_docdb:delete_doc(<<"mydb">>, <<"doc1">>, NewRevId).
+{ok, _} = barrel_docdb:delete_doc(<<"mydb">>, DocId).
 
 %% Delete the database
 ok = barrel_docdb:delete_db(<<"mydb">>).
@@ -69,7 +82,7 @@ In your `sys.config`:
 
 ### Database Operations
 
-- `create_db/2` - Create a new database
+- `create_db/1,2` - Create a new database
 - `open_db/1` - Open an existing database
 - `close_db/1` - Close a database
 - `delete_db/1` - Delete a database
@@ -77,25 +90,43 @@ In your `sys.config`:
 
 ### Document Operations
 
-- `save_doc/2,3` - Save a document (create or update)
-- `fetch_doc/3` - Fetch a document by ID
-- `delete_doc/3` - Delete a document
-- `fold_docs/4` - Iterate over documents
+- `put_doc/2,3` - Create or update a document
+- `get_doc/2,3` - Fetch a document by ID
+- `delete_doc/2,3` - Delete a document
+- `fold_docs/3` - Iterate over documents
+
+### Queries
+
+- `find/2,3` - Query documents with declarative syntax
+- `explain/2` - Explain query execution plan
+
+### Subscriptions
+
+- `subscribe/2,3` - Subscribe to path pattern changes
+- `unsubscribe/1` - Unsubscribe
+- `subscribe_query/2,3` - Subscribe to query-matching changes
+- `unsubscribe_query/1` - Unsubscribe
 
 ### Changes Feed
 
-- `changes_since/4` - Get changes since a sequence
-- `subscribe_changes/3` - Subscribe to real-time changes
+- `get_changes/2,3` - Get changes since HLC timestamp
+- `subscribe_changes/2,3` - Subscribe to changes stream
+
+### HLC (Distributed Ordering)
+
+- `get_hlc/0` - Get current HLC timestamp
+- `new_hlc/0` - Generate new HLC timestamp
+- `sync_hlc/1` - Synchronize with remote HLC
 
 ### Views
 
-- `query_view/4` - Query a view
-- `fold_view/5` - Iterate over view results
+- `register_view/3` - Register a secondary index
+- `query_view/3` - Query a view
+- `refresh_view/2` - Refresh and wait for view
 
 ### Replication
 
-- `start_replication/3` - Start replication between databases
-- `stop_replication/1` - Stop a replication
+- `barrel_rep:replicate/2,3` - Replicate between databases
 
 ## Architecture
 

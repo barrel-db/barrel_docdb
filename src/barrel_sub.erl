@@ -6,9 +6,11 @@
 %%% patterns are modified.
 %%%
 %%% Pattern examples:
-%%% - `<<"users/+/profile">>` matches `users/123/profile`, `users/abc/profile`
-%%% - `<<"orders/#">>` matches `orders/123`, `orders/123/items/1`
-%%% - `<<"config">>` matches exactly `config`
+%%% ```
+%%% "users/+/profile" - matches users/123/profile, users/abc/profile
+%%% "orders/#"        - matches orders/123, orders/123/items/1
+%%% "config"          - matches exactly config
+%%% '''
 %%%
 %%% Subscriptions are ephemeral - tied to subscriber process lifetime.
 %%% @end
@@ -82,8 +84,8 @@ subscribe(DbName, Pattern, Pid) when is_binary(Pattern), is_pid(Pid) ->
 unsubscribe(SubRef, Pid) when is_reference(SubRef), is_pid(Pid) ->
     gen_server:call(?MODULE, {unsubscribe, SubRef, Pid}).
 
-%% @doc Find all subscriber PIDs matching the given paths
-%% Paths should be slash-separated binaries like <<"users/123/name">>
+%% @doc Find all subscriber PIDs matching the given paths.
+%% Paths should be slash-separated binaries like `"users/123/name"'.
 -spec match(db_name(), [binary()]) -> [pid()].
 match(DbName, Paths) when is_list(Paths) ->
     gen_server:call(?MODULE, {match, DbName, Paths}).
