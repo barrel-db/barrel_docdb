@@ -5,8 +5,7 @@
     {applications, [
         kernel,
         stdlib,
-        barrel_docdb,
-        jsx
+        barrel_docdb
     ]},
     {env, []},
     {modules, []}

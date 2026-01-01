@@ -44,6 +44,15 @@ run(Config) ->
     cleanup_db(),
 
     print_results(Results),
+
+    %% Save JSON output
+    Output = #{
+        timestamp => timestamp(),
+        config => #{num_docs => NumDocs, iterations => Iterations},
+        results => Results
+    },
+    save_results(Output),
+
     Results.
 
 %% @doc Run only CRUD benchmarks
@@ -155,3 +164,27 @@ print_summary(Op, Summary) ->
     P99 = maps:get(latency_p99, Summary, 0),
     io:format("  ~-15s ~8.1f ops/sec, p50: ~6bus, p99: ~6bus (~p ops)~n",
               [atom_to_list(Op) ++ ":", Throughput, P50, P99, Count]).
+
+timestamp() ->
+    {{Y, M, D}, {H, Mi, S}} = calendar:local_time(),
+    list_to_binary(io_lib:format("~4..0B-~2..0B-~2..0B_~2..0B-~2..0B-~2..0B",
+                                  [Y, M, D, H, Mi, S])).
+
+save_results(Output) ->
+    %% Ensure results directory exists
+    ResultsDir = "results",
+    ok = filelib:ensure_dir(ResultsDir ++ "/"),
+
+    %% Save with timestamp
+    Timestamp = maps:get(timestamp, Output),
+    Filename = io_lib:format("~s/~s.json", [ResultsDir, Timestamp]),
+
+    %% Also save as latest.json
+    LatestFile = ResultsDir ++ "/latest.json",
+
+    Json = json:encode(Output),
+
+    ok = file:write_file(Filename, Json),
+    ok = file:write_file(LatestFile, Json),
+
+    io:format("Results saved to: ~s~n", [Filename]).
