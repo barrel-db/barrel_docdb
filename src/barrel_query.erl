@@ -140,7 +140,24 @@ validate_spec(_) ->
 -spec execute(barrel_store_rocksdb:db_ref(), db_name(), query_plan()) ->
     {ok, [map()], seq()} | {error, term()}.
 execute(StoreRef, DbName, #query_plan{} = Plan) ->
-    %% Execute based on strategy
+    #query_plan{order = Order, limit = Limit, conditions = Conditions} = Plan,
+
+    %% Check if we can use indexed order for ORDER BY + LIMIT optimization
+    %% Most beneficial when: no filter conditions, small limit, large dataset
+    case can_use_indexed_order(Order, Limit) of
+        {true, OrderPath, Dir} ->
+            case should_use_indexed_order(OrderPath, Conditions) of
+                true ->
+                    execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan);
+                false ->
+                    execute_by_strategy(StoreRef, DbName, Plan)
+            end;
+        false ->
+            execute_by_strategy(StoreRef, DbName, Plan)
+    end.
+
+%% @doc Execute based on query strategy
+execute_by_strategy(StoreRef, DbName, Plan) ->
     case Plan#query_plan.strategy of
         index_seek ->
             execute_index_seek(StoreRef, DbName, Plan);
@@ -151,6 +168,22 @@ execute(StoreRef, DbName, #query_plan{} = Plan) ->
         full_scan ->
             execute_full_scan(StoreRef, DbName, Plan)
     end.
+
+%% @doc Decide if indexed order should be used
+%% The Top-K optimization is most beneficial when:
+%% - No filter conditions (pure ORDER BY + LIMIT)
+%% - This avoids sorting all documents
+%% With filter conditions, the standard path with early limit + batch fetch is often faster
+should_use_indexed_order(_OrderPath, []) ->
+    %% No conditions - pure ORDER BY + LIMIT, definitely use indexed order
+    %% This is the main use case: "get latest N" without filtering
+    true;
+should_use_indexed_order(_OrderPath, _Conditions) ->
+    %% With filter conditions, the standard path is usually better because:
+    %% 1. It uses batch fetching (multi_get)
+    %% 2. The early limit optimization already helps
+    %% 3. Filter conditions typically reduce the result set significantly
+    false.
 
 %% @doc Check if a document matches a compiled query plan.
 %% This is useful for filtering documents in-memory without index access.
@@ -533,6 +566,111 @@ can_use_early_limit([], [], Limit) when is_integer(Limit), Limit > 0 ->
 can_use_early_limit(_, _, _) ->
     %% Either has ORDER BY or remaining conditions that need full scan
     false.
+
+%% @doc Check if we can use indexed order for ORDER BY + LIMIT
+%% Returns {true, Path, Dir} if ORDER BY can use index iteration order
+can_use_indexed_order([], _Limit) ->
+    false;
+can_use_indexed_order(_Order, undefined) ->
+    false;
+can_use_indexed_order([{Path, Dir}], Limit) when is_list(Path), is_integer(Limit), Limit > 0 ->
+    %% Single ORDER BY on a path - can use index order
+    {true, Path, Dir};
+can_use_indexed_order([{Var, _Dir}], Limit) when is_atom(Var), is_integer(Limit), Limit > 0 ->
+    %% ORDER BY on a variable - check if it's bound to a path
+    %% For now, we only support direct path ordering
+    case is_logic_var(Var) of
+        true -> false;  %% Variable - can't use directly
+        false -> false
+    end;
+can_use_indexed_order(_, _) ->
+    false.
+
+%% @doc Execute query using indexed order for ORDER BY + LIMIT
+%% Iterates the index in the requested order and stops early
+execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan) ->
+    #query_plan{
+        conditions = Conditions,
+        bindings = Bindings,
+        projections = Projections,
+        limit = Limit,
+        offset = Offset,
+        include_docs = IncludeDocs
+    } = Plan,
+
+    %% Calculate how many results we need (accounting for filtering)
+    %% Collect 3x to handle filtering and deleted docs
+    MaxCollect = (Limit + Offset) * 3,
+
+    %% Choose iteration direction based on ORDER BY
+    FoldFun = case Dir of
+        desc -> fun barrel_ars_index:fold_path_values_reverse/5;
+        asc -> fun barrel_ars_index:fold_path_values/5
+    end,
+
+    %% Collect matching documents with early termination
+    {_Count, Results} = FoldFun(
+        StoreRef, DbName, OrderPath,
+        fun({_Path, DocId}, {Count, Acc}) ->
+            case Count >= MaxCollect of
+                true ->
+                    {stop, {Count, Acc}};
+                false ->
+                    %% Fetch and filter document
+                    case fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings) of
+                        {ok, Doc, BoundVars} ->
+                            Result = project_result(Doc, DocId, Projections, BoundVars, IncludeDocs),
+                            {ok, {Count + 1, [Result | Acc]}};
+                        skip ->
+                            {ok, {Count, Acc}}
+                    end
+            end
+        end,
+        {0, []}
+    ),
+
+    %% Results are in reverse order due to prepend - reverse them
+    %% Note: For DESC we iterate high-to-low, prepend gives low-to-high, so reverse gives high-to-low
+    %% For ASC we iterate low-to-high, prepend gives high-to-low, so reverse gives low-to-high
+    OrderedResults = lists:reverse(Results),
+
+    %% Apply offset and limit (no sorting needed - already in order)
+    FinalResults = apply_offset_limit(OrderedResults, Offset, Limit),
+
+    %% Get last sequence
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    {ok, FinalResults, LastSeq}.
+
+%% @doc Fetch a document and check if it matches conditions
+%% Returns {ok, Doc, BoundVars} or skip
+fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings) ->
+    DocInfoKey = barrel_store_keys:doc_info(DbName, DocId),
+    case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
+        {ok, DocInfoBin} ->
+            DocInfo = binary_to_term(DocInfoBin),
+            case maps:get(deleted, DocInfo, false) of
+                true ->
+                    skip;
+                false ->
+                    Rev = maps:get(rev, DocInfo),
+                    RevKey = barrel_store_keys:doc_rev(DbName, DocId, Rev),
+                    case barrel_store_rocksdb:get(StoreRef, RevKey) of
+                        {ok, DocBin} ->
+                            Doc = binary_to_term(DocBin),
+                            case matches_conditions(Doc, Conditions, Bindings) of
+                                {true, BoundVars} ->
+                                    {ok, Doc, BoundVars};
+                                false ->
+                                    skip
+                            end;
+                        _ ->
+                            skip
+                    end
+            end;
+        _ ->
+            skip
+    end.
 
 %% @doc Execute using index prefix scan
 execute_index_scan(StoreRef, DbName, Plan) ->

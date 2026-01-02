@@ -38,12 +38,20 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running nested path queries...~n"),
     NestedPath = bench_query(Db, nested_path_query(), Iterations),
 
+    io:format("  Running ORDER BY + LIMIT queries (Top-K)...~n"),
+    TopK = bench_query(Db, order_by_limit_query(), Iterations),
+
+    io:format("  Running pure ORDER BY + LIMIT (no filter)...~n"),
+    PureTopK = bench_query(Db, pure_order_limit_query(), Iterations),
+
     #{
         simple_eq => barrel_bench_metrics:summarize(SimpleEq),
         simple_eq_limit => barrel_bench_metrics:summarize(SimpleEqLimit),
         range => barrel_bench_metrics:summarize(Range),
         multi_condition => barrel_bench_metrics:summarize(MultiCond),
-        nested_path => barrel_bench_metrics:summarize(NestedPath)
+        nested_path => barrel_bench_metrics:summarize(NestedPath),
+        order_by_limit => barrel_bench_metrics:summarize(TopK),
+        pure_topk => barrel_bench_metrics:summarize(PureTopK)
     }.
 
 %%====================================================================
@@ -70,6 +78,19 @@ multi_condition_query() ->
 
 nested_path_query() ->
     #{where => [{path, [<<"profile">>, <<"city">>], <<"Paris">>}]}.
+
+order_by_limit_query() ->
+    %% Get the 10 most recently created users (ORDER BY created_at DESC LIMIT 10)
+    #{where => [{path, [<<"type">>], <<"user">>}],
+      order_by => {[<<"created_at">>], desc},
+      limit => 10}.
+
+pure_order_limit_query() ->
+    %% Pure ORDER BY + LIMIT with no filter conditions
+    %% This is where Top-K optimization provides the most benefit
+    #{where => [],
+      order_by => {[<<"created_at">>], desc},
+      limit => 10}.
 
 %%====================================================================
 %% Internal functions

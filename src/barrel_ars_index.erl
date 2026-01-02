@@ -18,7 +18,9 @@
     remove_doc/3,
     fold_path/5,
     fold_path_reverse/5,
-    fold_path_range/6
+    fold_path_range/6,
+    fold_path_values/5,
+    fold_path_values_reverse/5
 ]).
 
 %% Operations-only variants (for batching with other ops)
@@ -236,6 +238,32 @@ fold_path_range(StoreRef, _DbName, StartKey, EndKey, Fun, Acc0) ->
         Fun({Path, DocId}, Acc)
     end,
     barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, Acc0).
+
+%% @doc Fold over all values for a path in ascending order.
+%% Useful for ORDER BY path ASC with early termination.
+%% The callback receives {FullPath, DocId} where FullPath includes the value.
+-spec fold_path_values(store_ref(), db_name(), [term()], fun(), term()) -> term().
+fold_path_values(StoreRef, DbName, PathPrefix, Fun, Acc0) ->
+    Prefix = barrel_store_keys:path_index_prefix(DbName, PathPrefix),
+    EndKey = barrel_store_keys:path_index_end(DbName, PathPrefix),
+    FoldFun = fun(Key, _Value, Acc) ->
+        {ok, {Path, DocId}} = decode_path_index_key(Key),
+        Fun({Path, DocId}, Acc)
+    end,
+    barrel_store_rocksdb:fold_range(StoreRef, Prefix, EndKey, FoldFun, Acc0).
+
+%% @doc Fold over all values for a path in descending order.
+%% Useful for ORDER BY path DESC with early termination.
+%% Iterates from highest value to lowest.
+-spec fold_path_values_reverse(store_ref(), db_name(), [term()], fun(), term()) -> term().
+fold_path_values_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0) ->
+    Prefix = barrel_store_keys:path_index_prefix(DbName, PathPrefix),
+    EndKey = barrel_store_keys:path_index_end(DbName, PathPrefix),
+    FoldFun = fun(Key, _Value, Acc) ->
+        {ok, {Path, DocId}} = decode_path_index_key(Key),
+        Fun({Path, DocId}, Acc)
+    end,
+    barrel_store_rocksdb:fold_range_reverse(StoreRef, Prefix, EndKey, FoldFun, Acc0).
 
 %%====================================================================
 %% Internal functions
