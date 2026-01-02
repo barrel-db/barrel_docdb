@@ -42,6 +42,9 @@
     normalize_condition/1
 ]).
 
+%% Profiling (temporary)
+-export([get_profile/0, reset_profile/0, dump_profile/0]).
+
 %%====================================================================
 %% Types
 %%====================================================================
@@ -551,8 +554,8 @@ execute_index_seek(StoreRef, DbName, Plan) ->
                     %% No matches - skip iteration entirely
                     filter_and_project(StoreRef, DbName, [], Plan);
                 _ ->
-                    %% Collect doc IDs via index iteration
-                    %% RocksDB prefix bloom filters will skip non-matching blocks
+                    %% PROFILING: Index iteration
+                    T0 = erlang:monotonic_time(microsecond),
                     RemainingConds = Conditions -- [IndexCond],
                     EarlyLimitResult = can_use_early_limit(Order, RemainingConds, Limit),
                     DocIds = case EarlyLimitResult of
@@ -561,11 +564,21 @@ execute_index_seek(StoreRef, DbName, Plan) ->
                         false ->
                             collect_docids_for_path(StoreRef, DbName, FullPath)
                     end,
+                    T1 = erlang:monotonic_time(microsecond),
+                    put(profile_index_iter, pdict_get(profile_index_iter, 0) + (T1 - T0)),
+                    put(profile_doc_count, length(DocIds)),
                     filter_and_project(StoreRef, DbName, DocIds, Plan)
             end;
         not_found ->
             %% Fallback to scan
             execute_index_scan(StoreRef, DbName, Plan)
+    end.
+
+%% @private Helper for process dictionary get with default
+pdict_get(Key, Default) ->
+    case erlang:get(Key) of
+        undefined -> Default;
+        Value -> Value
     end.
 
 %% @doc Check if early limit optimization can be used
@@ -1005,9 +1018,12 @@ batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projectio
     case DocIds of
         [] -> [];
         _ ->
-            %% Step 1: Batch fetch all doc_info keys
+            %% PROFILING: Doc info fetch
+            T0 = erlang:monotonic_time(microsecond),
             DocInfoKeys = [barrel_store_keys:doc_info(DbName, Id) || Id <- DocIds],
             DocInfoResults = barrel_store_rocksdb:multi_get(StoreRef, DocInfoKeys),
+            T1 = erlang:monotonic_time(microsecond),
+            put(profile_docinfo_fetch, pdict_get(profile_docinfo_fetch, 0) + (T1 - T0)),
 
             %% Step 2: Filter deleted docs, collect doc_rev keys for non-deleted
             {ActiveDocs, RevKeys} = lists:foldl(
@@ -1037,13 +1053,17 @@ batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projectio
             case RevKeys of
                 [] -> [];
                 _ ->
-                    %% Reverse to maintain order correspondence
+                    %% PROFILING: Doc body fetch
+                    T2 = erlang:monotonic_time(microsecond),
                     ReversedDocIds = lists:reverse(ActiveDocs),
                     ReversedRevKeys = lists:reverse(RevKeys),
                     DocBodyResults = barrel_store_rocksdb:multi_get(StoreRef, ReversedRevKeys),
+                    T3 = erlang:monotonic_time(microsecond),
+                    put(profile_docbody_fetch, pdict_get(profile_docbody_fetch, 0) + (T3 - T2)),
 
-                    %% Step 4: Match bodies with doc IDs and filter by conditions
-                    lists:filtermap(
+                    %% PROFILING: Deserialization + condition matching
+                    T4 = erlang:monotonic_time(microsecond),
+                    Results = lists:filtermap(
                         fun({DocId, BodyResult}) ->
                             case BodyResult of
                                 {ok, DocBin} ->
@@ -1062,7 +1082,10 @@ batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projectio
                             end
                         end,
                         lists:zip(ReversedDocIds, DocBodyResults)
-                    )
+                    ),
+                    T5 = erlang:monotonic_time(microsecond),
+                    put(profile_deser_match, pdict_get(profile_deser_match, 0) + (T5 - T4)),
+                    Results
             end
     end.
 
@@ -1360,4 +1383,55 @@ find_best_scan_path([{'and', Nested} | Rest]) ->
     end;
 find_best_scan_path([_ | Rest]) ->
     find_best_scan_path(Rest).
+
+%%====================================================================
+%% Profiling Functions (temporary)
+%%====================================================================
+
+%% @doc Get current profiling counters
+get_profile() ->
+    #{
+        index_iter_us => pdict_get(profile_index_iter, 0),
+        docinfo_fetch_us => pdict_get(profile_docinfo_fetch, 0),
+        docbody_fetch_us => pdict_get(profile_docbody_fetch, 0),
+        deser_match_us => pdict_get(profile_deser_match, 0),
+        doc_count => pdict_get(profile_doc_count, 0)
+    }.
+
+%% @doc Reset profiling counters
+reset_profile() ->
+    erase(profile_index_iter),
+    erase(profile_docinfo_fetch),
+    erase(profile_docbody_fetch),
+    erase(profile_deser_match),
+    erase(profile_doc_count),
+    ok.
+
+%% @doc Dump profiling data to console
+dump_profile() ->
+    Profile = get_profile(),
+    Total = maps:get(index_iter_us, Profile) +
+            maps:get(docinfo_fetch_us, Profile) +
+            maps:get(docbody_fetch_us, Profile) +
+            maps:get(deser_match_us, Profile),
+    io:format("~n=== Query Profile ===~n"),
+    io:format("  Index iteration:     ~8.B us (~5.1f%)~n",
+              [maps:get(index_iter_us, Profile),
+               pct(maps:get(index_iter_us, Profile), Total)]),
+    io:format("  Doc info fetch:      ~8.B us (~5.1f%)~n",
+              [maps:get(docinfo_fetch_us, Profile),
+               pct(maps:get(docinfo_fetch_us, Profile), Total)]),
+    io:format("  Doc body fetch:      ~8.B us (~5.1f%)~n",
+              [maps:get(docbody_fetch_us, Profile),
+               pct(maps:get(docbody_fetch_us, Profile), Total)]),
+    io:format("  Deser + matching:    ~8.B us (~5.1f%)~n",
+              [maps:get(deser_match_us, Profile),
+               pct(maps:get(deser_match_us, Profile), Total)]),
+    io:format("  --------------------------~n"),
+    io:format("  Total:               ~8.B us~n", [Total]),
+    io:format("  Docs processed:      ~8.B~n", [maps:get(doc_count, Profile)]),
+    ok.
+
+pct(_, 0) -> 0.0;
+pct(Part, Total) -> (Part / Total) * 100.
 
