@@ -284,7 +284,7 @@ get_doc(#{host := Host, db := Db}, DocId, Opts) ->
     Url = build_url(Host, Db, DocId, Opts),
     case httpc:request(get, {Url, []}, [], []) of
         {ok, {{_, 200, _}, _, Body}} ->
-            Doc = jsx:decode(Body, [return_maps]),
+            Doc = json:decode(Body),
             {ok, Doc, extract_meta(Doc)};
         {ok, {{_, 404, _}, _, _}} ->
             {error, not_found}
