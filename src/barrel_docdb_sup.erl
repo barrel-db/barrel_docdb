@@ -81,6 +81,16 @@ init([]) ->
         modules => [barrel_query_sub]
     },
 
+    %% Path dictionary for path ID interning (posting lists)
+    PathDict = #{
+        id => barrel_path_dict,
+        start => {barrel_path_dict, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [barrel_path_dict]
+    },
+
     %% Database supervisor for managing individual database processes
     DbSup = #{
         id => barrel_db_sup,
@@ -91,7 +101,7 @@ init([]) ->
         modules => [barrel_db_sup]
     },
 
-    %% Cache must start first, then HLC, Sub, QuerySub, finally DbSup
-    ChildSpecs = [Cache, Hlc, Sub, QuerySub, DbSup],
+    %% Cache must start first, then HLC, Sub, QuerySub, PathDict, finally DbSup
+    ChildSpecs = [Cache, Hlc, Sub, QuerySub, PathDict, DbSup],
 
     {ok, {SupFlags, ChildSpecs}}.
