@@ -21,6 +21,10 @@
 %% Bitmap operations
 -export([bitmap_set/3, bitmap_unset/3, bitmap_get/2, multi_get_bitmap/2]).
 
+%% Posting list operations
+-export([posting_get/2, posting_multi_get/2]).
+-export([posting_put/3, posting_delete/2]).
+
 %%====================================================================
 %% Types
 %%====================================================================
@@ -29,15 +33,17 @@
     ref := rocksdb:db_handle(),
     path := string(),
     default_cf := rocksdb:cf_handle(),
-    bitmap_cf := rocksdb:cf_handle()
+    bitmap_cf := rocksdb:cf_handle(),
+    posting_cf := rocksdb:cf_handle()
 }.
 
 -type snapshot() :: rocksdb:snapshot_handle().
 
 -export_type([db_ref/0, snapshot/0]).
 
-%% Bitmap column family name
+%% Column family names
 -define(BITMAP_CF_NAME, "bitmap").
+-define(POSTING_CF_NAME, "posting").
 
 %%====================================================================
 %% barrel_store callbacks
@@ -53,35 +59,65 @@ open(Path, Options) ->
     %% Column family descriptors
     DefaultCFOpts = [{merge_operator, counter_merge_operator}],
     BitmapCFOpts = [{merge_operator, {bitset_merge_operator, BitmapSize}}],
+    PostingCFOpts = [],  %% No merge operator - writes serialized by posting_writer
 
     CFDescriptors = [
         {"default", DefaultCFOpts},
-        {?BITMAP_CF_NAME, BitmapCFOpts}
+        {?BITMAP_CF_NAME, BitmapCFOpts},
+        {?POSTING_CF_NAME, PostingCFOpts}
     ],
 
     case rocksdb:open(Path, DbOpts, CFDescriptors) of
-        {ok, Ref, [DefaultCF, BitmapCF]} ->
+        {ok, Ref, [DefaultCF, BitmapCF, PostingCF]} ->
             {ok, #{ref => Ref, path => Path,
-                   default_cf => DefaultCF, bitmap_cf => BitmapCF}};
+                   default_cf => DefaultCF, bitmap_cf => BitmapCF,
+                   posting_cf => PostingCF}};
         {error, {db_open, _Msg}} ->
-            %% Database might not have bitmap CF yet, try to create it
+            %% Database might not have all CFs yet, try to create them
+            open_and_create_cfs(Path, DbOpts, BitmapCFOpts, PostingCFOpts);
+        {error, Reason} ->
+            {error, {db_open_failed, Reason}}
+    end.
+
+%% @private Open database and create missing column families
+open_and_create_cfs(Path, DbOpts, BitmapCFOpts, PostingCFOpts) ->
+    %% Try opening with just bitmap CF (for existing databases)
+    case rocksdb:open(Path, DbOpts, [{"default", []}, {?BITMAP_CF_NAME, BitmapCFOpts}]) of
+        {ok, Ref, [DefaultCF, BitmapCF]} ->
+            %% Add posting CF
+            case rocksdb:create_column_family(Ref, ?POSTING_CF_NAME, PostingCFOpts) of
+                {ok, PostingCF} ->
+                    {ok, #{ref => Ref, path => Path,
+                           default_cf => DefaultCF, bitmap_cf => BitmapCF,
+                           posting_cf => PostingCF}};
+                {error, CFErr} ->
+                    rocksdb:close(Ref),
+                    {error, {cf_create_failed, CFErr}}
+            end;
+        {error, _} ->
+            %% Try opening with no CFs (new database or very old)
             case rocksdb:open(Path, DbOpts) of
                 {ok, Ref} ->
+                    %% Create both bitmap and posting CFs
                     case rocksdb:create_column_family(Ref, ?BITMAP_CF_NAME, BitmapCFOpts) of
                         {ok, BitmapCF} ->
-                            %% Get handle to default CF (it's implicit)
-                            {ok, #{ref => Ref, path => Path,
-                                   default_cf => default_column_family,
-                                   bitmap_cf => BitmapCF}};
+                            case rocksdb:create_column_family(Ref, ?POSTING_CF_NAME, PostingCFOpts) of
+                                {ok, PostingCF} ->
+                                    {ok, #{ref => Ref, path => Path,
+                                           default_cf => default_column_family,
+                                           bitmap_cf => BitmapCF,
+                                           posting_cf => PostingCF}};
+                                {error, CFErr} ->
+                                    rocksdb:close(Ref),
+                                    {error, {cf_create_failed, CFErr}}
+                            end;
                         {error, CFErr} ->
                             rocksdb:close(Ref),
                             {error, {cf_create_failed, CFErr}}
                     end;
                 {error, Reason} ->
                     {error, {db_open_failed, Reason}}
-            end;
-        {error, Reason} ->
-            {error, {db_open_failed, Reason}}
+            end
     end.
 
 %% @doc Close the database
@@ -354,3 +390,28 @@ bitmap_get(#{ref := Ref, bitmap_cf := BitmapCF}, Key) ->
 -spec multi_get_bitmap(db_ref(), [binary()]) -> [{ok, binary()} | not_found | {error, term()}].
 multi_get_bitmap(#{ref := Ref, bitmap_cf := BitmapCF}, Keys) ->
     rocksdb:multi_get(Ref, BitmapCF, Keys, []).
+
+%%====================================================================
+%% Posting List Operations
+%%====================================================================
+
+%% @doc Get a posting list from the posting column family
+-spec posting_get(db_ref(), binary()) -> {ok, binary()} | not_found | {error, term()}.
+posting_get(#{ref := Ref, posting_cf := PostingCF}, Key) ->
+    rocksdb:get(Ref, PostingCF, Key, []).
+
+%% @doc Get multiple posting lists from the posting column family (batch read)
+-spec posting_multi_get(db_ref(), [binary()]) -> [{ok, binary()} | not_found | {error, term()}].
+posting_multi_get(#{ref := Ref, posting_cf := PostingCF}, Keys) ->
+    rocksdb:multi_get(Ref, PostingCF, Keys, []).
+
+%% @doc Put a posting list to the posting column family
+%% Note: Writes should be serialized through barrel_posting_writer
+-spec posting_put(db_ref(), binary(), binary()) -> ok | {error, term()}.
+posting_put(#{ref := Ref, posting_cf := PostingCF}, Key, Value) ->
+    rocksdb:put(Ref, PostingCF, Key, Value, []).
+
+%% @doc Delete a posting list from the posting column family
+-spec posting_delete(db_ref(), binary()) -> ok | {error, term()}.
+posting_delete(#{ref := Ref, posting_cf := PostingCF}, Key) ->
+    rocksdb:delete(Ref, PostingCF, Key, []).
