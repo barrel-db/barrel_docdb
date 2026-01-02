@@ -65,11 +65,19 @@
 %% @doc Index all paths from a document.
 %% Extracts paths using barrel_ars:analyze/1 and stores them.
 %% Also stores the reverse index (doc_id -> paths) for later updates.
+%% Updates posting lists for O(1) equality query lookups.
 -spec index_doc(store_ref(), db_name(), docid(), doc()) ->
     ok | {error, term()}.
 index_doc(StoreRef, DbName, DocId, Doc) ->
-    Operations = index_doc_ops(DbName, DocId, Doc),
-    barrel_store_rocksdb:write_batch(StoreRef, Operations).
+    Paths = barrel_ars:analyze(Doc),
+    Operations = make_index_ops(DbName, DocId, Paths),
+    case barrel_store_rocksdb:write_batch(StoreRef, Operations) of
+        ok ->
+            %% Update posting lists for each path
+            update_postings(StoreRef, DbName, DocId, Paths, add);
+        {error, _} = Error ->
+            Error
+    end.
 
 %% @doc Return batch operations to index all paths from a document.
 %% Use this to combine with other operations in a single write_batch.
@@ -80,18 +88,32 @@ index_doc_ops(DbName, DocId, Doc) ->
 
 %% @doc Update paths when a document changes.
 %% Computes the diff between old and new paths and applies changes.
+%% Updates posting lists for O(1) equality query lookups.
 -spec update_doc(store_ref(), db_name(), docid(), doc(), doc()) ->
     ok | {error, term()}.
 update_doc(StoreRef, DbName, DocId, OldDoc, NewDoc) ->
-    case update_doc_ops(DbName, DocId, OldDoc, NewDoc) of
-        [] ->
+    OldPaths = barrel_ars:analyze(OldDoc),
+    NewPaths = barrel_ars:analyze(NewDoc),
+    {Added, Removed} = barrel_ars:diff(OldPaths, NewPaths),
+
+    case {Added, Removed} of
+        {[], []} ->
             ok;
-        Operations ->
-            barrel_store_rocksdb:write_batch(StoreRef, Operations)
+        _ ->
+            Operations = make_update_ops(DbName, DocId, Added, Removed, NewPaths),
+            case barrel_store_rocksdb:write_batch(StoreRef, Operations) of
+                ok ->
+                    %% Update posting lists: remove old, add new
+                    ok = update_postings(StoreRef, DbName, DocId, Removed, remove),
+                    update_postings(StoreRef, DbName, DocId, Added, add);
+                {error, _} = Error ->
+                    Error
+            end
     end.
 
 %% @doc Return batch operations to update paths when a document changes.
 %% Use this to combine with other operations in a single write_batch.
+%% Note: Does not include posting list updates - use update_doc for full updates.
 -spec update_doc_ops(db_name(), docid(), doc(), doc()) ->
     [{put | delete, binary()} | {put, binary(), binary()}].
 update_doc_ops(DbName, DocId, OldDoc, NewDoc) ->
@@ -101,39 +123,14 @@ update_doc_ops(DbName, DocId, OldDoc, NewDoc) ->
 
     case {Added, Removed} of
         {[], []} ->
-            %% No changes
             [];
         _ ->
-            %% Build batch operations
-            RemoveOps = [{delete, barrel_store_keys:path_index_key(DbName, Path, DocId)}
-                         || {Path, _} <- Removed],
-            AddOps = [{put, barrel_store_keys:path_index_key(DbName, Path, DocId), <<>>}
-                      || {Path, _} <- Added],
-
-            %% Update counters: decrement removed, increment added
-            DecrOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), -1}
-                       || {Path, _} <- Removed],
-            IncrOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), 1}
-                       || {Path, _} <- Added],
-
-            %% Update bitmap for added paths (position varies by path depth)
-            %% Note: We don't unset on remove because other docs may share the position (hash collision)
-            %% The bitmap is a filter - false positives are OK, verified against actual index
-            BitmapSetOps = [{bitmap_set,
-                             barrel_store_keys:path_bitmap_key(DbName, Path),
-                             doc_to_position(DocId, Path)}
-                            || {Path, _} <- Added],
-
-            %% Update reverse index with new paths
-            ReverseOp = {put,
-                         barrel_store_keys:doc_paths_key(DbName, DocId),
-                         term_to_binary(NewPaths)},
-
-            RemoveOps ++ AddOps ++ DecrOps ++ IncrOps ++ BitmapSetOps ++ [ReverseOp]
+            make_update_ops(DbName, DocId, Added, Removed, NewPaths)
     end.
 
 %% @doc Remove all paths for a document.
 %% Reads the reverse index to find all paths and deletes them.
+%% Also removes from posting lists.
 -spec remove_doc(store_ref(), db_name(), docid()) ->
     ok | {error, term()}.
 remove_doc(StoreRef, DbName, DocId) ->
@@ -143,7 +140,13 @@ remove_doc(StoreRef, DbName, DocId) ->
         {ok, PathsBin} ->
             Paths = binary_to_term(PathsBin),
             Operations = remove_doc_ops(DbName, DocId, Paths),
-            barrel_store_rocksdb:write_batch(StoreRef, Operations);
+            case barrel_store_rocksdb:write_batch(StoreRef, Operations) of
+                ok ->
+                    %% Remove from posting lists
+                    update_postings(StoreRef, DbName, DocId, Paths, remove);
+                {error, _} = Error ->
+                    Error
+            end;
         not_found ->
             %% No paths indexed
             ok;
@@ -445,3 +448,57 @@ decode_float(<<Encoded:64/big-unsigned>>) ->
     end,
     <<F:64/float>> = <<Bits:64/big-unsigned>>,
     F.
+
+%% @private Create batch operations for updating paths (add/remove)
+make_update_ops(DbName, DocId, Added, Removed, NewPaths) ->
+    %% Build batch operations
+    RemoveOps = [{delete, barrel_store_keys:path_index_key(DbName, Path, DocId)}
+                 || {Path, _} <- Removed],
+    AddOps = [{put, barrel_store_keys:path_index_key(DbName, Path, DocId), <<>>}
+              || {Path, _} <- Added],
+
+    %% Update counters: decrement removed, increment added
+    DecrOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), -1}
+               || {Path, _} <- Removed],
+    IncrOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), 1}
+               || {Path, _} <- Added],
+
+    %% Update bitmap for added paths (position varies by path depth)
+    %% Note: We don't unset on remove because other docs may share the position
+    BitmapSetOps = [{bitmap_set,
+                     barrel_store_keys:path_bitmap_key(DbName, Path),
+                     doc_to_position(DocId, Path)}
+                    || {Path, _} <- Added],
+
+    %% Update reverse index with new paths
+    ReverseOp = {put,
+                 barrel_store_keys:doc_paths_key(DbName, DocId),
+                 term_to_binary(NewPaths)},
+
+    RemoveOps ++ AddOps ++ DecrOps ++ IncrOps ++ BitmapSetOps ++ [ReverseOp].
+
+%% @private Update posting lists for paths.
+%% Adds or removes DocId from posting lists based on Op.
+%% Paths format: [{[field, value], OrigValue}, ...]
+update_postings(StoreRef, DbName, DocId, Paths, Op) ->
+    lists:foreach(fun({Path, _Value}) ->
+        %% Path is like [<<"type">>, <<"user">>]
+        %% We need: FieldPath = [<<"type">>], Value = <<"user">>
+        case Path of
+            [] ->
+                ok;
+            _ ->
+                FieldPath = lists:droplast(Path),
+                PathValue = lists:last(Path),
+                %% Get or create PathId for the field path
+                PathId = barrel_path_dict:get_or_create_id(StoreRef, DbName, FieldPath),
+                %% Update posting list
+                case Op of
+                    add ->
+                        barrel_posting:add(StoreRef, DbName, PathId, PathValue, DocId);
+                    remove ->
+                        barrel_posting:remove(StoreRef, DbName, PathId, PathValue, DocId)
+                end
+        end
+    end, Paths),
+    ok.

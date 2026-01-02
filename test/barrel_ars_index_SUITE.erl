@@ -87,17 +87,22 @@ end_per_suite(_Config) ->
     ok.
 
 init_per_group(_Group, Config) ->
+    %% Start application for barrel_path_dict and other dependencies
+    {ok, Apps} = application:ensure_all_started(barrel_docdb),
+    %% Reset path dict for clean state
+    barrel_path_dict:reset(),
     %% Create a temporary directory for RocksDB
     TestDir = "/tmp/barrel_ars_index_test_" ++ integer_to_list(erlang:system_time(millisecond)),
     DbPath = TestDir ++ "/db",
     {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
-    [{test_dir, TestDir}, {store_ref, StoreRef}, {db_name, <<"testdb">>} | Config].
+    [{started_apps, Apps}, {test_dir, TestDir}, {store_ref, StoreRef}, {db_name, <<"testdb">>} | Config].
 
 end_per_group(_Group, Config) ->
     StoreRef = proplists:get_value(store_ref, Config),
     ok = barrel_store_rocksdb:close(StoreRef),
     TestDir = proplists:get_value(test_dir, Config),
     os:cmd("rm -rf " ++ TestDir),
+    application:stop(barrel_docdb),
     Config.
 
 init_per_testcase(_TestCase, Config) ->
