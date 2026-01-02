@@ -558,13 +558,8 @@ execute_multi_index(StoreRef, DbName, Plan) ->
         [] ->
             execute_full_scan(StoreRef, DbName, Plan);
         _ when length(IndexConditions) =< 2 ->
-            %% For 1-2 conditions, skip cardinality lookup (overhead not worth it)
-            [First | Rest] = IndexConditions,
-            {path, Path1, Value1} = First,
-            FullPath1 = Path1 ++ [Value1],
-            InitialDocIds = collect_docids_for_path(StoreRef, DbName, FullPath1),
-            FinalDocIds = intersect_conditions(StoreRef, DbName, Rest, InitialDocIds),
-            filter_and_project(StoreRef, DbName, FinalDocIds, Plan);
+            %% For 1-2 conditions, use bitmap-filtered collection if available
+            execute_with_bitmap_filter(StoreRef, DbName, IndexConditions, Plan);
         _ ->
             %% For 3+ conditions, order by cardinality (smallest first)
             %% Also short-circuit if any condition has 0 cardinality
@@ -572,15 +567,76 @@ execute_multi_index(StoreRef, DbName, Plan) ->
                 [] ->
                     %% All conditions have 0 cardinality - no matches possible
                     filter_and_project(StoreRef, DbName, [], Plan);
-                [First | Rest] ->
-                    %% Start with smallest cardinality condition
-                    {path, Path1, Value1} = First,
-                    FullPath1 = Path1 ++ [Value1],
-                    InitialDocIds = collect_docids_for_path(StoreRef, DbName, FullPath1),
-                    FinalDocIds = intersect_conditions(StoreRef, DbName, Rest, InitialDocIds),
-                    filter_and_project(StoreRef, DbName, FinalDocIds, Plan)
+                OrderedConditions ->
+                    %% Use bitmap-filtered collection
+                    execute_with_bitmap_filter(StoreRef, DbName, OrderedConditions, Plan)
             end
     end.
+
+%% @doc Execute multi-condition query using bitmap filtering
+%% Tries to use bitmaps for fast pre-filtering, falls back to sorted intersection
+execute_with_bitmap_filter(StoreRef, DbName, [First | Rest] = Conditions, Plan) ->
+    {path, Path1, Value1} = First,
+    FullPath1 = Path1 ++ [Value1],
+
+    %% Check if all conditions have same bitmap size (same path depth category)
+    AllSameSize = all_same_bitmap_size(Conditions),
+
+    case AllSameSize andalso length(Conditions) > 1 of
+        true ->
+            %% Try to get bitmaps for all conditions
+            FullPaths = [Path ++ [Value] || {path, Path, Value} <- Conditions],
+            BitmapKeys = [barrel_store_keys:path_bitmap_key(DbName, FP) || FP <- FullPaths],
+            BitmapResults = barrel_store_rocksdb:multi_get_bitmap(StoreRef, BitmapKeys),
+
+            %% Check if all bitmaps are available and non-empty
+            AllBitmaps = [B || {ok, B} <- BitmapResults, byte_size(B) > 0],
+            case length(AllBitmaps) =:= length(Conditions) of
+                true ->
+                    %% All bitmaps available - use bitmap intersection for filtering
+                    FilterBitmap = barrel_ars_index:bitmap_intersect(AllBitmaps),
+                    %% Collect DocIds from first condition, filtered by bitmap
+                    DocIds = collect_docids_with_bitmap_filter(StoreRef, DbName, FullPath1, FilterBitmap),
+                    filter_and_project(StoreRef, DbName, DocIds, Plan);
+                false ->
+                    %% Fallback: some bitmaps missing
+                    execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan)
+            end;
+        false ->
+            %% Fallback: different bitmap sizes or single condition
+            execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan)
+    end.
+
+%% @doc Check if all conditions use the same bitmap size
+all_same_bitmap_size([]) -> true;
+all_same_bitmap_size([{path, Path, Value} | Rest]) ->
+    FirstSize = barrel_ars_index:bitmap_size_for_path(Path ++ [Value]),
+    lists:all(
+        fun({path, P, V}) ->
+            barrel_ars_index:bitmap_size_for_path(P ++ [V]) =:= FirstSize
+        end,
+        Rest
+    ).
+
+%% @doc Execute using sorted intersection (fallback)
+execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan) ->
+    InitialDocIds = collect_docids_for_path(StoreRef, DbName, FullPath1),
+    FinalDocIds = intersect_conditions(StoreRef, DbName, Rest, InitialDocIds),
+    filter_and_project(StoreRef, DbName, FinalDocIds, Plan).
+
+%% @doc Collect DocIds from a path, filtering by bitmap
+collect_docids_with_bitmap_filter(StoreRef, DbName, FullPath, FilterBitmap) ->
+    barrel_ars_index:fold_path_reverse(
+        StoreRef, DbName, FullPath,
+        fun({_Path, DocId}, Acc) ->
+            Position = barrel_ars_index:doc_position(DocId, FullPath),
+            case barrel_ars_index:bitmap_test_position(FilterBitmap, Position) of
+                true -> {ok, [DocId | Acc]};
+                false -> {ok, Acc}  %% Skip - doesn't match filter
+            end
+        end,
+        []
+    ).
 
 %% @doc Order conditions by cardinality (smallest first) for optimal intersection.
 %% Returns empty list if any condition has 0 cardinality (short-circuit).

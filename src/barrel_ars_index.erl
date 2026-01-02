@@ -34,9 +34,26 @@
     get_path_cardinality/3
 ]).
 
+%% Bitmap utilities
+-export([
+    get_path_bitmap/3,
+    bitmap_size_for_path/1,
+    bitmap_intersect/1,
+    bitmap_test_position/2,
+    doc_position/2
+]).
+
 -include("barrel_docdb.hrl").
 
 -type store_ref() :: barrel_store_rocksdb:db_ref().
+
+%% Bitmap sizes based on path depth
+%% Top-level paths (depth 1-2): 1M bits - many docs likely match
+%% Mid-level paths (depth 3-4): 256K bits - fewer docs match
+%% Deep paths (depth 5+): 64K bits - very selective
+-define(BITMAP_SIZE_SHALLOW, 1048576).   %% 1M bits for depth 1-2
+-define(BITMAP_SIZE_MEDIUM, 262144).     %% 256K bits for depth 3-4
+-define(BITMAP_SIZE_DEEP, 65536).        %% 64K bits for depth 5+
 
 %%====================================================================
 %% API
@@ -96,12 +113,20 @@ update_doc_ops(DbName, DocId, OldDoc, NewDoc) ->
             IncrOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), 1}
                        || {Path, _} <- Added],
 
+            %% Update bitmap for added paths (position varies by path depth)
+            %% Note: We don't unset on remove because other docs may share the position (hash collision)
+            %% The bitmap is a filter - false positives are OK, verified against actual index
+            BitmapSetOps = [{bitmap_set,
+                             barrel_store_keys:path_bitmap_key(DbName, Path),
+                             doc_to_position(DocId, Path)}
+                            || {Path, _} <- Added],
+
             %% Update reverse index with new paths
             ReverseOp = {put,
                          barrel_store_keys:doc_paths_key(DbName, DocId),
                          term_to_binary(NewPaths)},
 
-            RemoveOps ++ AddOps ++ DecrOps ++ IncrOps ++ [ReverseOp]
+            RemoveOps ++ AddOps ++ DecrOps ++ IncrOps ++ BitmapSetOps ++ [ReverseOp]
     end.
 
 %% @doc Remove all paths for a document.
@@ -170,6 +195,14 @@ get_path_cardinality(StoreRef, DbName, Path) ->
             Error
     end.
 
+%% @doc Get the bitmap for a path+value.
+%% Returns the raw bitmap binary from the bitmap column family.
+-spec get_path_bitmap(store_ref(), db_name(), [term()]) ->
+    {ok, binary()} | not_found | {error, term()}.
+get_path_bitmap(StoreRef, DbName, Path) ->
+    Key = barrel_store_keys:path_bitmap_key(DbName, Path),
+    barrel_store_rocksdb:bitmap_get(StoreRef, Key).
+
 %% @doc Fold over path index entries matching a path prefix.
 %% The callback receives {Path, DocId} for each match.
 -spec fold_path(store_ref(), db_name(), [term()], fun(), term()) -> term().
@@ -218,12 +251,79 @@ make_index_ops(DbName, DocId, Paths) ->
     StatsOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), 1}
                 || {Path, _} <- Paths],
 
+    %% Set bitmap bits for each path (position varies by path depth)
+    BitmapOps = [{bitmap_set,
+                  barrel_store_keys:path_bitmap_key(DbName, Path),
+                  doc_to_position(DocId, Path)}
+                 || {Path, _} <- Paths],
+
     %% Store reverse index (doc_id -> paths) for later updates/deletes
     ReverseOp = {put,
                  barrel_store_keys:doc_paths_key(DbName, DocId),
                  term_to_binary(Paths)},
 
-    PathOps ++ StatsOps ++ [ReverseOp].
+    PathOps ++ StatsOps ++ BitmapOps ++ [ReverseOp].
+
+%% @private Convert DocId to a bitmap position using deterministic hash
+%% Uses path depth to determine bitmap size for better space efficiency
+doc_to_position(DocId, Path) ->
+    BitmapSize = bitmap_size_for_path(Path),
+    erlang:phash2(DocId, BitmapSize).
+
+%% @doc Get bitmap size based on path depth.
+%% Deeper paths are more selective, so we can use smaller bitmaps.
+%% This is used for consistent position calculation across read/write.
+-spec bitmap_size_for_path([term()]) -> pos_integer().
+bitmap_size_for_path(Path) when is_list(Path) ->
+    %% Path includes the value at the end, so actual depth = length - 1
+    Depth = length(Path) - 1,
+    if
+        Depth =< 2 -> ?BITMAP_SIZE_SHALLOW;
+        Depth =< 4 -> ?BITMAP_SIZE_MEDIUM;
+        true -> ?BITMAP_SIZE_DEEP
+    end.
+
+%% @doc Get the bitmap position for a document ID and path.
+%% This is the public version of doc_to_position/2.
+-spec doc_position(docid(), [term()]) -> non_neg_integer().
+doc_position(DocId, Path) ->
+    doc_to_position(DocId, Path).
+
+%% @doc Intersect multiple bitmaps (binary AND operation).
+%% Returns a bitmap with only bits set that are in ALL input bitmaps.
+-spec bitmap_intersect([binary()]) -> binary().
+bitmap_intersect([]) -> <<>>;
+bitmap_intersect([Bitmap]) -> Bitmap;
+bitmap_intersect([First | Rest]) ->
+    lists:foldl(fun bitmap_and/2, First, Rest).
+
+%% @doc Test if a position is set in a bitmap.
+%% Note: bitset_merge_operator uses big-endian bit ordering within bytes
+-spec bitmap_test_position(binary(), non_neg_integer()) -> boolean().
+bitmap_test_position(Bitmap, Position) when is_binary(Bitmap) ->
+    ByteIndex = Position div 8,
+    %% Big-endian bit ordering: bit 0 is MSB (leftmost), bit 7 is LSB
+    BitIndex = 7 - (Position rem 8),
+    case ByteIndex < byte_size(Bitmap) of
+        true ->
+            Byte = binary:at(Bitmap, ByteIndex),
+            (Byte band (1 bsl BitIndex)) =/= 0;
+        false ->
+            false
+    end.
+
+%% @private Binary AND of two bitmaps
+bitmap_and(A, B) ->
+    MinLen = min(byte_size(A), byte_size(B)),
+    bitmap_and_loop(A, B, MinLen, 0, <<>>).
+
+bitmap_and_loop(_A, _B, Len, Idx, Acc) when Idx >= Len ->
+    Acc;
+bitmap_and_loop(A, B, Len, Idx, Acc) ->
+    ByteA = binary:at(A, Idx),
+    ByteB = binary:at(B, Idx),
+    Result = ByteA band ByteB,
+    bitmap_and_loop(A, B, Len, Idx + 1, <<Acc/binary, Result>>).
 
 %% @private Decode a path index key to extract path and docid
 %% Key format: 0x0B + len:16 + dbname + encoded_path + docid

@@ -34,6 +34,9 @@
 %% Path stats keys (for cardinality counters)
 -export([path_stats_key/2]).
 
+%% Path bitmap keys (for bitmap index)
+-export([path_bitmap_key/2]).
+
 %% Path-HLC keys (for path-indexed change feeds)
 -export([path_hlc/3, path_hlc_prefix/2, path_hlc_end/2]).
 -export([encode_topic/1, decode_path_hlc_key/2]).
@@ -70,6 +73,7 @@
 -define(PREFIX_DOC_HLC, 16#0D).
 -define(PREFIX_PATH_HLC, 16#0E).
 -define(PREFIX_PATH_STATS, 16#0F).
+-define(PREFIX_PATH_BITMAP, 16#10).
 
 %% Path component type tags (for ordered encoding)
 -define(PATH_TYPE_NULL, 16#01).
@@ -408,6 +412,13 @@ doc_paths_prefix(DbName) ->
 path_stats_key(DbName, Path) ->
     EncodedPath = encode_path(Path),
     <<?PREFIX_PATH_STATS, (encode_name(DbName))/binary, EncodedPath/binary>>.
+
+%% @doc Path bitmap key for bitmap index.
+%% Stores a bitmap of document positions matching a specific path+value.
+-spec path_bitmap_key(db_name(), [term()]) -> binary().
+path_bitmap_key(DbName, Path) ->
+    EncodedPath = encode_path(Path),
+    <<?PREFIX_PATH_BITMAP, (encode_name(DbName))/binary, EncodedPath/binary>>.
 
 %% @doc Encode a path for lexicographic ordering.
 %% Path components are encoded with length prefix and type tags.

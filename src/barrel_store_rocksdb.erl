@@ -18,31 +18,68 @@
 -export([snapshot/1, release_snapshot/1]).
 -export([get_with_snapshot/3]).
 
+%% Bitmap operations
+-export([bitmap_set/3, bitmap_unset/3, bitmap_get/2, multi_get_bitmap/2]).
+
 %%====================================================================
 %% Types
 %%====================================================================
 
 -type db_ref() :: #{
     ref := rocksdb:db_handle(),
-    path := string()
+    path := string(),
+    default_cf := rocksdb:cf_handle(),
+    bitmap_cf := rocksdb:cf_handle()
 }.
 
 -type snapshot() :: rocksdb:snapshot_handle().
 
 -export_type([db_ref/0, snapshot/0]).
 
+%% Bitmap column family name
+-define(BITMAP_CF_NAME, "bitmap").
+
 %%====================================================================
 %% barrel_store callbacks
 %%====================================================================
 
-%% @doc Open a RocksDB database
+%% @doc Open a RocksDB database with column families
 -spec open(string(), map()) -> {ok, db_ref()} | {error, term()}.
 open(Path, Options) ->
     ok = filelib:ensure_dir(Path ++ "/"),
     DbOpts = build_db_options(Options),
-    case rocksdb:open(Path, DbOpts) of
-        {ok, Ref} ->
-            {ok, #{ref => Ref, path => Path}};
+    BitmapSize = maps:get(bitmap_size, Options, 1048576),  %% 1M bits default
+
+    %% Column family descriptors
+    DefaultCFOpts = [{merge_operator, counter_merge_operator}],
+    BitmapCFOpts = [{merge_operator, {bitset_merge_operator, BitmapSize}}],
+
+    CFDescriptors = [
+        {"default", DefaultCFOpts},
+        {?BITMAP_CF_NAME, BitmapCFOpts}
+    ],
+
+    case rocksdb:open(Path, DbOpts, CFDescriptors) of
+        {ok, Ref, [DefaultCF, BitmapCF]} ->
+            {ok, #{ref => Ref, path => Path,
+                   default_cf => DefaultCF, bitmap_cf => BitmapCF}};
+        {error, {db_open, _Msg}} ->
+            %% Database might not have bitmap CF yet, try to create it
+            case rocksdb:open(Path, DbOpts) of
+                {ok, Ref} ->
+                    case rocksdb:create_column_family(Ref, ?BITMAP_CF_NAME, BitmapCFOpts) of
+                        {ok, BitmapCF} ->
+                            %% Get handle to default CF (it's implicit)
+                            {ok, #{ref => Ref, path => Path,
+                                   default_cf => default_column_family,
+                                   bitmap_cf => BitmapCF}};
+                        {error, CFErr} ->
+                            rocksdb:close(Ref),
+                            {error, {cf_create_failed, CFErr}}
+                    end;
+                {error, Reason} ->
+                    {error, {db_open_failed, Reason}}
+            end;
         {error, Reason} ->
             {error, {db_open_failed, Reason}}
     end.
@@ -90,8 +127,14 @@ write_batch(DbRef, Operations) ->
 %% @doc Execute a batch of operations atomically with options
 %% Options:
 %%   - sync: boolean() - if true, sync to disk before returning (default: false)
+%% Operations:
+%%   - {put, Key, Value} - put to default CF
+%%   - {delete, Key} - delete from default CF
+%%   - {merge, Key, Delta} - merge counter in default CF
+%%   - {bitmap_set, Key, Position} - set bit in bitmap CF
+%%   - {bitmap_unset, Key, Position} - unset bit in bitmap CF
 -spec write_batch(db_ref(), list(), map()) -> ok | {error, term()}.
-write_batch(#{ref := Ref}, Operations, Opts) ->
+write_batch(#{ref := Ref, bitmap_cf := BitmapCF}, Operations, Opts) ->
     Sync = maps:get(sync, Opts, false),
     {ok, Batch} = rocksdb:batch(),
     try
@@ -101,7 +144,13 @@ write_batch(#{ref := Ref}, Operations, Opts) ->
                ({delete, Key}) ->
                 ok = rocksdb:batch_delete(Batch, Key);
                ({merge, Key, Delta}) when is_integer(Delta) ->
-                ok = rocksdb:batch_merge(Batch, Key, integer_to_binary(Delta))
+                ok = rocksdb:batch_merge(Batch, Key, integer_to_binary(Delta));
+               ({bitmap_set, Key, Position}) when is_integer(Position) ->
+                ok = rocksdb:batch_merge(Batch, BitmapCF, Key,
+                                         <<"+", (integer_to_binary(Position))/binary>>);
+               ({bitmap_unset, Key, Position}) when is_integer(Position) ->
+                ok = rocksdb:batch_merge(Batch, BitmapCF, Key,
+                                         <<"-", (integer_to_binary(Position))/binary>>)
             end,
             Operations
         ),
@@ -279,3 +328,29 @@ fold_loop_reverse({error, invalid_iterator}, _Itr, _Fun, Acc) ->
     Acc;
 fold_loop_reverse({error, _Reason}, _Itr, _Fun, Acc) ->
     Acc.
+
+%%====================================================================
+%% Bitmap Operations
+%%====================================================================
+
+%% @doc Set a bit in a bitmap using merge operator
+%% The bitset_merge_operator uses format: <<"+", Position/binary>>
+-spec bitmap_set(db_ref(), binary(), non_neg_integer()) -> ok | {error, term()}.
+bitmap_set(#{ref := Ref, bitmap_cf := BitmapCF}, Key, Position) ->
+    rocksdb:merge(Ref, BitmapCF, Key, <<"+", (integer_to_binary(Position))/binary>>, []).
+
+%% @doc Unset a bit in a bitmap using merge operator
+%% The bitset_merge_operator uses format: <<"-", Position/binary>>
+-spec bitmap_unset(db_ref(), binary(), non_neg_integer()) -> ok | {error, term()}.
+bitmap_unset(#{ref := Ref, bitmap_cf := BitmapCF}, Key, Position) ->
+    rocksdb:merge(Ref, BitmapCF, Key, <<"-", (integer_to_binary(Position))/binary>>, []).
+
+%% @doc Get a bitmap from the bitmap column family
+-spec bitmap_get(db_ref(), binary()) -> {ok, binary()} | not_found | {error, term()}.
+bitmap_get(#{ref := Ref, bitmap_cf := BitmapCF}, Key) ->
+    rocksdb:get(Ref, BitmapCF, Key, []).
+
+%% @doc Get multiple bitmaps from the bitmap column family (batch read)
+-spec multi_get_bitmap(db_ref(), [binary()]) -> [{ok, binary()} | not_found | {error, term()}].
+multi_get_bitmap(#{ref := Ref, bitmap_cf := BitmapCF}, Keys) ->
+    rocksdb:multi_get(Ref, BitmapCF, Keys, []).

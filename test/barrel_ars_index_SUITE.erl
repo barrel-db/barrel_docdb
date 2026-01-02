@@ -35,7 +35,9 @@
     multiple_docs_same_path/1,
     cardinality_basic/1,
     cardinality_update/1,
-    cardinality_remove/1
+    cardinality_remove/1,
+    bitmap_basic/1,
+    bitmap_size_by_depth/1
 ]).
 
 %%====================================================================
@@ -43,7 +45,7 @@
 %%====================================================================
 
 all() ->
-    [{group, index}, {group, update}, {group, remove}, {group, fold}, {group, cardinality}].
+    [{group, index}, {group, update}, {group, remove}, {group, fold}, {group, cardinality}, {group, bitmap}].
 
 groups() ->
     [
@@ -71,6 +73,10 @@ groups() ->
             cardinality_basic,
             cardinality_update,
             cardinality_remove
+        ]},
+        {bitmap, [sequence], [
+            bitmap_basic,
+            bitmap_size_by_depth
         ]}
     ].
 
@@ -451,5 +457,58 @@ cardinality_remove(Config) ->
     %% Remove second doc
     ok = barrel_ars_index:remove_doc(StoreRef, DbName, <<"rm2">>),
     {ok, 0} = barrel_ars_index:get_path_cardinality(StoreRef, DbName, [<<"cat">>, <<"rm_test">>]),
+
+    ok.
+
+%%====================================================================
+%% Test Cases - Bitmap
+%%====================================================================
+
+bitmap_basic(Config) ->
+    StoreRef = proplists:get_value(store_ref, Config),
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Initially no bitmap
+    not_found = barrel_ars_index:get_path_bitmap(StoreRef, DbName, [<<"type">>, <<"bitmap_test">>]),
+
+    %% Index a doc - bitmap should be created
+    Doc1 = #{<<"type">> => <<"bitmap_test">>},
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"bm1">>, Doc1),
+
+    %% Bitmap should now exist
+    {ok, Bitmap1} = barrel_ars_index:get_path_bitmap(StoreRef, DbName, [<<"type">>, <<"bitmap_test">>]),
+    ?assert(is_binary(Bitmap1)),
+
+    %% Index another doc with same path
+    Doc2 = #{<<"type">> => <<"bitmap_test">>},
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"bm2">>, Doc2),
+
+    %% Bitmap should still exist (and be updated)
+    {ok, Bitmap2} = barrel_ars_index:get_path_bitmap(StoreRef, DbName, [<<"type">>, <<"bitmap_test">>]),
+    ?assert(is_binary(Bitmap2)),
+
+    ok.
+
+bitmap_size_by_depth(Config) ->
+    _StoreRef = proplists:get_value(store_ref, Config),
+
+    %% Test that bitmap size varies by path depth
+    %% Shallow paths (depth 1-2) use larger bitmaps
+    Size1 = barrel_ars_index:bitmap_size_for_path([<<"type">>, <<"user">>]),
+    ?assertEqual(1048576, Size1),  %% 1M bits
+
+    Size2 = barrel_ars_index:bitmap_size_for_path([<<"a">>, <<"b">>, <<"c">>]),
+    ?assertEqual(1048576, Size2),  %% Still shallow (depth 2)
+
+    %% Medium depth (3-4) uses smaller bitmaps
+    Size3 = barrel_ars_index:bitmap_size_for_path([<<"a">>, <<"b">>, <<"c">>, <<"d">>]),
+    ?assertEqual(262144, Size3),  %% 256K bits (depth 3)
+
+    Size4 = barrel_ars_index:bitmap_size_for_path([<<"a">>, <<"b">>, <<"c">>, <<"d">>, <<"e">>]),
+    ?assertEqual(262144, Size4),  %% Still medium (depth 4)
+
+    %% Deep paths (5+) use smallest bitmaps
+    Size5 = barrel_ars_index:bitmap_size_for_path([<<"a">>, <<"b">>, <<"c">>, <<"d">>, <<"e">>, <<"f">>]),
+    ?assertEqual(65536, Size5),  %% 64K bits (depth 5)
 
     ok.
