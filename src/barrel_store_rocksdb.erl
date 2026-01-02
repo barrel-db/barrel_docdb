@@ -202,7 +202,8 @@ fold(#{ref := Ref}, Prefix, Fun, Acc) ->
     PrefixEnd = prefix_end(Prefix),
     ReadOpts = [
         {iterate_lower_bound, Prefix},
-        {iterate_upper_bound, PrefixEnd}
+        {iterate_upper_bound, PrefixEnd},
+        {total_order_seek, true}
     ],
     {ok, Itr} = rocksdb:iterator(Ref, ReadOpts),
     try
@@ -216,7 +217,8 @@ fold(#{ref := Ref}, Prefix, Fun, Acc) ->
 fold_range(#{ref := Ref}, StartKey, EndKey, Fun, Acc) ->
     ReadOpts = [
         {iterate_lower_bound, StartKey},
-        {iterate_upper_bound, EndKey}
+        {iterate_upper_bound, EndKey},
+        {total_order_seek, true}
     ],
     {ok, Itr} = rocksdb:iterator(Ref, ReadOpts),
     try
@@ -231,7 +233,8 @@ fold_range(#{ref := Ref}, StartKey, EndKey, Fun, Acc) ->
 fold_range_reverse(#{ref := Ref}, StartKey, EndKey, Fun, Acc) ->
     ReadOpts = [
         {iterate_lower_bound, StartKey},
-        {iterate_upper_bound, EndKey}
+        {iterate_upper_bound, EndKey},
+        {total_order_seek, true}
     ],
     {ok, Itr} = rocksdb:iterator(Ref, ReadOpts),
     try
