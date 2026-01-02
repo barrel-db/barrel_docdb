@@ -17,6 +17,7 @@
     update_doc/5,
     remove_doc/3,
     fold_path/5,
+    fold_path_reverse/5,
     fold_path_range/6
 ]).
 
@@ -149,6 +150,18 @@ fold_path(StoreRef, DbName, PathPrefix, Fun, Acc0) ->
     Prefix = barrel_store_keys:path_index_prefix(DbName, PathPrefix),
     EndKey = barrel_store_keys:path_index_end(DbName, PathPrefix),
     fold_path_range(StoreRef, DbName, Prefix, EndKey, Fun, Acc0).
+
+%% @doc Fold over path index entries in reverse order.
+%% Iterates from last to first; useful for building sorted lists with prepend.
+-spec fold_path_reverse(store_ref(), db_name(), [term()], fun(), term()) -> term().
+fold_path_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0) ->
+    Prefix = barrel_store_keys:path_index_prefix(DbName, PathPrefix),
+    EndKey = barrel_store_keys:path_index_end(DbName, PathPrefix),
+    FoldFun = fun(Key, _Value, Acc) ->
+        {ok, {Path, DocId}} = decode_path_index_key(Key),
+        Fun({Path, DocId}, Acc)
+    end,
+    barrel_store_rocksdb:fold_range_reverse(StoreRef, Prefix, EndKey, FoldFun, Acc0).
 
 %% @doc Fold over path index entries in a key range.
 %% Lower-level function for range queries.

@@ -11,7 +11,7 @@
 -export([open/2, close/1]).
 -export([put/3, put/4, get/2, multi_get/2, delete/2]).
 -export([write_batch/2, write_batch/3]).
--export([fold/4, fold_range/5]).
+-export([fold/4, fold_range/5, fold_range_reverse/5]).
 
 %% Additional utilities
 -export([snapshot/1, release_snapshot/1]).
@@ -132,6 +132,21 @@ fold_range(#{ref := Ref}, StartKey, EndKey, Fun, Acc) ->
         rocksdb:iterator_close(Itr)
     end.
 
+%% @doc Fold over a key range in reverse order (last to first)
+%% Useful for building sorted lists with prepend: [Item | Acc]
+-spec fold_range_reverse(db_ref(), binary(), binary(), fun(), term()) -> term().
+fold_range_reverse(#{ref := Ref}, StartKey, EndKey, Fun, Acc) ->
+    ReadOpts = [
+        {iterate_lower_bound, StartKey},
+        {iterate_upper_bound, EndKey}
+    ],
+    {ok, Itr} = rocksdb:iterator(Ref, ReadOpts),
+    try
+        fold_loop_reverse(rocksdb:iterator_move(Itr, last), Itr, Fun, Acc)
+    after
+        rocksdb:iterator_close(Itr)
+    end.
+
 %%====================================================================
 %% Snapshot Operations
 %%====================================================================
@@ -240,4 +255,19 @@ fold_loop({ok, Key, Value}, Itr, Fun, Acc) ->
 fold_loop({error, invalid_iterator}, _Itr, _Fun, Acc) ->
     Acc;
 fold_loop({error, _Reason}, _Itr, _Fun, Acc) ->
+    Acc.
+
+%% Fold loop for reverse iteration (uses prev instead of next)
+fold_loop_reverse({ok, Key, Value}, Itr, Fun, Acc) ->
+    case Fun(Key, Value, Acc) of
+        {ok, Acc1} ->
+            fold_loop_reverse(rocksdb:iterator_move(Itr, prev), Itr, Fun, Acc1);
+        {stop, Acc1} ->
+            Acc1;
+        stop ->
+            Acc
+    end;
+fold_loop_reverse({error, invalid_iterator}, _Itr, _Fun, Acc) ->
+    Acc;
+fold_loop_reverse({error, _Reason}, _Itr, _Fun, Acc) ->
     Acc.

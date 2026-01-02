@@ -540,27 +540,45 @@ execute_multi_index(StoreRef, DbName, Plan) ->
         [] ->
             execute_full_scan(StoreRef, DbName, Plan);
         [First | Rest] ->
-            %% Start with first condition's doc ids
+            %% Start with first condition's doc ids (already sorted)
             {path, Path1, Value1} = First,
             FullPath1 = Path1 ++ [Value1],
             InitialDocIds = collect_docids_for_path(StoreRef, DbName, FullPath1),
 
-            %% Intersect with remaining conditions
-            FinalDocIds = lists:foldl(
-                fun({path, Path, Value}, AccDocIds) ->
-                    FullPath = Path ++ [Value],
-                    CondDocIds = collect_docids_for_path(StoreRef, DbName, FullPath),
-                    ordsets:intersection(
-                        ordsets:from_list(AccDocIds),
-                        ordsets:from_list(CondDocIds)
-                    )
-                end,
-                InitialDocIds,
-                Rest
-            ),
+            %% Intersect with remaining conditions using merge intersection
+            %% Short-circuits when any condition produces empty set
+            FinalDocIds = intersect_conditions(StoreRef, DbName, Rest, InitialDocIds),
 
-            filter_and_project(StoreRef, DbName, ordsets:to_list(FinalDocIds), Plan)
+            filter_and_project(StoreRef, DbName, FinalDocIds, Plan)
     end.
+
+%% @doc Intersect doc IDs from multiple conditions with short-circuit
+intersect_conditions(_StoreRef, _DbName, _Conditions, []) ->
+    %% Short-circuit: empty accumulator means no matches possible
+    [];
+intersect_conditions(_StoreRef, _DbName, [], AccDocIds) ->
+    AccDocIds;
+intersect_conditions(StoreRef, DbName, [{path, Path, Value} | Rest], AccDocIds) ->
+    FullPath = Path ++ [Value],
+    CondDocIds = collect_docids_for_path(StoreRef, DbName, FullPath),
+    case CondDocIds of
+        [] ->
+            %% Short-circuit: this condition has no matches
+            [];
+        _ ->
+            Intersection = sorted_intersection(AccDocIds, CondDocIds),
+            intersect_conditions(StoreRef, DbName, Rest, Intersection)
+    end.
+
+%% @doc Merge-based intersection of two sorted lists - O(n+m)
+sorted_intersection([], _) -> [];
+sorted_intersection(_, []) -> [];
+sorted_intersection([H | T1], [H | T2]) ->
+    [H | sorted_intersection(T1, T2)];
+sorted_intersection([H1 | T1], [H2 | _] = L2) when H1 < H2 ->
+    sorted_intersection(T1, L2);
+sorted_intersection(L1, [_ | T2]) ->
+    sorted_intersection(L1, T2).
 
 %% @doc Execute full document scan (slowest, last resort)
 execute_full_scan(StoreRef, DbName, Plan) ->
@@ -579,8 +597,9 @@ execute_full_scan(StoreRef, DbName, Plan) ->
     filter_and_project(StoreRef, DbName, DocIds, Plan).
 
 %% @doc Collect document IDs matching an exact path+value
+%% Returns sorted list by using reverse iteration with prepend
 collect_docids_for_path(StoreRef, DbName, FullPath) ->
-    barrel_ars_index:fold_path(
+    barrel_ars_index:fold_path_reverse(
         StoreRef, DbName, FullPath,
         fun({_Path, DocId}, Acc) -> {ok, [DocId | Acc]} end,
         []
