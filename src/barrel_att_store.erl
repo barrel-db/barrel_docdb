@@ -12,7 +12,7 @@
 
 %% API
 -export([open/2, close/1]).
--export([put/5, get/4, delete/4]).
+-export([put/5, put/6, get/4, delete/4]).
 -export([delete_all/3]).
 -export([fold/5]).
 
@@ -48,14 +48,23 @@ open(Path, Options) ->
 close(#{ref := Ref}) ->
     rocksdb:close(Ref).
 
-%% @doc Store an attachment
+%% @doc Store an attachment (async by default)
 -spec put(att_ref(), db_name(), docid(), binary(), binary()) ->
     {ok, att_info()} | {error, term()}.
-put(#{ref := Ref}, DbName, DocId, AttName, Data) when is_binary(Data) ->
+put(AttRef, DbName, DocId, AttName, Data) ->
+    put(AttRef, DbName, DocId, AttName, Data, #{}).
+
+%% @doc Store an attachment with options
+%% Options:
+%%   - sync: boolean() - if true, sync to disk before returning (default: false)
+-spec put(att_ref(), db_name(), docid(), binary(), binary(), map()) ->
+    {ok, att_info()} | {error, term()}.
+put(#{ref := Ref}, DbName, DocId, AttName, Data, Opts) when is_binary(Data) ->
     Key = make_key(DbName, DocId, AttName),
     Digest = compute_digest(Data),
     ContentType = mimerl:filename(AttName),
-    case rocksdb:put(Ref, Key, Data, [{sync, true}]) of
+    Sync = maps:get(sync, Opts, false),
+    case rocksdb:put(Ref, Key, Data, [{sync, Sync}]) of
         ok ->
             AttInfo = #{
                 name => AttName,

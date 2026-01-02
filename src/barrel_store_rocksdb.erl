@@ -1,7 +1,7 @@
 %%%-------------------------------------------------------------------
 %%% @doc RocksDB storage backend for barrel_docdb
 %%%
-%%% Implements the barrel_store behaviour using RocksDB 2.0.0.
+%%% Implements the barrel_store behaviour using RocksDB 2.2.0.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_store_rocksdb).
@@ -10,7 +10,7 @@
 %% barrel_store callbacks
 -export([open/2, close/1]).
 -export([put/3, put/4, get/2, delete/2]).
--export([write_batch/2]).
+-export([write_batch/2, write_batch/3]).
 -export([fold/4, fold_range/5]).
 
 %% Additional utilities
@@ -71,9 +71,17 @@ get(#{ref := Ref}, Key) ->
 delete(#{ref := Ref}, Key) ->
     rocksdb:delete(Ref, Key, []).
 
-%% @doc Execute a batch of operations atomically
+%% @doc Execute a batch of operations atomically (async by default)
 -spec write_batch(db_ref(), list()) -> ok | {error, term()}.
-write_batch(#{ref := Ref}, Operations) ->
+write_batch(DbRef, Operations) ->
+    write_batch(DbRef, Operations, #{}).
+
+%% @doc Execute a batch of operations atomically with options
+%% Options:
+%%   - sync: boolean() - if true, sync to disk before returning (default: false)
+-spec write_batch(db_ref(), list(), map()) -> ok | {error, term()}.
+write_batch(#{ref := Ref}, Operations, Opts) ->
+    Sync = maps:get(sync, Opts, false),
     {ok, Batch} = rocksdb:batch(),
     try
         lists:foreach(
@@ -84,7 +92,7 @@ write_batch(#{ref := Ref}, Operations) ->
             end,
             Operations
         ),
-        Result = rocksdb:write_batch(Ref, Batch, [{sync, true}]),
+        Result = rocksdb:write_batch(Ref, Batch, [{sync, Sync}]),
         Result
     after
         rocksdb:release_batch(Batch)

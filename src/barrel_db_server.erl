@@ -414,7 +414,9 @@ find_view_by_pid(Pid, Views) ->
 %%====================================================================
 
 %% @doc Put a document (create or update)
-do_put_doc(StoreRef, DbName, Doc, _Opts) ->
+%% Options:
+%%   - sync: boolean() - if true, sync to disk before returning (default: false)
+do_put_doc(StoreRef, DbName, Doc, Opts) ->
     %% Build document record from input
     DocRecord = barrel_doc:make_doc_record(Doc),
     #{id := DocId, revs := Revs, deleted := Deleted, doc := DocBody} = DocRecord,
@@ -513,7 +515,8 @@ do_put_doc(StoreRef, DbName, Doc, _Opts) ->
 
     %% Write batch atomically (doc + path index + change + path_hlc in single batch)
     AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps,
-    ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps),
+    WriteOpts = #{sync => maps:get(sync, Opts, false)},
+    ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps, WriteOpts),
 
     %% Notify path subscribers
     notify_subscribers(DbName, DocId, NewRev, NextHlc, Deleted, DocBody),
@@ -564,6 +567,9 @@ do_get_doc(StoreRef, DbName, DocId, Opts) ->
     end.
 
 %% @doc Delete a document
+%% Options:
+%%   - rev: binary() - expected revision (optional, for conflict detection)
+%%   - sync: boolean() - if true, sync to disk before returning (default: false)
 do_delete_doc(StoreRef, DbName, DocId, Opts) ->
     %% Get current doc info
     DocInfoKey = barrel_store_keys:doc_info(DbName, DocId),
@@ -632,7 +638,8 @@ do_delete_doc(StoreRef, DbName, DocId, Opts) ->
 
             %% Write batch atomically (doc + path index + change + path_hlc in single batch)
             AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps,
-            ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps),
+            WriteOpts = #{sync => maps:get(sync, Opts, false)},
+            ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps, WriteOpts),
 
             %% Notify path subscribers
             notify_subscribers(DbName, DocId, NewRev, NextHlc, true, #{}),
