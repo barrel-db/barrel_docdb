@@ -1,16 +1,19 @@
 %%%-------------------------------------------------------------------
 %%% @doc Shared RocksDB block cache manager
 %%%
-%%% Manages a shared LRU block cache used by all RocksDB instances.
+%%% Manages a shared block cache used by all RocksDB instances.
 %%% This improves memory efficiency and cache hit rates by sharing
 %%% a single cache across document stores and attachment stores.
 %%%
 %%% The cache is configured via application environment:
 %%% ```
 %%% {barrel_docdb, [
-%%%     {block_cache_size, 536870912}  %% 512MB default
+%%%     {block_cache_size, 536870912},  %% 512MB default
+%%%     {block_cache_type, clock}       %% clock (default) or lru
 %%% ]}
 %%% '''
+%%%
+%%% Clock cache provides better performance under concurrent load.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_cache).
@@ -89,13 +92,14 @@ build_block_opts_no_cache(Options) ->
 
 init([]) ->
     CacheSize = application:get_env(barrel_docdb, block_cache_size, 512 * 1024 * 1024),
-    case rocksdb:new_lru_cache(CacheSize) of
+    CacheType = application:get_env(barrel_docdb, block_cache_type, clock),
+    case rocksdb:new_cache(CacheType, CacheSize) of
         {ok, Cache} ->
-            logger:info("barrel_cache: initialized ~p MB LRU cache",
-                       [CacheSize div (1024 * 1024)]),
+            logger:info("barrel_cache: initialized ~p MB ~p cache",
+                       [CacheSize div (1024 * 1024), CacheType]),
             {ok, #state{cache = Cache}};
         {error, Reason} ->
-            logger:error("barrel_cache: failed to create LRU cache: ~p", [Reason]),
+            logger:error("barrel_cache: failed to create ~p cache: ~p", [CacheType, Reason]),
             {ok, #state{cache = undefined}}
     end.
 
