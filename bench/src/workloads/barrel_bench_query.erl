@@ -26,6 +26,9 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running simple equality queries...~n"),
     SimpleEq = bench_query(Db, simple_eq_query(), Iterations),
 
+    io:format("  Running simple equality with LIMIT 10...~n"),
+    SimpleEqLimit = bench_query(Db, simple_eq_limit_query(), Iterations),
+
     io:format("  Running range queries...~n"),
     Range = bench_query(Db, range_query(), Iterations),
 
@@ -37,6 +40,7 @@ run(Db, NumDocs, Iterations) ->
 
     #{
         simple_eq => barrel_bench_metrics:summarize(SimpleEq),
+        simple_eq_limit => barrel_bench_metrics:summarize(SimpleEqLimit),
         range => barrel_bench_metrics:summarize(Range),
         multi_condition => barrel_bench_metrics:summarize(MultiCond),
         nested_path => barrel_bench_metrics:summarize(NestedPath)
@@ -48,6 +52,9 @@ run(Db, NumDocs, Iterations) ->
 
 simple_eq_query() ->
     #{where => [{path, [<<"type">>], <<"user">>}]}.
+
+simple_eq_limit_query() ->
+    #{where => [{path, [<<"type">>], <<"user">>}], limit => 10}.
 
 range_query() ->
     #{where => [

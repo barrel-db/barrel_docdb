@@ -500,21 +500,39 @@ is_valid_path_component(_) -> false.
 
 %% @doc Execute using direct index key lookup (fastest)
 execute_index_seek(StoreRef, DbName, Plan) ->
-    #query_plan{conditions = Conditions} = Plan,
+    #query_plan{conditions = Conditions, order = Order, limit = Limit, offset = Offset} = Plan,
 
     %% Find the first equality condition to use for index lookup
     case find_first_equality(Conditions) of
-        {ok, {path, Path, Value}} ->
+        {ok, {path, Path, Value} = IndexCond} ->
             %% Build full path with value for exact lookup
             FullPath = Path ++ [Value],
-            DocIds = collect_docids_for_path(StoreRef, DbName, FullPath),
 
-            %% Filter by remaining conditions and apply projections
+            %% Check if we can use early limit optimization
+            %% Safe when: no ORDER BY and only index-covered condition
+            RemainingConds = Conditions -- [IndexCond],
+            EarlyLimitResult = can_use_early_limit(Order, RemainingConds, Limit),
+            DocIds = case EarlyLimitResult of
+                {true, MaxCollect} ->
+                    collect_docids_for_path_limited(StoreRef, DbName, FullPath, MaxCollect + Offset);
+                false ->
+                    collect_docids_for_path(StoreRef, DbName, FullPath)
+            end,
             filter_and_project(StoreRef, DbName, DocIds, Plan);
         not_found ->
             %% Fallback to scan
             execute_index_scan(StoreRef, DbName, Plan)
     end.
+
+%% @doc Check if early limit optimization can be used
+%% Returns {true, MaxToCollect} or false
+can_use_early_limit([], [], Limit) when is_integer(Limit), Limit > 0 ->
+    %% No ORDER BY and no remaining conditions - safe to limit early
+    %% Collect 2x to account for deleted docs
+    {true, Limit * 2};
+can_use_early_limit(_, _, _) ->
+    %% Either has ORDER BY or remaining conditions that need full scan
+    false.
 
 %% @doc Execute using index prefix scan
 execute_index_scan(StoreRef, DbName, Plan) ->
@@ -648,6 +666,23 @@ collect_docids_for_path(StoreRef, DbName, FullPath) ->
         fun({_Path, DocId}, Acc) -> {ok, [DocId | Acc]} end,
         []
     ).
+
+%% @doc Collect document IDs with early termination at MaxCount
+%% For LIMIT pushdown optimization
+collect_docids_for_path_limited(StoreRef, DbName, FullPath, MaxCount) ->
+    {_, DocIds} = barrel_ars_index:fold_path_reverse(
+        StoreRef, DbName, FullPath,
+        fun({_Path, DocId}, {Count, Acc}) ->
+            NewCount = Count + 1,
+            NewAcc = [DocId | Acc],
+            case NewCount >= MaxCount of
+                true -> {stop, {NewCount, NewAcc}};
+                false -> {ok, {NewCount, NewAcc}}
+            end
+        end,
+        {0, []}
+    ),
+    DocIds.
 
 %% @doc Collect document IDs matching a path prefix
 collect_docids_for_prefix(StoreRef, DbName, PathPrefix) ->
