@@ -156,7 +156,7 @@ block_opts_defaults(_Config) ->
 
     %% Check default values
     ?assertEqual({bloom_filter, 10}, proplists:get_value(filter_policy, Opts)),
-    ?assertEqual(true, proplists:get_value(whole_key_filtering, Opts)),
+    ?assertEqual(false, proplists:get_value(whole_key_filtering, Opts)),
     ?assertEqual(4096, proplists:get_value(block_size, Opts)),
     ?assertEqual(true, proplists:get_value(cache_index_and_filter_blocks, Opts)),
 
@@ -246,7 +246,7 @@ fallback_opts_structure(_Config) ->
     Opts = barrel_cache:get_block_opts(#{bloom_bits => 12, block_size => 16384}),
 
     ?assertEqual({bloom_filter, 12}, proplists:get_value(filter_policy, Opts)),
-    ?assertEqual(true, proplists:get_value(whole_key_filtering, Opts)),
+    ?assertEqual(false, proplists:get_value(whole_key_filtering, Opts)),
     ?assertEqual(16384, proplists:get_value(block_size, Opts)),
     ?assertEqual(true, proplists:get_value(cache_index_and_filter_blocks, Opts)),
 

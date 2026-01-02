@@ -300,6 +300,10 @@ build_db_options(Options) ->
         {max_background_jobs, maps:get(max_background_jobs, Options, Schedulers)},
         {max_subcompactions, maps:get(max_subcompactions, Options, 4)},
 
+        %% Prefix extractor for prefix bloom filters
+        %% Enables O(1) existence check for key prefixes (up to 64 bytes)
+        {prefix_extractor, {capped_prefix_transform, 64}},
+
         %% Use counter merge operator for atomic counters
         {merge_operator, counter_merge_operator},
         {total_threads, erlang:max(4, Schedulers)},

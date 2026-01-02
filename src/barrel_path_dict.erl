@@ -67,12 +67,12 @@ get_or_create_id(StoreRef, DbName, Path) ->
     end.
 
 %% @doc Get path ID from cache only (no creation).
-%% Returns undefined if path is not in cache.
--spec get_id(db_name(), path()) -> path_id() | undefined.
+%% Returns not_found if path is not in cache.
+-spec get_id(db_name(), path()) -> {ok, path_id()} | not_found.
 get_id(DbName, Path) ->
     case ets:lookup(?ETS_CACHE, {DbName, Path}) of
-        [{_, PathId}] -> PathId;
-        [] -> undefined
+        [{_, PathId}] -> {ok, PathId};
+        [] -> not_found
     end.
 
 %% @doc Get path from cache by ID.

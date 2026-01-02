@@ -532,26 +532,37 @@ is_valid_path_component(_) -> false.
 %%====================================================================
 
 %% @doc Execute using direct index key lookup (fastest)
+%% Uses prefix bloom filters for O(1) skip of non-matching SST blocks.
 execute_index_seek(StoreRef, DbName, Plan) ->
     #query_plan{conditions = Conditions, order = Order, limit = Limit, offset = Offset} = Plan,
 
     %% Find the first equality condition to use for index lookup
     case find_first_equality(Conditions) of
         {ok, {path, Path, Value} = IndexCond} ->
-            %% Build full path with value for exact lookup
             FullPath = Path ++ [Value],
 
-            %% Check if we can use early limit optimization
-            %% Safe when: no ORDER BY and only index-covered condition
-            RemainingConds = Conditions -- [IndexCond],
-            EarlyLimitResult = can_use_early_limit(Order, RemainingConds, Limit),
-            DocIds = case EarlyLimitResult of
-                {true, MaxCollect} ->
-                    collect_docids_for_path_limited(StoreRef, DbName, FullPath, MaxCollect + Offset);
-                false ->
-                    collect_docids_for_path(StoreRef, DbName, FullPath)
+            %% O(1) cardinality check - skip iteration if no matches
+            Cardinality = case barrel_ars_index:get_path_cardinality(StoreRef, DbName, FullPath) of
+                {ok, C} -> C;
+                {error, _} -> 1  %% Assume at least 1 if error
             end,
-            filter_and_project(StoreRef, DbName, DocIds, Plan);
+            case Cardinality of
+                0 ->
+                    %% No matches - skip iteration entirely
+                    filter_and_project(StoreRef, DbName, [], Plan);
+                _ ->
+                    %% Collect doc IDs via index iteration
+                    %% RocksDB prefix bloom filters will skip non-matching blocks
+                    RemainingConds = Conditions -- [IndexCond],
+                    EarlyLimitResult = can_use_early_limit(Order, RemainingConds, Limit),
+                    DocIds = case EarlyLimitResult of
+                        {true, MaxCollect} ->
+                            collect_docids_for_path_limited(StoreRef, DbName, FullPath, MaxCollect + Offset);
+                        false ->
+                            collect_docids_for_path(StoreRef, DbName, FullPath)
+                    end,
+                    filter_and_project(StoreRef, DbName, DocIds, Plan)
+            end;
         not_found ->
             %% Fallback to scan
             execute_index_scan(StoreRef, DbName, Plan)
@@ -757,6 +768,7 @@ collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix) ->
     ).
 
 %% @doc Execute using multiple index lookups with intersection
+%% Uses cardinality-ordered intersection for efficient multi-condition queries.
 execute_multi_index(StoreRef, DbName, Plan) ->
     #query_plan{conditions = Conditions} = Plan,
 
@@ -766,19 +778,20 @@ execute_multi_index(StoreRef, DbName, Plan) ->
     case IndexConditions of
         [] ->
             execute_full_scan(StoreRef, DbName, Plan);
-        _ when length(IndexConditions) =< 2 ->
-            %% For 1-2 conditions, use bitmap-filtered collection if available
-            execute_with_bitmap_filter(StoreRef, DbName, IndexConditions, Plan);
         _ ->
-            %% For 3+ conditions, order by cardinality (smallest first)
-            %% Also short-circuit if any condition has 0 cardinality
+            %% Order by cardinality (smallest first) for efficient intersection
             case order_by_cardinality(StoreRef, DbName, IndexConditions) of
                 [] ->
-                    %% All conditions have 0 cardinality - no matches possible
+                    %% At least one condition has 0 cardinality - no results
                     filter_and_project(StoreRef, DbName, [], Plan);
+                OrderedConditions when length(OrderedConditions) =< 2 ->
+                    %% Few conditions - use bitmap filter
+                    execute_with_bitmap_filter(StoreRef, DbName, OrderedConditions, Plan);
                 OrderedConditions ->
-                    %% Use bitmap-filtered collection
-                    execute_with_bitmap_filter(StoreRef, DbName, OrderedConditions, Plan)
+                    %% Many conditions - use sorted intersection
+                    [{path, Path1, Value1} | Rest] = OrderedConditions,
+                    FullPath1 = Path1 ++ [Value1],
+                    execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan)
             end
     end.
 
@@ -1347,3 +1360,4 @@ find_best_scan_path([{'and', Nested} | Rest]) ->
     end;
 find_best_scan_path([_ | Rest]) ->
     find_best_scan_path(Rest).
+

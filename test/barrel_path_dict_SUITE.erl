@@ -287,7 +287,7 @@ cache_hit(Config) ->
     ?assertEqual(Id1, Id2),
 
     %% get_id should also work from cache
-    CachedId = barrel_path_dict:get_id(DbName, Path),
+    {ok, CachedId} = barrel_path_dict:get_id(DbName, Path),
     ?assertEqual(Id1, CachedId),
 
     ok.
@@ -296,15 +296,15 @@ get_id_from_cache(Config) ->
     StoreRef = ?config(store_ref, Config),
     DbName = ?config(db_name, Config),
 
-    %% Unknown path should return undefined
-    ?assertEqual(undefined, barrel_path_dict:get_id(DbName, [<<"unknown_field">>])),
+    %% Unknown path should return not_found
+    ?assertEqual(not_found, barrel_path_dict:get_id(DbName, [<<"unknown_field">>])),
 
     %% Create a path
     Path = [<<"known_field">>],
     Id = barrel_path_dict:get_or_create_id(StoreRef, DbName, Path),
 
     %% Now it should be in cache
-    ?assertEqual(Id, barrel_path_dict:get_id(DbName, Path)),
+    ?assertEqual({ok, Id}, barrel_path_dict:get_id(DbName, Path)),
 
     ok.
 
@@ -335,15 +335,15 @@ clear_cache(Config) ->
     Id2 = barrel_path_dict:get_or_create_id(StoreRef, DbName, Path2),
 
     %% Verify they're in cache
-    ?assertEqual(Id1, barrel_path_dict:get_id(DbName, Path1)),
-    ?assertEqual(Id2, barrel_path_dict:get_id(DbName, Path2)),
+    ?assertEqual({ok, Id1}, barrel_path_dict:get_id(DbName, Path1)),
+    ?assertEqual({ok, Id2}, barrel_path_dict:get_id(DbName, Path2)),
 
     %% Clear cache for this database
     ok = barrel_path_dict:clear_cache(DbName),
 
     %% Cache should be empty
-    ?assertEqual(undefined, barrel_path_dict:get_id(DbName, Path1)),
-    ?assertEqual(undefined, barrel_path_dict:get_id(DbName, Path2)),
+    ?assertEqual(not_found, barrel_path_dict:get_id(DbName, Path1)),
+    ?assertEqual(not_found, barrel_path_dict:get_id(DbName, Path2)),
 
     %% But can still get IDs (from store)
     ?assertEqual(Id1, barrel_path_dict:get_or_create_id(StoreRef, DbName, Path1)),
@@ -372,8 +372,8 @@ load_from_store(Config) ->
     ok = barrel_path_dict:load_from_store(StoreRef, DbName),
 
     %% Should be in cache again with same IDs
-    ?assertEqual(Id1, barrel_path_dict:get_id(DbName, Path1)),
-    ?assertEqual(Id2, barrel_path_dict:get_id(DbName, Path2)),
+    ?assertEqual({ok, Id1}, barrel_path_dict:get_id(DbName, Path1)),
+    ?assertEqual({ok, Id2}, barrel_path_dict:get_id(DbName, Path2)),
 
     ok.
 
