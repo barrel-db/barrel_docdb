@@ -675,15 +675,58 @@ fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings) ->
 %% @doc Execute using index prefix scan
 execute_index_scan(StoreRef, DbName, Plan) ->
     #query_plan{conditions = Conditions} = Plan,
+    DocIds = collect_scan_docids(StoreRef, DbName, Conditions),
+    filter_and_project(StoreRef, DbName, DocIds, Plan).
 
-    %% Find best path prefix for scanning
-    case find_best_scan_path(Conditions) of
-        {ok, Path} ->
-            DocIds = collect_docids_for_prefix(StoreRef, DbName, Path),
-            filter_and_project(StoreRef, DbName, DocIds, Plan);
+%% @doc Collect DocIds for scan-based execution
+%% Tries prefix value scan first, then path prefix scan, then full scan
+collect_scan_docids(StoreRef, DbName, Conditions) ->
+    case find_prefix_condition(Conditions) of
+        {ok, Path, Prefix} ->
+            %% Optimized interval scan for prefix queries
+            collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix);
         not_found ->
-            execute_full_scan(StoreRef, DbName, Plan)
+            case find_best_scan_path(Conditions) of
+                {ok, Path} ->
+                    collect_docids_for_prefix(StoreRef, DbName, Path);
+                not_found ->
+                    collect_all_docids(StoreRef, DbName)
+            end
     end.
+
+%% @doc Collect all document IDs (for full scan fallback)
+collect_all_docids(StoreRef, DbName) ->
+    barrel_store_rocksdb:fold_range(
+        StoreRef,
+        barrel_store_keys:doc_info_prefix(DbName),
+        barrel_store_keys:doc_info_end(DbName),
+        fun(Key, _Value, Acc) ->
+            DocId = barrel_store_keys:decode_doc_info_key(DbName, Key),
+            {ok, [DocId | Acc]}
+        end,
+        []
+    ).
+
+%% @doc Find a prefix condition for optimized interval scan
+find_prefix_condition([]) ->
+    not_found;
+find_prefix_condition([{prefix, Path, Prefix} | _]) ->
+    {ok, Path, Prefix};
+find_prefix_condition([{'and', Nested} | Rest]) ->
+    case find_prefix_condition(Nested) of
+        {ok, _, _} = Found -> Found;
+        not_found -> find_prefix_condition(Rest)
+    end;
+find_prefix_condition([_ | Rest]) ->
+    find_prefix_condition(Rest).
+
+%% @doc Collect DocIds using optimized prefix interval scan
+collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix) ->
+    barrel_ars_index:fold_prefix(
+        StoreRef, DbName, Path, Prefix,
+        fun({_FullPath, DocId}, Acc) -> {ok, [DocId | Acc]} end,
+        []
+    ).
 
 %% @doc Execute using multiple index lookups with intersection
 execute_multi_index(StoreRef, DbName, Plan) ->

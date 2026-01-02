@@ -44,6 +44,9 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running pure ORDER BY + LIMIT (no filter)...~n"),
     PureTopK = bench_query(Db, pure_order_limit_query(), Iterations),
 
+    io:format("  Running prefix queries...~n"),
+    PrefixQ = bench_query(Db, prefix_query(), Iterations),
+
     #{
         simple_eq => barrel_bench_metrics:summarize(SimpleEq),
         simple_eq_limit => barrel_bench_metrics:summarize(SimpleEqLimit),
@@ -51,7 +54,8 @@ run(Db, NumDocs, Iterations) ->
         multi_condition => barrel_bench_metrics:summarize(MultiCond),
         nested_path => barrel_bench_metrics:summarize(NestedPath),
         order_by_limit => barrel_bench_metrics:summarize(TopK),
-        pure_topk => barrel_bench_metrics:summarize(PureTopK)
+        pure_topk => barrel_bench_metrics:summarize(PureTopK),
+        prefix => barrel_bench_metrics:summarize(PrefixQ)
     }.
 
 %%====================================================================
@@ -91,6 +95,11 @@ pure_order_limit_query() ->
     #{where => [],
       order_by => {[<<"created_at">>], desc},
       limit => 10}.
+
+prefix_query() ->
+    %% Prefix query: find all users whose name starts with "User 1"
+    %% Uses optimized interval scan instead of full scan + regex
+    #{where => [{prefix, [<<"name">>], <<"User 1">>}]}.
 
 %%====================================================================
 %% Internal functions

@@ -20,7 +20,8 @@
     fold_path_reverse/5,
     fold_path_range/6,
     fold_path_values/5,
-    fold_path_values_reverse/5
+    fold_path_values_reverse/5,
+    fold_prefix/6
 ]).
 
 %% Operations-only variants (for batching with other ops)
@@ -264,6 +265,26 @@ fold_path_values_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0) ->
         Fun({Path, DocId}, Acc)
     end,
     barrel_store_rocksdb:fold_range_reverse(StoreRef, Prefix, EndKey, FoldFun, Acc0).
+
+%% @doc Fold over path index entries matching a value prefix.
+%% Uses interval scan: [path, prefix] to [path, prefix ++ 0xFF]
+%% Much faster than collecting all values and filtering.
+%% Example: fold_prefix(S, Db, [<<"name">>], <<"John">>, Fun, Acc)
+%%   matches: John, Johnny, Johnson, etc.
+-spec fold_prefix(store_ref(), db_name(), [term()], binary(), fun(), term()) -> term().
+fold_prefix(StoreRef, DbName, Path, Prefix, Fun, Acc0) when is_binary(Prefix) ->
+    %% Start key: path + prefix value
+    StartPath = Path ++ [Prefix],
+    StartKey = barrel_store_keys:path_index_prefix(DbName, StartPath),
+    %% End key: path + prefix + 0xFF (exclusive upper bound)
+    EndPrefix = <<Prefix/binary, 16#FF>>,
+    EndPath = Path ++ [EndPrefix],
+    EndKey = barrel_store_keys:path_index_prefix(DbName, EndPath),
+    FoldFun = fun(Key, _Value, Acc) ->
+        {ok, {FullPath, DocId}} = decode_path_index_key(Key),
+        Fun({FullPath, DocId}, Acc)
+    end,
+    barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, Acc0).
 
 %%====================================================================
 %% Internal functions
