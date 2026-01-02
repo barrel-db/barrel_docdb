@@ -178,6 +178,7 @@ build_db_options(Options) ->
         %% Concurrency
         {allow_concurrent_memtable_write, true},
         {enable_write_thread_adaptive_yield, true},
+        {enable_pipelined_write, true},
 
         %% Compaction tuning
         {level0_file_num_compaction_trigger, maps:get(l0_compaction_trigger, Options, 4)},
