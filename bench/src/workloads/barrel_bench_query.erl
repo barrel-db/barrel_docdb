@@ -47,6 +47,9 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running prefix queries...~n"),
     PrefixQ = bench_query(Db, prefix_query(), Iterations),
 
+    io:format("  Running exists queries...~n"),
+    ExistsQ = bench_query(Db, exists_query(), Iterations),
+
     #{
         simple_eq => barrel_bench_metrics:summarize(SimpleEq),
         simple_eq_limit => barrel_bench_metrics:summarize(SimpleEqLimit),
@@ -55,7 +58,8 @@ run(Db, NumDocs, Iterations) ->
         nested_path => barrel_bench_metrics:summarize(NestedPath),
         order_by_limit => barrel_bench_metrics:summarize(TopK),
         pure_topk => barrel_bench_metrics:summarize(PureTopK),
-        prefix => barrel_bench_metrics:summarize(PrefixQ)
+        prefix => barrel_bench_metrics:summarize(PrefixQ),
+        exists => barrel_bench_metrics:summarize(ExistsQ)
     }.
 
 %%====================================================================
@@ -100,6 +104,11 @@ prefix_query() ->
     %% Prefix query: find all users whose name starts with "User 1"
     %% Uses optimized interval scan instead of full scan + regex
     #{where => [{prefix, [<<"name">>], <<"User 1">>}]}.
+
+exists_query() ->
+    %% Exists query: find all docs that have a "profile" field
+    %% Uses path index scan without fetching full documents
+    #{where => [{exists, [<<"profile">>]}]}.
 
 %%====================================================================
 %% Internal functions

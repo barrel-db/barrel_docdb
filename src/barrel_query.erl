@@ -679,20 +679,48 @@ execute_index_scan(StoreRef, DbName, Plan) ->
     filter_and_project(StoreRef, DbName, DocIds, Plan).
 
 %% @doc Collect DocIds for scan-based execution
-%% Tries prefix value scan first, then path prefix scan, then full scan
+%% Tries optimized paths: exists/prefix first, then path prefix scan, then full scan
 collect_scan_docids(StoreRef, DbName, Conditions) ->
-    case find_prefix_condition(Conditions) of
-        {ok, Path, Prefix} ->
-            %% Optimized interval scan for prefix queries
-            collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix);
+    case find_exists_condition(Conditions) of
+        {ok, Path} ->
+            %% Exists check: collect all docs that have any value at this path
+            collect_docids_for_path_exists(StoreRef, DbName, Path);
         not_found ->
-            case find_best_scan_path(Conditions) of
-                {ok, Path} ->
-                    collect_docids_for_prefix(StoreRef, DbName, Path);
+            case find_prefix_condition(Conditions) of
+                {ok, Path, Prefix} ->
+                    %% Optimized interval scan for prefix queries
+                    collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix);
                 not_found ->
-                    collect_all_docids(StoreRef, DbName)
+                    case find_best_scan_path(Conditions) of
+                        {ok, Path} ->
+                            collect_docids_for_prefix(StoreRef, DbName, Path);
+                        not_found ->
+                            collect_all_docids(StoreRef, DbName)
+                    end
             end
     end.
+
+%% @doc Find an exists condition for optimized path scan
+find_exists_condition([]) ->
+    not_found;
+find_exists_condition([{exists, Path} | _]) ->
+    {ok, Path};
+find_exists_condition([{'and', Nested} | Rest]) ->
+    case find_exists_condition(Nested) of
+        {ok, _} = Found -> Found;
+        not_found -> find_exists_condition(Rest)
+    end;
+find_exists_condition([_ | Rest]) ->
+    find_exists_condition(Rest).
+
+%% @doc Collect all DocIds that have any value at the given path
+%% Uses the path index to find docs with the path without fetching full docs
+collect_docids_for_path_exists(StoreRef, DbName, Path) ->
+    barrel_ars_index:fold_path_values(
+        StoreRef, DbName, Path,
+        fun({_FullPath, DocId}, Acc) -> {ok, [DocId | Acc]} end,
+        []
+    ).
 
 %% @doc Collect all document IDs (for full scan fallback)
 collect_all_docids(StoreRef, DbName) ->
