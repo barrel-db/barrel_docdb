@@ -9,7 +9,7 @@
 
 %% barrel_store callbacks
 -export([open/2, close/1]).
--export([put/3, put/4, get/2, delete/2]).
+-export([put/3, put/4, get/2, multi_get/2, delete/2]).
 -export([write_batch/2, write_batch/3]).
 -export([fold/4, fold_range/5]).
 
@@ -65,6 +65,11 @@ put(#{ref := Ref}, Key, Value, Opts) ->
 -spec get(db_ref(), binary()) -> {ok, binary()} | not_found | {error, term()}.
 get(#{ref := Ref}, Key) ->
     rocksdb:get(Ref, Key, []).
+
+%% @doc Get multiple values by keys (batch read)
+-spec multi_get(db_ref(), [binary()]) -> [{ok, binary()} | not_found | {error, term()}].
+multi_get(#{ref := Ref}, Keys) ->
+    rocksdb:multi_get(Ref, Keys, []).
 
 %% @doc Delete a key
 -spec delete(db_ref(), binary()) -> ok | {error, term()}.

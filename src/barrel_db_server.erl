@@ -20,6 +20,7 @@
 -export([
     put_doc/3,
     get_doc/3,
+    get_docs/3,
     delete_doc/3,
     fold_docs/3
 ]).
@@ -101,6 +102,11 @@ put_doc(Pid, Doc, Opts) ->
 -spec get_doc(pid(), binary(), map()) -> {ok, map()} | {error, not_found} | {error, term()}.
 get_doc(Pid, DocId, Opts) ->
     gen_server:call(Pid, {get_doc, DocId, Opts}).
+
+%% @doc Get multiple documents (batch read)
+-spec get_docs(pid(), [binary()], map()) -> [{ok, map()} | {error, not_found} | {error, term()}].
+get_docs(Pid, DocIds, Opts) ->
+    gen_server:call(Pid, {get_docs, DocIds, Opts}).
 
 %% @doc Delete a document
 -spec delete_doc(pid(), binary(), map()) -> {ok, map()} | {error, term()}.
@@ -244,6 +250,11 @@ handle_call({put_doc, Doc, Opts}, _From,
 handle_call({get_doc, DocId, Opts}, _From,
             #state{name = DbName, store_ref = StoreRef} = State) ->
     Result = do_get_doc(StoreRef, DbName, DocId, Opts),
+    {reply, Result, State};
+
+handle_call({get_docs, DocIds, Opts}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_get_docs(StoreRef, DbName, DocIds, Opts),
     {reply, Result, State};
 
 handle_call({delete_doc, DocId, Opts}, _From,
@@ -565,6 +576,66 @@ do_get_doc(StoreRef, DbName, DocId, Opts) ->
         not_found ->
             {error, not_found}
     end.
+
+%% @doc Get multiple documents by ID (batch read using multi_get)
+do_get_docs(StoreRef, DbName, DocIds, Opts) ->
+    IncludeDeleted = maps:get(include_deleted, Opts, false),
+    %% Build doc_info keys
+    DocInfoKeys = [barrel_store_keys:doc_info(DbName, DocId) || DocId <- DocIds],
+    %% Batch fetch doc_infos
+    DocInfoResults = barrel_store_rocksdb:multi_get(StoreRef, DocInfoKeys),
+    %% Process each result and fetch doc bodies for found documents
+    {DocRevKeys, IndexMap} = lists:foldl(
+        fun({DocId, InfoResult}, {Keys, Map}) ->
+            case InfoResult of
+                {ok, DocInfoBin} ->
+                    DocInfo = binary_to_term(DocInfoBin),
+                    Rev = maps:get(rev, DocInfo),
+                    Deleted = maps:get(deleted, DocInfo, false),
+                    case {Deleted, IncludeDeleted} of
+                        {true, false} ->
+                            %% Skip deleted docs
+                            {Keys, Map};
+                        _ ->
+                            DocRevKey = barrel_store_keys:doc_rev(DbName, DocId, Rev),
+                            Idx = length(Keys),
+                            {[DocRevKey | Keys], Map#{Idx => {DocId, Rev, Deleted}}}
+                    end;
+                not_found ->
+                    {Keys, Map};
+                {error, _} ->
+                    {Keys, Map}
+            end
+        end,
+        {[], #{}},
+        lists:zip(DocIds, DocInfoResults)
+    ),
+    %% Batch fetch doc bodies
+    DocBodyResults = case DocRevKeys of
+        [] -> [];
+        _ -> barrel_store_rocksdb:multi_get(StoreRef, lists:reverse(DocRevKeys))
+    end,
+    %% Build final result maintaining order
+    DocBodyMap = lists:foldl(
+        fun({Idx, BodyResult}, Map) ->
+            case {maps:get(Idx, IndexMap, undefined), BodyResult} of
+                {undefined, _} -> Map;
+                {{DocId, Rev, Deleted}, {ok, DocBin}} ->
+                    DocBody = binary_to_term(DocBin),
+                    Result = DocBody#{<<"id">> => DocId, <<"_rev">> => Rev},
+                    Result2 = case Deleted of
+                        true -> Result#{<<"_deleted">> => true};
+                        false -> Result
+                    end,
+                    Map#{DocId => {ok, Result2}};
+                {_, _} -> Map
+            end
+        end,
+        #{},
+        lists:zip(lists:seq(0, length(DocBodyResults) - 1), DocBodyResults)
+    ),
+    %% Return results in original order
+    [maps:get(DocId, DocBodyMap, {error, not_found}) || DocId <- DocIds].
 
 %% @doc Delete a document
 %% Options:

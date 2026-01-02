@@ -72,6 +72,8 @@
     put_doc/3,
     get_doc/2,
     get_doc/3,
+    get_docs/2,
+    get_docs/3,
     delete_doc/2,
     delete_doc/3,
     fold_docs/3
@@ -402,6 +404,42 @@ get_doc(Db, DocId) ->
 get_doc(Db, DocId, Opts) ->
     with_db(Db, fun(Pid) ->
         barrel_db_server:get_doc(Pid, DocId, Opts)
+    end).
+
+%% @doc Get multiple documents by ID (batch read).
+%%
+%% Efficiently fetches multiple documents in a single operation using
+%% RocksDB's multi_get for improved performance over sequential reads.
+%%
+%% == Example ==
+%% ```
+%% Results = barrel_docdb:get_docs(<<"mydb">>, [<<"doc1">>, <<"doc2">>, <<"doc3">>]),
+%% %% Results = [{ok, Doc1}, {ok, Doc2}, {error, not_found}]
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param DocIds List of document IDs
+%% @returns List of `{ok, Document}' or `{error, not_found}' in same order as input
+%% @see get_docs/3
+-spec get_docs(binary() | pid(), [binary()]) -> [{ok, map()} | {error, term()}].
+get_docs(Db, DocIds) ->
+    get_docs(Db, DocIds, #{}).
+
+%% @doc Get multiple documents with options (batch read).
+%%
+%% == Options ==
+%% <ul>
+%%   <li>`include_deleted' - If true, include deleted documents</li>
+%% </ul>
+%%
+%% @param Db Database name or pid
+%% @param DocIds List of document IDs
+%% @param Opts Options map
+%% @returns List of `{ok, Document}' or `{error, not_found}' in same order as input
+-spec get_docs(binary() | pid(), [binary()], map()) -> [{ok, map()} | {error, term()}].
+get_docs(Db, DocIds, Opts) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:get_docs(Pid, DocIds, Opts)
     end).
 
 %% @doc Delete a document.

@@ -32,6 +32,7 @@
     api_delete_db/1,
     api_list_dbs/1,
     api_put_get_doc/1,
+    api_get_docs/1,
     api_update_doc/1,
     api_delete_doc/1,
     api_fold_docs/1,
@@ -82,6 +83,7 @@ groups() ->
             api_delete_db,
             api_list_dbs,
             api_put_get_doc,
+            api_get_docs,
             api_update_doc,
             api_delete_doc,
             api_fold_docs,
@@ -438,6 +440,43 @@ api_put_get_doc(_Config) ->
 
     %% Get non-existent document
     {error, not_found} = barrel_docdb:get_doc(DbName, <<"nonexistent">>),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test batch get documents (multi_get)
+api_get_docs(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_get_docs_test">>,
+    TestDir = "/tmp/barrel_api_get_docs_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Put multiple documents
+    Doc1 = #{<<"id">> => <<"doc1">>, <<"name">> => <<"Alice">>},
+    Doc2 = #{<<"id">> => <<"doc2">>, <<"name">> => <<"Bob">>},
+    Doc3 = #{<<"id">> => <<"doc3">>, <<"name">> => <<"Charlie">>},
+    {ok, _} = barrel_docdb:put_doc(DbName, Doc1),
+    {ok, _} = barrel_docdb:put_doc(DbName, Doc2),
+    {ok, _} = barrel_docdb:put_doc(DbName, Doc3),
+
+    %% Get multiple documents at once
+    Results = barrel_docdb:get_docs(DbName, [<<"doc1">>, <<"doc2">>, <<"doc3">>]),
+    ?assertEqual(3, length(Results)),
+    [{ok, R1}, {ok, R2}, {ok, R3}] = Results,
+    ?assertEqual(<<"Alice">>, maps:get(<<"name">>, R1)),
+    ?assertEqual(<<"Bob">>, maps:get(<<"name">>, R2)),
+    ?assertEqual(<<"Charlie">>, maps:get(<<"name">>, R3)),
+
+    %% Get with some non-existent documents
+    Results2 = barrel_docdb:get_docs(DbName, [<<"doc1">>, <<"nonexistent">>, <<"doc3">>]),
+    [{ok, _}, {error, not_found}, {ok, _}] = Results2,
+
+    %% Get empty list
+    Results3 = barrel_docdb:get_docs(DbName, []),
+    ?assertEqual([], Results3),
 
     %% Cleanup
     ok = barrel_docdb:delete_db(DbName),

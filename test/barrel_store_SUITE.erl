@@ -33,6 +33,7 @@
     %% RocksDB backend tests
     rocksdb_open_close/1,
     rocksdb_put_get/1,
+    rocksdb_multi_get/1,
     rocksdb_delete/1,
     rocksdb_batch/1,
     rocksdb_fold/1,
@@ -66,6 +67,7 @@ groups() ->
         {rocksdb, [sequence], [
             rocksdb_open_close,
             rocksdb_put_get,
+            rocksdb_multi_get,
             rocksdb_delete,
             rocksdb_batch,
             rocksdb_fold,
@@ -234,6 +236,32 @@ rocksdb_put_get(Config) ->
 
     %% Get non-existent key
     not_found = barrel_store_rocksdb:get(DbRef, <<"nonexistent">>),
+
+    ok = barrel_store_rocksdb:close(DbRef),
+    ok.
+
+rocksdb_multi_get(Config) ->
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/multi_get_test",
+
+    {ok, DbRef} = barrel_store_rocksdb:open(DbPath, #{}),
+
+    %% Put multiple values
+    ok = barrel_store_rocksdb:put(DbRef, <<"key1">>, <<"value1">>),
+    ok = barrel_store_rocksdb:put(DbRef, <<"key2">>, <<"value2">>),
+    ok = barrel_store_rocksdb:put(DbRef, <<"key3">>, <<"value3">>),
+
+    %% Multi-get existing keys
+    Results = barrel_store_rocksdb:multi_get(DbRef, [<<"key1">>, <<"key2">>, <<"key3">>]),
+    ?assertEqual([{ok, <<"value1">>}, {ok, <<"value2">>}, {ok, <<"value3">>}], Results),
+
+    %% Multi-get with some non-existent keys
+    Results2 = barrel_store_rocksdb:multi_get(DbRef, [<<"key1">>, <<"nonexistent">>, <<"key3">>]),
+    ?assertEqual([{ok, <<"value1">>}, not_found, {ok, <<"value3">>}], Results2),
+
+    %% Multi-get empty list
+    Results3 = barrel_store_rocksdb:multi_get(DbRef, []),
+    ?assertEqual([], Results3),
 
     ok = barrel_store_rocksdb:close(DbRef),
     ok.
