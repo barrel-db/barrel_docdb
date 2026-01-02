@@ -609,24 +609,9 @@ filter_and_project(StoreRef, DbName, DocIds, Plan) ->
     %% Remove duplicates
     UniqueDocIds = lists:usort(DocIds),
 
-    %% Fetch docs and filter
-    Results0 = lists:filtermap(
-        fun(DocId) ->
-            case get_doc_for_filter(StoreRef, DbName, DocId) of
-                {ok, Doc} ->
-                    case matches_conditions(Doc, Conditions, Bindings) of
-                        {true, BoundVars} ->
-                            Result = project_result(Doc, DocId, Projections, BoundVars, IncludeDocs),
-                            {true, Result};
-                        false ->
-                            false
-                    end;
-                not_found ->
-                    false
-            end
-        end,
-        UniqueDocIds
-    ),
+    %% Batch fetch documents using multi_get
+    Results0 = batch_fetch_and_filter(StoreRef, DbName, UniqueDocIds,
+                                       Conditions, Bindings, Projections, IncludeDocs),
 
     %% Apply ordering
     Results1 = apply_order(Results0, Order),
@@ -639,34 +624,70 @@ filter_and_project(StoreRef, DbName, DocIds, Plan) ->
 
     {ok, Results2, LastSeq}.
 
-%% @doc Get document body for filtering
-get_doc_for_filter(StoreRef, DbName, DocId) ->
-    DocInfoKey = barrel_store_keys:doc_info(DbName, DocId),
-    case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
-        {ok, DocInfoBin} ->
-            DocInfo = binary_to_term(DocInfoBin),
-            Rev = maps:get(rev, DocInfo),
-            Deleted = maps:get(deleted, DocInfo, false),
-            case Deleted of
-                true ->
-                    %% Skip deleted documents
-                    not_found;
-                false ->
-                    %% Get document body
-                    DocRevKey = barrel_store_keys:doc_rev(DbName, DocId, Rev),
-                    case barrel_store_rocksdb:get(StoreRef, DocRevKey) of
-                        {ok, DocBin} ->
-                            {ok, binary_to_term(DocBin)};
+%% @doc Batch fetch documents using multi_get for better performance
+batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs) ->
+    case DocIds of
+        [] -> [];
+        _ ->
+            %% Step 1: Batch fetch all doc_info keys
+            DocInfoKeys = [barrel_store_keys:doc_info(DbName, Id) || Id <- DocIds],
+            DocInfoResults = barrel_store_rocksdb:multi_get(StoreRef, DocInfoKeys),
+
+            %% Step 2: Filter deleted docs, collect doc_rev keys for non-deleted
+            {ActiveDocs, RevKeys} = lists:foldl(
+                fun({DocId, Result}, {AccDocs, AccKeys}) ->
+                    case Result of
+                        {ok, DocInfoBin} ->
+                            DocInfo = binary_to_term(DocInfoBin),
+                            case maps:get(deleted, DocInfo, false) of
+                                true ->
+                                    {AccDocs, AccKeys};
+                                false ->
+                                    Rev = maps:get(rev, DocInfo),
+                                    RevKey = barrel_store_keys:doc_rev(DbName, DocId, Rev),
+                                    {[DocId | AccDocs], [RevKey | AccKeys]}
+                            end;
                         not_found ->
-                            not_found;
+                            {AccDocs, AccKeys};
                         {error, _} ->
-                            not_found
+                            {AccDocs, AccKeys}
                     end
-            end;
-        not_found ->
-            not_found;
-        {error, _} ->
-            not_found
+                end,
+                {[], []},
+                lists:zip(DocIds, DocInfoResults)
+            ),
+
+            %% Step 3: Batch fetch all doc bodies
+            case RevKeys of
+                [] -> [];
+                _ ->
+                    %% Reverse to maintain order correspondence
+                    ReversedDocIds = lists:reverse(ActiveDocs),
+                    ReversedRevKeys = lists:reverse(RevKeys),
+                    DocBodyResults = barrel_store_rocksdb:multi_get(StoreRef, ReversedRevKeys),
+
+                    %% Step 4: Match bodies with doc IDs and filter by conditions
+                    lists:filtermap(
+                        fun({DocId, BodyResult}) ->
+                            case BodyResult of
+                                {ok, DocBin} ->
+                                    Doc = binary_to_term(DocBin),
+                                    case matches_conditions(Doc, Conditions, Bindings) of
+                                        {true, BoundVars} ->
+                                            Result = project_result(Doc, DocId, Projections, BoundVars, IncludeDocs),
+                                            {true, Result};
+                                        false ->
+                                            false
+                                    end;
+                                not_found ->
+                                    false;
+                                {error, _} ->
+                                    false
+                            end
+                        end,
+                        lists:zip(ReversedDocIds, DocBodyResults)
+                    )
+            end
     end.
 
 %% @doc Check if a document matches all conditions
