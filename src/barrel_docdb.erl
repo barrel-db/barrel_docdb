@@ -70,6 +70,8 @@
 -export([
     put_doc/2,
     put_doc/3,
+    put_docs/2,
+    put_docs/3,
     get_doc/2,
     get_doc/3,
     get_docs/2,
@@ -357,6 +359,48 @@ put_doc(Db, Doc) ->
 put_doc(Db, Doc, Opts) ->
     with_db(Db, fun(Pid) ->
         barrel_db_server:put_doc(Pid, Doc, Opts)
+    end).
+
+%% @doc Put multiple documents in a single batch.
+%%
+%% Efficiently writes multiple documents in a single RocksDB batch operation.
+%% This is significantly faster than calling put_doc multiple times when
+%% inserting many documents.
+%%
+%% == Example ==
+%% ```
+%% Docs = [
+%%     #{<<"id">> => <<"doc1">>, <<"name">> => <<"Alice">>},
+%%     #{<<"id">> => <<"doc2">>, <<"name">> => <<"Bob">>},
+%%     #{<<"id">> => <<"doc3">>, <<"name">> => <<"Charlie">>}
+%% ],
+%% Results = barrel_docdb:put_docs(<<"mydb">>, Docs),
+%% %% Results = [{ok, #{...}}, {ok, #{...}}, {ok, #{...}}]
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param Docs List of document maps to store
+%% @returns List of `{ok, Result}' or `{error, Reason}' in same order as input
+%% @see put_docs/3
+-spec put_docs(binary() | pid(), [map()]) -> [{ok, map()} | {error, term()}].
+put_docs(Db, Docs) ->
+    put_docs(Db, Docs, #{}).
+
+%% @doc Put multiple documents with options.
+%%
+%% == Options ==
+%% <ul>
+%%   <li>`sync' - If `true', sync to disk before returning (default: false)</li>
+%% </ul>
+%%
+%% @param Db Database name or pid
+%% @param Docs List of document maps to store
+%% @param Opts Options map
+%% @returns List of `{ok, Result}' or `{error, Reason}' in same order as input
+-spec put_docs(binary() | pid(), [map()], map()) -> [{ok, map()} | {error, term()}].
+put_docs(Db, Docs, Opts) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:put_docs(Pid, Docs, Opts)
     end).
 
 %% @doc Get a document by ID.

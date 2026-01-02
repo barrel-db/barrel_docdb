@@ -19,6 +19,7 @@
 %% Document API
 -export([
     put_doc/3,
+    put_docs/3,
     get_doc/3,
     get_docs/3,
     delete_doc/3,
@@ -97,6 +98,11 @@ stop(Pid) ->
 -spec put_doc(pid(), map(), map()) -> {ok, map()} | {error, term()}.
 put_doc(Pid, Doc, Opts) ->
     gen_server:call(Pid, {put_doc, Doc, Opts}).
+
+%% @doc Put multiple documents (batch write)
+-spec put_docs(pid(), [map()], map()) -> [{ok, map()} | {error, term()}].
+put_docs(Pid, Docs, Opts) ->
+    gen_server:call(Pid, {put_docs, Docs, Opts}).
 
 %% @doc Get a document
 -spec get_doc(pid(), binary(), map()) -> {ok, map()} | {error, not_found} | {error, term()}.
@@ -245,6 +251,11 @@ handle_call(get_att_ref, _From, #state{att_ref = AttRef} = State) ->
 handle_call({put_doc, Doc, Opts}, _From,
             #state{name = DbName, store_ref = StoreRef} = State) ->
     Result = do_put_doc(StoreRef, DbName, Doc, Opts),
+    {reply, Result, State};
+
+handle_call({put_docs, Docs, Opts}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_put_docs(StoreRef, DbName, Docs, Opts),
     {reply, Result, State};
 
 handle_call({get_doc, DocId, Opts}, _From,
@@ -539,6 +550,137 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
         <<"rev">> => NewRev
     },
     {ok, Result}.
+
+%% @doc Put multiple documents in a single batch (batch write)
+%% Options:
+%%   - sync: boolean() - if true, sync to disk before returning (default: false)
+do_put_docs(StoreRef, DbName, Docs, Opts) ->
+    %% Process each document to build operations and metadata
+    {AllOps, Notifications} = lists:foldl(
+        fun(Doc, {OpsAcc, NotifyAcc}) ->
+            case prepare_doc_ops(StoreRef, DbName, Doc) of
+                {ok, Ops, NotifyInfo} ->
+                    {OpsAcc ++ Ops, [NotifyInfo | NotifyAcc]};
+                {error, _Reason} = Err ->
+                    %% Skip failed docs, include error in notifications
+                    {OpsAcc, [{error, Err} | NotifyAcc]}
+            end
+        end,
+        {[], []},
+        Docs
+    ),
+
+    %% Write all operations in a single batch
+    case AllOps of
+        [] -> ok;
+        _ ->
+            WriteOpts = #{sync => maps:get(sync, Opts, false)},
+            ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps, WriteOpts)
+    end,
+
+    %% Notify subscribers and build results (reverse to maintain order)
+    Results = lists:map(
+        fun({error, Err}) ->
+            Err;
+           ({DocId, NewRev, NextHlc, Deleted, DocBody}) ->
+            notify_subscribers(DbName, DocId, NewRev, NextHlc, Deleted, DocBody),
+            {ok, #{<<"id">> => DocId, <<"ok">> => true, <<"rev">> => NewRev}}
+        end,
+        lists:reverse(Notifications)
+    ),
+    Results.
+
+%% @doc Prepare document operations without writing
+%% Returns {ok, Ops, NotifyInfo} or {error, Reason}
+prepare_doc_ops(StoreRef, DbName, Doc) ->
+    try
+        %% Build document record from input
+        DocRecord = barrel_doc:make_doc_record(Doc),
+        #{id := DocId, revs := Revs, deleted := Deleted, doc := DocBody} = DocRecord,
+        [NewRev | _] = Revs,
+
+        %% Check for existing document and get old doc body for path index update
+        DocInfoKey = barrel_store_keys:doc_info(DbName, DocId),
+        {OldHlc, OldDocBody} = case barrel_store_rocksdb:get(StoreRef, DocInfoKey) of
+            {ok, ExistingBin} ->
+                ExistingDocInfo = binary_to_term(ExistingBin),
+                ExistingRev = maps:get(rev, ExistingDocInfo),
+                OldBody = case barrel_store_rocksdb:get(StoreRef,
+                                barrel_store_keys:doc_rev(DbName, DocId, ExistingRev)) of
+                    {ok, OldBodyBin} -> binary_to_term(OldBodyBin);
+                    not_found -> #{}
+                end,
+                {maps:get(hlc, ExistingDocInfo, undefined), OldBody};
+            not_found ->
+                {undefined, undefined}
+        end,
+
+        %% Build revision tree
+        RevTree = case length(Revs) of
+            1 ->
+                #{NewRev => #{id => NewRev, parent => undefined, deleted => Deleted}};
+            _ ->
+                [CurRev, ParentRev | _] = Revs,
+                #{
+                    ParentRev => #{id => ParentRev, parent => undefined, deleted => false},
+                    CurRev => #{id => CurRev, parent => ParentRev, deleted => Deleted}
+                }
+        end,
+
+        %% Generate new HLC timestamp
+        NextHlc = barrel_hlc:new_hlc(),
+
+        %% Build doc_info
+        DocInfo = #{
+            id => DocId,
+            rev => NewRev,
+            deleted => Deleted,
+            revtree => RevTree,
+            hlc => NextHlc
+        },
+
+        %% Prepare batch operations
+        DocOps = [
+            {put, DocInfoKey, term_to_binary(DocInfo)},
+            {put, barrel_store_keys:doc_rev(DbName, DocId, NewRev), term_to_binary(DocBody)}
+        ],
+
+        HlcDeleteOps = case OldHlc of
+            undefined -> [];
+            _ -> [{delete, barrel_store_keys:doc_hlc(DbName, OldHlc)}]
+        end,
+
+        PathIndexOps = case Deleted of
+            true when OldDocBody =/= undefined ->
+                case barrel_ars_index:get_doc_paths(StoreRef, DbName, DocId) of
+                    {ok, OldPaths} -> barrel_ars_index:remove_doc_ops(DbName, DocId, OldPaths);
+                    not_found -> []
+                end;
+            true -> [];
+            false when OldDocBody =:= undefined ->
+                barrel_ars_index:index_doc_ops(DbName, DocId, DocBody);
+            false ->
+                barrel_ars_index:update_doc_ops(DbName, DocId, OldDocBody, DocBody)
+        end,
+
+        ChangeInfo = DocInfo#{doc => DocBody},
+        ChangeOps = barrel_changes:write_change_ops(DbName, NextHlc, ChangeInfo),
+
+        PathHlcOps = case OldHlc of
+            undefined ->
+                barrel_changes:write_path_index_ops(DbName, NextHlc, ChangeInfo);
+            _ ->
+                barrel_changes:update_path_index_ops(DbName, NextHlc, ChangeInfo,
+                                                      OldHlc, OldDocBody)
+        end,
+
+        AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps,
+        NotifyInfo = {DocId, NewRev, NextHlc, Deleted, DocBody},
+        {ok, AllOps, NotifyInfo}
+    catch
+        _:Reason ->
+            {error, Reason}
+    end.
 
 %% @doc Get a document by ID
 do_get_doc(StoreRef, DbName, DocId, Opts) ->

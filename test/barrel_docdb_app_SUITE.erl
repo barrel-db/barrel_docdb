@@ -33,6 +33,7 @@
     api_list_dbs/1,
     api_put_get_doc/1,
     api_get_docs/1,
+    api_put_docs/1,
     api_update_doc/1,
     api_delete_doc/1,
     api_fold_docs/1,
@@ -84,6 +85,7 @@ groups() ->
             api_list_dbs,
             api_put_get_doc,
             api_get_docs,
+            api_put_docs,
             api_update_doc,
             api_delete_doc,
             api_fold_docs,
@@ -477,6 +479,71 @@ api_get_docs(_Config) ->
     %% Get empty list
     Results3 = barrel_docdb:get_docs(DbName, []),
     ?assertEqual([], Results3),
+
+    %% Cleanup
+    ok = barrel_docdb:delete_db(DbName),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+%% @doc Test batch put documents
+api_put_docs(_Config) ->
+    {ok, _} = application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"api_put_docs_test">>,
+    TestDir = "/tmp/barrel_api_put_docs_" ++ integer_to_list(erlang:system_time(millisecond)),
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
+
+    %% Put multiple documents at once
+    Docs = [
+        #{<<"id">> => <<"doc1">>, <<"name">> => <<"Alice">>, <<"type">> => <<"user">>},
+        #{<<"id">> => <<"doc2">>, <<"name">> => <<"Bob">>, <<"type">> => <<"user">>},
+        #{<<"id">> => <<"doc3">>, <<"name">> => <<"Charlie">>, <<"type">> => <<"user">>}
+    ],
+    Results = barrel_docdb:put_docs(DbName, Docs),
+    ?assertEqual(3, length(Results)),
+
+    %% All should succeed
+    lists:foreach(
+        fun({ok, Result}) ->
+            ?assertEqual(true, maps:get(<<"ok">>, Result)),
+            ?assert(is_binary(maps:get(<<"rev">>, Result)))
+        end,
+        Results
+    ),
+
+    %% Verify documents were created
+    {ok, Doc1} = barrel_docdb:get_doc(DbName, <<"doc1">>),
+    ?assertEqual(<<"Alice">>, maps:get(<<"name">>, Doc1)),
+    {ok, Doc2} = barrel_docdb:get_doc(DbName, <<"doc2">>),
+    ?assertEqual(<<"Bob">>, maps:get(<<"name">>, Doc2)),
+    {ok, Doc3} = barrel_docdb:get_doc(DbName, <<"doc3">>),
+    ?assertEqual(<<"Charlie">>, maps:get(<<"name">>, Doc3)),
+
+    %% Verify path index was updated for all docs
+    {ok, QueryResults} = barrel_docdb:find(DbName, #{
+        where => [{path, [<<"type">>], <<"user">>}]
+    }),
+    ?assertEqual(3, length(QueryResults)),
+
+    %% Test batch update - get revisions first
+    Rev1 = maps:get(<<"_rev">>, Doc1),
+    Rev2 = maps:get(<<"_rev">>, Doc2),
+    UpdateDocs = [
+        #{<<"id">> => <<"doc1">>, <<"_rev">> => Rev1, <<"name">> => <<"Alice Updated">>, <<"type">> => <<"user">>},
+        #{<<"id">> => <<"doc2">>, <<"_rev">> => Rev2, <<"name">> => <<"Bob Updated">>, <<"type">> => <<"user">>}
+    ],
+    UpdateResults = barrel_docdb:put_docs(DbName, UpdateDocs),
+    ?assertEqual(2, length(UpdateResults)),
+
+    %% Verify updates
+    {ok, UpdatedDoc1} = barrel_docdb:get_doc(DbName, <<"doc1">>),
+    ?assertEqual(<<"Alice Updated">>, maps:get(<<"name">>, UpdatedDoc1)),
+    {ok, UpdatedDoc2} = barrel_docdb:get_doc(DbName, <<"doc2">>),
+    ?assertEqual(<<"Bob Updated">>, maps:get(<<"name">>, UpdatedDoc2)),
+
+    %% Test empty batch
+    EmptyResults = barrel_docdb:put_docs(DbName, []),
+    ?assertEqual([], EmptyResults),
 
     %% Cleanup
     ok = barrel_docdb:delete_db(DbName),
