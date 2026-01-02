@@ -30,7 +30,8 @@
 
 %% Utility for reading stored paths
 -export([
-    get_doc_paths/3
+    get_doc_paths/3,
+    get_path_cardinality/3
 ]).
 
 -include("barrel_docdb.hrl").
@@ -89,12 +90,18 @@ update_doc_ops(DbName, DocId, OldDoc, NewDoc) ->
             AddOps = [{put, barrel_store_keys:path_index_key(DbName, Path, DocId), <<>>}
                       || {Path, _} <- Added],
 
+            %% Update counters: decrement removed, increment added
+            DecrOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), -1}
+                       || {Path, _} <- Removed],
+            IncrOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), 1}
+                       || {Path, _} <- Added],
+
             %% Update reverse index with new paths
             ReverseOp = {put,
                          barrel_store_keys:doc_paths_key(DbName, DocId),
                          term_to_binary(NewPaths)},
 
-            RemoveOps ++ AddOps ++ [ReverseOp]
+            RemoveOps ++ AddOps ++ DecrOps ++ IncrOps ++ [ReverseOp]
     end.
 
 %% @doc Remove all paths for a document.
@@ -119,14 +126,18 @@ remove_doc(StoreRef, DbName, DocId) ->
 %% @doc Return batch operations to remove all paths for a document.
 %% Takes the stored paths (from reverse index) as parameter.
 %% Use this to combine with other operations in a single write_batch.
--spec remove_doc_ops(db_name(), docid(), [{[term()], term()}]) -> [{delete, binary()}].
+-spec remove_doc_ops(db_name(), docid(), [{[term()], term()}]) ->
+    [{delete, binary()} | {merge, binary(), integer()}].
 remove_doc_ops(DbName, DocId, Paths) ->
     %% Delete all path index entries
     DeleteOps = [{delete, barrel_store_keys:path_index_key(DbName, Path, DocId)}
                  || {Path, _} <- Paths],
+    %% Decrement counters for each path
+    DecrOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), -1}
+               || {Path, _} <- Paths],
     %% Delete reverse index
     ReverseKey = barrel_store_keys:doc_paths_key(DbName, DocId),
-    DeleteOps ++ [{delete, ReverseKey}].
+    DeleteOps ++ DecrOps ++ [{delete, ReverseKey}].
 
 %% @doc Get stored paths for a document from the reverse index.
 %% Returns {ok, Paths} or not_found.
@@ -139,6 +150,22 @@ get_doc_paths(StoreRef, DbName, DocId) ->
             {ok, binary_to_term(PathsBin)};
         not_found ->
             not_found;
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc Get the cardinality (document count) for a path+value.
+%% Returns 0 if the path has never been indexed.
+-spec get_path_cardinality(store_ref(), db_name(), [term()]) ->
+    {ok, non_neg_integer()} | {error, term()}.
+get_path_cardinality(StoreRef, DbName, Path) ->
+    Key = barrel_store_keys:path_stats_key(DbName, Path),
+    case barrel_store_rocksdb:get(StoreRef, Key) of
+        {ok, CountBin} ->
+            Count = binary_to_integer(CountBin),
+            {ok, max(0, Count)};
+        not_found ->
+            {ok, 0};
         {error, _} = Error ->
             Error
     end.
@@ -187,12 +214,16 @@ make_index_ops(DbName, DocId, Paths) ->
     PathOps = [{put, barrel_store_keys:path_index_key(DbName, Path, DocId), <<>>}
                || {Path, _} <- Paths],
 
+    %% Increment counters for each path
+    StatsOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), 1}
+                || {Path, _} <- Paths],
+
     %% Store reverse index (doc_id -> paths) for later updates/deletes
     ReverseOp = {put,
                  barrel_store_keys:doc_paths_key(DbName, DocId),
                  term_to_binary(Paths)},
 
-    PathOps ++ [ReverseOp].
+    PathOps ++ StatsOps ++ [ReverseOp].
 
 %% @private Decode a path index key to extract path and docid
 %% Key format: 0x0B + len:16 + dbname + encoded_path + docid

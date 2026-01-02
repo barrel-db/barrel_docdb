@@ -31,6 +31,9 @@
 -export([doc_paths_key/2, doc_paths_prefix/1]).
 -export([encode_path/1, decode_path/1]).
 
+%% Path stats keys (for cardinality counters)
+-export([path_stats_key/2]).
+
 %% Path-HLC keys (for path-indexed change feeds)
 -export([path_hlc/3, path_hlc_prefix/2, path_hlc_end/2]).
 -export([encode_topic/1, decode_path_hlc_key/2]).
@@ -66,6 +69,7 @@
 -define(PREFIX_DOC_PATHS, 16#0C).
 -define(PREFIX_DOC_HLC, 16#0D).
 -define(PREFIX_PATH_HLC, 16#0E).
+-define(PREFIX_PATH_STATS, 16#0F).
 
 %% Path component type tags (for ordered encoding)
 -define(PATH_TYPE_NULL, 16#01).
@@ -397,6 +401,13 @@ doc_paths_key(DbName, DocId) ->
 -spec doc_paths_prefix(db_name()) -> binary().
 doc_paths_prefix(DbName) ->
     <<?PREFIX_DOC_PATHS, (encode_name(DbName))/binary>>.
+
+%% @doc Path stats key for cardinality counter.
+%% Stores the count of documents matching a specific path+value.
+-spec path_stats_key(db_name(), [term()]) -> binary().
+path_stats_key(DbName, Path) ->
+    EncodedPath = encode_path(Path),
+    <<?PREFIX_PATH_STATS, (encode_name(DbName))/binary, EncodedPath/binary>>.
 
 %% @doc Encode a path for lexicographic ordering.
 %% Path components are encoded with length prefix and type tags.

@@ -10,6 +10,7 @@
 %% barrel_store callbacks
 -export([open/2, close/1]).
 -export([put/3, put/4, get/2, multi_get/2, delete/2]).
+-export([merge/3]).
 -export([write_batch/2, write_batch/3]).
 -export([fold/4, fold_range/5, fold_range_reverse/5]).
 
@@ -76,6 +77,11 @@ multi_get(#{ref := Ref}, Keys) ->
 delete(#{ref := Ref}, Key) ->
     rocksdb:delete(Ref, Key, []).
 
+%% @doc Merge a value with the counter merge operator
+-spec merge(db_ref(), binary(), integer()) -> ok | {error, term()}.
+merge(#{ref := Ref}, Key, Delta) ->
+    rocksdb:merge(Ref, Key, integer_to_binary(Delta), []).
+
 %% @doc Execute a batch of operations atomically (async by default)
 -spec write_batch(db_ref(), list()) -> ok | {error, term()}.
 write_batch(DbRef, Operations) ->
@@ -93,7 +99,9 @@ write_batch(#{ref := Ref}, Operations, Opts) ->
             fun({put, Key, Value}) ->
                 ok = rocksdb:batch_put(Batch, Key, Value);
                ({delete, Key}) ->
-                ok = rocksdb:batch_delete(Batch, Key)
+                ok = rocksdb:batch_delete(Batch, Key);
+               ({merge, Key, Delta}) when is_integer(Delta) ->
+                ok = rocksdb:batch_merge(Batch, Key, integer_to_binary(Delta))
             end,
             Operations
         ),

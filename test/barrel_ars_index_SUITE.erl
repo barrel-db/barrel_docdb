@@ -32,7 +32,10 @@
     fold_exact_path/1,
     fold_path_prefix/1,
     fold_empty_result/1,
-    multiple_docs_same_path/1
+    multiple_docs_same_path/1,
+    cardinality_basic/1,
+    cardinality_update/1,
+    cardinality_remove/1
 ]).
 
 %%====================================================================
@@ -40,7 +43,7 @@
 %%====================================================================
 
 all() ->
-    [{group, index}, {group, update}, {group, remove}, {group, fold}].
+    [{group, index}, {group, update}, {group, remove}, {group, fold}, {group, cardinality}].
 
 groups() ->
     [
@@ -63,6 +66,11 @@ groups() ->
             fold_path_prefix,
             fold_empty_result,
             multiple_docs_same_path
+        ]},
+        {cardinality, [sequence], [
+            cardinality_basic,
+            cardinality_update,
+            cardinality_remove
         ]}
     ].
 
@@ -376,3 +384,72 @@ fold_all_paths(StoreRef, DbName, PathPrefix) ->
         fun({Path, DocId}, Acc) -> {ok, [{Path, DocId} | Acc]} end,
         []
     ).
+
+%%====================================================================
+%% Test Cases - Cardinality
+%%====================================================================
+
+cardinality_basic(Config) ->
+    StoreRef = proplists:get_value(store_ref, Config),
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Initially no cardinality
+    {ok, 0} = barrel_ars_index:get_path_cardinality(StoreRef, DbName, [<<"type">>, <<"card_test">>]),
+
+    %% Index first doc
+    Doc1 = #{<<"type">> => <<"card_test">>},
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"card1">>, Doc1),
+    {ok, 1} = barrel_ars_index:get_path_cardinality(StoreRef, DbName, [<<"type">>, <<"card_test">>]),
+
+    %% Index second doc with same path
+    Doc2 = #{<<"type">> => <<"card_test">>},
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"card2">>, Doc2),
+    {ok, 2} = barrel_ars_index:get_path_cardinality(StoreRef, DbName, [<<"type">>, <<"card_test">>]),
+
+    %% Index doc with different value
+    Doc3 = #{<<"type">> => <<"other">>},
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"card3">>, Doc3),
+    {ok, 2} = barrel_ars_index:get_path_cardinality(StoreRef, DbName, [<<"type">>, <<"card_test">>]),
+    {ok, 1} = barrel_ars_index:get_path_cardinality(StoreRef, DbName, [<<"type">>, <<"other">>]),
+
+    ok.
+
+cardinality_update(Config) ->
+    StoreRef = proplists:get_value(store_ref, Config),
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Index doc
+    OldDoc = #{<<"status">> => <<"pending">>},
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"upd1">>, OldDoc),
+    {ok, 1} = barrel_ars_index:get_path_cardinality(StoreRef, DbName, [<<"status">>, <<"pending">>]),
+
+    %% Update doc to new status
+    NewDoc = #{<<"status">> => <<"complete">>},
+    ok = barrel_ars_index:update_doc(StoreRef, DbName, <<"upd1">>, OldDoc, NewDoc),
+
+    %% Old path decremented, new path incremented
+    {ok, 0} = barrel_ars_index:get_path_cardinality(StoreRef, DbName, [<<"status">>, <<"pending">>]),
+    {ok, 1} = barrel_ars_index:get_path_cardinality(StoreRef, DbName, [<<"status">>, <<"complete">>]),
+
+    ok.
+
+cardinality_remove(Config) ->
+    StoreRef = proplists:get_value(store_ref, Config),
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Index docs
+    Doc1 = #{<<"cat">> => <<"rm_test">>},
+    Doc2 = #{<<"cat">> => <<"rm_test">>},
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"rm1">>, Doc1),
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"rm2">>, Doc2),
+    {ok, 2} = barrel_ars_index:get_path_cardinality(StoreRef, DbName, [<<"cat">>, <<"rm_test">>]),
+
+    %% Remove first doc
+    ok = barrel_ars_index:remove_doc(StoreRef, DbName, <<"rm1">>),
+    {ok, 1} = barrel_ars_index:get_path_cardinality(StoreRef, DbName, [<<"cat">>, <<"rm_test">>]),
+
+    %% Remove second doc
+    ok = barrel_ars_index:remove_doc(StoreRef, DbName, <<"rm2">>),
+    {ok, 0} = barrel_ars_index:get_path_cardinality(StoreRef, DbName, [<<"cat">>, <<"rm_test">>]),
+
+    ok.
