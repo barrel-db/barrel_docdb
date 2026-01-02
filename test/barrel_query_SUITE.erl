@@ -69,7 +69,8 @@
     execute_with_order/1,
     execute_include_docs/1,
     execute_variable_binding/1,
-    execute_multi_index_intersection/1
+    execute_multi_index_intersection/1,
+    execute_multi_index_zero_cardinality/1
 ]).
 
 %%====================================================================
@@ -129,7 +130,8 @@ groups() ->
             execute_with_order,
             execute_include_docs,
             execute_variable_binding,
-            execute_multi_index_intersection
+            execute_multi_index_intersection,
+            execute_multi_index_zero_cardinality
         ]}
     ].
 
@@ -719,4 +721,24 @@ execute_multi_index_intersection(Config) ->
     DocIds = [maps:get(<<"id">>, R) || R <- Results],
     ?assert(lists:member(<<"user1">>, DocIds)),
     ?assert(lists:member(<<"user2">>, DocIds)),
+    ok.
+
+%% Test that 3+ condition queries with a zero-cardinality condition
+%% short-circuit and return empty results immediately
+execute_multi_index_zero_cardinality(Config) ->
+    DbName = proplists:get_value(db_name, Config),
+    StoreRef = proplists:get_value(store_ref, Config),
+
+    %% Query with nonexistent value - should short-circuit and return empty
+    Spec = #{
+        where => [
+            {path, [<<"type">>], <<"user">>},
+            {path, [<<"org">>], <<"org1">>},
+            {path, [<<"status">>], <<"nonexistent">>}  %% No docs have this status
+        ]
+    },
+    {ok, Plan} = barrel_query:compile(Spec),
+    {ok, Results, _} = barrel_query:execute(StoreRef, DbName, Plan),
+
+    ?assertEqual(0, length(Results)),
     ok.

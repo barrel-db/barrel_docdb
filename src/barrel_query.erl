@@ -539,17 +539,61 @@ execute_multi_index(StoreRef, DbName, Plan) ->
     case IndexConditions of
         [] ->
             execute_full_scan(StoreRef, DbName, Plan);
-        [First | Rest] ->
-            %% Start with first condition's doc ids (already sorted)
+        _ when length(IndexConditions) =< 2 ->
+            %% For 1-2 conditions, skip cardinality lookup (overhead not worth it)
+            [First | Rest] = IndexConditions,
             {path, Path1, Value1} = First,
             FullPath1 = Path1 ++ [Value1],
             InitialDocIds = collect_docids_for_path(StoreRef, DbName, FullPath1),
-
-            %% Intersect with remaining conditions using merge intersection
-            %% Short-circuits when any condition produces empty set
             FinalDocIds = intersect_conditions(StoreRef, DbName, Rest, InitialDocIds),
+            filter_and_project(StoreRef, DbName, FinalDocIds, Plan);
+        _ ->
+            %% For 3+ conditions, order by cardinality (smallest first)
+            %% Also short-circuit if any condition has 0 cardinality
+            case order_by_cardinality(StoreRef, DbName, IndexConditions) of
+                [] ->
+                    %% All conditions have 0 cardinality - no matches possible
+                    filter_and_project(StoreRef, DbName, [], Plan);
+                [First | Rest] ->
+                    %% Start with smallest cardinality condition
+                    {path, Path1, Value1} = First,
+                    FullPath1 = Path1 ++ [Value1],
+                    InitialDocIds = collect_docids_for_path(StoreRef, DbName, FullPath1),
+                    FinalDocIds = intersect_conditions(StoreRef, DbName, Rest, InitialDocIds),
+                    filter_and_project(StoreRef, DbName, FinalDocIds, Plan)
+            end
+    end.
 
-            filter_and_project(StoreRef, DbName, FinalDocIds, Plan)
+%% @doc Order conditions by cardinality (smallest first) for optimal intersection.
+%% Returns empty list if any condition has 0 cardinality (short-circuit).
+order_by_cardinality(StoreRef, DbName, Conditions) ->
+    %% Build keys for all conditions
+    Keys = [barrel_store_keys:path_stats_key(DbName, Path ++ [Value])
+            || {path, Path, Value} <- Conditions],
+
+    %% Batch fetch all cardinalities with multi_get
+    Results = barrel_store_rocksdb:multi_get(StoreRef, Keys),
+
+    %% Parse results and associate with conditions
+    WithCardinality = lists:zipwith(
+        fun(Cond, Result) ->
+            Count = case Result of
+                {ok, CountBin} -> max(0, binary_to_integer(CountBin));
+                not_found -> 0
+            end,
+            {Count, Cond}
+        end,
+        Conditions, Results
+    ),
+
+    %% Check for any zero cardinality (short-circuit)
+    case lists:any(fun({0, _}) -> true; (_) -> false end, WithCardinality) of
+        true ->
+            [];
+        false ->
+            %% Sort by cardinality ascending and extract conditions
+            Sorted = lists:keysort(1, WithCardinality),
+            [Cond || {_, Cond} <- Sorted]
     end.
 
 %% @doc Intersect doc IDs from multiple conditions with short-circuit
