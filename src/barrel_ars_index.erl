@@ -71,13 +71,7 @@
 index_doc(StoreRef, DbName, DocId, Doc) ->
     Paths = barrel_ars:analyze(Doc),
     Operations = make_index_ops(DbName, DocId, Paths),
-    case barrel_store_rocksdb:write_batch(StoreRef, Operations) of
-        ok ->
-            %% Update posting lists for each path
-            update_postings(StoreRef, DbName, DocId, Paths, add);
-        {error, _} = Error ->
-            Error
-    end.
+    barrel_store_rocksdb:write_batch(StoreRef, Operations).
 
 %% @doc Return batch operations to index all paths from a document.
 %% Use this to combine with other operations in a single write_batch.
@@ -88,7 +82,6 @@ index_doc_ops(DbName, DocId, Doc) ->
 
 %% @doc Update paths when a document changes.
 %% Computes the diff between old and new paths and applies changes.
-%% Updates posting lists for O(1) equality query lookups.
 -spec update_doc(store_ref(), db_name(), docid(), doc(), doc()) ->
     ok | {error, term()}.
 update_doc(StoreRef, DbName, DocId, OldDoc, NewDoc) ->
@@ -101,14 +94,7 @@ update_doc(StoreRef, DbName, DocId, OldDoc, NewDoc) ->
             ok;
         _ ->
             Operations = make_update_ops(DbName, DocId, Added, Removed, NewPaths),
-            case barrel_store_rocksdb:write_batch(StoreRef, Operations) of
-                ok ->
-                    %% Update posting lists: remove old, add new
-                    ok = update_postings(StoreRef, DbName, DocId, Removed, remove),
-                    update_postings(StoreRef, DbName, DocId, Added, add);
-                {error, _} = Error ->
-                    Error
-            end
+            barrel_store_rocksdb:write_batch(StoreRef, Operations)
     end.
 
 %% @doc Return batch operations to update paths when a document changes.
@@ -130,7 +116,6 @@ update_doc_ops(DbName, DocId, OldDoc, NewDoc) ->
 
 %% @doc Remove all paths for a document.
 %% Reads the reverse index to find all paths and deletes them.
-%% Also removes from posting lists.
 -spec remove_doc(store_ref(), db_name(), docid()) ->
     ok | {error, term()}.
 remove_doc(StoreRef, DbName, DocId) ->
@@ -140,13 +125,7 @@ remove_doc(StoreRef, DbName, DocId) ->
         {ok, PathsBin} ->
             Paths = binary_to_term(PathsBin),
             Operations = remove_doc_ops(DbName, DocId, Paths),
-            case barrel_store_rocksdb:write_batch(StoreRef, Operations) of
-                ok ->
-                    %% Remove from posting lists
-                    update_postings(StoreRef, DbName, DocId, Paths, remove);
-                {error, _} = Error ->
-                    Error
-            end;
+            barrel_store_rocksdb:write_batch(StoreRef, Operations);
         not_found ->
             %% No paths indexed
             ok;
@@ -476,29 +455,3 @@ make_update_ops(DbName, DocId, Added, Removed, NewPaths) ->
                  term_to_binary(NewPaths)},
 
     RemoveOps ++ AddOps ++ DecrOps ++ IncrOps ++ BitmapSetOps ++ [ReverseOp].
-
-%% @private Update posting lists for paths.
-%% Adds or removes DocId from posting lists based on Op.
-%% Paths format: [{[field, value], OrigValue}, ...]
-update_postings(StoreRef, DbName, DocId, Paths, Op) ->
-    lists:foreach(fun({Path, _Value}) ->
-        %% Path is like [<<"type">>, <<"user">>]
-        %% We need: FieldPath = [<<"type">>], Value = <<"user">>
-        case Path of
-            [] ->
-                ok;
-            _ ->
-                FieldPath = lists:droplast(Path),
-                PathValue = lists:last(Path),
-                %% Get or create PathId for the field path
-                PathId = barrel_path_dict:get_or_create_id(StoreRef, DbName, FieldPath),
-                %% Update posting list
-                case Op of
-                    add ->
-                        barrel_posting:add(StoreRef, DbName, PathId, PathValue, DocId);
-                    remove ->
-                        barrel_posting:remove(StoreRef, DbName, PathId, PathValue, DocId)
-                end
-        end
-    end, Paths),
-    ok.

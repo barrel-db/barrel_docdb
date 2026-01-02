@@ -59,7 +59,7 @@ open(Path, Options) ->
     %% Column family descriptors
     DefaultCFOpts = [{merge_operator, counter_merge_operator}],
     BitmapCFOpts = [{merge_operator, {bitset_merge_operator, BitmapSize}}],
-    PostingCFOpts = [],  %% No merge operator - writes serialized by posting_writer
+    PostingCFOpts = [],  %% Reserved for future use
 
     CFDescriptors = [
         {"default", DefaultCFOpts},
@@ -409,8 +409,7 @@ posting_get(#{ref := Ref, posting_cf := PostingCF}, Key) ->
 posting_multi_get(#{ref := Ref, posting_cf := PostingCF}, Keys) ->
     rocksdb:multi_get(Ref, PostingCF, Keys, []).
 
-%% @doc Put a posting list to the posting column family
-%% Note: Writes should be serialized through barrel_posting_writer
+%% @doc Put a value to the posting column family
 -spec posting_put(db_ref(), binary(), binary()) -> ok | {error, term()}.
 posting_put(#{ref := Ref, posting_cf := PostingCF}, Key, Value) ->
     rocksdb:put(Ref, PostingCF, Key, Value, []).
