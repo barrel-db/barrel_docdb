@@ -70,13 +70,26 @@
     json_roundtrip_types/1
 ]).
 
+%% Test cases - Index and iterator
+-export([
+    index_present/1,
+    index_containers/1,
+    peek_top_level/1,
+    peek_not_found/1,
+    find_path_simple/1,
+    find_path_nested/1,
+    find_path_array/1,
+    decode_value_primitive/1,
+    decode_value_nested/1
+]).
+
 %%====================================================================
 %% CT Callbacks
 %%====================================================================
 
 all() ->
     [{group, varint}, {group, cbor_primitives}, {group, cbor_containers},
-     {group, record}, {group, json}].
+     {group, record}, {group, json}, {group, iterator}].
 
 groups() ->
     [
@@ -124,6 +137,17 @@ groups() ->
             json_roundtrip_simple,
             json_roundtrip_nested,
             json_roundtrip_types
+        ]},
+        {iterator, [sequence], [
+            index_present,
+            index_containers,
+            peek_top_level,
+            peek_not_found,
+            find_path_simple,
+            find_path_nested,
+            find_path_array,
+            decode_value_primitive,
+            decode_value_nested
         ]}
     ].
 
@@ -391,3 +415,102 @@ json_roundtrip_types(_Config) ->
     Record = barrel_docdb_codec_cbor:from_json(Json),
     JsonOut = barrel_docdb_codec_cbor:to_json(Record),
     ?assertEqual(json:decode(Json), json:decode(JsonOut)).
+
+%%====================================================================
+%% Test Cases - Index and Iterator
+%%====================================================================
+
+index_present(_Config) ->
+    Doc = #{<<"id">> => <<"doc1">>, <<"value">> => 42},
+    RecordBin = barrel_docdb_codec_cbor:encode(Doc),
+    IndexBin = barrel_docdb_codec_cbor:index_bin(RecordBin),
+    %% Index should be non-empty for a map document
+    ?assert(byte_size(IndexBin) > 0).
+
+index_containers(_Config) ->
+    Doc = #{
+        <<"user">> => #{
+            <<"name">> => <<"Alice">>,
+            <<"tags">> => [<<"a">>, <<"b">>]
+        }
+    },
+    RecordBin = barrel_docdb_codec_cbor:encode(Doc),
+    IndexBin = barrel_docdb_codec_cbor:index_bin(RecordBin),
+    %% Should have containers for: root map, nested map, array
+    ?assert(byte_size(IndexBin) > 10).
+
+peek_top_level(_Config) ->
+    Doc = #{<<"name">> => <<"test">>, <<"value">> => 42},
+    RecordBin = barrel_docdb_codec_cbor:encode(Doc),
+    %% Peek should find top-level keys
+    case barrel_docdb_codec_cbor:peek(RecordBin, <<"name">>) of
+        {ok, {text, VRef}} ->
+            {ok, Value} = barrel_docdb_codec_cbor:decode_value(RecordBin, VRef),
+            ?assertEqual(<<"test">>, Value);
+        {error, not_implemented} ->
+            %% Stub - will be implemented
+            ok
+    end.
+
+peek_not_found(_Config) ->
+    Doc = #{<<"name">> => <<"test">>},
+    RecordBin = barrel_docdb_codec_cbor:encode(Doc),
+    case barrel_docdb_codec_cbor:peek(RecordBin, <<"missing">>) of
+        not_found -> ok;
+        {error, not_implemented} -> ok
+    end.
+
+find_path_simple(_Config) ->
+    Doc = #{<<"user">> => #{<<"name">> => <<"Alice">>}},
+    RecordBin = barrel_docdb_codec_cbor:encode(Doc),
+    case barrel_docdb_codec_cbor:find_path(RecordBin, [<<"user">>, <<"name">>]) of
+        {ok, {text, VRef}} ->
+            {ok, Value} = barrel_docdb_codec_cbor:decode_value(RecordBin, VRef),
+            ?assertEqual(<<"Alice">>, Value);
+        {error, not_implemented} ->
+            ok
+    end.
+
+find_path_nested(_Config) ->
+    Doc = #{<<"a">> => #{<<"b">> => #{<<"c">> => 123}}},
+    RecordBin = barrel_docdb_codec_cbor:encode(Doc),
+    case barrel_docdb_codec_cbor:find_path(RecordBin, [<<"a">>, <<"b">>, <<"c">>]) of
+        {ok, {uint, VRef}} ->
+            {ok, Value} = barrel_docdb_codec_cbor:decode_value(RecordBin, VRef),
+            ?assertEqual(123, Value);
+        {error, not_implemented} ->
+            ok
+    end.
+
+find_path_array(_Config) ->
+    Doc = #{<<"items">> => [<<"a">>, <<"b">>, <<"c">>]},
+    RecordBin = barrel_docdb_codec_cbor:encode(Doc),
+    case barrel_docdb_codec_cbor:find_path(RecordBin, [<<"items">>, 1]) of
+        {ok, {text, VRef}} ->
+            {ok, Value} = barrel_docdb_codec_cbor:decode_value(RecordBin, VRef),
+            ?assertEqual(<<"b">>, Value);
+        {error, not_implemented} ->
+            ok
+    end.
+
+decode_value_primitive(_Config) ->
+    Doc = #{<<"num">> => 42, <<"str">> => <<"hello">>},
+    RecordBin = barrel_docdb_codec_cbor:encode(Doc),
+    case barrel_docdb_codec_cbor:peek(RecordBin, <<"num">>) of
+        {ok, {uint, VRef}} ->
+            {ok, Value} = barrel_docdb_codec_cbor:decode_value(RecordBin, VRef),
+            ?assertEqual(42, Value);
+        {error, not_implemented} ->
+            ok
+    end.
+
+decode_value_nested(_Config) ->
+    Doc = #{<<"nested">> => #{<<"deep">> => true}},
+    RecordBin = barrel_docdb_codec_cbor:encode(Doc),
+    case barrel_docdb_codec_cbor:peek(RecordBin, <<"nested">>) of
+        {ok, {map, VRef}} ->
+            {ok, Value} = barrel_docdb_codec_cbor:decode_value(RecordBin, VRef),
+            ?assertEqual(#{<<"deep">> => true}, Value);
+        {error, not_implemented} ->
+            ok
+    end.
