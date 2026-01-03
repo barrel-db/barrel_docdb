@@ -22,44 +22,44 @@ run(Db, NumDocs, Iterations) ->
             ok
     end,
 
-    %% Benchmark different query types
+    %% Benchmark different query types - summarize immediately after each to get correct elapsed time
     io:format("  Running simple equality queries...~n"),
-    SimpleEq = bench_query(Db, simple_eq_query(), Iterations),
+    SimpleEq = barrel_bench_metrics:summarize(bench_query(Db, simple_eq_query(), Iterations)),
 
     io:format("  Running simple equality with LIMIT 10...~n"),
-    SimpleEqLimit = bench_query(Db, simple_eq_limit_query(), Iterations),
+    SimpleEqLimit = barrel_bench_metrics:summarize(bench_query(Db, simple_eq_limit_query(), Iterations)),
 
     io:format("  Running range queries...~n"),
-    Range = bench_query(Db, range_query(), Iterations),
+    Range = barrel_bench_metrics:summarize(bench_query(Db, range_query(), Iterations)),
 
     io:format("  Running multi-condition queries...~n"),
-    MultiCond = bench_query(Db, multi_condition_query(), Iterations),
+    MultiCond = barrel_bench_metrics:summarize(bench_query(Db, multi_condition_query(), Iterations)),
 
     io:format("  Running nested path queries...~n"),
-    NestedPath = bench_query(Db, nested_path_query(), Iterations),
+    NestedPath = barrel_bench_metrics:summarize(bench_query(Db, nested_path_query(), Iterations)),
 
     io:format("  Running ORDER BY + LIMIT queries (Top-K)...~n"),
-    TopK = bench_query(Db, order_by_limit_query(), Iterations),
+    TopK = barrel_bench_metrics:summarize(bench_query(Db, order_by_limit_query(), Iterations)),
 
     io:format("  Running pure ORDER BY + LIMIT (no filter)...~n"),
-    PureTopK = bench_query(Db, pure_order_limit_query(), Iterations),
+    PureTopK = barrel_bench_metrics:summarize(bench_query(Db, pure_order_limit_query(), Iterations)),
 
     io:format("  Running prefix queries...~n"),
-    PrefixQ = bench_query(Db, prefix_query(), Iterations),
+    PrefixQ = barrel_bench_metrics:summarize(bench_query(Db, prefix_query(), Iterations)),
 
     io:format("  Running exists queries...~n"),
-    ExistsQ = bench_query(Db, exists_query(), Iterations),
+    ExistsQ = barrel_bench_metrics:summarize(bench_query(Db, exists_query(), Iterations)),
 
     #{
-        simple_eq => barrel_bench_metrics:summarize(SimpleEq),
-        simple_eq_limit => barrel_bench_metrics:summarize(SimpleEqLimit),
-        range => barrel_bench_metrics:summarize(Range),
-        multi_condition => barrel_bench_metrics:summarize(MultiCond),
-        nested_path => barrel_bench_metrics:summarize(NestedPath),
-        order_by_limit => barrel_bench_metrics:summarize(TopK),
-        pure_topk => barrel_bench_metrics:summarize(PureTopK),
-        prefix => barrel_bench_metrics:summarize(PrefixQ),
-        exists => barrel_bench_metrics:summarize(ExistsQ)
+        simple_eq => SimpleEq,
+        simple_eq_limit => SimpleEqLimit,
+        range => Range,
+        multi_condition => MultiCond,
+        nested_path => NestedPath,
+        order_by_limit => TopK,
+        pure_topk => PureTopK,
+        prefix => PrefixQ,
+        exists => ExistsQ
     }.
 
 %%====================================================================
