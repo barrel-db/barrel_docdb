@@ -107,6 +107,16 @@
 -export_type([query_spec/0, query_plan/0, condition/0, logic_var/0]).
 
 %%====================================================================
+%% Chunked Execution Constants
+%%====================================================================
+
+%% Target: ~1MB of doc data per chunk for good cache utilization
+-define(TARGET_CHUNK_BYTES, 1048576).
+-define(MIN_CHUNK_SIZE, 50).
+-define(MAX_CHUNK_SIZE, 1000).
+-define(INITIAL_CHUNK_SIZE, 200).
+
+%%====================================================================
 %% API
 %%====================================================================
 
@@ -556,30 +566,34 @@ execute_index_seek(StoreRef, DbName, Plan) ->
                 _ ->
                     %% Compute remaining conditions (index condition already satisfied by iteration)
                     RemainingConds = Conditions -- [IndexCond],
-                    %% Check if streaming execution is better
-                    %% Streaming fetches docs one-by-one and stops early
-                    %% Better for small limits on high-cardinality indexes
                     %% Index condition already satisfied - use remaining conditions only
                     FilterPlan = Plan#query_plan{conditions = RemainingConds},
-                    case should_use_streaming(Limit, Cardinality) of
-                        true ->
-                            %% Streaming: fetch/match documents one-by-one
-                            execute_index_seek_streaming(StoreRef, DbName, FullPath, FilterPlan);
-                        false ->
-                            %% Batch: collect DocIds then fetch/filter
-                            %% PROFILING: Index iteration
-                            T0 = erlang:monotonic_time(microsecond),
-                            EarlyLimitResult = can_use_early_limit(Order, RemainingConds, Limit),
-                            DocIds = case EarlyLimitResult of
-                                {true, MaxCollect} ->
-                                    collect_docids_for_path_limited(StoreRef, DbName, FullPath, MaxCollect + Offset);
+                    case Limit of
+                        undefined ->
+                            %% Unbounded query - use adaptive chunked execution
+                            execute_index_seek_chunked(StoreRef, DbName, FullPath, FilterPlan);
+                        _ when is_integer(Limit) ->
+                            %% Limited query - check streaming vs batch
+                            case should_use_streaming(Limit, Cardinality) of
+                                true ->
+                                    %% Streaming: fetch/match documents one-by-one
+                                    execute_index_seek_streaming(StoreRef, DbName, FullPath, FilterPlan);
                                 false ->
-                                    collect_docids_for_path(StoreRef, DbName, FullPath)
-                            end,
-                            T1 = erlang:monotonic_time(microsecond),
-                            put(profile_index_iter, pdict_get(profile_index_iter, 0) + (T1 - T0)),
-                            put(profile_doc_count, length(DocIds)),
-                            filter_and_project(StoreRef, DbName, DocIds, FilterPlan)
+                                    %% Batch: collect DocIds then fetch/filter
+                                    %% PROFILING: Index iteration
+                                    T0 = erlang:monotonic_time(microsecond),
+                                    EarlyLimitResult = can_use_early_limit(Order, RemainingConds, Limit),
+                                    DocIds = case EarlyLimitResult of
+                                        {true, MaxCollect} ->
+                                            collect_docids_for_path_limited(StoreRef, DbName, FullPath, MaxCollect + Offset);
+                                        false ->
+                                            collect_docids_for_path(StoreRef, DbName, FullPath)
+                                    end,
+                                    T1 = erlang:monotonic_time(microsecond),
+                                    put(profile_index_iter, pdict_get(profile_index_iter, 0) + (T1 - T0)),
+                                    put(profile_doc_count, length(DocIds)),
+                                    filter_and_project(StoreRef, DbName, DocIds, FilterPlan)
+                            end
                     end
             end;
         not_found ->
@@ -641,6 +655,71 @@ execute_index_seek_streaming(StoreRef, DbName, FullPath, Plan) ->
     LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
 
     {ok, FinalResults, LastSeq}.
+
+%% @doc Execute index seek with adaptive chunked processing for unbounded queries.
+%% Processes index entries in chunks, batch-fetching each chunk for efficiency.
+%% Chunk size adapts based on average document size to target ~1MB per batch.
+execute_index_seek_chunked(StoreRef, DbName, FullPath, Plan) ->
+    #query_plan{
+        conditions = Conditions,
+        bindings = Bindings,
+        projections = Projections,
+        order = Order,
+        offset = Offset,
+        include_docs = IncludeDocs
+    } = Plan,
+
+    %% Fold index in chunks, batch-fetch and filter each chunk
+    {ResultChunks, _TotalBytes, _ChunkCount} = barrel_ars_index:fold_path_chunked(
+        StoreRef, DbName, FullPath, ?INITIAL_CHUNK_SIZE,
+        fun(DocIdChunk, {Acc, TotalBytes, ChunkCount}) ->
+            {ChunkResults, ChunkBytes} = batch_fetch_and_filter_with_size(
+                StoreRef, DbName, DocIdChunk,
+                Conditions, Bindings, Projections, IncludeDocs),
+
+            %% Calculate new chunk size based on average doc size
+            NewTotalBytes = TotalBytes + ChunkBytes,
+            NewChunkCount = ChunkCount + 1,
+            TotalDocs = length(DocIdChunk) * NewChunkCount,
+            AvgDocSize = case TotalDocs > 0 of
+                true -> NewTotalBytes div TotalDocs;
+                false -> 0
+            end,
+            NewChunkSize = calculate_chunk_size(AvgDocSize),
+
+            {ok, {[ChunkResults | Acc], NewTotalBytes, NewChunkCount}, NewChunkSize}
+        end,
+        {[], 0, 0}
+    ),
+
+    %% Flatten result chunks (they're in reverse order)
+    FlatResults = lists:append(lists:reverse(ResultChunks)),
+
+    %% Apply ordering if specified
+    OrderedResults = apply_order(FlatResults, Order),
+
+    %% Apply offset (no limit for unbounded queries)
+    FinalResults = apply_offset_limit(OrderedResults, Offset, undefined),
+
+    %% Get last sequence
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    {ok, FinalResults, LastSeq}.
+
+%% @doc Calculate optimal chunk size based on average doc size
+%% Targets ~1MB of doc data per chunk for good cache utilization
+calculate_chunk_size(AvgDocSize) when AvgDocSize > 0 ->
+    Optimal = ?TARGET_CHUNK_BYTES div AvgDocSize,
+    max(?MIN_CHUNK_SIZE, min(?MAX_CHUNK_SIZE, Optimal));
+calculate_chunk_size(_) ->
+    ?INITIAL_CHUNK_SIZE.
+
+%% @doc Batch fetch with size tracking for adaptive chunking
+batch_fetch_and_filter_with_size(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs) ->
+    Results = batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs),
+    %% Estimate bytes from doc count (conservative ~500 bytes avg per doc)
+    EstimatedBytes = length(DocIds) * 500,
+    {Results, EstimatedBytes}.
 
 %% @private Helper for process dictionary get with default
 pdict_get(Key, Default) ->

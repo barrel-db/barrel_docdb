@@ -18,6 +18,7 @@
     remove_doc/3,
     fold_path/5,
     fold_path_reverse/5,
+    fold_path_chunked/6,
     fold_path_range/6,
     fold_path_values/5,
     fold_path_values_reverse/5,
@@ -207,6 +208,54 @@ fold_path_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0) ->
         Fun({Path, DocId}, Acc)
     end,
     barrel_store_rocksdb:fold_range_reverse(StoreRef, Prefix, EndKey, FoldFun, Acc0).
+
+%% @doc Fold over path index entries in chunks for efficient batch processing.
+%% Collects DocIds into chunks of ChunkSize, calling Fun with each chunk.
+%% The callback can return:
+%%   - {ok, Acc} to continue with next chunk
+%%   - {ok, Acc, NewChunkSize} to adjust chunk size adaptively
+%%   - {stop, Acc} to terminate early
+%% Returns the final accumulated value after processing all chunks.
+-spec fold_path_chunked(store_ref(), db_name(), [term()], pos_integer(),
+                        fun(([docid()], Acc) -> {ok, Acc} | {ok, Acc, pos_integer()} | {stop, Acc}), Acc) -> Acc
+    when Acc :: term().
+fold_path_chunked(StoreRef, DbName, PathPrefix, InitialChunkSize, Fun, Acc0) ->
+    Prefix = barrel_store_keys:path_index_prefix(DbName, PathPrefix),
+    EndKey = barrel_store_keys:path_index_end(DbName, PathPrefix),
+
+    {FinalChunk, FinalAcc, _} = barrel_store_rocksdb:fold_range_reverse(
+        StoreRef, Prefix, EndKey,
+        fun(Key, _Value, {CurrentChunk, ChunkAcc, ChunkSize}) ->
+            {ok, {_Path, DocId}} = decode_path_index_key(Key),
+            NewChunk = [DocId | CurrentChunk],
+            case length(NewChunk) >= ChunkSize of
+                true ->
+                    %% Chunk full - process it (reverse to maintain order)
+                    case Fun(lists:reverse(NewChunk), ChunkAcc) of
+                        {ok, NewAcc} ->
+                            {ok, {[], NewAcc, ChunkSize}};
+                        {ok, NewAcc, NewChunkSize} ->
+                            %% Callback adjusted chunk size
+                            {ok, {[], NewAcc, NewChunkSize}};
+                        {stop, StopAcc} ->
+                            {stop, {[], StopAcc, ChunkSize}}
+                    end;
+                false ->
+                    {ok, {NewChunk, ChunkAcc, ChunkSize}}
+            end
+        end,
+        {[], Acc0, InitialChunkSize}
+    ),
+    %% Process remaining items in final partial chunk
+    case FinalChunk of
+        [] -> FinalAcc;
+        _ ->
+            case Fun(lists:reverse(FinalChunk), FinalAcc) of
+                {ok, Result} -> Result;
+                {ok, Result, _} -> Result;
+                {stop, Result} -> Result
+            end
+    end.
 
 %% @doc Fold over path index entries in a key range.
 %% Lower-level function for range queries.
