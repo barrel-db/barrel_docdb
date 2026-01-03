@@ -106,6 +106,9 @@
 
 -export_type([query_spec/0, query_plan/0, condition/0, logic_var/0]).
 
+%% Read profile type from storage layer
+-type read_profile() :: barrel_store_rocksdb:read_profile().
+
 %%====================================================================
 %% Chunked Execution Constants
 %%====================================================================
@@ -461,6 +464,9 @@ find_index_conditions([{compare, Path, _Op, _Value} | Rest], Acc) ->
 find_index_conditions([{prefix, Path, _Prefix} | Rest], Acc) ->
     %% Prefix match - can use index scan
     find_index_conditions(Rest, [{prefix, Path} | Acc]);
+find_index_conditions([{exists, Path} | Rest], Acc) ->
+    %% Exists check - can use index scan on path prefix
+    find_index_conditions(Rest, [{exists, Path} | Acc]);
 find_index_conditions([{'and', Nested} | Rest], Acc) ->
     NestedIndexable = find_index_conditions(Nested),
     find_index_conditions(Rest, NestedIndexable ++ Acc);
@@ -471,6 +477,7 @@ find_index_conditions([_ | Rest], Acc) ->
 has_range_condition([]) -> false;
 has_range_condition([{compare, _, Op, _} | _]) when Op =/= '==' -> true;
 has_range_condition([{prefix, _, _} | _]) -> true;
+has_range_condition([{exists, _} | _]) -> true;
 has_range_condition([{'and', Nested} | Rest]) ->
     has_range_condition(Nested) orelse has_range_condition(Rest);
 has_range_condition([{'or', Nested} | Rest]) ->
@@ -543,6 +550,20 @@ is_valid_path_component(_) -> false.
 %%====================================================================
 %% Internal - Execution
 %%====================================================================
+
+%% @doc Select read profile based on limit and cardinality.
+%% - point: Small result sets (limit <= 10), keep blocks in cache
+%% - short_range: Medium scans (limit <= 200 or cardinality <= 200), auto-readahead
+%% - long_scan: Large/unbounded scans, prefetch aggressively, avoid cache pollution
+-spec select_read_profile(undefined | pos_integer(), non_neg_integer()) -> read_profile().
+select_read_profile(Limit, _Cardinality) when is_integer(Limit), Limit =< 10 ->
+    point;
+select_read_profile(Limit, _Cardinality) when is_integer(Limit), Limit =< 200 ->
+    short_range;
+select_read_profile(_Limit, Cardinality) when Cardinality =< 200 ->
+    short_range;
+select_read_profile(_, _) ->
+    long_scan.
 
 %% @doc Execute using direct index key lookup (fastest)
 %% Uses prefix bloom filters for O(1) skip of non-matching SST blocks.
@@ -620,6 +641,7 @@ execute_index_seek_streaming(StoreRef, DbName, FullPath, Plan) ->
     MaxCollect = round((Limit + Offset) * 1.5),
 
     %% Iterate index entries and fetch/match documents one-by-one
+    %% Use point profile since streaming is for small limits
     {_Count, Results} = barrel_ars_index:fold_path_reverse(
         StoreRef, DbName, FullPath,
         fun({_Path, DocId}, {Count, Acc}) ->
@@ -642,7 +664,8 @@ execute_index_seek_streaming(StoreRef, DbName, FullPath, Plan) ->
                     end
             end
         end,
-        {0, []}
+        {0, []},
+        point
     ),
 
     %% Results are in reverse order due to prepend - reverse them
@@ -670,6 +693,7 @@ execute_index_seek_chunked(StoreRef, DbName, FullPath, Plan) ->
     } = Plan,
 
     %% Fold index in chunks, batch-fetch and filter each chunk
+    %% Use long_scan profile for unbounded queries (prefetch, avoid cache pollution)
     {ResultChunks, _TotalBytes, _ChunkCount} = barrel_ars_index:fold_path_chunked(
         StoreRef, DbName, FullPath, ?INITIAL_CHUNK_SIZE,
         fun(DocIdChunk, {Acc, TotalBytes, ChunkCount}) ->
@@ -689,7 +713,8 @@ execute_index_seek_chunked(StoreRef, DbName, FullPath, Plan) ->
 
             {ok, {[ChunkResults | Acc], NewTotalBytes, NewChunkCount}, NewChunkSize}
         end,
-        {[], 0, 0}
+        {[], 0, 0},
+        long_scan
     ),
 
     %% Flatten result chunks (they're in reverse order)
@@ -784,10 +809,13 @@ execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan) ->
     %% Collect 3x to handle filtering and deleted docs
     MaxCollect = (Limit + Offset) * 3,
 
+    %% Select read profile based on limit (ORDER BY + LIMIT is typically small)
+    Profile = select_read_profile(Limit, MaxCollect),
+
     %% Choose iteration direction based on ORDER BY
     FoldFun = case Dir of
-        desc -> fun barrel_ars_index:fold_path_values_reverse/5;
-        asc -> fun barrel_ars_index:fold_path_values/5
+        desc -> fun barrel_ars_index:fold_path_values_reverse/6;
+        asc -> fun barrel_ars_index:fold_path_values/6
     end,
 
     %% Collect matching documents with early termination
@@ -813,7 +841,8 @@ execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan) ->
                     end
             end
         end,
-        {0, []}
+        {0, []},
+        Profile
     ),
 
     %% Results are in reverse order due to prepend - reverse them
@@ -870,8 +899,74 @@ fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) 
 %% @doc Execute using index prefix scan
 execute_index_scan(StoreRef, DbName, Plan) ->
     #query_plan{conditions = Conditions} = Plan,
-    DocIds = collect_scan_docids(StoreRef, DbName, Conditions),
-    filter_and_project(StoreRef, DbName, DocIds, Plan).
+    %% Fast path for pure exists queries - no doc body fetch needed
+    case is_pure_exists_query(Conditions) of
+        {true, Path} ->
+            execute_pure_exists(StoreRef, DbName, Path, Plan);
+        false ->
+            DocIds = collect_scan_docids(StoreRef, DbName, Conditions),
+            filter_and_project(StoreRef, DbName, DocIds, Plan)
+    end.
+
+%% @doc Check if query is a pure exists condition (nothing else)
+is_pure_exists_query([{exists, Path}]) -> {true, Path};
+is_pure_exists_query(_) -> false.
+
+%% @doc Execute pure exists query - iterate posting lists directly
+%% Path index only contains non-deleted docs, so no doc_current check needed
+%% Uses fold_posting which gets list of DocIds per key - much more efficient
+execute_pure_exists(StoreRef, DbName, Path, Plan) ->
+    #query_plan{
+        limit = Limit,
+        offset = Offset
+    } = Plan,
+
+    %% Calculate how many unique docs we need
+    MaxCollect = case Limit of
+        undefined -> undefined;
+        L -> L + Offset
+    end,
+
+    %% Iterate posting lists directly - each key contains a list of DocIds
+    %% Much more efficient than expanding to {Path, DocId} tuples
+    {_, _, Results} = barrel_ars_index:fold_posting(
+        StoreRef, DbName, Path,
+        fun(_Key, DocIds, {Seen, Count, Acc}) ->
+            %% Process all DocIds from this posting list (ignore Key)
+            process_exists_docids(DocIds, Seen, Count, Acc, MaxCollect)
+        end,
+        {#{}, 0, []}
+    ),
+
+    %% Apply offset and limit (results are in reverse order)
+    Results1 = lists:reverse(Results),
+    Results2 = apply_offset_limit(Results1, Offset, Limit),
+
+    %% Get last sequence
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    {ok, Results2, LastSeq}.
+
+%% @private Process DocIds from a posting list for exists query
+process_exists_docids([], Seen, Count, Acc, _MaxCollect) ->
+    {ok, {Seen, Count, Acc}};
+process_exists_docids([DocId | Rest], Seen, Count, Acc, MaxCollect) ->
+    case maps:is_key(DocId, Seen) of
+        true ->
+            %% Already seen this doc, skip
+            process_exists_docids(Rest, Seen, Count, Acc, MaxCollect);
+        false ->
+            %% New doc
+            NewSeen = Seen#{DocId => true},
+            NewCount = Count + 1,
+            NewAcc = [#{id => DocId} | Acc],
+            case MaxCollect =/= undefined andalso NewCount >= MaxCollect of
+                true ->
+                    {stop, {NewSeen, NewCount, NewAcc}};
+                false ->
+                    process_exists_docids(Rest, NewSeen, NewCount, NewAcc, MaxCollect)
+            end
+    end.
 
 %% @doc Collect DocIds for scan-based execution
 %% Tries optimized paths: exists/prefix first, then path prefix scan, then full scan
@@ -911,14 +1006,17 @@ find_exists_condition([_ | Rest]) ->
 %% @doc Collect all DocIds that have any value at the given path
 %% Uses the path index to find docs with the path without fetching full docs
 collect_docids_for_path_exists(StoreRef, DbName, Path) ->
+    %% Use long_scan profile since exists queries typically return many docs
     barrel_ars_index:fold_path_values(
         StoreRef, DbName, Path,
         fun({_FullPath, DocId}, Acc) -> {ok, [DocId | Acc]} end,
-        []
+        [],
+        long_scan
     ).
 
 %% @doc Collect all document IDs (for full scan fallback)
 collect_all_docids(StoreRef, DbName) ->
+    %% Use long_scan profile for full table scans (prefetch, avoid cache pollution)
     barrel_store_rocksdb:fold_range(
         StoreRef,
         barrel_store_keys:doc_info_prefix(DbName),
@@ -927,7 +1025,8 @@ collect_all_docids(StoreRef, DbName) ->
             DocId = barrel_store_keys:decode_doc_info_key(DbName, Key),
             {ok, [DocId | Acc]}
         end,
-        []
+        [],
+        long_scan
     ).
 
 %% @doc Find a prefix condition for optimized interval scan
@@ -945,10 +1044,12 @@ find_prefix_condition([_ | Rest]) ->
 
 %% @doc Collect DocIds using optimized prefix interval scan
 collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix) ->
+    %% Use short_range profile - prefix queries typically have moderate selectivity
     barrel_ars_index:fold_prefix(
         StoreRef, DbName, Path, Prefix,
         fun({_FullPath, DocId}, Acc) -> {ok, [DocId | Acc]} end,
-        []
+        [],
+        short_range
     ).
 
 %% @doc Execute using multiple index lookups with intersection
@@ -1032,6 +1133,7 @@ execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan) ->
 
 %% @doc Collect DocIds from a path, filtering by bitmap
 collect_docids_with_bitmap_filter(StoreRef, DbName, FullPath, FilterBitmap) ->
+    %% Use short_range profile - bitmap-filtered scans are typically moderate size
     barrel_ars_index:fold_path_reverse(
         StoreRef, DbName, FullPath,
         fun({_Path, DocId}, Acc) ->
@@ -1041,7 +1143,8 @@ collect_docids_with_bitmap_filter(StoreRef, DbName, FullPath, FilterBitmap) ->
                 false -> {ok, Acc}  %% Skip - doesn't match filter
             end
         end,
-        []
+        [],
+        short_range
     ).
 
 %% @doc Order conditions by cardinality (smallest first) for optimal intersection.
@@ -1107,6 +1210,7 @@ sorted_intersection(L1, [_ | T2]) ->
 %% @doc Execute full document scan (slowest, last resort, using column-wide storage)
 execute_full_scan(StoreRef, DbName, Plan) ->
     %% Collect all doc IDs by scanning doc_current keys
+    %% Use long_scan profile for full table scans (prefetch, avoid cache pollution)
     StartKey = barrel_store_keys:doc_current_prefix(DbName),
     EndKey = barrel_store_keys:doc_current_end(DbName),
     PrefixLen = byte_size(StartKey),
@@ -1119,7 +1223,8 @@ execute_full_scan(StoreRef, DbName, Plan) ->
             DocId = binary:part(Key, PrefixLen, byte_size(Key) - PrefixLen),
             {ok, [DocId | Acc]}
         end,
-        []
+        [],
+        long_scan
     ),
 
     filter_and_project(StoreRef, DbName, DocIds, Plan).
@@ -1127,15 +1232,19 @@ execute_full_scan(StoreRef, DbName, Plan) ->
 %% @doc Collect document IDs matching an exact path+value
 %% Returns sorted list by using reverse iteration with prepend
 collect_docids_for_path(StoreRef, DbName, FullPath) ->
+    %% Use short_range profile as default for unbounded path collection
     barrel_ars_index:fold_path_reverse(
         StoreRef, DbName, FullPath,
         fun({_Path, DocId}, Acc) -> {ok, [DocId | Acc]} end,
-        []
+        [],
+        short_range
     ).
 
 %% @doc Collect document IDs with early termination at MaxCount
 %% For LIMIT pushdown optimization
 collect_docids_for_path_limited(StoreRef, DbName, FullPath, MaxCount) ->
+    %% Select profile based on max count - small limits use point profile
+    Profile = select_read_profile(MaxCount, MaxCount),
     {_, DocIds} = barrel_ars_index:fold_path_reverse(
         StoreRef, DbName, FullPath,
         fun({_Path, DocId}, {Count, Acc}) ->
@@ -1146,16 +1255,19 @@ collect_docids_for_path_limited(StoreRef, DbName, FullPath, MaxCount) ->
                 false -> {ok, {NewCount, NewAcc}}
             end
         end,
-        {0, []}
+        {0, []},
+        Profile
     ),
     DocIds.
 
 %% @doc Collect document IDs matching a path prefix
 collect_docids_for_prefix(StoreRef, DbName, PathPrefix) ->
+    %% Use short_range profile - prefix scans have unknown but typically moderate size
     barrel_ars_index:fold_path(
         StoreRef, DbName, PathPrefix,
         fun({_Path, DocId}, Acc) -> {ok, [DocId | Acc]} end,
-        []
+        [],
+        short_range
     ).
 
 %% @doc Filter results by remaining conditions and apply projections
