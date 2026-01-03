@@ -554,25 +554,93 @@ execute_index_seek(StoreRef, DbName, Plan) ->
                     %% No matches - skip iteration entirely
                     filter_and_project(StoreRef, DbName, [], Plan);
                 _ ->
-                    %% PROFILING: Index iteration
-                    T0 = erlang:monotonic_time(microsecond),
+                    %% Compute remaining conditions (index condition already satisfied by iteration)
                     RemainingConds = Conditions -- [IndexCond],
-                    EarlyLimitResult = can_use_early_limit(Order, RemainingConds, Limit),
-                    DocIds = case EarlyLimitResult of
-                        {true, MaxCollect} ->
-                            collect_docids_for_path_limited(StoreRef, DbName, FullPath, MaxCollect + Offset);
+                    %% Check if streaming execution is better
+                    %% Streaming fetches docs one-by-one and stops early
+                    %% Better for small limits on high-cardinality indexes
+                    %% Index condition already satisfied - use remaining conditions only
+                    FilterPlan = Plan#query_plan{conditions = RemainingConds},
+                    case should_use_streaming(Limit, Cardinality) of
+                        true ->
+                            %% Streaming: fetch/match documents one-by-one
+                            execute_index_seek_streaming(StoreRef, DbName, FullPath, FilterPlan);
                         false ->
-                            collect_docids_for_path(StoreRef, DbName, FullPath)
-                    end,
-                    T1 = erlang:monotonic_time(microsecond),
-                    put(profile_index_iter, pdict_get(profile_index_iter, 0) + (T1 - T0)),
-                    put(profile_doc_count, length(DocIds)),
-                    filter_and_project(StoreRef, DbName, DocIds, Plan)
+                            %% Batch: collect DocIds then fetch/filter
+                            %% PROFILING: Index iteration
+                            T0 = erlang:monotonic_time(microsecond),
+                            EarlyLimitResult = can_use_early_limit(Order, RemainingConds, Limit),
+                            DocIds = case EarlyLimitResult of
+                                {true, MaxCollect} ->
+                                    collect_docids_for_path_limited(StoreRef, DbName, FullPath, MaxCollect + Offset);
+                                false ->
+                                    collect_docids_for_path(StoreRef, DbName, FullPath)
+                            end,
+                            T1 = erlang:monotonic_time(microsecond),
+                            put(profile_index_iter, pdict_get(profile_index_iter, 0) + (T1 - T0)),
+                            put(profile_doc_count, length(DocIds)),
+                            filter_and_project(StoreRef, DbName, DocIds, FilterPlan)
+                    end
             end;
         not_found ->
             %% Fallback to scan
             execute_index_scan(StoreRef, DbName, Plan)
     end.
+
+%% @doc Execute index seek using streaming approach
+%% Iterates index entries and fetches/matches documents one-by-one
+%% Stops early when enough results are collected
+%% Much faster than batch-fetch for small limits on high-cardinality indexes
+execute_index_seek_streaming(StoreRef, DbName, FullPath, Plan) ->
+    #query_plan{
+        conditions = Conditions,
+        bindings = Bindings,
+        projections = Projections,
+        limit = Limit,
+        offset = Offset,
+        include_docs = IncludeDocs
+    } = Plan,
+
+    %% Calculate how many results we need
+    %% Use 1.5x to account for deleted docs (less than batch approach)
+    MaxCollect = round((Limit + Offset) * 1.5),
+
+    %% Iterate index entries and fetch/match documents one-by-one
+    {_Count, Results} = barrel_ars_index:fold_path_reverse(
+        StoreRef, DbName, FullPath,
+        fun({_Path, DocId}, {Count, Acc}) ->
+            case Count >= MaxCollect of
+                true ->
+                    {stop, {Count, Acc}};
+                false ->
+                    %% Fetch and filter document using CBOR iterator
+                    case fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) of
+                        {ok, Doc, BoundVars} ->
+                            %% Full doc decoded (include_docs=true)
+                            Result = project_result(Doc, DocId, Projections, BoundVars, IncludeDocs),
+                            {ok, {Count + 1, [Result | Acc]}};
+                        {ok_cbor, CborBin, BoundVars} ->
+                            %% CBOR binary (include_docs=false) - use iterator projection
+                            Result = project_result_cbor(CborBin, DocId, Projections, BoundVars, IncludeDocs),
+                            {ok, {Count + 1, [Result | Acc]}};
+                        skip ->
+                            {ok, {Count, Acc}}
+                    end
+            end
+        end,
+        {0, []}
+    ),
+
+    %% Results are in reverse order due to prepend - reverse them
+    OrderedResults = lists:reverse(Results),
+
+    %% Apply offset and limit
+    FinalResults = apply_offset_limit(OrderedResults, Offset, Limit),
+
+    %% Get last sequence
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    {ok, FinalResults, LastSeq}.
 
 %% @private Helper for process dictionary get with default
 pdict_get(Key, Default) ->
@@ -585,10 +653,20 @@ pdict_get(Key, Default) ->
 %% Returns {true, MaxToCollect} or false
 can_use_early_limit([], [], Limit) when is_integer(Limit), Limit > 0 ->
     %% No ORDER BY and no remaining conditions - safe to limit early
-    %% Collect 2x to account for deleted docs
-    {true, Limit * 2};
+    %% Collect limit + small buffer to account for deleted docs (reduced from 2x)
+    {true, max(Limit + 5, round(Limit * 1.2))};
 can_use_early_limit(_, _, _) ->
     %% Either has ORDER BY or remaining conditions that need full scan
+    false.
+
+%% @doc Check if streaming execution should be used for index seek
+%% Streaming is better when: small limit + high cardinality index
+%% Returns true if streaming should be used
+should_use_streaming(Limit, Cardinality) when is_integer(Limit), Limit > 0, Limit =< 100 ->
+    %% Use streaming when cardinality is much higher than limit
+    %% This avoids batch-fetching many documents we won't use
+    Cardinality > Limit * 10;
+should_use_streaming(_, _) ->
     false.
 
 %% @doc Check if we can use indexed order for ORDER BY + LIMIT

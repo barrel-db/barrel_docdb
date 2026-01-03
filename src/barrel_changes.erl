@@ -408,16 +408,30 @@ get_last_seq(StoreRef, DbName) ->
     barrel_hlc:encode(Hlc).
 
 %% @doc Get the last HLC timestamp for a database
+%% First tries the fast path (metadata key), falls back to reverse iteration
 -spec get_last_hlc(barrel_store_rocksdb:db_ref(), db_name()) -> barrel_hlc:timestamp().
 get_last_hlc(StoreRef, DbName) ->
+    %% Try fast path: read from metadata key (O(1))
+    LastHlcKey = barrel_store_keys:db_last_hlc(DbName),
+    case barrel_store_rocksdb:get(StoreRef, LastHlcKey) of
+        {ok, EncodedHlc} ->
+            barrel_hlc:decode(EncodedHlc);
+        not_found ->
+            %% Fallback for databases created before this optimization
+            get_last_hlc_slow(StoreRef, DbName)
+    end.
+
+%% @private Get last HLC by reverse iteration (slow path, O(n) worst case)
+get_last_hlc_slow(StoreRef, DbName) ->
     StartKey = barrel_store_keys:doc_hlc_prefix(DbName),
     EndKey = barrel_store_keys:doc_hlc_end(DbName),
 
-    barrel_store_rocksdb:fold_range(
+    barrel_store_rocksdb:fold_range_reverse(
         StoreRef, StartKey, EndKey,
         fun(Key, _Value, _Acc) ->
             Hlc = barrel_store_keys:decode_hlc_key(DbName, Key),
-            {ok, Hlc}
+            %% Stop immediately after finding the first (last in order) entry
+            {stop, Hlc}
         end,
         barrel_hlc:min()
     ).
@@ -450,17 +464,21 @@ count_changes_since(StoreRef, DbName, Since) ->
 -spec write_change(barrel_store_rocksdb:db_ref(), db_name(),
                    barrel_hlc:timestamp(), doc_info()) -> ok.
 write_change(StoreRef, DbName, Hlc, DocInfo) ->
-    [{put, Key, Value}] = write_change_ops(DbName, Hlc, DocInfo),
-    barrel_store_rocksdb:put(StoreRef, Key, Value).
+    Ops = write_change_ops(DbName, Hlc, DocInfo),
+    barrel_store_rocksdb:write_batch(StoreRef, Ops).
 
 %% @doc Return batch operation to write a change entry.
 %% Use this to combine with other operations in a single write_batch.
+%% Also updates the last_hlc metadata for efficient get_last_seq lookups.
 -spec write_change_ops(db_name(), barrel_hlc:timestamp(), doc_info()) ->
     [{put, binary(), binary()}].
 write_change_ops(DbName, Hlc, DocInfo) ->
     Key = barrel_store_keys:doc_hlc(DbName, Hlc),
     Value = encode_change(DocInfo),
-    [{put, Key, Value}].
+    %% Also update last_hlc metadata for O(1) get_last_seq
+    LastHlcKey = barrel_store_keys:db_last_hlc(DbName),
+    LastHlcValue = barrel_hlc:encode(Hlc),
+    [{put, Key, Value}, {put, LastHlcKey, LastHlcValue}].
 
 %% @doc Delete an old HLC entry (when document is updated)
 -spec delete_old_change(barrel_store_rocksdb:db_ref(), db_name(),

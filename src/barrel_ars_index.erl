@@ -371,40 +371,67 @@ decode_path_and_docid(Bin) ->
     {ok, {Path, DocId}}.
 
 %% @private Decode path components, treating the remaining bytes as docid
-decode_path_components(Bin, Acc) ->
-    case Bin of
-        <<16#01, Rest/binary>> ->  %% null
-            decode_path_components(Rest, [null | Acc]);
-        <<16#02, Rest/binary>> ->  %% false
-            decode_path_components(Rest, [false | Acc]);
-        <<16#03, Rest/binary>> ->  %% true
-            decode_path_components(Rest, [true | Acc]);
-        <<16#20, Rest/binary>> ->  %% zero
-            decode_path_components(Rest, [0 | Acc]);
-        <<16#30, Len:8, IntBin:Len/binary, Rest/binary>> ->  %% positive int
+%% Tries each path encoding pattern; if none match, remaining bytes are the DocId
+decode_path_components(<<>>, Acc) ->
+    %% Empty remaining means no docid (shouldn't happen in practice)
+    {lists:reverse(Acc), <<>>};
+decode_path_components(<<16#01, Rest/binary>>, Acc) ->  %% null
+    decode_path_components(Rest, [null | Acc]);
+decode_path_components(<<16#02, Rest/binary>>, Acc) ->  %% false
+    decode_path_components(Rest, [false | Acc]);
+decode_path_components(<<16#03, Rest/binary>>, Acc) ->  %% true
+    decode_path_components(Rest, [true | Acc]);
+decode_path_components(<<16#20, Rest/binary>>, Acc) ->  %% zero
+    decode_path_components(Rest, [0 | Acc]);
+decode_path_components(<<16#30, Len:8, IntBin:Len/binary, Rest/binary>>, Acc)
+        when Len > 0 ->
+    %% Positive int: verify it's actually valid integer digits
+    case is_valid_integer_digits(IntBin) of
+        true ->
             N = binary_to_integer(IntBin),
             decode_path_components(Rest, [N | Acc]);
-        <<16#10, InvLen:8, Rest/binary>> ->  %% negative int
-            Len = 255 - InvLen,
+        false ->
+            %% Not valid digits - this is DocId starting with '0' (0x30)
+            {lists:reverse(Acc), <<16#30, Len, IntBin/binary, Rest/binary>>}
+    end;
+decode_path_components(<<16#10, InvLen:8, Rest/binary>>, Acc) when InvLen < 255 ->  %% negative int
+    Len = 255 - InvLen,
+    case byte_size(Rest) >= Len of
+        true ->
             <<InvBytes:Len/binary, Rest2/binary>> = Rest,
             Bin2 = << <<(255 - B)>> || <<B>> <= InvBytes >>,
-            N = -binary_to_integer(Bin2),
-            decode_path_components(Rest2, [N | Acc]);
-        <<16#40, _Encoded:8/binary, Rest/binary>> ->  %% float
-            %% We'll use the existing decode function
-            <<16#40, Encoded:8/binary, _/binary>> = <<16#40, _Encoded/binary>>,
-            F = decode_float(Encoded),
-            decode_path_components(Rest, [F | Acc]);
-        <<16#50, Rest/binary>> ->  %% binary (null-escaped)
-            {BinVal, Rest2} = unescape_binary(Rest),
-            decode_path_components(Rest2, [BinVal | Acc]);
-        DocId when is_binary(DocId), byte_size(DocId) > 0 ->
-            %% Remaining bytes are the docid
-            {lists:reverse(Acc), DocId};
-        <<>> ->
-            %% Empty remaining means no docid (shouldn't happen in practice)
-            {lists:reverse(Acc), <<>>}
-    end.
+            case is_valid_integer_digits(Bin2) of
+                true ->
+                    N = -binary_to_integer(Bin2),
+                    decode_path_components(Rest2, [N | Acc]);
+                false ->
+                    {lists:reverse(Acc), <<16#10, InvLen, Rest/binary>>}
+            end;
+        false ->
+            {lists:reverse(Acc), <<16#10, InvLen, Rest/binary>>}
+    end;
+decode_path_components(<<16#40, Encoded:8/binary, Rest/binary>>, Acc) ->  %% float
+    F = decode_float(Encoded),
+    decode_path_components(Rest, [F | Acc]);
+decode_path_components(<<16#50, Rest/binary>>, Acc) ->  %% binary (null-escaped)
+    {BinVal, Rest2} = unescape_binary(Rest),
+    decode_path_components(Rest2, [BinVal | Acc]);
+decode_path_components(Bin, Acc) ->
+    %% No pattern matched - remaining bytes are the DocId
+    {lists:reverse(Acc), Bin}.
+
+%% @private Check if a binary contains only valid ASCII digits (0-9)
+is_valid_integer_digits(<<>>) ->
+    false;
+is_valid_integer_digits(Bin) ->
+    is_valid_integer_digits_loop(Bin).
+
+is_valid_integer_digits_loop(<<>>) ->
+    true;
+is_valid_integer_digits_loop(<<C, Rest/binary>>) when C >= $0, C =< $9 ->
+    is_valid_integer_digits_loop(Rest);
+is_valid_integer_digits_loop(_) ->
+    false.
 
 %% @private Unescape binary (same as in barrel_store_keys)
 unescape_binary(Bin) ->

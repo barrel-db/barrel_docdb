@@ -10,7 +10,7 @@
 -include("barrel_docdb.hrl").
 
 %% Database metadata keys
--export([db_meta/2, db_uid/1, db_docs_count/1, db_del_count/1]).
+-export([db_meta/2, db_uid/1, db_docs_count/1, db_del_count/1, db_last_hlc/1]).
 
 %% Document keys (legacy)
 -export([doc_info/2, doc_info_prefix/1, doc_info_end/1]).
@@ -99,6 +99,7 @@
 -define(META_UID, <<"uid">>).
 -define(META_DOCS_COUNT, <<"docs_count">>).
 -define(META_DEL_COUNT, <<"del_count">>).
+-define(META_LAST_HLC, <<"last_hlc">>).
 
 %%====================================================================
 %% Database Metadata Keys
@@ -123,6 +124,11 @@ db_docs_count(DbName) ->
 -spec db_del_count(db_name()) -> binary().
 db_del_count(DbName) ->
     db_meta(DbName, ?META_DEL_COUNT).
+
+%% @doc Last HLC timestamp key
+-spec db_last_hlc(db_name()) -> binary().
+db_last_hlc(DbName) ->
+    db_meta(DbName, ?META_LAST_HLC).
 
 %%====================================================================
 %% Document Keys
