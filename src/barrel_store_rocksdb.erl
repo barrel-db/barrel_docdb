@@ -24,7 +24,7 @@
 %% Posting list operations (using erlang_merge_operator for append/remove)
 -export([posting_append/3, posting_remove/3]).
 -export([posting_get/2, posting_multi_get/2]).
--export([fold_range_posting/5]).
+-export([fold_range_posting/5, fold_range_posting_reverse/5]).
 
 %%====================================================================
 %% Types
@@ -550,4 +550,30 @@ fold_posting_loop({ok, Key, Value}, Iter, Fun, Acc) ->
             fold_posting_loop(rocksdb:iterator_move(Iter, next), Iter, Fun, NewAcc);
         {stop, FinalAcc} ->
             FinalAcc
+    end.
+
+%% @doc Fold over posting list entries in a range in reverse order
+-spec fold_range_posting_reverse(db_ref(), binary(), binary(), fun(), term()) -> term().
+fold_range_posting_reverse(#{ref := Ref, posting_cf := PostingCF}, StartKey, EndKey, Fun, Acc0) ->
+    Opts = [{iterate_lower_bound, StartKey},
+            {iterate_upper_bound, EndKey}],
+    {ok, Iter} = rocksdb:iterator(Ref, PostingCF, Opts),
+    try
+        fold_posting_loop_reverse(rocksdb:iterator_move(Iter, last), Iter, Fun, Acc0)
+    after
+        rocksdb:iterator_close(Iter)
+    end.
+
+fold_posting_loop_reverse({error, invalid_iterator}, _Iter, _Fun, Acc) ->
+    Acc;
+fold_posting_loop_reverse({ok, Key, Value}, Iter, Fun, Acc) ->
+    DocIds = binary_to_term(Value),
+    case Fun(Key, DocIds, Acc) of
+        {ok, NewAcc} ->
+            fold_posting_loop_reverse(rocksdb:iterator_move(Iter, prev), Iter, Fun, NewAcc);
+        {stop, FinalAcc} ->
+            FinalAcc;
+        NewAcc ->
+            %% Support non-wrapped return values
+            fold_posting_loop_reverse(rocksdb:iterator_move(Iter, prev), Iter, Fun, NewAcc)
     end.

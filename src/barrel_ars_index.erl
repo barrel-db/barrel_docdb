@@ -16,13 +16,14 @@
     index_doc/4,
     update_doc/5,
     remove_doc/3,
-    fold_path/5,
-    fold_path_reverse/5,
-    fold_path_chunked/6,
-    fold_path_range/6,
-    fold_path_values/5,
-    fold_path_values_reverse/5,
-    fold_prefix/6
+    fold_path/5, fold_path/6,
+    fold_path_reverse/5, fold_path_reverse/6,
+    fold_path_chunked/6, fold_path_chunked/7,
+    fold_path_range/6, fold_path_range/7,
+    fold_path_values/5, fold_path_values/6,
+    fold_path_values_reverse/5, fold_path_values_reverse/6,
+    fold_prefix/6, fold_prefix/7,
+    fold_posting/5, fold_posting/6
 ]).
 
 %% Operations-only variants (for batching with other ops)
@@ -50,6 +51,7 @@
 -include("barrel_docdb.hrl").
 
 -type store_ref() :: barrel_store_rocksdb:db_ref().
+-type read_profile() :: barrel_store_rocksdb:read_profile().
 
 %% Bitmap sizes based on path depth
 %% Top-level paths (depth 1-2): 1M bits - many docs likely match
@@ -138,17 +140,19 @@ remove_doc(StoreRef, DbName, DocId) ->
 %% Takes the stored paths (from reverse index) as parameter.
 %% Use this to combine with other operations in a single write_batch.
 -spec remove_doc_ops(db_name(), docid(), [{[term()], term()}]) ->
-    [{delete, binary()} | {merge, binary(), integer()}].
+    [{posting_remove, binary(), binary()} | {delete, binary()} | {merge, binary(), integer()}].
 remove_doc_ops(DbName, DocId, Paths) ->
-    %% Delete all path index entries
-    DeleteOps = [{delete, barrel_store_keys:path_index_key(DbName, Path, DocId)}
-                 || {Path, _} <- Paths],
+    %% Remove DocId from all posting lists
+    PostingOps = [{posting_remove,
+                   barrel_store_keys:path_posting_key(DbName, Path),
+                   DocId}
+                  || {Path, _} <- Paths],
     %% Decrement counters for each path
     DecrOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), -1}
                || {Path, _} <- Paths],
     %% Delete reverse index
     ReverseKey = barrel_store_keys:doc_paths_key(DbName, DocId),
-    DeleteOps ++ DecrOps ++ [{delete, ReverseKey}].
+    PostingOps ++ DecrOps ++ [{delete, ReverseKey}].
 
 %% @doc Get stored paths for a document from the reverse index.
 %% Returns {ok, Paths} or not_found.
@@ -191,23 +195,72 @@ get_path_bitmap(StoreRef, DbName, Path) ->
 
 %% @doc Fold over path index entries matching a path prefix.
 %% The callback receives {Path, DocId} for each match.
+%% Uses posting lists internally - each posting list key contains multiple DocIds.
 -spec fold_path(store_ref(), db_name(), [term()], fun(), term()) -> term().
 fold_path(StoreRef, DbName, PathPrefix, Fun, Acc0) ->
-    Prefix = barrel_store_keys:path_index_prefix(DbName, PathPrefix),
-    EndKey = barrel_store_keys:path_index_end(DbName, PathPrefix),
-    fold_path_range(StoreRef, DbName, Prefix, EndKey, Fun, Acc0).
+    fold_path(StoreRef, DbName, PathPrefix, Fun, Acc0, short_range).
+
+%% @doc Fold over path index entries with explicit read profile.
+%% Uses posting lists: iterates posting keys and expands each to {Path, DocId} tuples.
+-spec fold_path(store_ref(), db_name(), [term()], fun(), term(), read_profile()) -> term().
+fold_path(StoreRef, DbName, PathPrefix, Fun, Acc0, _Profile) ->
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, PathPrefix),
+    EndKey = barrel_store_keys:path_posting_end(DbName, PathPrefix),
+    %% Fold over posting lists and expand each to {Path, DocId} tuples
+    FoldFun = fun(Key, DocIds, Acc) ->
+        {ok, Path} = decode_posting_key(Key),
+        %% Call Fun for each DocId in the posting list
+        NewAcc = lists:foldl(
+            fun(DocId, InnerAcc) ->
+                case Fun({Path, DocId}, InnerAcc) of
+                    {ok, Updated} -> Updated;
+                    {stop, StopAcc} -> throw({stop, StopAcc})
+                end
+            end,
+            Acc,
+            DocIds
+        ),
+        {ok, NewAcc}
+    end,
+    try
+        barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, FoldFun, Acc0)
+    catch
+        throw:{stop, Result} -> Result
+    end.
 
 %% @doc Fold over path index entries in reverse order.
 %% Iterates from last to first; useful for building sorted lists with prepend.
+%% Uses posting lists internally.
 -spec fold_path_reverse(store_ref(), db_name(), [term()], fun(), term()) -> term().
 fold_path_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0) ->
-    Prefix = barrel_store_keys:path_index_prefix(DbName, PathPrefix),
-    EndKey = barrel_store_keys:path_index_end(DbName, PathPrefix),
-    FoldFun = fun(Key, _Value, Acc) ->
-        {ok, {Path, DocId}} = decode_path_index_key(Key),
-        Fun({Path, DocId}, Acc)
+    fold_path_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0, short_range).
+
+%% @doc Fold over path index entries in reverse order with explicit read profile.
+%% Uses posting lists: iterates in reverse and expands to {Path, DocId} tuples.
+-spec fold_path_reverse(store_ref(), db_name(), [term()], fun(), term(), read_profile()) -> term().
+fold_path_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0, _Profile) ->
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, PathPrefix),
+    EndKey = barrel_store_keys:path_posting_end(DbName, PathPrefix),
+    FoldFun = fun(Key, DocIds, Acc) ->
+        {ok, Path} = decode_posting_key(Key),
+        %% Reverse the DocIds to maintain reverse order within each posting list
+        NewAcc = lists:foldl(
+            fun(DocId, InnerAcc) ->
+                case Fun({Path, DocId}, InnerAcc) of
+                    {ok, Updated} -> Updated;
+                    {stop, StopAcc} -> throw({stop, StopAcc})
+                end
+            end,
+            Acc,
+            lists:reverse(DocIds)
+        ),
+        {ok, NewAcc}
     end,
-    barrel_store_rocksdb:fold_range_reverse(StoreRef, Prefix, EndKey, FoldFun, Acc0).
+    try
+        barrel_store_rocksdb:fold_range_posting_reverse(StoreRef, StartKey, EndKey, FoldFun, Acc0)
+    catch
+        throw:{stop, Result} -> Result
+    end.
 
 %% @doc Fold over path index entries in chunks for efficient batch processing.
 %% Collects DocIds into chunks of ChunkSize, calling Fun with each chunk.
@@ -216,33 +269,27 @@ fold_path_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0) ->
 %%   - {ok, Acc, NewChunkSize} to adjust chunk size adaptively
 %%   - {stop, Acc} to terminate early
 %% Returns the final accumulated value after processing all chunks.
+%% Uses posting lists internally.
 -spec fold_path_chunked(store_ref(), db_name(), [term()], pos_integer(),
                         fun(([docid()], Acc) -> {ok, Acc} | {ok, Acc, pos_integer()} | {stop, Acc}), Acc) -> Acc
     when Acc :: term().
 fold_path_chunked(StoreRef, DbName, PathPrefix, InitialChunkSize, Fun, Acc0) ->
-    Prefix = barrel_store_keys:path_index_prefix(DbName, PathPrefix),
-    EndKey = barrel_store_keys:path_index_end(DbName, PathPrefix),
+    fold_path_chunked(StoreRef, DbName, PathPrefix, InitialChunkSize, Fun, Acc0, short_range).
 
-    {FinalChunk, FinalAcc, _} = barrel_store_rocksdb:fold_range_reverse(
-        StoreRef, Prefix, EndKey,
-        fun(Key, _Value, {CurrentChunk, ChunkAcc, ChunkSize}) ->
-            {ok, {_Path, DocId}} = decode_path_index_key(Key),
-            NewChunk = [DocId | CurrentChunk],
-            case length(NewChunk) >= ChunkSize of
-                true ->
-                    %% Chunk full - process it (reverse to maintain order)
-                    case Fun(lists:reverse(NewChunk), ChunkAcc) of
-                        {ok, NewAcc} ->
-                            {ok, {[], NewAcc, ChunkSize}};
-                        {ok, NewAcc, NewChunkSize} ->
-                            %% Callback adjusted chunk size
-                            {ok, {[], NewAcc, NewChunkSize}};
-                        {stop, StopAcc} ->
-                            {stop, {[], StopAcc, ChunkSize}}
-                    end;
-                false ->
-                    {ok, {NewChunk, ChunkAcc, ChunkSize}}
-            end
+%% @doc Fold over path index entries in chunks with explicit read profile.
+%% Uses posting lists: iterates posting keys and chunks the DocIds.
+-spec fold_path_chunked(store_ref(), db_name(), [term()], pos_integer(),
+                        fun(([docid()], Acc) -> {ok, Acc} | {ok, Acc, pos_integer()} | {stop, Acc}), Acc, read_profile()) -> Acc
+    when Acc :: term().
+fold_path_chunked(StoreRef, DbName, PathPrefix, InitialChunkSize, Fun, Acc0, _Profile) ->
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, PathPrefix),
+    EndKey = barrel_store_keys:path_posting_end(DbName, PathPrefix),
+
+    {FinalChunk, FinalAcc, _} = barrel_store_rocksdb:fold_range_posting_reverse(
+        StoreRef, StartKey, EndKey,
+        fun(_Key, DocIds, {CurrentChunk, ChunkAcc, ChunkSize}) ->
+            %% Add all DocIds from this posting list to the current chunk
+            process_docids_chunked(lists:reverse(DocIds), CurrentChunk, ChunkAcc, ChunkSize, Fun)
         end,
         {[], Acc0, InitialChunkSize}
     ),
@@ -257,65 +304,184 @@ fold_path_chunked(StoreRef, DbName, PathPrefix, InitialChunkSize, Fun, Acc0) ->
             end
     end.
 
+%% @private Process DocIds in chunks, handling chunk boundaries
+process_docids_chunked([], Chunk, Acc, ChunkSize, _Fun) ->
+    {Chunk, Acc, ChunkSize};
+process_docids_chunked([DocId | Rest], Chunk, Acc, ChunkSize, Fun) ->
+    NewChunk = [DocId | Chunk],
+    case length(NewChunk) >= ChunkSize of
+        true ->
+            case Fun(lists:reverse(NewChunk), Acc) of
+                {ok, NewAcc} ->
+                    process_docids_chunked(Rest, [], NewAcc, ChunkSize, Fun);
+                {ok, NewAcc, NewChunkSize} ->
+                    process_docids_chunked(Rest, [], NewAcc, NewChunkSize, Fun);
+                {stop, StopAcc} ->
+                    throw({stop, {[], StopAcc, ChunkSize}})
+            end;
+        false ->
+            process_docids_chunked(Rest, NewChunk, Acc, ChunkSize, Fun)
+    end.
+
 %% @doc Fold over path index entries in a key range.
 %% Lower-level function for range queries.
+%% Note: StartKey and EndKey should be posting key format.
 -spec fold_path_range(store_ref(), db_name(), binary(), binary(), fun(), term()) ->
     term().
-fold_path_range(StoreRef, _DbName, StartKey, EndKey, Fun, Acc0) ->
-    FoldFun = fun(Key, _Value, Acc) ->
-        %% Extract DocId from the end of the key
-        %% Key format: prefix + db_name + encoded_path + docid
-        %% We need to extract the docid from the end
-        {ok, {Path, DocId}} = decode_path_index_key(Key),
-        Fun({Path, DocId}, Acc)
+fold_path_range(StoreRef, DbName, StartKey, EndKey, Fun, Acc0) ->
+    fold_path_range(StoreRef, DbName, StartKey, EndKey, Fun, Acc0, short_range).
+
+%% @doc Fold over path index entries in a key range with explicit read profile.
+%% Uses posting lists: iterates posting keys and expands to {Path, DocId} tuples.
+-spec fold_path_range(store_ref(), db_name(), binary(), binary(), fun(), term(), read_profile()) ->
+    term().
+fold_path_range(StoreRef, _DbName, StartKey, EndKey, Fun, Acc0, _Profile) ->
+    FoldFun = fun(Key, DocIds, Acc) ->
+        {ok, Path} = decode_posting_key(Key),
+        NewAcc = lists:foldl(
+            fun(DocId, InnerAcc) ->
+                case Fun({Path, DocId}, InnerAcc) of
+                    {ok, Updated} -> Updated;
+                    {stop, StopAcc} -> throw({stop, StopAcc})
+                end
+            end,
+            Acc,
+            DocIds
+        ),
+        {ok, NewAcc}
     end,
-    barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, Acc0).
+    try
+        barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, FoldFun, Acc0)
+    catch
+        throw:{stop, Result} -> Result
+    end.
 
 %% @doc Fold over all values for a path in ascending order.
 %% Useful for ORDER BY path ASC with early termination.
 %% The callback receives {FullPath, DocId} where FullPath includes the value.
+%% Uses posting lists internally.
 -spec fold_path_values(store_ref(), db_name(), [term()], fun(), term()) -> term().
 fold_path_values(StoreRef, DbName, PathPrefix, Fun, Acc0) ->
-    Prefix = barrel_store_keys:path_index_prefix(DbName, PathPrefix),
-    EndKey = barrel_store_keys:path_index_end(DbName, PathPrefix),
-    FoldFun = fun(Key, _Value, Acc) ->
-        {ok, {Path, DocId}} = decode_path_index_key(Key),
-        Fun({Path, DocId}, Acc)
+    fold_path_values(StoreRef, DbName, PathPrefix, Fun, Acc0, short_range).
+
+%% @doc Fold over all values for a path in ascending order with explicit read profile.
+%% Uses posting lists: iterates posting keys and expands to {Path, DocId} tuples.
+-spec fold_path_values(store_ref(), db_name(), [term()], fun(), term(), read_profile()) -> term().
+fold_path_values(StoreRef, DbName, PathPrefix, Fun, Acc0, _Profile) ->
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, PathPrefix),
+    EndKey = barrel_store_keys:path_posting_end(DbName, PathPrefix),
+    FoldFun = fun(Key, DocIds, Acc) ->
+        {ok, Path} = decode_posting_key(Key),
+        NewAcc = lists:foldl(
+            fun(DocId, InnerAcc) ->
+                case Fun({Path, DocId}, InnerAcc) of
+                    {ok, Updated} -> Updated;
+                    {stop, StopAcc} -> throw({stop, StopAcc})
+                end
+            end,
+            Acc,
+            DocIds
+        ),
+        {ok, NewAcc}
     end,
-    barrel_store_rocksdb:fold_range(StoreRef, Prefix, EndKey, FoldFun, Acc0).
+    try
+        barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, FoldFun, Acc0)
+    catch
+        throw:{stop, Result} -> Result
+    end.
 
 %% @doc Fold over all values for a path in descending order.
 %% Useful for ORDER BY path DESC with early termination.
 %% Iterates from highest value to lowest.
+%% Uses posting lists internally.
 -spec fold_path_values_reverse(store_ref(), db_name(), [term()], fun(), term()) -> term().
 fold_path_values_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0) ->
-    Prefix = barrel_store_keys:path_index_prefix(DbName, PathPrefix),
-    EndKey = barrel_store_keys:path_index_end(DbName, PathPrefix),
-    FoldFun = fun(Key, _Value, Acc) ->
-        {ok, {Path, DocId}} = decode_path_index_key(Key),
-        Fun({Path, DocId}, Acc)
+    fold_path_values_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0, short_range).
+
+%% @doc Fold over all values for a path in descending order with explicit read profile.
+%% Uses posting lists: iterates in reverse and expands to {Path, DocId} tuples.
+-spec fold_path_values_reverse(store_ref(), db_name(), [term()], fun(), term(), read_profile()) -> term().
+fold_path_values_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0, _Profile) ->
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, PathPrefix),
+    EndKey = barrel_store_keys:path_posting_end(DbName, PathPrefix),
+    FoldFun = fun(Key, DocIds, Acc) ->
+        {ok, Path} = decode_posting_key(Key),
+        NewAcc = lists:foldl(
+            fun(DocId, InnerAcc) ->
+                case Fun({Path, DocId}, InnerAcc) of
+                    {ok, Updated} -> Updated;
+                    {stop, StopAcc} -> throw({stop, StopAcc})
+                end
+            end,
+            Acc,
+            lists:reverse(DocIds)
+        ),
+        {ok, NewAcc}
     end,
-    barrel_store_rocksdb:fold_range_reverse(StoreRef, Prefix, EndKey, FoldFun, Acc0).
+    try
+        barrel_store_rocksdb:fold_range_posting_reverse(StoreRef, StartKey, EndKey, FoldFun, Acc0)
+    catch
+        throw:{stop, Result} -> Result
+    end.
 
 %% @doc Fold over path index entries matching a value prefix.
 %% Uses interval scan: [path, prefix] to [path, prefix ++ 0xFF]
 %% Much faster than collecting all values and filtering.
 %% Example: fold_prefix(S, Db, [<<"name">>], <<"John">>, Fun, Acc)
 %%   matches: John, Johnny, Johnson, etc.
+%% Uses posting lists internally.
 -spec fold_prefix(store_ref(), db_name(), [term()], binary(), fun(), term()) -> term().
 fold_prefix(StoreRef, DbName, Path, Prefix, Fun, Acc0) when is_binary(Prefix) ->
+    fold_prefix(StoreRef, DbName, Path, Prefix, Fun, Acc0, short_range).
+
+%% @doc Fold over path index entries matching a value prefix with explicit read profile.
+%% Uses posting lists: iterates posting keys and expands to {Path, DocId} tuples.
+-spec fold_prefix(store_ref(), db_name(), [term()], binary(), fun(), term(), read_profile()) -> term().
+fold_prefix(StoreRef, DbName, Path, Prefix, Fun, Acc0, _Profile) when is_binary(Prefix) ->
     %% Start key: path + prefix value
     StartPath = Path ++ [Prefix],
-    StartKey = barrel_store_keys:path_index_prefix(DbName, StartPath),
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, StartPath),
     %% End key: path + prefix + 0xFF (exclusive upper bound)
     EndPrefix = <<Prefix/binary, 16#FF>>,
     EndPath = Path ++ [EndPrefix],
-    EndKey = barrel_store_keys:path_index_prefix(DbName, EndPath),
-    FoldFun = fun(Key, _Value, Acc) ->
-        {ok, {FullPath, DocId}} = decode_path_index_key(Key),
-        Fun({FullPath, DocId}, Acc)
+    EndKey = barrel_store_keys:path_posting_prefix(DbName, EndPath),
+    FoldFun = fun(Key, DocIds, Acc) ->
+        {ok, FullPath} = decode_posting_key(Key),
+        NewAcc = lists:foldl(
+            fun(DocId, InnerAcc) ->
+                case Fun({FullPath, DocId}, InnerAcc) of
+                    {ok, Updated} -> Updated;
+                    {stop, StopAcc} -> throw({stop, StopAcc})
+                end
+            end,
+            Acc,
+            DocIds
+        ),
+        {ok, NewAcc}
     end,
-    barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, Acc0).
+    try
+        barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, FoldFun, Acc0)
+    catch
+        throw:{stop, Result} -> Result
+    end.
+
+%% @doc Fold over posting lists matching a path prefix.
+%% The callback receives a list of DocIds from each posting list entry.
+%% Much more efficient than fold_path for exists queries since each key
+%% contains multiple DocIds instead of one.
+%% The callback can return:
+%%   - {ok, Acc} to continue
+%%   - {stop, Acc} to terminate early
+-spec fold_posting(store_ref(), db_name(), [term()], fun(), term()) -> term().
+fold_posting(StoreRef, DbName, PathPrefix, Fun, Acc0) ->
+    fold_posting(StoreRef, DbName, PathPrefix, Fun, Acc0, short_range).
+
+%% @doc Fold over posting lists with explicit read profile.
+-spec fold_posting(store_ref(), db_name(), [term()], fun(), term(), read_profile()) -> term().
+fold_posting(StoreRef, DbName, PathPrefix, Fun, Acc0, _Profile) ->
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, PathPrefix),
+    EndKey = barrel_store_keys:path_posting_end(DbName, PathPrefix),
+    barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, Fun, Acc0).
 
 %%====================================================================
 %% Internal functions
@@ -323,9 +489,12 @@ fold_prefix(StoreRef, DbName, Path, Prefix, Fun, Acc0) when is_binary(Prefix) ->
 
 %% @private Create batch operations for indexing paths
 make_index_ops(DbName, DocId, Paths) ->
-    %% Create batch operations for all path entries
-    PathOps = [{put, barrel_store_keys:path_index_key(DbName, Path, DocId), <<>>}
-               || {Path, _} <- Paths],
+    %% Create posting list append operations for all paths
+    %% Key: [prefix, db, path] -> Value: list of DocIds
+    PostingOps = [{posting_append,
+                   barrel_store_keys:path_posting_key(DbName, Path),
+                   DocId}
+                  || {Path, _} <- Paths],
 
     %% Increment counters for each path
     StatsOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), 1}
@@ -342,7 +511,7 @@ make_index_ops(DbName, DocId, Paths) ->
                  barrel_store_keys:doc_paths_key(DbName, DocId),
                  term_to_binary(Paths)},
 
-    PathOps ++ StatsOps ++ BitmapOps ++ [ReverseOp].
+    PostingOps ++ StatsOps ++ BitmapOps ++ [ReverseOp].
 
 %% @private Convert DocId to a bitmap position using deterministic hash
 %% Uses path depth to determine bitmap size for better space efficiency
@@ -405,82 +574,41 @@ bitmap_and_loop(A, B, Len, Idx, Acc) ->
     Result = ByteA band ByteB,
     bitmap_and_loop(A, B, Len, Idx + 1, <<Acc/binary, Result>>).
 
-%% @private Decode a path index key to extract path and docid
-%% Key format: 0x0B + len:16 + dbname + encoded_path + docid
-decode_path_index_key(Key) ->
-    %% Skip prefix byte (0x0B) and extract db name length
-    <<16#0B, DbNameLen:16, _DbName:DbNameLen/binary, Rest/binary>> = Key,
-    %% The rest is encoded_path + docid
-    %% We need to parse the path components until we reach the docid
-    decode_path_and_docid(Rest).
+%% @private Decode a posting key to extract path (no docid - docids are in value)
+%% Key format: 0x14 + len:16 + dbname + encoded_path
+decode_posting_key(Key) ->
+    %% Skip prefix byte (0x14) and extract db name length
+    <<16#14, DbNameLen:16, _DbName:DbNameLen/binary, Rest/binary>> = Key,
+    %% The rest is just the encoded_path (no docid)
+    Path = decode_path_only(Rest, []),
+    {ok, Path}.
 
-%% @private Parse encoded path components and extract trailing docid
-decode_path_and_docid(Bin) ->
-    {Path, DocId} = decode_path_components(Bin, []),
-    {ok, {Path, DocId}}.
-
-%% @private Decode path components, treating the remaining bytes as docid
-%% Tries each path encoding pattern; if none match, remaining bytes are the DocId
-decode_path_components(<<>>, Acc) ->
-    %% Empty remaining means no docid (shouldn't happen in practice)
-    {lists:reverse(Acc), <<>>};
-decode_path_components(<<16#01, Rest/binary>>, Acc) ->  %% null
-    decode_path_components(Rest, [null | Acc]);
-decode_path_components(<<16#02, Rest/binary>>, Acc) ->  %% false
-    decode_path_components(Rest, [false | Acc]);
-decode_path_components(<<16#03, Rest/binary>>, Acc) ->  %% true
-    decode_path_components(Rest, [true | Acc]);
-decode_path_components(<<16#20, Rest/binary>>, Acc) ->  %% zero
-    decode_path_components(Rest, [0 | Acc]);
-decode_path_components(<<16#30, Len:8, IntBin:Len/binary, Rest/binary>>, Acc)
-        when Len > 0 ->
-    %% Positive int: verify it's actually valid integer digits
-    case is_valid_integer_digits(IntBin) of
-        true ->
-            N = binary_to_integer(IntBin),
-            decode_path_components(Rest, [N | Acc]);
-        false ->
-            %% Not valid digits - this is DocId starting with '0' (0x30)
-            {lists:reverse(Acc), <<16#30, Len, IntBin/binary, Rest/binary>>}
-    end;
-decode_path_components(<<16#10, InvLen:8, Rest/binary>>, Acc) when InvLen < 255 ->  %% negative int
+%% @private Decode path components only (no trailing docid)
+decode_path_only(<<>>, Acc) ->
+    lists:reverse(Acc);
+decode_path_only(<<16#01, Rest/binary>>, Acc) ->  %% null
+    decode_path_only(Rest, [null | Acc]);
+decode_path_only(<<16#02, Rest/binary>>, Acc) ->  %% false
+    decode_path_only(Rest, [false | Acc]);
+decode_path_only(<<16#03, Rest/binary>>, Acc) ->  %% true
+    decode_path_only(Rest, [true | Acc]);
+decode_path_only(<<16#20, Rest/binary>>, Acc) ->  %% zero
+    decode_path_only(Rest, [0 | Acc]);
+decode_path_only(<<16#30, Len:8, IntBin:Len/binary, Rest/binary>>, Acc) when Len > 0 ->  %% positive int
+    N = binary_to_integer(IntBin),
+    decode_path_only(Rest, [N | Acc]);
+decode_path_only(<<16#10, InvLen:8, Rest/binary>>, Acc) when InvLen < 255 ->  %% negative int
     Len = 255 - InvLen,
-    case byte_size(Rest) >= Len of
-        true ->
-            <<InvBytes:Len/binary, Rest2/binary>> = Rest,
-            Bin2 = << <<(255 - B)>> || <<B>> <= InvBytes >>,
-            case is_valid_integer_digits(Bin2) of
-                true ->
-                    N = -binary_to_integer(Bin2),
-                    decode_path_components(Rest2, [N | Acc]);
-                false ->
-                    {lists:reverse(Acc), <<16#10, InvLen, Rest/binary>>}
-            end;
-        false ->
-            {lists:reverse(Acc), <<16#10, InvLen, Rest/binary>>}
-    end;
-decode_path_components(<<16#40, Encoded:8/binary, Rest/binary>>, Acc) ->  %% float
+    <<InvBytes:Len/binary, Rest2/binary>> = Rest,
+    Bin2 = << <<(255 - B)>> || <<B>> <= InvBytes >>,
+    N = -binary_to_integer(Bin2),
+    decode_path_only(Rest2, [N | Acc]);
+decode_path_only(<<16#40, Encoded:8/binary, Rest/binary>>, Acc) ->  %% float
     F = decode_float(Encoded),
-    decode_path_components(Rest, [F | Acc]);
-decode_path_components(<<16#50, Rest/binary>>, Acc) ->  %% binary (null-escaped)
+    decode_path_only(Rest, [F | Acc]);
+decode_path_only(<<16#50, Rest/binary>>, Acc) ->  %% binary (null-escaped)
     {BinVal, Rest2} = unescape_binary(Rest),
-    decode_path_components(Rest2, [BinVal | Acc]);
-decode_path_components(Bin, Acc) ->
-    %% No pattern matched - remaining bytes are the DocId
-    {lists:reverse(Acc), Bin}.
-
-%% @private Check if a binary contains only valid ASCII digits (0-9)
-is_valid_integer_digits(<<>>) ->
-    false;
-is_valid_integer_digits(Bin) ->
-    is_valid_integer_digits_loop(Bin).
-
-is_valid_integer_digits_loop(<<>>) ->
-    true;
-is_valid_integer_digits_loop(<<C, Rest/binary>>) when C >= $0, C =< $9 ->
-    is_valid_integer_digits_loop(Rest);
-is_valid_integer_digits_loop(_) ->
-    false.
+    decode_path_only(Rest2, [BinVal | Acc]).
 
 %% @private Unescape binary (same as in barrel_store_keys)
 unescape_binary(Bin) ->
@@ -506,10 +634,14 @@ decode_float(<<Encoded:64/big-unsigned>>) ->
 
 %% @private Create batch operations for updating paths (add/remove)
 make_update_ops(DbName, DocId, Added, Removed, NewPaths) ->
-    %% Build batch operations
-    RemoveOps = [{delete, barrel_store_keys:path_index_key(DbName, Path, DocId)}
+    %% Build posting list operations
+    RemoveOps = [{posting_remove,
+                  barrel_store_keys:path_posting_key(DbName, Path),
+                  DocId}
                  || {Path, _} <- Removed],
-    AddOps = [{put, barrel_store_keys:path_index_key(DbName, Path, DocId), <<>>}
+    AddOps = [{posting_append,
+               barrel_store_keys:path_posting_key(DbName, Path),
+               DocId}
               || {Path, _} <- Added],
 
     %% Update counters: decrement removed, increment added
