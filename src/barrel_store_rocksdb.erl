@@ -21,7 +21,7 @@
 %% Bitmap operations
 -export([bitmap_set/3, bitmap_unset/3, bitmap_get/2, multi_get_bitmap/2]).
 
-%% Posting list operations (using erlang_merge_operator for append/remove)
+%% Posting list operations (using erlang_merge_operator)
 -export([posting_append/3, posting_remove/3]).
 -export([posting_get/2, posting_multi_get/2]).
 -export([fold_range_posting/5, fold_range_posting_reverse/5]).
@@ -497,37 +497,60 @@ multi_get_bitmap(#{ref := Ref, bitmap_cf := BitmapCF}, Keys) ->
 %% Posting List Operations
 %%====================================================================
 
-%% @doc Append a DocId to a posting list using merge operator
-%% Uses erlang_merge_operator with list_append
+%% Posting list binary format:
+%% <<Type:8, Len:16, DocId:Len/binary, ...>>
+%% Type: 0 = add, 255 = tombstone (delete marker)
+%% Uses binary_append for O(1) appends, tombstones cleaned by compaction
+
+%% @doc Append a DocId to a posting list using binary_append (O(1))
 -spec posting_append(db_ref(), binary(), binary()) -> ok | {error, term()}.
 posting_append(#{ref := Ref, posting_cf := PostingCF}, Key, DocId) ->
-    rocksdb:merge(Ref, PostingCF, Key, term_to_binary({list_append, [DocId]}), []).
+    Entry = <<0, (byte_size(DocId)):16, DocId/binary>>,
+    rocksdb:merge(Ref, PostingCF, Key, term_to_binary({binary_append, Entry}), []).
 
-%% @doc Remove a DocId from a posting list using merge operator
-%% Uses erlang_merge_operator with list_substract
+%% @doc Remove a DocId from a posting list using tombstone marker
 -spec posting_remove(db_ref(), binary(), binary()) -> ok | {error, term()}.
 posting_remove(#{ref := Ref, posting_cf := PostingCF}, Key, DocId) ->
-    rocksdb:merge(Ref, PostingCF, Key, term_to_binary({list_substract, [DocId]}), []).
+    Entry = <<255, (byte_size(DocId)):16, DocId/binary>>,
+    rocksdb:merge(Ref, PostingCF, Key, term_to_binary({binary_append, Entry}), []).
 
 %% @doc Get a posting list from the posting column family
-%% Returns decoded list of DocIds
+%% Parses binary format and filters out tombstoned entries
 -spec posting_get(db_ref(), binary()) -> {ok, [binary()]} | not_found | {error, term()}.
 posting_get(#{ref := Ref, posting_cf := PostingCF}, Key) ->
     case rocksdb:get(Ref, PostingCF, Key, []) of
-        {ok, Bin} -> {ok, binary_to_term(Bin)};
+        {ok, Bin} -> {ok, parse_posting_bin(Bin)};
         not_found -> not_found;
         {error, _} = Err -> Err
     end.
 
 %% @doc Get multiple posting lists from the posting column family (batch read)
-%% Returns decoded lists of DocIds
 -spec posting_multi_get(db_ref(), [binary()]) -> [{ok, [binary()]} | not_found | {error, term()}].
 posting_multi_get(#{ref := Ref, posting_cf := PostingCF}, Keys) ->
     Results = rocksdb:multi_get(Ref, PostingCF, Keys, []),
     [case R of
-        {ok, Bin} -> {ok, binary_to_term(Bin)};
+        {ok, Bin} -> {ok, parse_posting_bin(Bin)};
         Other -> Other
     end || R <- Results].
+
+%% @doc Parse posting binary, returning list of active DocIds
+parse_posting_bin(Bin) ->
+    parse_posting_bin(Bin, #{}, []).
+
+parse_posting_bin(<<>>, _Deleted, Acc) ->
+    Acc;
+parse_posting_bin(<<255, Len:16, DocId:Len/binary, Rest/binary>>, Deleted, Acc) ->
+    %% Tombstone - mark as deleted and remove from acc
+    parse_posting_bin(Rest, Deleted#{DocId => true}, lists:delete(DocId, Acc));
+parse_posting_bin(<<0, Len:16, DocId:Len/binary, Rest/binary>>, Deleted, Acc) ->
+    %% Add entry - include if not tombstoned
+    case maps:is_key(DocId, Deleted) of
+        true -> parse_posting_bin(Rest, Deleted, Acc);
+        false -> parse_posting_bin(Rest, Deleted, [DocId | Acc])
+    end;
+parse_posting_bin(_, _Deleted, Acc) ->
+    %% Malformed - return what we have
+    Acc.
 
 %% @doc Fold over posting list entries in a range
 -spec fold_range_posting(db_ref(), binary(), binary(), fun(), term()) -> term().
@@ -544,7 +567,7 @@ fold_range_posting(#{ref := Ref, posting_cf := PostingCF}, StartKey, EndKey, Fun
 fold_posting_loop({error, invalid_iterator}, _Iter, _Fun, Acc) ->
     Acc;
 fold_posting_loop({ok, Key, Value}, Iter, Fun, Acc) ->
-    DocIds = binary_to_term(Value),
+    DocIds = parse_posting_bin(Value),
     case Fun(Key, DocIds, Acc) of
         {ok, NewAcc} ->
             fold_posting_loop(rocksdb:iterator_move(Iter, next), Iter, Fun, NewAcc);
@@ -567,7 +590,7 @@ fold_range_posting_reverse(#{ref := Ref, posting_cf := PostingCF}, StartKey, End
 fold_posting_loop_reverse({error, invalid_iterator}, _Iter, _Fun, Acc) ->
     Acc;
 fold_posting_loop_reverse({ok, Key, Value}, Iter, Fun, Acc) ->
-    DocIds = binary_to_term(Value),
+    DocIds = parse_posting_bin(Value),
     case Fun(Key, DocIds, Acc) of
         {ok, NewAcc} ->
             fold_posting_loop_reverse(rocksdb:iterator_move(Iter, prev), Iter, Fun, NewAcc);
@@ -577,3 +600,4 @@ fold_posting_loop_reverse({ok, Key, Value}, Iter, Fun, Acc) ->
             %% Support non-wrapped return values
             fold_posting_loop_reverse(rocksdb:iterator_move(Iter, prev), Iter, Fun, NewAcc)
     end.
+
