@@ -31,10 +31,13 @@
 -export([view_by_docid/3, view_by_docid_prefix/3, view_by_docid_end/3]).
 -export([encode_view_key/1, decode_view_key/1]).
 
-%% Path index keys
+%% Path index keys (old format: DocId in key)
 -export([path_index_key/3, path_index_prefix/2, path_index_end/2]).
 -export([doc_paths_key/2, doc_paths_prefix/1]).
 -export([encode_path/1, decode_path/1]).
+
+%% Posting list keys (new format: DocIds in value as posting list)
+-export([path_posting_key/2, path_posting_prefix/2, path_posting_end/2]).
 
 %% Path stats keys (for cardinality counters)
 -export([path_stats_key/2]).
@@ -79,6 +82,7 @@
 -define(PREFIX_PATH_HLC, 16#0E).
 -define(PREFIX_PATH_STATS, 16#0F).
 -define(PREFIX_PATH_BITMAP, 16#10).
+-define(PREFIX_PATH_POSTING, 16#14).  %% Posting lists: path → [DocId, ...]
 
 %% Column-wide document storage prefixes (for CBOR codec integration)
 -define(PREFIX_DOC_CURRENT, 16#11).  %% DbName + DocId → {rev, deleted, hlc}
@@ -469,6 +473,27 @@ path_stats_key(DbName, Path) ->
 path_bitmap_key(DbName, Path) ->
     EncodedPath = encode_path(Path),
     <<?PREFIX_PATH_BITMAP, (encode_name(DbName))/binary, EncodedPath/binary>>.
+
+%% @doc Posting list key for path index.
+%% Key format: prefix | db_name | encoded_path (NO DocId - DocIds are in value)
+%% Path includes the value at the end: [field1, field2, value]
+-spec path_posting_key(db_name(), [term()]) -> binary().
+path_posting_key(DbName, Path) ->
+    EncodedPath = encode_path(Path),
+    <<?PREFIX_PATH_POSTING, (encode_name(DbName))/binary, EncodedPath/binary>>.
+
+%% @doc Prefix for scanning posting list entries.
+%% Can be used with partial paths for prefix scans.
+-spec path_posting_prefix(db_name(), [term()]) -> binary().
+path_posting_prefix(DbName, PathPrefix) ->
+    EncodedPath = encode_path(PathPrefix),
+    <<?PREFIX_PATH_POSTING, (encode_name(DbName))/binary, EncodedPath/binary>>.
+
+%% @doc End marker for posting list range scan.
+-spec path_posting_end(db_name(), [term()]) -> binary().
+path_posting_end(DbName, PathPrefix) ->
+    Prefix = path_posting_prefix(DbName, PathPrefix),
+    <<Prefix/binary, 16#FF>>.
 
 %% @doc Encode a path for lexicographic ordering.
 %% Path components are encoded with length prefix and type tags.
