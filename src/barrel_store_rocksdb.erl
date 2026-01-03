@@ -12,7 +12,7 @@
 -export([put/3, put/4, get/2, multi_get/2, delete/2]).
 -export([merge/3]).
 -export([write_batch/2, write_batch/3]).
--export([fold/4, fold_range/5, fold_range_reverse/5]).
+-export([fold/4, fold_range/5, fold_range/6, fold_range_reverse/5, fold_range_reverse/6]).
 
 %% Additional utilities
 -export([snapshot/1, release_snapshot/1]).
@@ -21,9 +21,10 @@
 %% Bitmap operations
 -export([bitmap_set/3, bitmap_unset/3, bitmap_get/2, multi_get_bitmap/2]).
 
-%% Posting list operations
+%% Posting list operations (using erlang_merge_operator for append/remove)
+-export([posting_append/3, posting_remove/3]).
 -export([posting_get/2, posting_multi_get/2]).
--export([posting_put/3, posting_delete/2]).
+-export([fold_range_posting/5]).
 
 %%====================================================================
 %% Types
@@ -39,7 +40,13 @@
 
 -type snapshot() :: rocksdb:snapshot_handle().
 
--export_type([db_ref/0, snapshot/0]).
+%% Read profiles for different query patterns
+%% - point: Small result sets (limit <= 10), keep blocks in cache
+%% - short_range: Medium result sets (limit <= 200), rely on auto-readahead
+%% - long_scan: Large/unbounded scans, prefetch aggressively, avoid cache pollution
+-type read_profile() :: point | short_range | long_scan.
+
+-export_type([db_ref/0, snapshot/0, read_profile/0]).
 
 %% Column family names
 -define(BITMAP_CF_NAME, "bitmap").
@@ -59,7 +66,7 @@ open(Path, Options) ->
     %% Column family descriptors
     DefaultCFOpts = [{merge_operator, counter_merge_operator}],
     BitmapCFOpts = [{merge_operator, {bitset_merge_operator, BitmapSize}}],
-    PostingCFOpts = [],  %% Reserved for future use
+    PostingCFOpts = [{merge_operator, erlang_merge_operator}],  %% For posting lists
 
     CFDescriptors = [
         {"default", DefaultCFOpts},
@@ -169,8 +176,10 @@ write_batch(DbRef, Operations) ->
 %%   - {merge, Key, Delta} - merge counter in default CF
 %%   - {bitmap_set, Key, Position} - set bit in bitmap CF
 %%   - {bitmap_unset, Key, Position} - unset bit in bitmap CF
+%%   - {posting_append, Key, DocId} - append DocId to posting list
+%%   - {posting_remove, Key, DocId} - remove DocId from posting list
 -spec write_batch(db_ref(), list(), map()) -> ok | {error, term()}.
-write_batch(#{ref := Ref, bitmap_cf := BitmapCF}, Operations, Opts) ->
+write_batch(#{ref := Ref, bitmap_cf := BitmapCF, posting_cf := PostingCF}, Operations, Opts) ->
     Sync = maps:get(sync, Opts, false),
     {ok, Batch} = rocksdb:batch(),
     try
@@ -186,7 +195,13 @@ write_batch(#{ref := Ref, bitmap_cf := BitmapCF}, Operations, Opts) ->
                                          <<"+", (integer_to_binary(Position))/binary>>);
                ({bitmap_unset, Key, Position}) when is_integer(Position) ->
                 ok = rocksdb:batch_merge(Batch, BitmapCF, Key,
-                                         <<"-", (integer_to_binary(Position))/binary>>)
+                                         <<"-", (integer_to_binary(Position))/binary>>);
+               ({posting_append, Key, DocId}) ->
+                ok = rocksdb:batch_merge(Batch, PostingCF, Key,
+                                         term_to_binary({list_append, [DocId]}));
+               ({posting_remove, Key, DocId}) ->
+                ok = rocksdb:batch_merge(Batch, PostingCF, Key,
+                                         term_to_binary({list_substract, [DocId]}))
             end,
             Operations
         ),
@@ -212,7 +227,7 @@ fold(#{ref := Ref}, Prefix, Fun, Acc) ->
         rocksdb:iterator_close(Itr)
     end.
 
-%% @doc Fold over a key range
+%% @doc Fold over a key range with default read options
 -spec fold_range(db_ref(), binary(), binary(), fun(), term()) -> term().
 fold_range(#{ref := Ref}, StartKey, EndKey, Fun, Acc) ->
     ReadOpts = [
@@ -227,7 +242,20 @@ fold_range(#{ref := Ref}, StartKey, EndKey, Fun, Acc) ->
         rocksdb:iterator_close(Itr)
     end.
 
-%% @doc Fold over a key range in reverse order (last to first)
+%% @doc Fold over a key range with explicit read profile
+%% Profile controls RocksDB read options for different access patterns.
+%% Currently all profiles use defaults; infrastructure for future tuning.
+-spec fold_range(db_ref(), binary(), binary(), fun(), term(), read_profile()) -> term().
+fold_range(DbRef, StartKey, EndKey, Fun, Acc, Profile) ->
+    case read_profile_opts(Profile) of
+        [] ->
+            %% Fast path: no extra options, use 5-arity directly
+            fold_range(DbRef, StartKey, EndKey, Fun, Acc);
+        ExtraOpts ->
+            fold_range_with_opts(DbRef, StartKey, EndKey, Fun, Acc, ExtraOpts)
+    end.
+
+%% @doc Fold over a key range in reverse order with default options
 %% Useful for building sorted lists with prepend: [Item | Acc]
 -spec fold_range_reverse(db_ref(), binary(), binary(), fun(), term()) -> term().
 fold_range_reverse(#{ref := Ref}, StartKey, EndKey, Fun, Acc) ->
@@ -236,6 +264,49 @@ fold_range_reverse(#{ref := Ref}, StartKey, EndKey, Fun, Acc) ->
         {iterate_upper_bound, EndKey},
         {total_order_seek, true}
     ],
+    {ok, Itr} = rocksdb:iterator(Ref, ReadOpts),
+    try
+        fold_loop_reverse(rocksdb:iterator_move(Itr, last), Itr, Fun, Acc)
+    after
+        rocksdb:iterator_close(Itr)
+    end.
+
+%% @doc Fold over a key range in reverse order with explicit read profile
+-spec fold_range_reverse(db_ref(), binary(), binary(), fun(), term(), read_profile()) -> term().
+fold_range_reverse(DbRef, StartKey, EndKey, Fun, Acc, Profile) ->
+    case read_profile_opts(Profile) of
+        [] ->
+            %% Fast path: no extra options, use 5-arity directly
+            fold_range_reverse(DbRef, StartKey, EndKey, Fun, Acc);
+        ExtraOpts ->
+            fold_range_reverse_with_opts(DbRef, StartKey, EndKey, Fun, Acc, ExtraOpts)
+    end.
+
+%% @doc Fold over a key range with explicit extra options (internal)
+-spec fold_range_with_opts(db_ref(), binary(), binary(), fun(), term(), list()) -> term().
+fold_range_with_opts(#{ref := Ref}, StartKey, EndKey, Fun, Acc, ExtraOpts) ->
+    BaseOpts = [
+        {iterate_lower_bound, StartKey},
+        {iterate_upper_bound, EndKey},
+        {total_order_seek, true}
+    ],
+    ReadOpts = BaseOpts ++ ExtraOpts,
+    {ok, Itr} = rocksdb:iterator(Ref, ReadOpts),
+    try
+        fold_loop(rocksdb:iterator_move(Itr, first), Itr, Fun, Acc)
+    after
+        rocksdb:iterator_close(Itr)
+    end.
+
+%% @doc Fold over a key range in reverse with explicit extra options (internal)
+-spec fold_range_reverse_with_opts(db_ref(), binary(), binary(), fun(), term(), list()) -> term().
+fold_range_reverse_with_opts(#{ref := Ref}, StartKey, EndKey, Fun, Acc, ExtraOpts) ->
+    BaseOpts = [
+        {iterate_lower_bound, StartKey},
+        {iterate_upper_bound, EndKey},
+        {total_order_seek, true}
+    ],
+    ReadOpts = BaseOpts ++ ExtraOpts,
     {ok, Itr} = rocksdb:iterator(Ref, ReadOpts),
     try
         fold_loop_reverse(rocksdb:iterator_move(Itr, last), Itr, Fun, Acc)
@@ -266,6 +337,30 @@ get_with_snapshot(#{ref := Ref}, Key, Snapshot) ->
 %%====================================================================
 %% Internal Functions
 %%====================================================================
+
+%% @doc Convert read profile to RocksDB read options
+%% - point: Use RocksDB defaults (fill_cache=true is default)
+%% - short_range: Use RocksDB defaults, rely on auto-readahead
+%% - long_scan: Same as short_range for now (infrastructure for future tuning)
+%%
+%% Note: fill_cache=false, readahead_size, and async_io hurt on small/warm datasets.
+%% These aggressive options should only be enabled when:
+%% - Dataset is large (won't fit in cache anyway)
+%% - Storage is slow (IO-bound, not CPU-bound)
+%% - Scan is truly sequential and long
+%%
+%% Future long_scan options when IO-bound on large cold datasets:
+%%   [{fill_cache, false}, {readahead_size, 65536}, {async_io, true}]
+-spec read_profile_opts(read_profile()) -> list().
+read_profile_opts(point) ->
+    [];  %% Use RocksDB defaults
+read_profile_opts(short_range) ->
+    [];  %% Use RocksDB defaults
+read_profile_opts(long_scan) ->
+    %% For now, same as short_range. On small/warm datasets, aggressive
+    %% prefetch (readahead_size, async_io) and fill_cache=false hurt more
+    %% than they help. Enable these only after measuring IO-bound workloads.
+    [].
 
 %% Build RocksDB options from config
 build_db_options(Options) ->
@@ -402,22 +497,57 @@ multi_get_bitmap(#{ref := Ref, bitmap_cf := BitmapCF}, Keys) ->
 %% Posting List Operations
 %%====================================================================
 
+%% @doc Append a DocId to a posting list using merge operator
+%% Uses erlang_merge_operator with list_append
+-spec posting_append(db_ref(), binary(), binary()) -> ok | {error, term()}.
+posting_append(#{ref := Ref, posting_cf := PostingCF}, Key, DocId) ->
+    rocksdb:merge(Ref, PostingCF, Key, term_to_binary({list_append, [DocId]}), []).
+
+%% @doc Remove a DocId from a posting list using merge operator
+%% Uses erlang_merge_operator with list_substract
+-spec posting_remove(db_ref(), binary(), binary()) -> ok | {error, term()}.
+posting_remove(#{ref := Ref, posting_cf := PostingCF}, Key, DocId) ->
+    rocksdb:merge(Ref, PostingCF, Key, term_to_binary({list_substract, [DocId]}), []).
+
 %% @doc Get a posting list from the posting column family
--spec posting_get(db_ref(), binary()) -> {ok, binary()} | not_found | {error, term()}.
+%% Returns decoded list of DocIds
+-spec posting_get(db_ref(), binary()) -> {ok, [binary()]} | not_found | {error, term()}.
 posting_get(#{ref := Ref, posting_cf := PostingCF}, Key) ->
-    rocksdb:get(Ref, PostingCF, Key, []).
+    case rocksdb:get(Ref, PostingCF, Key, []) of
+        {ok, Bin} -> {ok, binary_to_term(Bin)};
+        not_found -> not_found;
+        {error, _} = Err -> Err
+    end.
 
 %% @doc Get multiple posting lists from the posting column family (batch read)
--spec posting_multi_get(db_ref(), [binary()]) -> [{ok, binary()} | not_found | {error, term()}].
+%% Returns decoded lists of DocIds
+-spec posting_multi_get(db_ref(), [binary()]) -> [{ok, [binary()]} | not_found | {error, term()}].
 posting_multi_get(#{ref := Ref, posting_cf := PostingCF}, Keys) ->
-    rocksdb:multi_get(Ref, PostingCF, Keys, []).
+    Results = rocksdb:multi_get(Ref, PostingCF, Keys, []),
+    [case R of
+        {ok, Bin} -> {ok, binary_to_term(Bin)};
+        Other -> Other
+    end || R <- Results].
 
-%% @doc Put a value to the posting column family
--spec posting_put(db_ref(), binary(), binary()) -> ok | {error, term()}.
-posting_put(#{ref := Ref, posting_cf := PostingCF}, Key, Value) ->
-    rocksdb:put(Ref, PostingCF, Key, Value, []).
+%% @doc Fold over posting list entries in a range
+-spec fold_range_posting(db_ref(), binary(), binary(), fun(), term()) -> term().
+fold_range_posting(#{ref := Ref, posting_cf := PostingCF}, StartKey, EndKey, Fun, Acc0) ->
+    Opts = [{iterate_lower_bound, StartKey},
+            {iterate_upper_bound, EndKey}],
+    {ok, Iter} = rocksdb:iterator(Ref, PostingCF, Opts),
+    try
+        fold_posting_loop(rocksdb:iterator_move(Iter, first), Iter, Fun, Acc0)
+    after
+        rocksdb:iterator_close(Iter)
+    end.
 
-%% @doc Delete a posting list from the posting column family
--spec posting_delete(db_ref(), binary()) -> ok | {error, term()}.
-posting_delete(#{ref := Ref, posting_cf := PostingCF}, Key) ->
-    rocksdb:delete(Ref, PostingCF, Key, []).
+fold_posting_loop({error, invalid_iterator}, _Iter, _Fun, Acc) ->
+    Acc;
+fold_posting_loop({ok, Key, Value}, Iter, Fun, Acc) ->
+    DocIds = binary_to_term(Value),
+    case Fun(Key, DocIds, Acc) of
+        {ok, NewAcc} ->
+            fold_posting_loop(rocksdb:iterator_move(Iter, next), Iter, Fun, NewAcc);
+        {stop, FinalAcc} ->
+            FinalAcc
+    end.
