@@ -12,11 +12,16 @@
 %% Database metadata keys
 -export([db_meta/2, db_uid/1, db_docs_count/1, db_del_count/1]).
 
-%% Document keys
+%% Document keys (legacy)
 -export([doc_info/2, doc_info_prefix/1, doc_info_end/1]).
 -export([doc_rev/3, doc_rev_prefix/2]).
 -export([doc_seq/2, doc_seq_prefix/1, doc_seq_end/1]).
 -export([doc_hlc/2, doc_hlc_prefix/1, doc_hlc_end/1]).
+
+%% Column-wide document keys (CBOR codec)
+-export([doc_current/2, doc_current_prefix/1, doc_current_end/1]).
+-export([doc_tree/2]).
+-export([doc_body/3, doc_body_prefix/2]).
 
 %% Local document keys
 -export([local_doc/2]).
@@ -74,6 +79,11 @@
 -define(PREFIX_PATH_HLC, 16#0E).
 -define(PREFIX_PATH_STATS, 16#0F).
 -define(PREFIX_PATH_BITMAP, 16#10).
+
+%% Column-wide document storage prefixes (for CBOR codec integration)
+-define(PREFIX_DOC_CURRENT, 16#11).  %% DbName + DocId → {rev, deleted, hlc}
+-define(PREFIX_DOC_TREE, 16#12).     %% DbName + DocId → revtree (term_to_binary)
+-define(PREFIX_DOC_BODY, 16#13).     %% DbName + DocId + Rev → CBOR body
 
 %% Path component type tags (for ordered encoding)
 -define(PATH_TYPE_NULL, 16#01).
@@ -240,6 +250,40 @@ split_on_null(<<B, Rest/binary>>, Acc) ->
 -spec local_doc(db_name(), docid()) -> binary().
 local_doc(DbName, DocId) ->
     <<?PREFIX_LOCAL_DOC, (encode_name(DbName))/binary, DocId/binary>>.
+
+%%====================================================================
+%% Column-Wide Document Keys (CBOR Codec Integration)
+%%====================================================================
+
+%% @doc Document current state key (stores {rev, deleted, hlc})
+-spec doc_current(db_name(), docid()) -> binary().
+doc_current(DbName, DocId) ->
+    <<?PREFIX_DOC_CURRENT, (encode_name(DbName))/binary, DocId/binary>>.
+
+%% @doc Prefix for all doc_current keys in a database
+-spec doc_current_prefix(db_name()) -> binary().
+doc_current_prefix(DbName) ->
+    <<?PREFIX_DOC_CURRENT, (encode_name(DbName))/binary>>.
+
+%% @doc End marker for doc_current range scan
+-spec doc_current_end(db_name()) -> binary().
+doc_current_end(DbName) ->
+    <<?PREFIX_DOC_CURRENT, (encode_name(DbName))/binary, 16#FF>>.
+
+%% @doc Document revision tree key (stores revtree as term_to_binary)
+-spec doc_tree(db_name(), docid()) -> binary().
+doc_tree(DbName, DocId) ->
+    <<?PREFIX_DOC_TREE, (encode_name(DbName))/binary, DocId/binary>>.
+
+%% @doc Document body key (stores CBOR-encoded body for specific revision)
+-spec doc_body(db_name(), docid(), revid()) -> binary().
+doc_body(DbName, DocId, RevId) ->
+    <<?PREFIX_DOC_BODY, (encode_name(DbName))/binary, DocId/binary, $:, RevId/binary>>.
+
+%% @doc Prefix for all body revisions of a document
+-spec doc_body_prefix(db_name(), docid()) -> binary().
+doc_body_prefix(DbName, DocId) ->
+    <<?PREFIX_DOC_BODY, (encode_name(DbName))/binary, DocId/binary, $:>>.
 
 %%====================================================================
 %% View Keys
