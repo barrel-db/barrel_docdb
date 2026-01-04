@@ -39,7 +39,8 @@
     changes_query_and_path_filter/1,
     changes_style/1,
     changes_last_seq/1,
-    changes_count_since/1
+    changes_count_since/1,
+    changes_has_changes_since/1
 ]).
 
 %% Test cases - barrel_changes_stream
@@ -78,7 +79,8 @@ groups() ->
             changes_query_and_path_filter,
             changes_style,
             changes_last_seq,
-            changes_count_since
+            changes_count_since,
+            changes_has_changes_since
         ]},
         {stream, [sequence], [
             stream_iterate_mode,
@@ -681,6 +683,58 @@ changes_count_since(Config) ->
 
     %% Count from end
     ?assertEqual(0, barrel_changes:count_changes_since(StoreRef, DbName, make_test_hlc(1000, 10))),
+
+    barrel_store_rocksdb:close(StoreRef),
+    ok.
+
+changes_has_changes_since(Config) ->
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/changes_has_since",
+
+    {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
+    DbName = <<"testdb">>,
+
+    %% Before any writes, has_changes_since should return true (safe fallback)
+    ?assertEqual(true, barrel_changes:has_changes_since(StoreRef, DbName, barrel_hlc:min())),
+
+    %% Write changes with HLC - this also updates the bucket hints
+    lists:foreach(
+        fun(N) ->
+            DocId = iolist_to_binary(["doc", integer_to_list(N)]),
+            Hlc = make_test_hlc(2000, N),
+            DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false},
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
+        end,
+        lists:seq(1, 5)
+    ),
+
+    %% After writes, has_changes_since with old HLC should return true
+    %% (bucket hint shows max_hlc > since)
+    OldHlc = make_test_hlc(1000, 1),  %% Before all changes
+    ?assertEqual(true, barrel_changes:has_changes_since(StoreRef, DbName, OldHlc)),
+
+    %% has_changes_since with min HLC should return true
+    ?assertEqual(true, barrel_changes:has_changes_since(StoreRef, DbName, barrel_hlc:min())),
+
+    %% has_changes_since with the last written HLC should return true
+    %% (safe fallback when no changes after)
+    LastHlc = make_test_hlc(2000, 5),
+    ?assertEqual(true, barrel_changes:has_changes_since(StoreRef, DbName, LastHlc)),
+
+    %% Verify the bucket was written by checking the key directly
+    NowSecs = erlang:system_time(second),
+    BucketTs = NowSecs div 60,  %% 60 second granularity
+    BucketKey = barrel_store_keys:change_bucket(DbName, BucketTs),
+    {ok, BucketValue} = barrel_store_rocksdb:get(StoreRef, BucketKey),
+
+    %% Bucket format: <<MinHlc:12/binary, MaxHlc:12/binary, Count:32>>
+    ?assertEqual(28, byte_size(BucketValue)),
+    <<_MinBin:12/binary, MaxBin:12/binary, Count:32>> = BucketValue,
+    ?assertEqual(5, Count),  %% 5 changes written
+
+    %% Verify max HLC in bucket matches last written change
+    MaxHlc = barrel_hlc:decode(MaxBin),
+    ?assertEqual(make_test_hlc(2000, 5), MaxHlc),
 
     barrel_store_rocksdb:close(StoreRef),
     ok.
