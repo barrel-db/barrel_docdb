@@ -46,6 +46,9 @@
 %% Value-first index keys (for iterable equality queries with early termination)
 -export([value_index_key/4, value_index_prefix/3, value_index_end/3]).
 
+%% Change bucket keys (for idle poll optimization)
+-export([change_bucket/2, change_bucket_prefix/1, change_bucket_end/1]).
+
 %% Path stats keys (for cardinality counters)
 -export([path_stats_key/2]).
 
@@ -92,6 +95,7 @@
 -define(PREFIX_PATH_POSTING, 16#14).  %% Posting lists: path → [DocId, ...]
 -define(PREFIX_VALUE_POSTING, 16#15). %% Value-first posting: [value_prefix, path] → [DocId, ...]
 -define(PREFIX_VALUE_INDEX, 16#16).   %% Value-first index: [value_prefix, path, DocId] → marker (for iteration)
+-define(PREFIX_CHANGE_BUCKET, 16#17). %% Change bucket: DbName + BucketTs → {min_hlc, max_hlc, count}
 
 %% Value prefix max length for value-first index (128 bytes)
 -define(VALUE_PREFIX_MAX_LEN, 128).
@@ -694,3 +698,25 @@ decode_path_components(<<?PATH_TYPE_FLOAT, Encoded:8/binary, Rest/binary>>, Acc)
 decode_path_components(<<?PATH_TYPE_BINARY, Rest/binary>>, Acc) ->
     {Bin, Rest2} = unescape_binary(Rest),
     decode_path_components(Rest2, [Bin | Acc]).
+
+%%====================================================================
+%% Change Bucket Keys (Idle Poll Optimization)
+%%====================================================================
+
+%% @doc Change bucket key for time-bucketed change hints.
+%% BucketTs is typically erlang:system_time(second) div 60 (minute granularity).
+%% Value stores {min_hlc, max_hlc, count} for quick "has changes?" checks.
+-spec change_bucket(db_name(), non_neg_integer()) -> binary().
+change_bucket(DbName, BucketTs) ->
+    <<?PREFIX_CHANGE_BUCKET, (encode_name(DbName))/binary, BucketTs:64/big-unsigned>>.
+
+%% @doc Prefix for all change buckets in a database.
+-spec change_bucket_prefix(db_name()) -> binary().
+change_bucket_prefix(DbName) ->
+    <<?PREFIX_CHANGE_BUCKET, (encode_name(DbName))/binary>>.
+
+%% @doc End marker for change bucket range scan.
+-spec change_bucket_end(db_name()) -> binary().
+change_bucket_end(DbName) ->
+    <<?PREFIX_CHANGE_BUCKET, (encode_name(DbName))/binary,
+      16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF>>.
