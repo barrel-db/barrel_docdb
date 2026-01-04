@@ -514,42 +514,52 @@ delete_old_change(StoreRef, DbName, OldHlc, _DocId) ->
 %% Internal Functions
 %%====================================================================
 
+%% @doc Encode change to compact binary format.
+%% Format: <<DocIdLen:16, DocId/binary, RevLen:16, Rev/binary, Deleted:8, NumConflicts:16>>
+%% Stores conflict count for quick check; fetch doc for actual conflict revs.
+-spec encode_change(doc_info()) -> binary().
 encode_change(DocInfo) ->
-    term_to_binary(DocInfo).
-
-decode_change(Value, Hlc) ->
-    DocInfo = binary_to_term(Value),
+    DocId = maps:get(id, DocInfo),
     Rev = maps:get(rev, DocInfo),
-    Deleted = maps:get(deleted, DocInfo, false),
+    Deleted = case maps:get(deleted, DocInfo, false) of true -> 1; false -> 0 end,
+    NumConflicts = count_conflicts(DocInfo),
+    DocIdLen = byte_size(DocId),
+    RevLen = byte_size(Rev),
+    <<DocIdLen:16, DocId/binary, RevLen:16, Rev/binary, Deleted:8, NumConflicts:16>>.
 
-    ConflictRevs = get_conflict_revs(DocInfo),
-    AllRevs = [#{rev => Rev} | [#{rev => R} || R <- ConflictRevs]],
+count_conflicts(#{revtree := RevTree}) when is_map(RevTree) ->
+    length(barrel_revtree:conflicts(RevTree));
+count_conflicts(_) ->
+    0.
 
+%% @doc Decode change to compact tuple format for efficient iteration.
+%% Returns {DocId, Hlc, Rev, Deleted, NumConflicts} - minimal allocation.
+-spec decode_change_compact(binary(), barrel_hlc:timestamp()) ->
+    {docid(), barrel_hlc:timestamp(), binary(), boolean(), non_neg_integer()}.
+decode_change_compact(<<DocIdLen:16, DocId:DocIdLen/binary,
+                        RevLen:16, Rev:RevLen/binary,
+                        Deleted:8, NumConflicts:16>>, Hlc) ->
+    {DocId, Hlc, Rev, Deleted =:= 1, NumConflicts}.
+
+%% @doc Decode change to full map format for API responses.
+%% Note: Only includes conflict count, not actual conflict revs.
+%% Fetch doc with include_conflicts to get full conflict details.
+-spec decode_change(binary(), barrel_hlc:timestamp()) -> change().
+decode_change(<<DocIdLen:16, DocId:DocIdLen/binary,
+                RevLen:16, Rev:RevLen/binary,
+                Deleted:8, NumConflicts:16>>, Hlc) ->
     Change = #{
-        id => maps:get(id, DocInfo),
+        id => DocId,
         hlc => Hlc,
         rev => Rev,
-        changes => AllRevs
+        changes => [#{rev => Rev}],
+        num_conflicts => NumConflicts
     },
-
-    %% Include document body if present
-    Change1 = case maps:get(doc, DocInfo, undefined) of
-        undefined -> Change;
-        Doc -> Change#{doc => Doc}
-    end,
-
-    case Deleted of
-        true -> Change1#{deleted => true};
-        false -> Change1
+    case Deleted =:= 1 of
+        true -> Change#{deleted => true};
+        false -> Change
     end.
 
-get_conflict_revs(#{revtree := RevTree}) when is_map(RevTree) ->
-    case barrel_revtree:conflicts(RevTree) of
-        [] -> [];
-        Conflicts -> [maps:get(id, C) || C <- Conflicts]
-    end;
-get_conflict_revs(_) ->
-    [].
 
 %%====================================================================
 %% Path-Indexed Changes API
