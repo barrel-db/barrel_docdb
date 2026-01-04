@@ -15,6 +15,7 @@
     fold_changes/5,
     fold_changes_compact/5,
     get_changes/4,
+    get_changes_chunked/4,  %% Returns continuation token for pagination
     get_last_seq/2,  %% Returns opaque sequence (encoded HLC binary)
     get_last_hlc/2,  %% Returns decoded HLC timestamp
     count_changes_since/3,
@@ -63,7 +64,14 @@
     query => barrel_query:query_spec()  % Query to filter by
 }.
 
--export_type([changes_result/0, fold_fun/0, compact_change/0, compact_fold_fun/0, changes_opts/0]).
+-type continuation_info() :: #{
+    last_hlc := barrel_hlc:timestamp(),
+    has_more := boolean(),
+    continuation => binary()  %% Only present when has_more=true
+}.
+
+-export_type([changes_result/0, fold_fun/0, compact_change/0, compact_fold_fun/0,
+              changes_opts/0, continuation_info/0]).
 
 %%====================================================================
 %% API
@@ -205,6 +213,80 @@ get_changes(StoreRef, DbName, Since, Opts) ->
             %% - no paths specified
             get_changes_full_scan(StoreRef, DbName, Since, Opts)
     end.
+
+%% @doc Get changes with continuation support for pagination.
+%% Accepts either an HLC timestamp, 'first', or a continuation token (binary).
+%% Returns changes along with continuation info for fetching the next batch.
+%%
+%% Example usage:
+%% ```
+%% %% First request
+%% {ok, Changes1, Info1} = get_changes_chunked(Store, Db, first, #{limit => 100}),
+%% %% Check if more changes available
+%% case maps:get(has_more, Info1) of
+%%     true ->
+%%         Continuation = maps:get(continuation, Info1),
+%%         {ok, Changes2, Info2} = get_changes_chunked(Store, Db, Continuation, #{limit => 100});
+%%     false ->
+%%         done
+%% end.
+%% '''
+-spec get_changes_chunked(barrel_store_rocksdb:db_ref(), db_name(),
+                          barrel_hlc:timestamp() | first | binary(), changes_opts()) ->
+    {ok, [change()], continuation_info()}.
+get_changes_chunked(StoreRef, DbName, ContinuationOrSince, Opts) ->
+    %% Decode continuation token if binary
+    Since = case ContinuationOrSince of
+        first -> first;
+        Bin when is_binary(Bin), byte_size(Bin) =:= 12 ->
+            %% This is an encoded HLC (continuation token)
+            barrel_hlc:decode(Bin);
+        Hlc when is_tuple(Hlc) ->
+            %% Already an HLC timestamp
+            Hlc
+    end,
+
+    %% Get one extra to determine if there are more
+    Limit = maps:get(limit, Opts, 100),
+    OptsWithExtra = Opts#{limit => Limit + 1},
+
+    {ok, AllChanges, _LastHlc} = get_changes(StoreRef, DbName, Since, OptsWithExtra),
+
+    %% Check if we got the extra one (meaning there are more)
+    {Changes, HasMore} = case length(AllChanges) > Limit of
+        true ->
+            {lists:sublist(AllChanges, Limit), true};
+        false ->
+            {AllChanges, false}
+    end,
+
+    %% Build continuation info
+    ResultLastHlc = case Changes of
+        [] ->
+            case Since of
+                first -> barrel_hlc:min();
+                _ -> Since
+            end;
+        _ ->
+            LastChange = lists:last(Changes),
+            maps:get(hlc, LastChange)
+    end,
+
+    ContinuationInfo = case HasMore of
+        true ->
+            #{
+                last_hlc => ResultLastHlc,
+                has_more => true,
+                continuation => barrel_hlc:encode(ResultLastHlc)
+            };
+        false ->
+            #{
+                last_hlc => ResultLastHlc,
+                has_more => false
+            }
+    end,
+
+    {ok, Changes, ContinuationInfo}.
 
 %% @private Get changes using path index for a single path pattern
 %% Falls back to full scan if path index is empty (backwards compatibility)

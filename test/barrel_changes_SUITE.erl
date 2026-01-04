@@ -40,7 +40,8 @@
     changes_style/1,
     changes_last_seq/1,
     changes_count_since/1,
-    changes_has_changes_since/1
+    changes_has_changes_since/1,
+    changes_chunked_pagination/1
 ]).
 
 %% Test cases - barrel_changes_stream
@@ -80,7 +81,8 @@ groups() ->
             changes_style,
             changes_last_seq,
             changes_count_since,
-            changes_has_changes_since
+            changes_has_changes_since,
+            changes_chunked_pagination
         ]},
         {stream, [sequence], [
             stream_iterate_mode,
@@ -735,6 +737,82 @@ changes_has_changes_since(Config) ->
     %% Verify max HLC in bucket matches last written change
     MaxHlc = barrel_hlc:decode(MaxBin),
     ?assertEqual(make_test_hlc(2000, 5), MaxHlc),
+
+    barrel_store_rocksdb:close(StoreRef),
+    ok.
+
+changes_chunked_pagination(Config) ->
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/changes_chunked",
+
+    {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
+    DbName = <<"testdb">>,
+
+    %% Write 10 changes
+    lists:foreach(
+        fun(N) ->
+            DocId = iolist_to_binary(["doc", integer_to_list(N)]),
+            Hlc = make_test_hlc(1000, N),
+            DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false},
+            ok = barrel_changes:write_change(StoreRef, DbName, Hlc, DocInfo)
+        end,
+        lists:seq(1, 10)
+    ),
+
+    %% Get first chunk with limit 3
+    {ok, Changes1, Info1} = barrel_changes:get_changes_chunked(
+        StoreRef, DbName, first, #{limit => 3}
+    ),
+    ?assertEqual(3, length(Changes1)),
+    ?assertEqual(true, maps:get(has_more, Info1)),
+    ?assert(maps:is_key(continuation, Info1)),
+
+    %% Verify first chunk has doc1, doc2, doc3
+    Ids1 = [maps:get(id, C) || C <- Changes1],
+    ?assertEqual([<<"doc1">>, <<"doc2">>, <<"doc3">>], Ids1),
+
+    %% Get second chunk using continuation token
+    Continuation1 = maps:get(continuation, Info1),
+    ?assertEqual(12, byte_size(Continuation1)),  %% Encoded HLC is 12 bytes
+
+    {ok, Changes2, Info2} = barrel_changes:get_changes_chunked(
+        StoreRef, DbName, Continuation1, #{limit => 3}
+    ),
+    ?assertEqual(3, length(Changes2)),
+    ?assertEqual(true, maps:get(has_more, Info2)),
+
+    %% Verify second chunk has doc4, doc5, doc6
+    Ids2 = [maps:get(id, C) || C <- Changes2],
+    ?assertEqual([<<"doc4">>, <<"doc5">>, <<"doc6">>], Ids2),
+
+    %% Get third chunk
+    Continuation2 = maps:get(continuation, Info2),
+    {ok, Changes3, Info3} = barrel_changes:get_changes_chunked(
+        StoreRef, DbName, Continuation2, #{limit => 3}
+    ),
+    ?assertEqual(3, length(Changes3)),
+    ?assertEqual(true, maps:get(has_more, Info3)),
+
+    %% Verify third chunk has doc7, doc8, doc9
+    Ids3 = [maps:get(id, C) || C <- Changes3],
+    ?assertEqual([<<"doc7">>, <<"doc8">>, <<"doc9">>], Ids3),
+
+    %% Get final chunk
+    Continuation3 = maps:get(continuation, Info3),
+    {ok, Changes4, Info4} = barrel_changes:get_changes_chunked(
+        StoreRef, DbName, Continuation3, #{limit => 3}
+    ),
+    ?assertEqual(1, length(Changes4)),
+    ?assertEqual(false, maps:get(has_more, Info4)),
+    ?assertNot(maps:is_key(continuation, Info4)),
+
+    %% Verify final chunk has doc10
+    Ids4 = [maps:get(id, C) || C <- Changes4],
+    ?assertEqual([<<"doc10">>], Ids4),
+
+    %% Verify last_hlc is set correctly
+    LastHlc = maps:get(last_hlc, Info4),
+    ?assertEqual(make_test_hlc(1000, 10), LastHlc),
 
     barrel_store_rocksdb:close(StoreRef),
     ok.
