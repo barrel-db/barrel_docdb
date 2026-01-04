@@ -26,6 +26,7 @@
 -export([posting_append/3, posting_remove/3]).
 -export([posting_get/2, posting_multi_get/2]).
 -export([fold_range_posting/5, fold_range_posting_reverse/5]).
+-export([fold_range_posting_prefix/5, fold_range_posting_prefix_with_snapshot/6]).
 
 %%====================================================================
 %% Types
@@ -552,6 +553,38 @@ posting_multi_get(#{ref := Ref, posting_cf := PostingCF}, Keys) ->
 fold_range_posting(#{ref := Ref, posting_cf := PostingCF}, StartKey, EndKey, Fun, Acc0) ->
     Opts = [{iterate_lower_bound, StartKey},
             {iterate_upper_bound, EndKey}],
+    {ok, Iter} = rocksdb:iterator(Ref, PostingCF, Opts),
+    try
+        fold_posting_loop(rocksdb:iterator_move(Iter, first), Iter, Fun, Acc0)
+    after
+        rocksdb:iterator_close(Iter)
+    end.
+
+%% @doc Fold over posting list entries with prefix bloom optimization
+%% Uses prefix_same_as_start=true to stop at prefix boundary and
+%% total_order_seek=false to enable prefix bloom filter.
+%% Use this for prefix queries where all keys share a common prefix.
+-spec fold_range_posting_prefix(db_ref(), binary(), binary(), fun(), term()) -> term().
+fold_range_posting_prefix(#{ref := Ref, posting_cf := PostingCF}, StartKey, EndKey, Fun, Acc0) ->
+    Opts = [{iterate_lower_bound, StartKey},
+            {iterate_upper_bound, EndKey},
+            {prefix_same_as_start, true},
+            {total_order_seek, false}],
+    {ok, Iter} = rocksdb:iterator(Ref, PostingCF, Opts),
+    try
+        fold_posting_loop(rocksdb:iterator_move(Iter, first), Iter, Fun, Acc0)
+    after
+        rocksdb:iterator_close(Iter)
+    end.
+
+%% @doc Fold over posting list entries with prefix bloom and snapshot
+-spec fold_range_posting_prefix_with_snapshot(db_ref(), binary(), binary(), fun(), term(), snapshot()) -> term().
+fold_range_posting_prefix_with_snapshot(#{ref := Ref, posting_cf := PostingCF}, StartKey, EndKey, Fun, Acc0, Snapshot) ->
+    Opts = [{iterate_lower_bound, StartKey},
+            {iterate_upper_bound, EndKey},
+            {prefix_same_as_start, true},
+            {total_order_seek, false},
+            {snapshot, Snapshot}],
     {ok, Iter} = rocksdb:iterator(Ref, PostingCF, Opts),
     try
         fold_posting_loop(rocksdb:iterator_move(Iter, first), Iter, Fun, Acc0)
