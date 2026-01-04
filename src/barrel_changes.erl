@@ -319,8 +319,62 @@ get_changes_with_multiple_paths(StoreRef, DbName, Paths, Since, Opts, QuerySpec)
             {ok, Changes, LastHlc}
     end.
 
-%% @private Full scan with filtering (original implementation)
+%% @private Full scan with filtering
 get_changes_full_scan(StoreRef, DbName, Since, Opts) ->
+    DocIds = maps:get(doc_ids, Opts, undefined),
+    PathPatterns = maps:get(paths, Opts, undefined),
+    QuerySpec = maps:get(query, Opts, undefined),
+
+    %% Fast path: no filters - use compact format for efficiency
+    case {DocIds, PathPatterns, QuerySpec} of
+        {undefined, undefined, undefined} ->
+            get_changes_fast(StoreRef, DbName, Since, Opts);
+        _ ->
+            get_changes_filtered(StoreRef, DbName, Since, Opts)
+    end.
+
+%% @private Fast path using compact format (no filtering needed)
+get_changes_fast(StoreRef, DbName, Since, Opts) ->
+    Limit = maps:get(limit, Opts, infinity),
+    Style = maps:get(style, Opts, all_docs),
+    StartHlc = case Since of first -> barrel_hlc:min(); H -> H end,
+
+    %% Accumulator: {Count, LastProcessedHlc, Changes}
+    FoldFun = fun({DocId, Hlc, Rev, Deleted, NumConflicts}, {Count, _LastHlc, Acc}) ->
+        Change = compact_to_change(DocId, Hlc, Rev, Deleted, NumConflicts, Style),
+        NewCount = Count + 1,
+        NewAcc = {NewCount, Hlc, [Change | Acc]},
+        case Limit =/= infinity andalso NewCount >= Limit of
+            true -> {stop, NewAcc};
+            false -> {ok, NewAcc}
+        end
+    end,
+
+    {ok, {_Count, LastHlc, RevChanges}, _FoldHlc} = fold_changes_compact(
+        StoreRef, DbName, Since, FoldFun, {0, StartHlc, []}),
+
+    Changes = case maps:get(descending, Opts, false) of
+        true -> RevChanges;
+        false -> lists:reverse(RevChanges)
+    end,
+    {ok, Changes, LastHlc}.
+
+%% @private Convert compact tuple to change map
+compact_to_change(DocId, Hlc, Rev, Deleted, NumConflicts, _Style) ->
+    Change = #{
+        id => DocId,
+        hlc => Hlc,
+        rev => Rev,
+        changes => [#{rev => Rev}],
+        num_conflicts => NumConflicts
+    },
+    case Deleted of
+        true -> Change#{deleted => true};
+        false -> Change
+    end.
+
+%% @private Filtered scan (needs full change format)
+get_changes_filtered(StoreRef, DbName, Since, Opts) ->
     Limit = maps:get(limit, Opts, infinity),
     DocIds = maps:get(doc_ids, Opts, undefined),
     Style = maps:get(style, Opts, all_docs),
@@ -340,6 +394,9 @@ get_changes_full_scan(StoreRef, DbName, Since, Opts) ->
     %% If query filter specified, compile it
     CompiledQuery = compile_query(QuerySpec),
 
+    %% Do we need doc body for filtering?
+    NeedsDoc = PathMatcher =/= undefined orelse CompiledQuery =/= undefined,
+
     FoldFun = fun(Change, {Count, Changes}) ->
         %% Check doc_ids filter
         IncludeByDocId = case DocIds of
@@ -347,18 +404,28 @@ get_changes_full_scan(StoreRef, DbName, Since, Opts) ->
             Ids when is_list(Ids) -> lists:member(maps:get(id, Change), Ids)
         end,
 
+        %% Fetch doc body if needed for path/query filtering
+        ChangeWithDoc = case NeedsDoc andalso IncludeByDocId of
+            true ->
+                DocId = maps:get(id, Change),
+                case fetch_doc_body(StoreRef, DbName, DocId) of
+                    {ok, Doc} -> Change#{doc => Doc};
+                    _ -> Change
+                end;
+            false ->
+                Change
+        end,
+
         %% Check path patterns filter
         IncludeByPath = case PathMatcher of
             undefined ->
                 true;
             MatchTrie ->
-                case maps:get(doc, Change, undefined) of
+                case maps:get(doc, ChangeWithDoc, undefined) of
                     undefined ->
-                        %% No doc body, can't match paths - skip
                         false;
-                    Doc when is_map(Doc) ->
-                        %% Extract topics from document and check for matches
-                        DocPaths = barrel_ars:analyze(Doc),
+                    DocBody when is_map(DocBody) ->
+                        DocPaths = barrel_ars:analyze(DocBody),
                         Topics = barrel_ars:paths_to_topics(DocPaths),
                         matches_any_pattern(MatchTrie, Topics);
                     _ ->
@@ -367,13 +434,13 @@ get_changes_full_scan(StoreRef, DbName, Since, Opts) ->
         end,
 
         %% Check query filter
-        IncludeByQuery = maybe_match_query(CompiledQuery, Change),
+        IncludeByQuery = maybe_match_query(CompiledQuery, ChangeWithDoc),
 
         case IncludeByDocId andalso IncludeByPath andalso IncludeByQuery of
             false ->
                 {ok, {Count, Changes}};
             true ->
-                FilteredChange = apply_style(Style, Change),
+                FilteredChange = apply_style(Style, ChangeWithDoc),
                 NewCount = Count + 1,
                 NewChanges = [FilteredChange | Changes],
                 case Limit of
@@ -532,6 +599,29 @@ count_changes_since(StoreRef, DbName, Since) ->
         0
     ).
 
+%% @private Fetch doc body for path/query filtering
+fetch_doc_body(StoreRef, DbName, DocId) ->
+    DocCurrentKey = barrel_store_keys:doc_current(DbName, DocId),
+    case barrel_store_rocksdb:get(StoreRef, DocCurrentKey) of
+        {ok, CurrentBin} ->
+            {Rev, Deleted, _Hlc} = binary_to_term(CurrentBin),
+            case Deleted of
+                true ->
+                    {error, deleted};
+                false ->
+                    DocBodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
+                    case barrel_store_rocksdb:get(StoreRef, DocBodyKey) of
+                        {ok, CborBin} ->
+                            DocBody = barrel_docdb_codec_cbor:decode(CborBin),
+                            {ok, DocBody};
+                        not_found ->
+                            {error, not_found}
+                    end
+            end;
+        not_found ->
+            {error, not_found}
+    end.
+
 %%====================================================================
 %% Internal API - for barrel_db_writer
 %%====================================================================
@@ -568,8 +658,8 @@ delete_old_change(StoreRef, DbName, OldHlc, _DocId) ->
 %%====================================================================
 
 %% @doc Encode change to compact binary format.
-%% Format: <<DocIdLen:16, DocId/binary, RevLen:16, Rev/binary, Deleted:8, NumConflicts:16>>
-%% Stores conflict count for quick check; fetch doc for actual conflict revs.
+%% Format: <<DocIdLen:16, DocId/binary, RevLen:16, Rev/binary, Deleted:8, NumConflicts:16, HasDoc:8, [DocCbor/binary]>>
+%% Stores conflict count for quick check; optionally includes doc body for filtering.
 -spec encode_change(doc_info()) -> binary().
 encode_change(DocInfo) ->
     DocId = maps:get(id, DocInfo),
@@ -578,7 +668,16 @@ encode_change(DocInfo) ->
     NumConflicts = count_conflicts(DocInfo),
     DocIdLen = byte_size(DocId),
     RevLen = byte_size(Rev),
-    <<DocIdLen:16, DocId/binary, RevLen:16, Rev/binary, Deleted:8, NumConflicts:16>>.
+    Base = <<DocIdLen:16, DocId/binary, RevLen:16, Rev/binary, Deleted:8, NumConflicts:16>>,
+    case maps:get(doc, DocInfo, undefined) of
+        undefined ->
+            <<Base/binary, 0:8>>;
+        Doc when is_map(Doc) ->
+            DocCbor = barrel_docdb_codec_cbor:encode(Doc),
+            <<Base/binary, 1:8, DocCbor/binary>>;
+        _ ->
+            <<Base/binary, 0:8>>
+    end.
 
 count_conflicts(#{revtree := RevTree}) when is_map(RevTree) ->
     length(barrel_revtree:conflicts(RevTree));
@@ -591,16 +690,15 @@ count_conflicts(_) ->
     {docid(), barrel_hlc:timestamp(), binary(), boolean(), non_neg_integer()}.
 decode_change_compact(<<DocIdLen:16, DocId:DocIdLen/binary,
                         RevLen:16, Rev:RevLen/binary,
-                        Deleted:8, NumConflicts:16>>, Hlc) ->
+                        Deleted:8, NumConflicts:16, _Rest/binary>>, Hlc) ->
     {DocId, Hlc, Rev, Deleted =:= 1, NumConflicts}.
 
 %% @doc Decode change to full map format for API responses.
-%% Note: Only includes conflict count, not actual conflict revs.
-%% Fetch doc with include_conflicts to get full conflict details.
+%% Includes doc body if present in the change record.
 -spec decode_change(binary(), barrel_hlc:timestamp()) -> change().
 decode_change(<<DocIdLen:16, DocId:DocIdLen/binary,
                 RevLen:16, Rev:RevLen/binary,
-                Deleted:8, NumConflicts:16>>, Hlc) ->
+                Deleted:8, NumConflicts:16, HasDoc:8, Rest/binary>>, Hlc) ->
     Change = #{
         id => DocId,
         hlc => Hlc,
@@ -608,9 +706,16 @@ decode_change(<<DocIdLen:16, DocId:DocIdLen/binary,
         changes => [#{rev => Rev}],
         num_conflicts => NumConflicts
     },
-    case Deleted =:= 1 of
+    Change1 = case Deleted =:= 1 of
         true -> Change#{deleted => true};
         false -> Change
+    end,
+    case HasDoc of
+        1 ->
+            Doc = barrel_docdb_codec_cbor:decode(Rest),
+            Change1#{doc => Doc};
+        0 ->
+            Change1
     end.
 
 
