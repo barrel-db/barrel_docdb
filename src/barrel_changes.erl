@@ -69,6 +69,19 @@
                    barrel_hlc:timestamp() | first, fold_fun(), term()) ->
     {ok, term(), barrel_hlc:timestamp()}.
 fold_changes(StoreRef, DbName, Since, Fun, Acc) ->
+    fold_changes_internal(StoreRef, DbName, Since, Fun, Acc, normal).
+
+%% @doc Fold over changes optimized for full sequential scans.
+%% Uses readahead and avoids cache pollution for large scans.
+%% Best for scanning all changes from the beginning without limit.
+-spec fold_changes_long_scan(barrel_store_rocksdb:db_ref(), db_name(),
+                              barrel_hlc:timestamp() | first, fold_fun(), term()) ->
+    {ok, term(), barrel_hlc:timestamp()}.
+fold_changes_long_scan(StoreRef, DbName, Since, Fun, Acc) ->
+    fold_changes_internal(StoreRef, DbName, Since, Fun, Acc, long_scan).
+
+%% @private Internal fold with scan mode selection
+fold_changes_internal(StoreRef, DbName, Since, Fun, Acc, ScanMode) ->
     {StartHlc, StartKey} = case Since of
         first ->
             %% Start from the very beginning
@@ -80,28 +93,33 @@ fold_changes(StoreRef, DbName, Since, Fun, Acc) ->
     end,
     EndKey = barrel_store_keys:doc_hlc_end(DbName),
 
-    {LastHlc, FinalAcc} = barrel_store_rocksdb:fold_range(
-        StoreRef, StartKey, EndKey,
-        fun(Key, Value, {CurrentHlc, AccIn}) ->
-            ChangeHlc = barrel_store_keys:decode_hlc_key(DbName, Key),
-            %% Skip if we're at the exact Since HLC (exclusive)
-            case Since =/= first andalso barrel_hlc:equal(ChangeHlc, Since) of
-                true ->
-                    {ok, {CurrentHlc, AccIn}};
-                false ->
-                    Change = decode_change(Value, ChangeHlc),
-                    case Fun(Change, AccIn) of
-                        {ok, AccOut} ->
-                            {ok, {ChangeHlc, AccOut}};
-                        {stop, AccOut} ->
-                            {stop, {ChangeHlc, AccOut}};
-                        stop ->
-                            {stop, {CurrentHlc, AccIn}}
-                    end
-            end
-        end,
-        {StartHlc, Acc}
-    ),
+    FoldFun = fun(Key, Value, {CurrentHlc, AccIn}) ->
+        ChangeHlc = barrel_store_keys:decode_hlc_key(DbName, Key),
+        %% Skip if we're at the exact Since HLC (exclusive)
+        case Since =/= first andalso barrel_hlc:equal(ChangeHlc, Since) of
+            true ->
+                {ok, {CurrentHlc, AccIn}};
+            false ->
+                Change = decode_change(Value, ChangeHlc),
+                case Fun(Change, AccIn) of
+                    {ok, AccOut} ->
+                        {ok, {ChangeHlc, AccOut}};
+                    {stop, AccOut} ->
+                        {stop, {ChangeHlc, AccOut}};
+                    stop ->
+                        {stop, {CurrentHlc, AccIn}}
+                end
+        end
+    end,
+
+    {LastHlc, FinalAcc} = case ScanMode of
+        long_scan ->
+            barrel_store_rocksdb:fold_range_long_scan(
+                StoreRef, StartKey, EndKey, FoldFun, {StartHlc, Acc});
+        normal ->
+            barrel_store_rocksdb:fold_range(
+                StoreRef, StartKey, EndKey, FoldFun, {StartHlc, Acc})
+    end,
     {ok, FinalAcc, LastHlc}.
 
 %% @doc Get a list of changes since an HLC timestamp
@@ -316,7 +334,12 @@ get_changes_full_scan(StoreRef, DbName, Since, Opts) ->
         end
     end,
 
-    {ok, {_Count, RevChanges}, LastHlc} = fold_changes(StoreRef, DbName, Since, FoldFun, {0, []}),
+    %% Use long_scan optimization for full unbounded scans
+    FoldChanges = case {Since, Limit} of
+        {first, infinity} -> fun fold_changes_long_scan/5;
+        _ -> fun fold_changes/5
+    end,
+    {ok, {_Count, RevChanges}, LastHlc} = FoldChanges(StoreRef, DbName, Since, FoldFun, {0, []}),
 
     %% Cleanup the trie if we created one
     case PathMatcher of

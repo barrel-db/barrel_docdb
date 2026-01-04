@@ -578,6 +578,7 @@ fold_value_index(StoreRef, DbName, Value, FieldPath, Fun, Acc0, Snapshot) ->
         <<_:PrefixLen/binary, DocId/binary>> = Key,
         Fun(DocId, Acc)
     end,
+    %% Use range fold with snapshot - prefix optimization requires prefix extractor config
     barrel_store_rocksdb:fold_range_with_snapshot(
         StoreRef, StartKey, EndKey, FoldFun, Acc0, Snapshot).
 

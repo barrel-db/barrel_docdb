@@ -13,7 +13,8 @@
 -export([merge/3]).
 -export([write_batch/2, write_batch/3]).
 -export([fold/4, fold_range/5, fold_range/6, fold_range_reverse/5, fold_range_reverse/6]).
--export([fold_range_with_snapshot/6]).
+-export([fold_range_with_snapshot/6, fold_range_prefix_with_snapshot/6]).
+-export([fold_range_long_scan/5]).
 
 %% Additional utilities
 -export([snapshot/1, release_snapshot/1]).
@@ -351,6 +352,41 @@ fold_range_with_snapshot(#{ref := Ref}, StartKey, EndKey, Fun, Acc0, Snapshot) -
             {iterate_upper_bound, EndKey},
             {total_order_seek, true},
             {snapshot, Snapshot}],
+    {ok, Iter} = rocksdb:iterator(Ref, Opts),
+    try
+        fold_loop(rocksdb:iterator_move(Iter, first), Iter, Fun, Acc0)
+    after
+        rocksdb:iterator_close(Iter)
+    end.
+
+%% @doc Fold over a key range with prefix bloom optimization and snapshot
+%% Uses prefix_same_as_start=true to stop at prefix boundary and
+%% total_order_seek=false to enable prefix bloom filter.
+%% Use this for prefix queries where all keys share a common prefix (e.g., value_index scans).
+-spec fold_range_prefix_with_snapshot(db_ref(), binary(), binary(), fun(), term(), snapshot()) -> term().
+fold_range_prefix_with_snapshot(#{ref := Ref}, StartKey, EndKey, Fun, Acc0, Snapshot) ->
+    Opts = [{iterate_lower_bound, StartKey},
+            {iterate_upper_bound, EndKey},
+            {prefix_same_as_start, true},
+            {total_order_seek, false},
+            {snapshot, Snapshot}],
+    {ok, Iter} = rocksdb:iterator(Ref, Opts),
+    try
+        fold_loop(rocksdb:iterator_move(Iter, first), Iter, Fun, Acc0)
+    after
+        rocksdb:iterator_close(Iter)
+    end.
+
+%% @doc Fold over a key range optimized for long sequential scans
+%% Uses readahead_size for prefetching and fill_cache=false to avoid cache pollution.
+%% Best for scanning large datasets like full changes feed.
+-spec fold_range_long_scan(db_ref(), binary(), binary(), fun(), term()) -> term().
+fold_range_long_scan(#{ref := Ref}, StartKey, EndKey, Fun, Acc0) ->
+    Opts = [{iterate_lower_bound, StartKey},
+            {iterate_upper_bound, EndKey},
+            {total_order_seek, true},
+            {readahead_size, 2 * 1024 * 1024},  %% 2MB readahead
+            {fill_cache, false}],               %% Don't pollute block cache
     {ok, Iter} = rocksdb:iterator(Ref, Opts),
     try
         fold_loop(rocksdb:iterator_move(Iter, first), Iter, Fun, Acc0)
