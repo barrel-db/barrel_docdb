@@ -13,6 +13,7 @@
 %% API
 -export([
     fold_changes/5,
+    fold_changes_compact/5,
     get_changes/4,
     get_last_seq/2,  %% Returns opaque sequence (encoded HLC binary)
     get_last_hlc/2,  %% Returns decoded HLC timestamp
@@ -46,6 +47,10 @@
 -type fold_fun() :: fun((change(), Acc :: term()) ->
     {ok, Acc :: term()} | {stop, Acc :: term()} | stop).
 
+-type compact_change() :: {docid(), barrel_hlc:timestamp(), binary(), boolean(), non_neg_integer()}.
+-type compact_fold_fun() :: fun((compact_change(), Acc :: term()) ->
+    {ok, Acc :: term()} | {stop, Acc :: term()} | stop).
+
 -type changes_opts() :: #{
     include_docs => boolean(),
     limit => non_neg_integer(),
@@ -56,7 +61,7 @@
     query => barrel_query:query_spec()  % Query to filter by
 }.
 
--export_type([changes_result/0, fold_fun/0, changes_opts/0]).
+-export_type([changes_result/0, fold_fun/0, compact_change/0, compact_fold_fun/0, changes_opts/0]).
 
 %%====================================================================
 %% API
@@ -80,6 +85,15 @@ fold_changes(StoreRef, DbName, Since, Fun, Acc) ->
 fold_changes_long_scan(StoreRef, DbName, Since, Fun, Acc) ->
     fold_changes_internal(StoreRef, DbName, Since, Fun, Acc, long_scan).
 
+%% @doc Fold over changes with compact tuple format for efficiency.
+%% Callback receives {DocId, Hlc, Rev, Deleted, NumConflicts} tuples.
+%% Use for internal iteration; convert to maps at API boundary.
+-spec fold_changes_compact(barrel_store_rocksdb:db_ref(), db_name(),
+                           barrel_hlc:timestamp() | first, compact_fold_fun(), term()) ->
+    {ok, term(), barrel_hlc:timestamp()}.
+fold_changes_compact(StoreRef, DbName, Since, Fun, Acc) ->
+    fold_changes_compact_internal(StoreRef, DbName, Since, Fun, Acc, long_scan).
+
 %% @private Internal fold with scan mode selection
 fold_changes_internal(StoreRef, DbName, Since, Fun, Acc, ScanMode) ->
     {StartHlc, StartKey} = case Since of
@@ -102,6 +116,45 @@ fold_changes_internal(StoreRef, DbName, Since, Fun, Acc, ScanMode) ->
             false ->
                 Change = decode_change(Value, ChangeHlc),
                 case Fun(Change, AccIn) of
+                    {ok, AccOut} ->
+                        {ok, {ChangeHlc, AccOut}};
+                    {stop, AccOut} ->
+                        {stop, {ChangeHlc, AccOut}};
+                    stop ->
+                        {stop, {CurrentHlc, AccIn}}
+                end
+        end
+    end,
+
+    {LastHlc, FinalAcc} = case ScanMode of
+        long_scan ->
+            barrel_store_rocksdb:fold_range_long_scan(
+                StoreRef, StartKey, EndKey, FoldFun, {StartHlc, Acc});
+        normal ->
+            barrel_store_rocksdb:fold_range(
+                StoreRef, StartKey, EndKey, FoldFun, {StartHlc, Acc})
+    end,
+    {ok, FinalAcc, LastHlc}.
+
+%% @private Internal fold with compact tuple format
+fold_changes_compact_internal(StoreRef, DbName, Since, Fun, Acc, ScanMode) ->
+    {StartHlc, StartKey} = case Since of
+        first ->
+            Min = barrel_hlc:min(),
+            {Min, barrel_store_keys:doc_hlc(DbName, Min)};
+        SinceHlc ->
+            {SinceHlc, barrel_store_keys:doc_hlc(DbName, SinceHlc)}
+    end,
+    EndKey = barrel_store_keys:doc_hlc_end(DbName),
+
+    FoldFun = fun(Key, Value, {CurrentHlc, AccIn}) ->
+        ChangeHlc = barrel_store_keys:decode_hlc_key(DbName, Key),
+        case Since =/= first andalso barrel_hlc:equal(ChangeHlc, Since) of
+            true ->
+                {ok, {CurrentHlc, AccIn}};
+            false ->
+                CompactChange = decode_change_compact(Value, ChangeHlc),
+                case Fun(CompactChange, AccIn) of
                     {ok, AccOut} ->
                         {ok, {ChangeHlc, AccOut}};
                     {stop, AccOut} ->
