@@ -17,13 +17,15 @@
     get_changes/4,
     get_last_seq/2,  %% Returns opaque sequence (encoded HLC binary)
     get_last_hlc/2,  %% Returns decoded HLC timestamp
-    count_changes_since/3
+    count_changes_since/3,
+    has_changes_since/3  %% Fast O(1) check using buckets
 ]).
 
 %% Internal - for use by barrel_db_writer
 -export([
     write_change/4,
     write_change_ops/3,
+    update_change_bucket_ops/3,
     delete_old_change/4
 ]).
 
@@ -599,6 +601,47 @@ count_changes_since(StoreRef, DbName, Since) ->
         0
     ).
 
+%% Bucket granularity: 1 minute
+-define(BUCKET_GRANULARITY_SECS, 60).
+%% Number of recent buckets to check
+-define(BUCKET_CHECK_COUNT, 5).
+
+%% @doc Fast O(1) check if there are changes since a given HLC.
+%% Uses time-bucketed hints to avoid scanning the change log.
+%% Returns true if there might be changes, false if definitely no changes.
+%% Note: May return true even if no changes (false positive OK, false negative not OK).
+-spec has_changes_since(barrel_store_rocksdb:db_ref(), db_name(),
+                        barrel_hlc:timestamp()) -> boolean().
+has_changes_since(StoreRef, DbName, Since) ->
+    %% Get current bucket and check recent buckets
+    NowSecs = erlang:system_time(second),
+    CurrentBucket = NowSecs div ?BUCKET_GRANULARITY_SECS,
+
+    %% Check the last N buckets for any max_hlc > Since
+    check_recent_buckets(StoreRef, DbName, Since, CurrentBucket, ?BUCKET_CHECK_COUNT).
+
+%% @private Check recent buckets for changes
+check_recent_buckets(_StoreRef, _DbName, _Since, _Bucket, 0) ->
+    %% No buckets had changes > Since, but bucket data might be stale
+    %% Fall back to true to be safe (will do full scan)
+    true;
+check_recent_buckets(StoreRef, DbName, Since, Bucket, Count) when Bucket >= 0 ->
+    BucketKey = barrel_store_keys:change_bucket(DbName, Bucket),
+    case barrel_store_rocksdb:get(StoreRef, BucketKey) of
+        {ok, <<_MinBin:12/binary, MaxBin:12/binary, BucketCount:32>>} ->
+            MaxHlc = barrel_hlc:decode(MaxBin),
+            case BucketCount > 0 andalso barrel_hlc:compare(MaxHlc, Since) =:= gt of
+                true -> true;  %% Found changes after Since
+                false -> check_recent_buckets(StoreRef, DbName, Since, Bucket - 1, Count - 1)
+            end;
+        not_found ->
+            %% No bucket data, check older bucket
+            check_recent_buckets(StoreRef, DbName, Since, Bucket - 1, Count - 1)
+    end;
+check_recent_buckets(_StoreRef, _DbName, _Since, _Bucket, _Count) ->
+    %% Bucket < 0, shouldn't happen in practice
+    true.
+
 %% @private Fetch doc body for path/query filtering
 fetch_doc_body(StoreRef, DbName, DocId) ->
     DocCurrentKey = barrel_store_keys:doc_current(DbName, DocId),
@@ -626,16 +669,19 @@ fetch_doc_body(StoreRef, DbName, DocId) ->
 %% Internal API - for barrel_db_writer
 %%====================================================================
 
-%% @doc Write a change entry for a document
+%% @doc Write a change entry for a document.
+%% Also updates change buckets for idle poll optimization.
 -spec write_change(barrel_store_rocksdb:db_ref(), db_name(),
                    barrel_hlc:timestamp(), doc_info()) -> ok.
 write_change(StoreRef, DbName, Hlc, DocInfo) ->
-    Ops = write_change_ops(DbName, Hlc, DocInfo),
-    barrel_store_rocksdb:write_batch(StoreRef, Ops).
+    ChangeOps = write_change_ops(DbName, Hlc, DocInfo),
+    BucketOps = update_change_bucket_ops(StoreRef, DbName, Hlc),
+    barrel_store_rocksdb:write_batch(StoreRef, ChangeOps ++ BucketOps).
 
 %% @doc Return batch operation to write a change entry.
 %% Use this to combine with other operations in a single write_batch.
 %% Also updates the last_hlc metadata for efficient get_last_seq lookups.
+%% Note: Does NOT update change buckets - call write_change/4 for full update.
 -spec write_change_ops(db_name(), barrel_hlc:timestamp(), doc_info()) ->
     [{put, binary(), binary()}].
 write_change_ops(DbName, Hlc, DocInfo) ->
@@ -645,6 +691,36 @@ write_change_ops(DbName, Hlc, DocInfo) ->
     LastHlcKey = barrel_store_keys:db_last_hlc(DbName),
     LastHlcValue = barrel_hlc:encode(Hlc),
     [{put, Key, Value}, {put, LastHlcKey, LastHlcValue}].
+
+%% @doc Return batch operation to update change bucket.
+%% Buckets store {MinHlc, MaxHlc, Count} in compact binary format.
+%% Format: <<MinHlc:12/binary, MaxHlc:12/binary, Count:32>>
+-spec update_change_bucket_ops(barrel_store_rocksdb:db_ref(), db_name(),
+                                barrel_hlc:timestamp()) -> [{put, binary(), binary()}].
+update_change_bucket_ops(StoreRef, DbName, Hlc) ->
+    NowSecs = erlang:system_time(second),
+    BucketTs = NowSecs div ?BUCKET_GRANULARITY_SECS,
+    BucketKey = barrel_store_keys:change_bucket(DbName, BucketTs),
+    HlcBin = barrel_hlc:encode(Hlc),
+
+    %% Read current bucket value and update
+    NewValue = case barrel_store_rocksdb:get(StoreRef, BucketKey) of
+        {ok, <<MinBin:12/binary, MaxBin:12/binary, Count:32>>} ->
+            MinHlc = barrel_hlc:decode(MinBin),
+            MaxHlc = barrel_hlc:decode(MaxBin),
+            NewMinBin = case barrel_hlc:compare(Hlc, MinHlc) of
+                lt -> HlcBin;
+                _ -> MinBin
+            end,
+            NewMaxBin = case barrel_hlc:compare(Hlc, MaxHlc) of
+                gt -> HlcBin;
+                _ -> MaxBin
+            end,
+            <<NewMinBin/binary, NewMaxBin/binary, (Count + 1):32>>;
+        not_found ->
+            <<HlcBin/binary, HlcBin/binary, 1:32>>
+    end,
+    [{put, BucketKey, NewValue}].
 
 %% @doc Delete an old HLC entry (when document is updated)
 -spec delete_old_change(barrel_store_rocksdb:db_ref(), db_name(),
