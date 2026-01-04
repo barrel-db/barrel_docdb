@@ -135,6 +135,19 @@
 -define(INITIAL_CHUNK_SIZE, 200).
 
 %%====================================================================
+%% Adaptive Strategy Constants
+%%====================================================================
+
+%% Threshold for choosing between scan vs posting list strategies:
+%% - Below threshold: use value_index scan (per-doc keys, early termination)
+%% - Above threshold: use posting list decode (one seek, bulk decode)
+-define(ADAPTIVE_CARDINALITY_THRESHOLD, 1000).
+
+%% Maximum unbounded results before forcing pagination
+%% For include_docs=true queries without limit, auto-paginate at this size
+-define(MAX_UNBOUNDED_RESULTS, 1000).
+
+%%====================================================================
 %% API
 %%====================================================================
 
@@ -169,15 +182,54 @@ validate_spec(_) ->
 %% @doc Execute a compiled query plan against a database.
 %% Returns {ok, Results, LastSeq} or {error, Reason}.
 %% Uses a snapshot for read consistency across all index and document reads.
+%%
+%% For unbounded include_docs queries, automatically paginates internally
+%% to avoid excessive memory usage from large MultiGet operations.
 -spec execute(barrel_store_rocksdb:db_ref(), db_name(), query_plan()) ->
     {ok, [map()], seq()} | {error, term()}.
+execute(StoreRef, DbName, #query_plan{include_docs = true, limit = undefined} = Plan) ->
+    %% Unbounded include_docs query - auto-paginate to avoid memory issues
+    execute_with_auto_pagination(StoreRef, DbName, Plan);
 execute(StoreRef, DbName, #query_plan{} = Plan) ->
-    %% Create snapshot for consistent reads across index and doc fetches
+    %% Bounded query or pure index query - execute directly
     {ok, Snapshot} = barrel_store_rocksdb:snapshot(StoreRef),
     try
         execute_with_snapshot(StoreRef, DbName, Plan, Snapshot)
     after
         barrel_store_rocksdb:release_snapshot(Snapshot)
+    end.
+
+%% @private Execute unbounded include_docs query with automatic pagination
+%% Collects results in chunks to avoid memory pressure from large MultiGet
+execute_with_auto_pagination(StoreRef, DbName, Plan) ->
+    execute_auto_paginated_loop(StoreRef, DbName, Plan, undefined, []).
+
+%% @private Direct execution bypassing auto-pagination
+%% Used when chunked execution falls back to non-chunked for needs_body queries
+execute_direct(StoreRef, DbName, Plan) ->
+    {ok, Snapshot} = barrel_store_rocksdb:snapshot(StoreRef),
+    try
+        execute_with_snapshot(StoreRef, DbName, Plan, Snapshot)
+    after
+        barrel_store_rocksdb:release_snapshot(Snapshot)
+    end.
+
+%% @private Auto-pagination loop for unbounded include_docs queries
+execute_auto_paginated_loop(StoreRef, DbName, Plan, Continuation, AccResults) ->
+    Opts = case Continuation of
+        undefined -> #{chunk_size => ?MAX_UNBOUNDED_RESULTS};
+        Token -> #{chunk_size => ?MAX_UNBOUNDED_RESULTS, continuation => Token}
+    end,
+    case execute(StoreRef, DbName, Plan, Opts) of
+        {ok, ChunkResults, #{has_more := false, last_seq := LastSeq}} ->
+            %% Final chunk - combine all results
+            AllResults = AccResults ++ ChunkResults,
+            {ok, AllResults, LastSeq};
+        {ok, ChunkResults, #{has_more := true, continuation := NextToken}} ->
+            %% More results available - continue loop
+            execute_auto_paginated_loop(StoreRef, DbName, Plan, NextToken, AccResults ++ ChunkResults);
+        {error, _} = Error ->
+            Error
     end.
 
 %% @doc Execute a compiled query plan with chunked execution options.
@@ -263,7 +315,7 @@ execute_chunked_resume(StoreRef, DbName, Plan, Token, Opts) ->
 
 %% @private Execute chunked query with snapshot
 execute_chunked_with_snapshot(StoreRef, DbName, Plan, ChunkSize, StartKey, Snapshot) ->
-    #query_plan{conditions = Conditions, include_docs = IncludeDocs, projections = Projections} = Plan,
+    #query_plan{conditions = Conditions} = Plan,
 
     %% Classify query type for pure index execution
     QueryType = classify_scan_query(Conditions, Plan),
@@ -278,18 +330,10 @@ execute_chunked_with_snapshot(StoreRef, DbName, Plan, ChunkSize, StartKey, Snaps
         needs_body ->
             %% For body-fetch queries, fall back to non-chunked for now
             %% TODO: Implement chunked body-fetch queries
-            NeedsBody = IncludeDocs orelse needs_body_for_projection(Projections),
-            case NeedsBody of
-                true ->
-                    %% Release snapshot if we own it and fall back
-                    maybe_release_snapshot(Snapshot),
-                    {ok, Results, LastSeq} = execute(StoreRef, DbName, Plan),
-                    {ok, Results, #{last_seq => LastSeq, has_more => false}};
-                false ->
-                    maybe_release_snapshot(Snapshot),
-                    {ok, Results, LastSeq} = execute(StoreRef, DbName, Plan),
-                    {ok, Results, #{last_seq => LastSeq, has_more => false}}
-            end
+            %% Note: We call execute_direct to avoid infinite loop with auto-pagination
+            maybe_release_snapshot(Snapshot),
+            {ok, Results, LastSeq} = execute_direct(StoreRef, DbName, Plan),
+            {ok, Results, #{last_seq => LastSeq, has_more => false}}
     end.
 
 %% @private Execute chunked pure equality query
@@ -1274,13 +1318,25 @@ fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) 
             skip
     end.
 
-%% @doc Execute using index prefix scan
+%% @doc Execute using index prefix scan with adaptive strategy selection
 execute_index_scan(StoreRef, DbName, Plan, Snapshot) ->
-    #query_plan{conditions = Conditions} = Plan,
-    %% Classify query for pure index execution (no doc fetch)
-    case classify_scan_query(Conditions, Plan) of
-        {pure_equality, Path, Value} ->
+    #query_plan{conditions = Conditions, limit = Limit} = Plan,
+    %% Use adaptive classification for equality queries
+    %% For limited queries, always prefer scan (early termination)
+    %% For unlimited high-cardinality, prefer bulk decode
+    case classify_scan_query_adaptive(StoreRef, DbName, Conditions, Plan) of
+        {scan_equality, Path, Value} ->
+            %% Low cardinality or has limit: iterate value_index keys
             execute_pure_equality(StoreRef, DbName, Path, Value, Plan, Snapshot);
+        {bulk_equality, Path, Value} ->
+            %% High cardinality without limit: single posting list decode
+            case Limit of
+                undefined ->
+                    execute_bulk_equality(StoreRef, DbName, Path, Value, Plan, Snapshot);
+                _ ->
+                    %% Has limit, prefer scan for early termination
+                    execute_pure_equality(StoreRef, DbName, Path, Value, Plan, Snapshot)
+            end;
         {pure_exists, Path} ->
             execute_pure_exists(StoreRef, DbName, Path, Plan, Snapshot);
         {pure_prefix, Path, Prefix} ->
@@ -1325,6 +1381,60 @@ needs_body_for_projection([]) -> false;
 needs_body_for_projection(Projections) ->
     %% Projections require body if they include path references
     lists:any(fun(P) -> is_list(P) end, Projections).
+
+%% @doc Adaptive query classification with cardinality-based strategy selection
+%% For equality queries, chooses between:
+%% - scan_equality: iterate value_index keys (good for selective queries, early termination)
+%% - bulk_equality: decode posting list (good for high-cardinality, one seek)
+-spec classify_scan_query_adaptive(barrel_store_rocksdb:db_ref(), db_name(), [condition()], query_plan()) ->
+    {scan_equality, [term()], term()} |
+    {bulk_equality, [term()], term()} |
+    {pure_exists, [term()]} |
+    {pure_prefix, [term()], binary()} |
+    needs_body.
+classify_scan_query_adaptive(StoreRef, DbName, Conditions, Plan) ->
+    #query_plan{include_docs = IncludeDocs, projections = Projections} = Plan,
+    NeedsBody = IncludeDocs orelse needs_body_for_projection(Projections),
+    case {Conditions, NeedsBody} of
+        {[{path, Path, Value}], false} ->
+            case is_logic_var(Value) of
+                true ->
+                    needs_body;
+                false ->
+                    %% Check cardinality to choose strategy
+                    choose_equality_strategy(StoreRef, DbName, Path, Value)
+            end;
+        {[{exists, Path}], false} ->
+            {pure_exists, Path};
+        {[{prefix, Path, Prefix}], false} ->
+            {pure_prefix, Path, Prefix};
+        _ ->
+            needs_body
+    end.
+
+%% @doc Choose between scan vs bulk strategy based on estimated cardinality
+-spec choose_equality_strategy(barrel_store_rocksdb:db_ref(), db_name(), [term()], term()) ->
+    {scan_equality, [term()], term()} | {bulk_equality, [term()], term()}.
+choose_equality_strategy(StoreRef, DbName, Path, Value) ->
+    case estimate_cardinality(StoreRef, DbName, Path, Value) of
+        {ok, Count} when Count =< ?ADAPTIVE_CARDINALITY_THRESHOLD ->
+            %% Low cardinality: use value_index scan with early termination
+            {scan_equality, Path, Value};
+        {ok, _HighCount} ->
+            %% High cardinality: use posting list bulk decode
+            {bulk_equality, Path, Value};
+        {error, _} ->
+            %% Error getting stats, fall back to scan (safer default)
+            {scan_equality, Path, Value}
+    end.
+
+%% @doc Estimate cardinality for a path+value combination
+%% Uses stored path statistics for O(1) lookup
+-spec estimate_cardinality(barrel_store_rocksdb:db_ref(), db_name(), [term()], term()) ->
+    {ok, non_neg_integer()} | {error, term()}.
+estimate_cardinality(StoreRef, DbName, Path, Value) ->
+    FullPath = Path ++ [Value],
+    barrel_ars_index:get_path_cardinality(StoreRef, DbName, FullPath).
 
 %% @doc Execute pure exists query - iterate posting lists directly
 %% Path index only contains non-deleted docs, so no doc_current check needed
@@ -1451,6 +1561,28 @@ execute_pure_equality(StoreRef, DbName, Path, Value, Plan, Snapshot) ->
 
     %% Results are in reverse order, fix and apply offset
     FinalResults = apply_offset_limit(lists:reverse(Results), Offset, Limit),
+
+    %% Get last sequence
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    {ok, FinalResults, LastSeq}.
+
+%% @doc Execute bulk equality query - single seek + posting list decode
+%% Used for high-cardinality queries where iterating individual keys is slower
+%% than decoding a posting list in one go.
+execute_bulk_equality(StoreRef, DbName, Path, Value, Plan, _Snapshot) ->
+    #query_plan{
+        limit = Limit,
+        offset = Offset
+    } = Plan,
+
+    %% Single O(1) posting list lookup
+    FullPath = Path ++ [Value],
+    DocIds = barrel_ars_index:get_posting_list(StoreRef, DbName, FullPath),
+
+    %% Build results and apply offset/limit
+    Results = [#{<<"id">> => Id} || Id <- DocIds],
+    FinalResults = apply_offset_limit(Results, Offset, Limit),
 
     %% Get last sequence
     LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
