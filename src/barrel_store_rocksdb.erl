@@ -1,7 +1,7 @@
 %%%-------------------------------------------------------------------
 %%% @doc RocksDB storage backend for barrel_docdb
 %%%
-%%% Implements the barrel_store behaviour using RocksDB 2.2.0.
+%%% Implements the barrel_store behaviour using RocksDB 2.4.0.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_store_rocksdb).
@@ -66,7 +66,7 @@ open(Path, Options) ->
     %% Column family descriptors
     DefaultCFOpts = [{merge_operator, counter_merge_operator}],
     BitmapCFOpts = [{merge_operator, {bitset_merge_operator, BitmapSize}}],
-    PostingCFOpts = [{merge_operator, erlang_merge_operator}],  %% For posting lists
+    PostingCFOpts = [{merge_operator, posting_list_merge_operator}],
 
     CFDescriptors = [
         {"default", DefaultCFOpts},
@@ -197,11 +197,9 @@ write_batch(#{ref := Ref, bitmap_cf := BitmapCF, posting_cf := PostingCF}, Opera
                 ok = rocksdb:batch_merge(Batch, BitmapCF, Key,
                                          <<"-", (integer_to_binary(Position))/binary>>);
                ({posting_append, Key, DocId}) ->
-                ok = rocksdb:batch_merge(Batch, PostingCF, Key,
-                                         term_to_binary({list_append, [DocId]}));
+                ok = rocksdb:batch_merge(Batch, PostingCF, Key, {posting_add, DocId});
                ({posting_remove, Key, DocId}) ->
-                ok = rocksdb:batch_merge(Batch, PostingCF, Key,
-                                         term_to_binary({list_substract, [DocId]}))
+                ok = rocksdb:batch_merge(Batch, PostingCF, Key, {posting_delete, DocId})
             end,
             Operations
         ),
@@ -497,29 +495,25 @@ multi_get_bitmap(#{ref := Ref, bitmap_cf := BitmapCF}, Keys) ->
 %% Posting List Operations
 %%====================================================================
 
-%% Posting list binary format:
-%% <<Type:8, Len:16, DocId:Len/binary, ...>>
-%% Type: 0 = add, 255 = tombstone (delete marker)
-%% Uses binary_append for O(1) appends, tombstones cleaned by compaction
+%% Uses rocksdb 2.4.0 posting_list_merge_operator for O(1) appends.
+%% Tombstones automatically cleaned during compaction.
 
-%% @doc Append a DocId to a posting list using binary_append (O(1))
+%% @doc Append a DocId to a posting list
 -spec posting_append(db_ref(), binary(), binary()) -> ok | {error, term()}.
 posting_append(#{ref := Ref, posting_cf := PostingCF}, Key, DocId) ->
-    Entry = <<0, (byte_size(DocId)):16, DocId/binary>>,
-    rocksdb:merge(Ref, PostingCF, Key, term_to_binary({binary_append, Entry}), []).
+    rocksdb:merge(Ref, PostingCF, Key, {posting_add, DocId}, []).
 
 %% @doc Remove a DocId from a posting list using tombstone marker
 -spec posting_remove(db_ref(), binary(), binary()) -> ok | {error, term()}.
 posting_remove(#{ref := Ref, posting_cf := PostingCF}, Key, DocId) ->
-    Entry = <<255, (byte_size(DocId)):16, DocId/binary>>,
-    rocksdb:merge(Ref, PostingCF, Key, term_to_binary({binary_append, Entry}), []).
+    rocksdb:merge(Ref, PostingCF, Key, {posting_delete, DocId}, []).
 
 %% @doc Get a posting list from the posting column family
-%% Parses binary format and filters out tombstoned entries
+%% Returns list of active DocIds (tombstoned entries are filtered)
 -spec posting_get(db_ref(), binary()) -> {ok, [binary()]} | not_found | {error, term()}.
 posting_get(#{ref := Ref, posting_cf := PostingCF}, Key) ->
     case rocksdb:get(Ref, PostingCF, Key, []) of
-        {ok, Bin} -> {ok, parse_posting_bin(Bin)};
+        {ok, Bin} -> {ok, rocksdb:posting_list_keys(Bin)};
         not_found -> not_found;
         {error, _} = Err -> Err
     end.
@@ -529,28 +523,9 @@ posting_get(#{ref := Ref, posting_cf := PostingCF}, Key) ->
 posting_multi_get(#{ref := Ref, posting_cf := PostingCF}, Keys) ->
     Results = rocksdb:multi_get(Ref, PostingCF, Keys, []),
     [case R of
-        {ok, Bin} -> {ok, parse_posting_bin(Bin)};
+        {ok, Bin} -> {ok, rocksdb:posting_list_keys(Bin)};
         Other -> Other
     end || R <- Results].
-
-%% @doc Parse posting binary, returning list of active DocIds
-parse_posting_bin(Bin) ->
-    parse_posting_bin(Bin, #{}, []).
-
-parse_posting_bin(<<>>, _Deleted, Acc) ->
-    Acc;
-parse_posting_bin(<<255, Len:16, DocId:Len/binary, Rest/binary>>, Deleted, Acc) ->
-    %% Tombstone - mark as deleted and remove from acc
-    parse_posting_bin(Rest, Deleted#{DocId => true}, lists:delete(DocId, Acc));
-parse_posting_bin(<<0, Len:16, DocId:Len/binary, Rest/binary>>, Deleted, Acc) ->
-    %% Add entry - include if not tombstoned
-    case maps:is_key(DocId, Deleted) of
-        true -> parse_posting_bin(Rest, Deleted, Acc);
-        false -> parse_posting_bin(Rest, Deleted, [DocId | Acc])
-    end;
-parse_posting_bin(_, _Deleted, Acc) ->
-    %% Malformed - return what we have
-    Acc.
 
 %% @doc Fold over posting list entries in a range
 -spec fold_range_posting(db_ref(), binary(), binary(), fun(), term()) -> term().
@@ -567,7 +542,7 @@ fold_range_posting(#{ref := Ref, posting_cf := PostingCF}, StartKey, EndKey, Fun
 fold_posting_loop({error, invalid_iterator}, _Iter, _Fun, Acc) ->
     Acc;
 fold_posting_loop({ok, Key, Value}, Iter, Fun, Acc) ->
-    DocIds = parse_posting_bin(Value),
+    DocIds = rocksdb:posting_list_keys(Value),
     case Fun(Key, DocIds, Acc) of
         {ok, NewAcc} ->
             fold_posting_loop(rocksdb:iterator_move(Iter, next), Iter, Fun, NewAcc);
@@ -590,7 +565,7 @@ fold_range_posting_reverse(#{ref := Ref, posting_cf := PostingCF}, StartKey, End
 fold_posting_loop_reverse({error, invalid_iterator}, _Iter, _Fun, Acc) ->
     Acc;
 fold_posting_loop_reverse({ok, Key, Value}, Iter, Fun, Acc) ->
-    DocIds = parse_posting_bin(Value),
+    DocIds = rocksdb:posting_list_keys(Value),
     case Fun(Key, DocIds, Acc) of
         {ok, NewAcc} ->
             fold_posting_loop_reverse(rocksdb:iterator_move(Iter, prev), Iter, Fun, NewAcc);

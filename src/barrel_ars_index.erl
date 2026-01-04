@@ -23,7 +23,8 @@
     fold_path_values/5, fold_path_values/6,
     fold_path_values_reverse/5, fold_path_values_reverse/6,
     fold_prefix/6, fold_prefix/7,
-    fold_posting/5, fold_posting/6
+    fold_posting/5, fold_posting/6,
+    get_posting_list/3
 ]).
 
 %% Operations-only variants (for batching with other ops)
@@ -482,6 +483,18 @@ fold_posting(StoreRef, DbName, PathPrefix, Fun, Acc0, _Profile) ->
     StartKey = barrel_store_keys:path_posting_prefix(DbName, PathPrefix),
     EndKey = barrel_store_keys:path_posting_end(DbName, PathPrefix),
     barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, Fun, Acc0).
+
+%% @doc Get posting list for an exact path+value.
+%% This is O(1) lookup - no iteration needed.
+%% Returns list of DocIds or empty list if path not found.
+-spec get_posting_list(store_ref(), db_name(), [term()]) -> [binary()].
+get_posting_list(StoreRef, DbName, FullPath) ->
+    Key = barrel_store_keys:path_posting_key(DbName, FullPath),
+    case barrel_store_rocksdb:posting_get(StoreRef, Key) of
+        {ok, DocIds} -> DocIds;
+        not_found -> [];
+        {error, _} -> []
+    end.
 
 %%====================================================================
 %% Internal functions

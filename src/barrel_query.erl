@@ -1230,35 +1230,17 @@ execute_full_scan(StoreRef, DbName, Plan) ->
     filter_and_project(StoreRef, DbName, DocIds, Plan).
 
 %% @doc Collect document IDs matching an exact path+value
-%% Returns sorted list by using reverse iteration with prepend
+%% Uses direct posting list lookup - O(1) key fetch instead of iteration
+%% Returns sorted list for intersection operations
 collect_docids_for_path(StoreRef, DbName, FullPath) ->
-    %% Use short_range profile as default for unbounded path collection
-    barrel_ars_index:fold_path_reverse(
-        StoreRef, DbName, FullPath,
-        fun({_Path, DocId}, Acc) -> {ok, [DocId | Acc]} end,
-        [],
-        short_range
-    ).
+    lists:sort(barrel_ars_index:get_posting_list(StoreRef, DbName, FullPath)).
 
 %% @doc Collect document IDs with early termination at MaxCount
 %% For LIMIT pushdown optimization
+%% Uses direct posting list lookup with sublist - O(1) fetch + truncate
 collect_docids_for_path_limited(StoreRef, DbName, FullPath, MaxCount) ->
-    %% Select profile based on max count - small limits use point profile
-    Profile = select_read_profile(MaxCount, MaxCount),
-    {_, DocIds} = barrel_ars_index:fold_path_reverse(
-        StoreRef, DbName, FullPath,
-        fun({_Path, DocId}, {Count, Acc}) ->
-            NewCount = Count + 1,
-            NewAcc = [DocId | Acc],
-            case NewCount >= MaxCount of
-                true -> {stop, {NewCount, NewAcc}};
-                false -> {ok, {NewCount, NewAcc}}
-            end
-        end,
-        {0, []},
-        Profile
-    ),
-    DocIds.
+    AllDocIds = barrel_ars_index:get_posting_list(StoreRef, DbName, FullPath),
+    lists:sublist(AllDocIds, MaxCount).
 
 %% @doc Collect document IDs matching a path prefix
 collect_docids_for_prefix(StoreRef, DbName, PathPrefix) ->
