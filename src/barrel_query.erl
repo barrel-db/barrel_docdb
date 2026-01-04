@@ -153,9 +153,20 @@ validate_spec(_) ->
 
 %% @doc Execute a compiled query plan against a database.
 %% Returns {ok, Results, LastSeq} or {error, Reason}.
+%% Uses a snapshot for read consistency across all index and document reads.
 -spec execute(barrel_store_rocksdb:db_ref(), db_name(), query_plan()) ->
     {ok, [map()], seq()} | {error, term()}.
 execute(StoreRef, DbName, #query_plan{} = Plan) ->
+    %% Create snapshot for consistent reads across index and doc fetches
+    {ok, Snapshot} = barrel_store_rocksdb:snapshot(StoreRef),
+    try
+        execute_with_snapshot(StoreRef, DbName, Plan, Snapshot)
+    after
+        barrel_store_rocksdb:release_snapshot(Snapshot)
+    end.
+
+%% @doc Execute query with a snapshot for read consistency
+execute_with_snapshot(StoreRef, DbName, Plan, Snapshot) ->
     #query_plan{order = Order, limit = Limit, conditions = Conditions} = Plan,
 
     %% Check if we can use indexed order for ORDER BY + LIMIT optimization
@@ -164,25 +175,25 @@ execute(StoreRef, DbName, #query_plan{} = Plan) ->
         {true, OrderPath, Dir} ->
             case should_use_indexed_order(OrderPath, Conditions) of
                 true ->
-                    execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan);
+                    execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan, Snapshot);
                 false ->
-                    execute_by_strategy(StoreRef, DbName, Plan)
+                    execute_by_strategy(StoreRef, DbName, Plan, Snapshot)
             end;
         false ->
-            execute_by_strategy(StoreRef, DbName, Plan)
+            execute_by_strategy(StoreRef, DbName, Plan, Snapshot)
     end.
 
 %% @doc Execute based on query strategy
-execute_by_strategy(StoreRef, DbName, Plan) ->
+execute_by_strategy(StoreRef, DbName, Plan, Snapshot) ->
     case Plan#query_plan.strategy of
         index_seek ->
-            execute_index_seek(StoreRef, DbName, Plan);
+            execute_index_seek(StoreRef, DbName, Plan, Snapshot);
         index_scan ->
-            execute_index_scan(StoreRef, DbName, Plan);
+            execute_index_scan(StoreRef, DbName, Plan, Snapshot);
         multi_index ->
-            execute_multi_index(StoreRef, DbName, Plan);
+            execute_multi_index(StoreRef, DbName, Plan, Snapshot);
         full_scan ->
-            execute_full_scan(StoreRef, DbName, Plan)
+            execute_full_scan(StoreRef, DbName, Plan, Snapshot)
     end.
 
 %% @doc Decide if indexed order should be used
@@ -567,7 +578,7 @@ select_read_profile(_, _) ->
 
 %% @doc Execute using direct index key lookup (fastest)
 %% Uses prefix bloom filters for O(1) skip of non-matching SST blocks.
-execute_index_seek(StoreRef, DbName, Plan) ->
+execute_index_seek(StoreRef, DbName, Plan, Snapshot) ->
     #query_plan{conditions = Conditions, order = Order, limit = Limit, offset = Offset} = Plan,
 
     %% Find the first equality condition to use for index lookup
@@ -583,7 +594,7 @@ execute_index_seek(StoreRef, DbName, Plan) ->
             case Cardinality of
                 0 ->
                     %% No matches - skip iteration entirely
-                    filter_and_project(StoreRef, DbName, [], Plan);
+                    filter_and_project(StoreRef, DbName, [], Plan, Snapshot);
                 _ ->
                     %% Compute remaining conditions (index condition already satisfied by iteration)
                     RemainingConds = Conditions -- [IndexCond],
@@ -592,13 +603,13 @@ execute_index_seek(StoreRef, DbName, Plan) ->
                     case Limit of
                         undefined ->
                             %% Unbounded query - use adaptive chunked execution
-                            execute_index_seek_chunked(StoreRef, DbName, FullPath, FilterPlan);
+                            execute_index_seek_chunked(StoreRef, DbName, FullPath, FilterPlan, Snapshot);
                         _ when is_integer(Limit) ->
                             %% Limited query - check streaming vs batch
                             case should_use_streaming(Limit, Cardinality) of
                                 true ->
                                     %% Streaming: fetch/match documents one-by-one
-                                    execute_index_seek_streaming(StoreRef, DbName, FullPath, FilterPlan);
+                                    execute_index_seek_streaming(StoreRef, DbName, FullPath, FilterPlan, Snapshot);
                                 false ->
                                     %% Batch: collect DocIds then fetch/filter
                                     %% PROFILING: Index iteration
@@ -613,20 +624,20 @@ execute_index_seek(StoreRef, DbName, Plan) ->
                                     T1 = erlang:monotonic_time(microsecond),
                                     put(profile_index_iter, pdict_get(profile_index_iter, 0) + (T1 - T0)),
                                     put(profile_doc_count, length(DocIds)),
-                                    filter_and_project(StoreRef, DbName, DocIds, FilterPlan)
+                                    filter_and_project(StoreRef, DbName, DocIds, FilterPlan, Snapshot)
                             end
                     end
             end;
         not_found ->
             %% Fallback to scan
-            execute_index_scan(StoreRef, DbName, Plan)
+            execute_index_scan(StoreRef, DbName, Plan, Snapshot)
     end.
 
 %% @doc Execute index seek using streaming approach
 %% Iterates index entries and fetches/matches documents one-by-one
 %% Stops early when enough results are collected
 %% Much faster than batch-fetch for small limits on high-cardinality indexes
-execute_index_seek_streaming(StoreRef, DbName, FullPath, Plan) ->
+execute_index_seek_streaming(StoreRef, DbName, FullPath, Plan, _Snapshot) ->
     #query_plan{
         conditions = Conditions,
         bindings = Bindings,
@@ -682,7 +693,7 @@ execute_index_seek_streaming(StoreRef, DbName, FullPath, Plan) ->
 %% @doc Execute index seek with adaptive chunked processing for unbounded queries.
 %% Processes index entries in chunks, batch-fetching each chunk for efficiency.
 %% Chunk size adapts based on average document size to target ~1MB per batch.
-execute_index_seek_chunked(StoreRef, DbName, FullPath, Plan) ->
+execute_index_seek_chunked(StoreRef, DbName, FullPath, Plan, Snapshot) ->
     #query_plan{
         conditions = Conditions,
         bindings = Bindings,
@@ -699,7 +710,7 @@ execute_index_seek_chunked(StoreRef, DbName, FullPath, Plan) ->
         fun(DocIdChunk, {Acc, TotalBytes, ChunkCount}) ->
             {ChunkResults, ChunkBytes} = batch_fetch_and_filter_with_size(
                 StoreRef, DbName, DocIdChunk,
-                Conditions, Bindings, Projections, IncludeDocs),
+                Conditions, Bindings, Projections, IncludeDocs, Snapshot),
 
             %% Calculate new chunk size based on average doc size
             NewTotalBytes = TotalBytes + ChunkBytes,
@@ -740,8 +751,8 @@ calculate_chunk_size(_) ->
     ?INITIAL_CHUNK_SIZE.
 
 %% @doc Batch fetch with size tracking for adaptive chunking
-batch_fetch_and_filter_with_size(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs) ->
-    Results = batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs),
+batch_fetch_and_filter_with_size(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs, Snapshot) ->
+    Results = batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs, Snapshot),
     %% Estimate bytes from doc count (conservative ~500 bytes avg per doc)
     EstimatedBytes = length(DocIds) * 500,
     {Results, EstimatedBytes}.
@@ -795,7 +806,7 @@ can_use_indexed_order(_, _) ->
 %% @doc Execute query using indexed order for ORDER BY + LIMIT
 %% Iterates the index in the requested order and stops early
 %% Uses CBOR iterator for condition matching and projection
-execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan) ->
+execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan, _Snapshot) ->
     #query_plan{
         conditions = Conditions,
         bindings = Bindings,
@@ -897,17 +908,17 @@ fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) 
     end.
 
 %% @doc Execute using index prefix scan
-execute_index_scan(StoreRef, DbName, Plan) ->
+execute_index_scan(StoreRef, DbName, Plan, Snapshot) ->
     #query_plan{conditions = Conditions} = Plan,
     %% Classify query for pure index execution (no doc fetch)
     case classify_scan_query(Conditions, Plan) of
         {pure_exists, Path} ->
-            execute_pure_exists(StoreRef, DbName, Path, Plan);
+            execute_pure_exists(StoreRef, DbName, Path, Plan, Snapshot);
         {pure_prefix, Path, Prefix} ->
-            execute_pure_prefix(StoreRef, DbName, Path, Prefix, Plan);
+            execute_pure_prefix(StoreRef, DbName, Path, Prefix, Plan, Snapshot);
         needs_body ->
-            DocIds = collect_scan_docids(StoreRef, DbName, Conditions),
-            filter_and_project(StoreRef, DbName, DocIds, Plan)
+            DocIds = collect_scan_docids(StoreRef, DbName, Conditions, Snapshot),
+            filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot)
     end.
 
 %% @doc Classify scan query for pure index execution.
@@ -941,7 +952,7 @@ needs_body_for_projection(Projections) ->
 %% @doc Execute pure exists query - iterate posting lists directly
 %% Path index only contains non-deleted docs, so no doc_current check needed
 %% Uses fold_posting which gets list of DocIds per key - much more efficient
-execute_pure_exists(StoreRef, DbName, Path, Plan) ->
+execute_pure_exists(StoreRef, DbName, Path, Plan, Snapshot) ->
     #query_plan{
         limit = Limit,
         offset = Offset
@@ -953,15 +964,16 @@ execute_pure_exists(StoreRef, DbName, Path, Plan) ->
         L -> L + Offset
     end,
 
-    %% Iterate posting lists directly - each key contains a list of DocIds
-    %% Much more efficient than expanding to {Path, DocId} tuples
-    {_, _, Results} = barrel_ars_index:fold_posting(
+    %% Iterate posting lists directly with snapshot for consistency
+    %% Each key contains a list of DocIds
+    {_, _, Results} = barrel_ars_index:fold_posting_with_snapshot(
         StoreRef, DbName, Path,
         fun(_Key, DocIds, {Seen, Count, Acc}) ->
             %% Process all DocIds from this posting list (ignore Key)
             process_exists_docids(DocIds, Seen, Count, Acc, MaxCollect)
         end,
-        {#{}, 0, []}
+        {#{}, 0, []},
+        Snapshot
     ),
 
     %% Apply offset and limit (results are in reverse order)
@@ -997,7 +1009,7 @@ process_exists_docids([DocId | Rest], Seen, Count, Acc, MaxCollect) ->
 %% @doc Execute pure prefix query - iterate posting lists directly
 %% No doc_current check needed since path index only contains non-deleted docs
 %% Uses fold_prefix_posting which gets raw DocId lists per posting list key
-execute_pure_prefix(StoreRef, DbName, Path, Prefix, Plan) ->
+execute_pure_prefix(StoreRef, DbName, Path, Prefix, Plan, Snapshot) ->
     #query_plan{
         limit = Limit,
         offset = Offset
@@ -1009,15 +1021,16 @@ execute_pure_prefix(StoreRef, DbName, Path, Prefix, Plan) ->
         L -> L + Offset
     end,
 
-    %% Iterate posting lists directly - each key contains a list of DocIds
-    %% Much more efficient than fold_prefix which expands to individual tuples
-    {_, _, Results} = barrel_ars_index:fold_prefix_posting(
+    %% Iterate posting lists directly with snapshot for consistency
+    %% Each key contains a list of DocIds
+    {_, _, Results} = barrel_ars_index:fold_prefix_posting_with_snapshot(
         StoreRef, DbName, Path, Prefix,
         fun(_Key, DocIds, {Seen, Count, Acc}) ->
             %% Process all DocIds from this posting list
             process_prefix_docids(DocIds, Seen, Count, Acc, MaxCollect)
         end,
-        {#{}, 0, []}
+        {#{}, 0, []},
+        Snapshot
     ),
 
     %% Apply offset and limit (results are in reverse order)
@@ -1052,7 +1065,7 @@ process_prefix_docids([DocId | Rest], Seen, Count, Acc, MaxCollect) ->
 
 %% @doc Collect DocIds for scan-based execution
 %% Tries optimized paths: exists/prefix first, then path prefix scan, then full scan
-collect_scan_docids(StoreRef, DbName, Conditions) ->
+collect_scan_docids(StoreRef, DbName, Conditions, _Snapshot) ->
     case find_exists_condition(Conditions) of
         {ok, Path} ->
             %% Exists check: collect all docs that have any value at this path
@@ -1136,7 +1149,7 @@ collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix) ->
 
 %% @doc Execute using multiple index lookups with intersection
 %% Uses cardinality-ordered intersection for efficient multi-condition queries.
-execute_multi_index(StoreRef, DbName, Plan) ->
+execute_multi_index(StoreRef, DbName, Plan, Snapshot) ->
     #query_plan{conditions = Conditions} = Plan,
 
     %% Find all indexable conditions
@@ -1144,27 +1157,27 @@ execute_multi_index(StoreRef, DbName, Plan) ->
 
     case IndexConditions of
         [] ->
-            execute_full_scan(StoreRef, DbName, Plan);
+            execute_full_scan(StoreRef, DbName, Plan, Snapshot);
         _ ->
             %% Order by cardinality (smallest first) for efficient intersection
             case order_by_cardinality(StoreRef, DbName, IndexConditions) of
                 [] ->
                     %% At least one condition has 0 cardinality - no results
-                    filter_and_project(StoreRef, DbName, [], Plan);
+                    filter_and_project(StoreRef, DbName, [], Plan, Snapshot);
                 OrderedConditions when length(OrderedConditions) =< 2 ->
                     %% Few conditions - use bitmap filter
-                    execute_with_bitmap_filter(StoreRef, DbName, OrderedConditions, Plan);
+                    execute_with_bitmap_filter(StoreRef, DbName, OrderedConditions, Plan, Snapshot);
                 OrderedConditions ->
                     %% Many conditions - use sorted intersection
                     [{path, Path1, Value1} | Rest] = OrderedConditions,
                     FullPath1 = Path1 ++ [Value1],
-                    execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan)
+                    execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan, Snapshot)
             end
     end.
 
 %% @doc Execute multi-condition query using bitmap filtering
 %% Tries to use bitmaps for fast pre-filtering, falls back to sorted intersection
-execute_with_bitmap_filter(StoreRef, DbName, [First | Rest] = Conditions, Plan) ->
+execute_with_bitmap_filter(StoreRef, DbName, [First | Rest] = Conditions, Plan, Snapshot) ->
     {path, Path1, Value1} = First,
     FullPath1 = Path1 ++ [Value1],
 
@@ -1186,14 +1199,14 @@ execute_with_bitmap_filter(StoreRef, DbName, [First | Rest] = Conditions, Plan) 
                     FilterBitmap = barrel_ars_index:bitmap_intersect(AllBitmaps),
                     %% Collect DocIds from first condition, filtered by bitmap
                     DocIds = collect_docids_with_bitmap_filter(StoreRef, DbName, FullPath1, FilterBitmap),
-                    filter_and_project(StoreRef, DbName, DocIds, Plan);
+                    filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot);
                 false ->
                     %% Fallback: some bitmaps missing
-                    execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan)
+                    execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan, Snapshot)
             end;
         false ->
             %% Fallback: different bitmap sizes or single condition
-            execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan)
+            execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan, Snapshot)
     end.
 
 %% @doc Check if all conditions use the same bitmap size
@@ -1208,10 +1221,10 @@ all_same_bitmap_size([{path, Path, Value} | Rest]) ->
     ).
 
 %% @doc Execute using sorted intersection (fallback)
-execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan) ->
+execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan, Snapshot) ->
     InitialDocIds = collect_docids_for_path(StoreRef, DbName, FullPath1),
     FinalDocIds = intersect_conditions(StoreRef, DbName, Rest, InitialDocIds),
-    filter_and_project(StoreRef, DbName, FinalDocIds, Plan).
+    filter_and_project(StoreRef, DbName, FinalDocIds, Plan, Snapshot).
 
 %% @doc Collect DocIds from a path, filtering by bitmap
 collect_docids_with_bitmap_filter(StoreRef, DbName, FullPath, FilterBitmap) ->
@@ -1290,7 +1303,7 @@ sorted_intersection(L1, [_ | T2]) ->
     sorted_intersection(L1, T2).
 
 %% @doc Execute full document scan (slowest, last resort, using column-wide storage)
-execute_full_scan(StoreRef, DbName, Plan) ->
+execute_full_scan(StoreRef, DbName, Plan, Snapshot) ->
     %% Collect all doc IDs by scanning doc_current keys
     %% Use long_scan profile for full table scans (prefetch, avoid cache pollution)
     StartKey = barrel_store_keys:doc_current_prefix(DbName),
@@ -1309,7 +1322,7 @@ execute_full_scan(StoreRef, DbName, Plan) ->
         long_scan
     ),
 
-    filter_and_project(StoreRef, DbName, DocIds, Plan).
+    filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot).
 
 %% @doc Collect document IDs matching an exact path+value
 %% Uses direct posting list lookup - O(1) key fetch instead of iteration
@@ -1335,7 +1348,7 @@ collect_docids_for_prefix(StoreRef, DbName, PathPrefix) ->
     ).
 
 %% @doc Filter results by remaining conditions and apply projections
-filter_and_project(StoreRef, DbName, DocIds, Plan) ->
+filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot) ->
     #query_plan{
         conditions = Conditions,
         bindings = Bindings,
@@ -1349,9 +1362,9 @@ filter_and_project(StoreRef, DbName, DocIds, Plan) ->
     %% Remove duplicates
     UniqueDocIds = lists:usort(DocIds),
 
-    %% Batch fetch documents using multi_get
+    %% Batch fetch documents using multi_get with snapshot for consistency
     Results0 = batch_fetch_and_filter(StoreRef, DbName, UniqueDocIds,
-                                       Conditions, Bindings, Projections, IncludeDocs),
+                                       Conditions, Bindings, Projections, IncludeDocs, Snapshot),
 
     %% Apply ordering
     Results1 = apply_order(Results0, Order),
@@ -1366,14 +1379,14 @@ filter_and_project(StoreRef, DbName, DocIds, Plan) ->
 
 %% @doc Batch fetch documents using multi_get (column-wide storage with CBOR iterator)
 %% Uses find_path for condition matching and projection - no full decode unless include_docs=true
-batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs) ->
+batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs, Snapshot) ->
     case DocIds of
         [] -> [];
         _ ->
             %% PROFILING: Doc current state fetch
             T0 = erlang:monotonic_time(microsecond),
             DocCurrentKeys = [barrel_store_keys:doc_current(DbName, Id) || Id <- DocIds],
-            DocCurrentResults = barrel_store_rocksdb:multi_get(StoreRef, DocCurrentKeys),
+            DocCurrentResults = barrel_store_rocksdb:multi_get_with_snapshot(StoreRef, DocCurrentKeys, Snapshot),
             T1 = erlang:monotonic_time(microsecond),
             put(profile_docinfo_fetch, pdict_get(profile_docinfo_fetch, 0) + (T1 - T0)),
 
@@ -1408,7 +1421,7 @@ batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projectio
                     T2 = erlang:monotonic_time(microsecond),
                     ReversedDocIds = lists:reverse(ActiveDocs),
                     ReversedBodyKeys = lists:reverse(BodyKeys),
-                    DocBodyResults = barrel_store_rocksdb:multi_get(StoreRef, ReversedBodyKeys),
+                    DocBodyResults = barrel_store_rocksdb:multi_get_with_snapshot(StoreRef, ReversedBodyKeys, Snapshot),
                     T3 = erlang:monotonic_time(microsecond),
                     put(profile_docbody_fetch, pdict_get(profile_docbody_fetch, 0) + (T3 - T2)),
 

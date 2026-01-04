@@ -16,7 +16,8 @@
 
 %% Additional utilities
 -export([snapshot/1, release_snapshot/1]).
--export([get_with_snapshot/3]).
+-export([get_with_snapshot/3, multi_get_with_snapshot/3]).
+-export([fold_range_posting_with_snapshot/6]).
 
 %% Bitmap operations
 -export([bitmap_set/3, bitmap_unset/3, bitmap_get/2, multi_get_bitmap/2]).
@@ -331,6 +332,25 @@ release_snapshot(Snapshot) ->
     {ok, binary()} | not_found | {error, term()}.
 get_with_snapshot(#{ref := Ref}, Key, Snapshot) ->
     rocksdb:get(Ref, Key, [{snapshot, Snapshot}]).
+
+%% @doc Multi-get with a snapshot for consistent reads
+-spec multi_get_with_snapshot(db_ref(), [binary()], snapshot()) ->
+    [{ok, binary()} | not_found | {error, term()}].
+multi_get_with_snapshot(#{ref := Ref}, Keys, Snapshot) ->
+    rocksdb:multi_get(Ref, Keys, [{snapshot, Snapshot}]).
+
+%% @doc Fold over posting list entries with snapshot for consistent reads
+-spec fold_range_posting_with_snapshot(db_ref(), binary(), binary(), fun(), term(), snapshot()) -> term().
+fold_range_posting_with_snapshot(#{ref := Ref, posting_cf := PostingCF}, StartKey, EndKey, Fun, Acc0, Snapshot) ->
+    Opts = [{iterate_lower_bound, StartKey},
+            {iterate_upper_bound, EndKey},
+            {snapshot, Snapshot}],
+    {ok, Iter} = rocksdb:iterator(Ref, PostingCF, Opts),
+    try
+        fold_posting_loop(rocksdb:iterator_move(Iter, first), Iter, Fun, Acc0)
+    after
+        rocksdb:iterator_close(Iter)
+    end.
 
 %%====================================================================
 %% Internal Functions

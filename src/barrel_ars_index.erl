@@ -25,6 +25,8 @@
     fold_prefix/6, fold_prefix/7,
     fold_posting/5, fold_posting/6,
     fold_prefix_posting/6,
+    fold_posting_with_snapshot/6,
+    fold_prefix_posting_with_snapshot/7,
     get_posting_list/3
 ]).
 
@@ -492,6 +494,27 @@ fold_prefix_posting(StoreRef, DbName, Path, Prefix, Fun, Acc0) when is_binary(Pr
     EndPath = Path ++ [EndPrefix],
     EndKey = barrel_store_keys:path_posting_prefix(DbName, EndPath),
     barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, Fun, Acc0).
+
+%% @doc Fold over posting lists with snapshot for consistent reads.
+%% Same as fold_posting but uses a snapshot for read consistency.
+-spec fold_posting_with_snapshot(store_ref(), db_name(), [term()], fun(), term(),
+                                  barrel_store_rocksdb:snapshot()) -> term().
+fold_posting_with_snapshot(StoreRef, DbName, PathPrefix, Fun, Acc0, Snapshot) ->
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, PathPrefix),
+    EndKey = barrel_store_keys:path_posting_end(DbName, PathPrefix),
+    barrel_store_rocksdb:fold_range_posting_with_snapshot(StoreRef, StartKey, EndKey, Fun, Acc0, Snapshot).
+
+%% @doc Fold over prefix posting lists with snapshot for consistent reads.
+%% Same as fold_prefix_posting but uses a snapshot for read consistency.
+-spec fold_prefix_posting_with_snapshot(store_ref(), db_name(), [term()], binary(), fun(), term(),
+                                         barrel_store_rocksdb:snapshot()) -> term().
+fold_prefix_posting_with_snapshot(StoreRef, DbName, Path, Prefix, Fun, Acc0, Snapshot) when is_binary(Prefix) ->
+    StartPath = Path ++ [Prefix],
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, StartPath),
+    EndPrefix = <<Prefix/binary, 16#FF>>,
+    EndPath = Path ++ [EndPrefix],
+    EndKey = barrel_store_keys:path_posting_prefix(DbName, EndPath),
+    barrel_store_rocksdb:fold_range_posting_with_snapshot(StoreRef, StartKey, EndKey, Fun, Acc0, Snapshot).
 
 %% @doc Fold over posting lists with explicit read profile.
 -spec fold_posting(store_ref(), db_name(), [term()], fun(), term(), read_profile()) -> term().
