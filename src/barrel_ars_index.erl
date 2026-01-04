@@ -27,7 +27,8 @@
     fold_prefix_posting/6,
     fold_posting_with_snapshot/6,
     fold_prefix_posting_with_snapshot/7,
-    get_posting_list/3
+    get_posting_list/3,
+    fold_value_index/7
 ]).
 
 %% Operations-only variants (for batching with other ops)
@@ -151,12 +152,30 @@ remove_doc_ops(DbName, DocId, Paths) ->
                    barrel_store_keys:path_posting_key(DbName, Path),
                    DocId}
                   || {Path, _} <- Paths],
+    %% Remove DocId from value-first index
+    ValueIndexOps = make_value_index_remove_ops(DbName, DocId, Paths),
     %% Decrement counters for each path
     DecrOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), -1}
                || {Path, _} <- Paths],
     %% Delete reverse index
     ReverseKey = barrel_store_keys:doc_paths_key(DbName, DocId),
-    PostingOps ++ DecrOps ++ [{delete, ReverseKey}].
+    PostingOps ++ ValueIndexOps ++ DecrOps ++ [{delete, ReverseKey}].
+
+%% @private Create value-first index remove operations (individual key deletes)
+make_value_index_remove_ops(_DbName, _DocId, []) ->
+    [];
+make_value_index_remove_ops(DbName, DocId, [{Path, _Type} | Rest]) ->
+    case Path of
+        [] ->
+            make_value_index_remove_ops(DbName, DocId, Rest);
+        [_Single] ->
+            make_value_index_remove_ops(DbName, DocId, Rest);
+        _ ->
+            {FieldPath, Value} = split_path_value(Path),
+            %% Individual key with DocId - just delete it
+            Key = barrel_store_keys:value_index_key(DbName, Value, FieldPath, DocId),
+            [{delete, Key} | make_value_index_remove_ops(DbName, DocId, Rest)]
+    end.
 
 %% @doc Get stored paths for a document from the reverse index.
 %% Returns {ok, Paths} or not_found.
@@ -538,6 +557,30 @@ get_posting_list(StoreRef, DbName, FullPath) ->
         {error, _} -> []
     end.
 
+%% @doc Fold over value-first index with early termination support.
+%% Iterates over individual keys (one per DocId) allowing bounded queries
+%% to stop after collecting enough results.
+%%
+%% Fun receives (DocId, Acc) and should return:
+%%   {ok, NewAcc} - continue iteration
+%%   {stop, FinalAcc} - stop iteration early
+%%
+%% Example: fold_value_index(S, Db, <<"user">>, [<<"type">>], Fun, Acc, Snapshot)
+%%   finds all docs where type = "user"
+-spec fold_value_index(store_ref(), db_name(), term(), [term()], fun(), term(),
+                       barrel_store_rocksdb:snapshot()) -> term().
+fold_value_index(StoreRef, DbName, Value, FieldPath, Fun, Acc0, Snapshot) ->
+    StartKey = barrel_store_keys:value_index_prefix(DbName, Value, FieldPath),
+    EndKey = barrel_store_keys:value_index_end(DbName, Value, FieldPath),
+    PrefixLen = byte_size(StartKey),
+    FoldFun = fun(Key, _Value, Acc) ->
+        %% Extract DocId from key (everything after the prefix)
+        <<_:PrefixLen/binary, DocId/binary>> = Key,
+        Fun(DocId, Acc)
+    end,
+    barrel_store_rocksdb:fold_range_with_snapshot(
+        StoreRef, StartKey, EndKey, FoldFun, Acc0, Snapshot).
+
 %%====================================================================
 %% Internal functions
 %%====================================================================
@@ -550,6 +593,10 @@ make_index_ops(DbName, DocId, Paths) ->
                    barrel_store_keys:path_posting_key(DbName, Path),
                    DocId}
                   || {Path, _} <- Paths],
+
+    %% Create value-first index operations for fast equality queries
+    %% Key: [prefix, db, value_prefix, field_path, DocId] -> Value: empty
+    ValueIndexOps = make_value_index_ops(DbName, DocId, Paths),
 
     %% Increment counters for each path
     StatsOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), 1}
@@ -566,7 +613,35 @@ make_index_ops(DbName, DocId, Paths) ->
                  barrel_store_keys:doc_paths_key(DbName, DocId),
                  term_to_binary(Paths)},
 
-    PostingOps ++ StatsOps ++ BitmapOps ++ [ReverseOp].
+    PostingOps ++ ValueIndexOps ++ StatsOps ++ BitmapOps ++ [ReverseOp].
+
+%% @private Create value-first index operations for equality queries
+%% Path format: [field1, field2, value] -> value_index_key(DbName, value, [field1, field2], DocId)
+%% Uses individual keys (one per DocId) for iterable scans with early termination
+make_value_index_ops(_DbName, _DocId, []) ->
+    [];
+make_value_index_ops(DbName, DocId, [{Path, _Type} | Rest]) ->
+    case Path of
+        [] ->
+            make_value_index_ops(DbName, DocId, Rest);
+        [_Single] ->
+            %% Single element path (just value, no field) - skip value-first
+            make_value_index_ops(DbName, DocId, Rest);
+        _ ->
+            %% Extract value (last element) and field path (rest)
+            {FieldPath, Value} = split_path_value(Path),
+            %% Individual key with DocId in the key, empty value
+            Key = barrel_store_keys:value_index_key(DbName, Value, FieldPath, DocId),
+            Op = {put, Key, <<>>},
+            [Op | make_value_index_ops(DbName, DocId, Rest)]
+    end.
+
+%% @private Split path into field path and value
+%% [field1, field2, value] -> {[field1, field2], value}
+split_path_value(Path) ->
+    ReversedPath = lists:reverse(Path),
+    [Value | ReversedFieldPath] = ReversedPath,
+    {lists:reverse(ReversedFieldPath), Value}.
 
 %% @private Convert DocId to a bitmap position using deterministic hash
 %% Uses path depth to determine bitmap size for better space efficiency
@@ -699,6 +774,10 @@ make_update_ops(DbName, DocId, Added, Removed, NewPaths) ->
                DocId}
               || {Path, _} <- Added],
 
+    %% Value-first index operations
+    ValueRemoveOps = make_value_index_remove_ops(DbName, DocId, Removed),
+    ValueAddOps = make_value_index_ops(DbName, DocId, Added),
+
     %% Update counters: decrement removed, increment added
     DecrOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), -1}
                || {Path, _} <- Removed],
@@ -717,4 +796,5 @@ make_update_ops(DbName, DocId, Added, Removed, NewPaths) ->
                  barrel_store_keys:doc_paths_key(DbName, DocId),
                  term_to_binary(NewPaths)},
 
-    RemoveOps ++ AddOps ++ DecrOps ++ IncrOps ++ BitmapSetOps ++ [ReverseOp].
+    RemoveOps ++ AddOps ++ ValueRemoveOps ++ ValueAddOps ++
+        DecrOps ++ IncrOps ++ BitmapSetOps ++ [ReverseOp].

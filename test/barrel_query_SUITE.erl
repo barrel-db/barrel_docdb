@@ -70,7 +70,8 @@
     execute_include_docs/1,
     execute_variable_binding/1,
     execute_multi_index_intersection/1,
-    execute_multi_index_zero_cardinality/1
+    execute_multi_index_zero_cardinality/1,
+    execute_chunked_query/1
 ]).
 
 %%====================================================================
@@ -131,7 +132,8 @@ groups() ->
             execute_include_docs,
             execute_variable_binding,
             execute_multi_index_intersection,
-            execute_multi_index_zero_cardinality
+            execute_multi_index_zero_cardinality,
+            execute_chunked_query
         ]}
     ].
 
@@ -741,4 +743,43 @@ execute_multi_index_zero_cardinality(Config) ->
     {ok, Results, _} = barrel_query:execute(StoreRef, DbName, Plan),
 
     ?assertEqual(0, length(Results)),
+    ok.
+
+%% Test chunked query execution with continuation tokens
+execute_chunked_query(Config) ->
+    DbName = proplists:get_value(db_name, Config),
+    StoreRef = proplists:get_value(store_ref, Config),
+
+    %% Pure equality query with small chunk size
+    Spec = #{
+        where => [{path, [<<"type">>], <<"user">>}],
+        include_docs => false
+    },
+    {ok, Plan} = barrel_query:compile(Spec),
+
+    %% First chunk with size 2 (we have 3 users)
+    {ok, Results1, Meta1} = barrel_query:execute(StoreRef, DbName, Plan, #{chunk_size => 2}),
+
+    ?assertEqual(2, length(Results1)),
+    ?assertEqual(true, maps:get(has_more, Meta1)),
+    ?assert(maps:is_key(continuation, Meta1)),
+    ?assert(maps:is_key(last_seq, Meta1)),
+
+    %% Get continuation token
+    Token = maps:get(continuation, Meta1),
+
+    %% Second chunk should get remaining docs
+    {ok, Results2, Meta2} = barrel_query:execute(StoreRef, DbName, Plan, #{continuation => Token}),
+
+    ?assertEqual(1, length(Results2)),
+    ?assertEqual(false, maps:get(has_more, Meta2)),
+    ?assertNot(maps:is_key(continuation, Meta2)),
+
+    %% Verify all users were returned across chunks
+    AllDocIds = [maps:get(<<"id">>, R) || R <- Results1 ++ Results2],
+    ?assertEqual(3, length(AllDocIds)),
+    ?assert(lists:member(<<"user1">>, AllDocIds)),
+    ?assert(lists:member(<<"user2">>, AllDocIds)),
+    ?assert(lists:member(<<"user3">>, AllDocIds)),
+
     ok.

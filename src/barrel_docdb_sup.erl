@@ -91,6 +91,16 @@ init([]) ->
         modules => [barrel_path_dict]
     },
 
+    %% Query cursor manager for chunked query execution
+    QueryCursor = #{
+        id => barrel_query_cursor,
+        start => {barrel_query_cursor, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [barrel_query_cursor]
+    },
+
     %% Database supervisor for managing individual database processes
     DbSup = #{
         id => barrel_db_sup,
@@ -101,7 +111,7 @@ init([]) ->
         modules => [barrel_db_sup]
     },
 
-    %% Cache must start first, then HLC, Sub, QuerySub, PathDict, finally DbSup
-    ChildSpecs = [Cache, Hlc, Sub, QuerySub, PathDict, DbSup],
+    %% Cache must start first, then HLC, Sub, QuerySub, PathDict, QueryCursor, finally DbSup
+    ChildSpecs = [Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, DbSup],
 
     {ok, {SupFlags, ChildSpecs}}.

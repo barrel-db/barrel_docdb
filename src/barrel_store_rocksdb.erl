@@ -13,6 +13,7 @@
 -export([merge/3]).
 -export([write_batch/2, write_batch/3]).
 -export([fold/4, fold_range/5, fold_range/6, fold_range_reverse/5, fold_range_reverse/6]).
+-export([fold_range_with_snapshot/6]).
 
 %% Additional utilities
 -export([snapshot/1, release_snapshot/1]).
@@ -339,6 +340,23 @@ get_with_snapshot(#{ref := Ref}, Key, Snapshot) ->
     [{ok, binary()} | not_found | {error, term()}].
 multi_get_with_snapshot(#{ref := Ref}, Keys, Snapshot) ->
     rocksdb:multi_get(Ref, Keys, [{snapshot, Snapshot}]).
+
+%% @doc Fold over a key range with snapshot for consistent reads
+%% The fold function receives (Key, Value, Acc) and should return:
+%%   {ok, NewAcc} - continue iteration
+%%   {stop, FinalAcc} - stop iteration early
+-spec fold_range_with_snapshot(db_ref(), binary(), binary(), fun(), term(), snapshot()) -> term().
+fold_range_with_snapshot(#{ref := Ref}, StartKey, EndKey, Fun, Acc0, Snapshot) ->
+    Opts = [{iterate_lower_bound, StartKey},
+            {iterate_upper_bound, EndKey},
+            {total_order_seek, true},
+            {snapshot, Snapshot}],
+    {ok, Iter} = rocksdb:iterator(Ref, Opts),
+    try
+        fold_loop(rocksdb:iterator_move(Iter, first), Iter, Fun, Acc0)
+    after
+        rocksdb:iterator_close(Iter)
+    end.
 
 %% @doc Fold over posting list entries with snapshot for consistent reads
 -spec fold_range_posting_with_snapshot(db_ref(), binary(), binary(), fun(), term(), snapshot()) -> term().

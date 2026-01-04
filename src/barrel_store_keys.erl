@@ -39,6 +39,13 @@
 %% Posting list keys (new format: DocIds in value as posting list)
 -export([path_posting_key/2, path_posting_prefix/2, path_posting_end/2]).
 
+%% Value-first posting keys (for fast equality queries)
+-export([value_posting_key/3, value_posting_prefix/2, value_posting_end/2]).
+-export([truncate_value/1]).
+
+%% Value-first index keys (for iterable equality queries with early termination)
+-export([value_index_key/4, value_index_prefix/3, value_index_end/3]).
+
 %% Path stats keys (for cardinality counters)
 -export([path_stats_key/2]).
 
@@ -83,6 +90,11 @@
 -define(PREFIX_PATH_STATS, 16#0F).
 -define(PREFIX_PATH_BITMAP, 16#10).
 -define(PREFIX_PATH_POSTING, 16#14).  %% Posting lists: path → [DocId, ...]
+-define(PREFIX_VALUE_POSTING, 16#15). %% Value-first posting: [value_prefix, path] → [DocId, ...]
+-define(PREFIX_VALUE_INDEX, 16#16).   %% Value-first index: [value_prefix, path, DocId] → marker (for iteration)
+
+%% Value prefix max length for value-first index (128 bytes)
+-define(VALUE_PREFIX_MAX_LEN, 128).
 
 %% Column-wide document storage prefixes (for CBOR codec integration)
 -define(PREFIX_DOC_CURRENT, 16#11).  %% DbName + DocId → {rev, deleted, hlc}
@@ -493,6 +505,73 @@ path_posting_prefix(DbName, PathPrefix) ->
 -spec path_posting_end(db_name(), [term()]) -> binary().
 path_posting_end(DbName, PathPrefix) ->
     Prefix = path_posting_prefix(DbName, PathPrefix),
+    <<Prefix/binary, 16#FF>>.
+
+%% @doc Value-first posting list key for fast equality queries.
+%% Key format: prefix | db_name | value_prefix | encoded_path
+%% Value is truncated to 128 bytes max for efficient prefix scans.
+%% Path is the field path WITHOUT the value (e.g., [<<"type">>] for type=user)
+-spec value_posting_key(db_name(), term(), [term()]) -> binary().
+value_posting_key(DbName, Value, Path) ->
+    TruncatedValue = truncate_value(Value),
+    EncodedValue = encode_path_component(TruncatedValue),
+    EncodedPath = encode_path(Path),
+    <<?PREFIX_VALUE_POSTING, (encode_name(DbName))/binary,
+      EncodedValue/binary, EncodedPath/binary>>.
+
+%% @doc Prefix for scanning value-first posting lists by value.
+%% Use this to find all paths with a specific value.
+-spec value_posting_prefix(db_name(), term()) -> binary().
+value_posting_prefix(DbName, Value) ->
+    TruncatedValue = truncate_value(Value),
+    EncodedValue = encode_path_component(TruncatedValue),
+    <<?PREFIX_VALUE_POSTING, (encode_name(DbName))/binary, EncodedValue/binary>>.
+
+%% @doc End marker for value-first posting list range scan.
+-spec value_posting_end(db_name(), term()) -> binary().
+value_posting_end(DbName, Value) ->
+    Prefix = value_posting_prefix(DbName, Value),
+    <<Prefix/binary, 16#FF>>.
+
+%% @doc Truncate a value to max 128 bytes for value-first index.
+%% Only applies to binary values; other types are unchanged.
+-spec truncate_value(term()) -> term().
+truncate_value(Bin) when is_binary(Bin), byte_size(Bin) > ?VALUE_PREFIX_MAX_LEN ->
+    <<Prefix:?VALUE_PREFIX_MAX_LEN/binary, _/binary>> = Bin,
+    Prefix;
+truncate_value(Value) ->
+    Value.
+
+%%====================================================================
+%% Value-First Index Keys (Iterable)
+%%====================================================================
+
+%% @doc Value-first index key for iterable equality queries.
+%% Format: [value_prefix, path, DocId] enables prefix scan with early termination.
+%% Unlike value_posting_key which stores DocIds in a posting list, this stores
+%% one key per DocId allowing iteration without full deserialization.
+-spec value_index_key(db_name(), term(), [term()], docid()) -> binary().
+value_index_key(DbName, Value, Path, DocId) ->
+    TruncatedValue = truncate_value(Value),
+    EncodedValue = encode_path_component(TruncatedValue),
+    EncodedPath = encode_path(Path),
+    <<?PREFIX_VALUE_INDEX, (encode_name(DbName))/binary,
+      EncodedValue/binary, EncodedPath/binary, DocId/binary>>.
+
+%% @doc Prefix for scanning value-first index by value and path.
+%% Use this to find all DocIds matching a specific (path, value) pair.
+-spec value_index_prefix(db_name(), term(), [term()]) -> binary().
+value_index_prefix(DbName, Value, Path) ->
+    TruncatedValue = truncate_value(Value),
+    EncodedValue = encode_path_component(TruncatedValue),
+    EncodedPath = encode_path(Path),
+    <<?PREFIX_VALUE_INDEX, (encode_name(DbName))/binary,
+      EncodedValue/binary, EncodedPath/binary>>.
+
+%% @doc End marker for value-first index range scan.
+-spec value_index_end(db_name(), term(), [term()]) -> binary().
+value_index_end(DbName, Value, Path) ->
+    Prefix = value_index_prefix(DbName, Value, Path),
     <<Prefix/binary, 16#FF>>.
 
 %% @doc Encode a path for lexicographic ordering.

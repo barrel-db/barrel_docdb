@@ -29,6 +29,12 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running simple equality with LIMIT 10...~n"),
     SimpleEqLimit = barrel_bench_metrics:summarize(bench_query(Db, simple_eq_limit_query(), Iterations)),
 
+    io:format("  Running selective equality (status=active, ~~1/3 docs)...~n"),
+    SelectiveEq = barrel_bench_metrics:summarize(bench_query(Db, selective_eq_query(), Iterations)),
+
+    io:format("  Running very selective equality (city=Paris, ~~1/8 docs)...~n"),
+    VerySelectiveEq = barrel_bench_metrics:summarize(bench_query(Db, very_selective_eq_query(), Iterations)),
+
     io:format("  Running range queries...~n"),
     Range = barrel_bench_metrics:summarize(bench_query(Db, range_query(), Iterations)),
 
@@ -59,6 +65,8 @@ run(Db, NumDocs, Iterations) ->
     #{
         simple_eq => SimpleEq,
         simple_eq_limit => SimpleEqLimit,
+        selective_eq => SelectiveEq,
+        very_selective_eq => VerySelectiveEq,
         range => Range,
         multi_condition => MultiCond,
         nested_path => NestedPath,
@@ -75,10 +83,22 @@ run(Db, NumDocs, Iterations) ->
 %%====================================================================
 
 simple_eq_query() ->
-    #{where => [{path, [<<"type">>], <<"user">>}]}.
+    %% Simple equality: find all users with type=user
+    %% include_docs => false enables pure index path (no doc body fetch)
+    #{where => [{path, [<<"type">>], <<"user">>}], include_docs => false}.
 
 simple_eq_limit_query() ->
-    #{where => [{path, [<<"type">>], <<"user">>}], limit => 10}.
+    %% Simple equality with LIMIT - tests early termination
+    #{where => [{path, [<<"type">>], <<"user">>}], limit => 10, include_docs => false}.
+
+selective_eq_query() ->
+    %% Selective equality: find docs with status=active (~1/3 of docs)
+    %% Shows that we only scan matching keys, not all docs
+    #{where => [{path, [<<"status">>], <<"active">>}], include_docs => false}.
+
+very_selective_eq_query() ->
+    %% Very selective: find docs with profile.city=Paris (~1/8 of docs)
+    #{where => [{path, [<<"profile">>, <<"city">>], <<"Paris">>}], include_docs => false}.
 
 range_query() ->
     #{where => [

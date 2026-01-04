@@ -31,6 +31,7 @@
     compile/1,
     validate_spec/1,
     execute/3,
+    execute/4,
     match/2,
     explain/1,
     extract_paths/1
@@ -104,7 +105,21 @@
 
 -type query_plan() :: #query_plan{}.
 
--export_type([query_spec/0, query_plan/0, condition/0, logic_var/0]).
+%% Chunked execution options
+-type chunk_opts() :: #{
+    chunk_size => pos_integer(),          %% Max results per chunk (default 1000)
+    continuation => binary() | undefined, %% Resume from previous chunk
+    eventual_consistency => boolean()     %% Skip snapshot for fresh reads (default false)
+}.
+
+%% Chunked execution result metadata
+-type result_meta() :: #{
+    last_seq := seq(),
+    has_more := boolean(),
+    continuation => binary()  %% Only present if has_more = true
+}.
+
+-export_type([query_spec/0, query_plan/0, condition/0, logic_var/0, chunk_opts/0, result_meta/0]).
 
 %% Read profile type from storage layer
 -type read_profile() :: barrel_store_rocksdb:read_profile().
@@ -164,6 +179,341 @@ execute(StoreRef, DbName, #query_plan{} = Plan) ->
     after
         barrel_store_rocksdb:release_snapshot(Snapshot)
     end.
+
+%% @doc Execute a compiled query plan with chunked execution options.
+%% Returns {ok, Results, ResultMeta} where ResultMeta includes:
+%%   - last_seq: sequence number for change tracking
+%%   - has_more: true if more results available
+%%   - continuation: opaque token to resume (only if has_more = true)
+%%
+%% Options:
+%%   - chunk_size: max results per chunk (default 1000)
+%%   - continuation: resume token from previous call
+%%   - eventual_consistency: if true, each chunk sees current data (default false)
+%%
+%% Example:
+%% ```
+%% %% First chunk
+%% {ok, R1, #{has_more := true, continuation := Token}} =
+%%     barrel_query:execute(Store, Db, Plan, #{chunk_size => 100}),
+%%
+%% %% Next chunk
+%% {ok, R2, #{has_more := false}} =
+%%     barrel_query:execute(Store, Db, Plan, #{continuation => Token}).
+%% '''
+-spec execute(barrel_store_rocksdb:db_ref(), db_name(), query_plan(), chunk_opts()) ->
+    {ok, [map()], result_meta()} | {error, term()}.
+execute(StoreRef, DbName, #query_plan{} = Plan, Opts) when is_map(Opts) ->
+    case maps:get(continuation, Opts, undefined) of
+        undefined ->
+            %% Fresh query - create new snapshot
+            execute_chunked_fresh(StoreRef, DbName, Plan, Opts);
+        Token ->
+            %% Resume from cursor
+            execute_chunked_resume(StoreRef, DbName, Plan, Token, Opts)
+    end.
+
+%%====================================================================
+%% Chunked Execution Implementation
+%%====================================================================
+
+%% @private Execute fresh chunked query (no continuation token)
+execute_chunked_fresh(StoreRef, DbName, Plan, Opts) ->
+    ChunkSize = maps:get(chunk_size, Opts, 1000),
+    EventualConsistency = maps:get(eventual_consistency, Opts, false),
+
+    %% Create snapshot for consistent reads (unless eventual consistency)
+    Snapshot = case EventualConsistency of
+        true -> undefined;
+        false ->
+            {ok, S} = barrel_store_rocksdb:snapshot(StoreRef),
+            S
+    end,
+
+    try
+        execute_chunked_with_snapshot(StoreRef, DbName, Plan, ChunkSize, undefined, Snapshot)
+    catch
+        Class:Reason:Stack ->
+            %% Release snapshot on error
+            maybe_release_snapshot(Snapshot),
+            erlang:raise(Class, Reason, Stack)
+    end.
+
+%% @private Resume chunked query from cursor
+execute_chunked_resume(StoreRef, DbName, Plan, Token, Opts) ->
+    case barrel_query_cursor:lookup(Token) of
+        {ok, Cursor} ->
+            %% Get cursor fields
+            #{snapshot := Snapshot, last_key := LastKey, query_type := QueryType} = cursor_to_map(Cursor),
+            ChunkSize = maps:get(chunk_size, Opts, 1000),
+
+            %% Validate cursor matches current query
+            case validate_cursor_for_plan(QueryType, Plan) of
+                ok ->
+                    execute_chunked_with_snapshot(StoreRef, DbName, Plan, ChunkSize, LastKey, Snapshot);
+                {error, _} = Error ->
+                    barrel_query_cursor:release(Token),
+                    Error
+            end;
+        {error, expired} ->
+            {error, cursor_expired};
+        {error, not_found} ->
+            {error, cursor_not_found}
+    end.
+
+%% @private Execute chunked query with snapshot
+execute_chunked_with_snapshot(StoreRef, DbName, Plan, ChunkSize, StartKey, Snapshot) ->
+    #query_plan{conditions = Conditions, include_docs = IncludeDocs, projections = Projections} = Plan,
+
+    %% Classify query type for pure index execution
+    QueryType = classify_scan_query(Conditions, Plan),
+
+    case QueryType of
+        {pure_equality, Path, Value} ->
+            execute_pure_equality_chunked(StoreRef, DbName, Path, Value, Plan, ChunkSize, StartKey, Snapshot);
+        {pure_exists, Path} ->
+            execute_pure_exists_chunked(StoreRef, DbName, Path, Plan, ChunkSize, StartKey, Snapshot);
+        {pure_prefix, Path, Prefix} ->
+            execute_pure_prefix_chunked(StoreRef, DbName, Path, Prefix, Plan, ChunkSize, StartKey, Snapshot);
+        needs_body ->
+            %% For body-fetch queries, fall back to non-chunked for now
+            %% TODO: Implement chunked body-fetch queries
+            NeedsBody = IncludeDocs orelse needs_body_for_projection(Projections),
+            case NeedsBody of
+                true ->
+                    %% Release snapshot if we own it and fall back
+                    maybe_release_snapshot(Snapshot),
+                    {ok, Results, LastSeq} = execute(StoreRef, DbName, Plan),
+                    {ok, Results, #{last_seq => LastSeq, has_more => false}};
+                false ->
+                    maybe_release_snapshot(Snapshot),
+                    {ok, Results, LastSeq} = execute(StoreRef, DbName, Plan),
+                    {ok, Results, #{last_seq => LastSeq, has_more => false}}
+            end
+    end.
+
+%% @private Execute chunked pure equality query
+execute_pure_equality_chunked(StoreRef, DbName, Path, Value, Plan, ChunkSize, StartKey, Snapshot) ->
+    #query_plan{offset = Offset} = Plan,
+
+    %% Determine start key for iteration
+    ActualStartKey = case StartKey of
+        undefined ->
+            barrel_store_keys:value_index_prefix(DbName, Value, Path);
+        Key ->
+            %% Resume after the last key
+            <<Key/binary, 0>>
+    end,
+    EndKey = barrel_store_keys:value_index_end(DbName, Value, Path),
+    PrefixLen = byte_size(barrel_store_keys:value_index_prefix(DbName, Value, Path)),
+
+    %% Collect ChunkSize + 1 to detect if there are more results
+    %% Track the last key of the ChunkSize-th result separately
+    MaxCollect = ChunkSize + 1,
+    FoldFun = fun(Key, _Val, {Count, ChunkLastK, Acc}) ->
+        <<_:PrefixLen/binary, DocId/binary>> = Key,
+        NewCount = Count + 1,
+        if
+            NewCount > MaxCollect ->
+                %% Already collected enough, stop
+                {stop, {Count, ChunkLastK, Acc}};
+            NewCount =:= ChunkSize ->
+                %% This is the ChunkSize-th result - save its key for cursor
+                {ok, {NewCount, Key, [#{<<"id">> => DocId} | Acc]}};
+            NewCount > ChunkSize ->
+                %% Extra result to detect has_more - don't update ChunkLastK
+                {ok, {NewCount, ChunkLastK, [#{<<"id">> => DocId} | Acc]}};
+            true ->
+                {ok, {NewCount, ChunkLastK, [#{<<"id">> => DocId} | Acc]}}
+        end
+    end,
+
+    {CollectedCount, ChunkLastKey, Results} =
+        case Snapshot of
+            undefined ->
+                barrel_store_rocksdb:fold_range(
+                    StoreRef, ActualStartKey, EndKey, FoldFun, {0, undefined, []});
+            _ ->
+                barrel_store_rocksdb:fold_range_with_snapshot(
+                    StoreRef, ActualStartKey, EndKey, FoldFun, {0, undefined, []}, Snapshot)
+        end,
+
+    %% Check if we have more results
+    HasMore = CollectedCount > ChunkSize,
+
+    %% Take only ChunkSize results (drop the extra one if present)
+    FinalResults0 = case HasMore of
+        true -> tl(Results);  %% Drop the extra one (results are reversed)
+        false -> Results
+    end,
+    FinalResults = apply_offset_limit(lists:reverse(FinalResults0), Offset, ChunkSize),
+
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    case HasMore of
+        true ->
+            %% Create cursor with the key of the last result we're returning
+            Token = barrel_query_cursor:create(
+                StoreRef, DbName, pure_equality, ChunkLastKey, Snapshot),
+            {ok, FinalResults, #{last_seq => LastSeq, has_more => true, continuation => Token}};
+        false ->
+            %% No more results - release snapshot
+            maybe_release_snapshot(Snapshot),
+            {ok, FinalResults, #{last_seq => LastSeq, has_more => false}}
+    end.
+
+%% @private Execute chunked pure exists query
+execute_pure_exists_chunked(StoreRef, DbName, Path, Plan, ChunkSize, StartKey, Snapshot) ->
+    #query_plan{offset = Offset} = Plan,
+
+    %% Determine start key for iteration
+    ActualStartKey = case StartKey of
+        undefined ->
+            barrel_store_keys:path_posting_prefix(DbName, Path);
+        Key ->
+            <<Key/binary, 0>>
+    end,
+    EndKey = barrel_store_keys:path_posting_end(DbName, Path),
+
+    %% Collect ChunkSize + 1 to detect if there are more
+    MaxCollect = ChunkSize + 1,
+
+    %% Fold over posting lists
+    FoldResult = barrel_store_rocksdb:fold_range_posting_with_snapshot(
+        StoreRef, ActualStartKey, EndKey,
+        fun(Key, DocIds, {Seen, Count, LastK, Acc}) ->
+            process_exists_docids_chunked(DocIds, Key, Seen, Count, LastK, Acc, MaxCollect)
+        end,
+        {#{}, 0, undefined, []},
+        case Snapshot of undefined -> barrel_store_rocksdb:snapshot(StoreRef); S -> {ok, S} end
+    ),
+
+    {_, CollectedCount, LastCollectedKey, Results} = FoldResult,
+
+    HasMore = CollectedCount > ChunkSize,
+    FinalResults0 = case HasMore of
+        true -> tl(Results);
+        false -> Results
+    end,
+    FinalResults = apply_offset_limit(lists:reverse(FinalResults0), Offset, ChunkSize),
+
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    case HasMore of
+        true ->
+            Token = barrel_query_cursor:create(
+                StoreRef, DbName, pure_exists, LastCollectedKey, Snapshot),
+            {ok, FinalResults, #{last_seq => LastSeq, has_more => true, continuation => Token}};
+        false ->
+            maybe_release_snapshot(Snapshot),
+            {ok, FinalResults, #{last_seq => LastSeq, has_more => false}}
+    end.
+
+%% @private Execute chunked pure prefix query
+execute_pure_prefix_chunked(StoreRef, DbName, Path, Prefix, Plan, ChunkSize, StartKey, Snapshot) ->
+    #query_plan{offset = Offset} = Plan,
+
+    %% Build prefix range
+    FullPath = Path ++ [Prefix],
+    ActualStartKey = case StartKey of
+        undefined ->
+            barrel_store_keys:path_posting_prefix(DbName, FullPath);
+        Key ->
+            <<Key/binary, 0>>
+    end,
+
+    %% End key for prefix scan: path + prefix + 0xFF
+    EndKey = barrel_store_keys:path_posting_end(DbName, FullPath),
+
+    MaxCollect = ChunkSize + 1,
+
+    FoldResult = barrel_store_rocksdb:fold_range_posting_with_snapshot(
+        StoreRef, ActualStartKey, EndKey,
+        fun(Key, DocIds, {Seen, Count, LastK, Acc}) ->
+            process_prefix_docids_chunked(DocIds, Key, Seen, Count, LastK, Acc, MaxCollect)
+        end,
+        {#{}, 0, undefined, []},
+        case Snapshot of undefined -> barrel_store_rocksdb:snapshot(StoreRef); S -> {ok, S} end
+    ),
+
+    {_, CollectedCount, LastCollectedKey, Results} = FoldResult,
+
+    HasMore = CollectedCount > ChunkSize,
+    FinalResults0 = case HasMore of
+        true -> tl(Results);
+        false -> Results
+    end,
+    FinalResults = apply_offset_limit(lists:reverse(FinalResults0), Offset, ChunkSize),
+
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    case HasMore of
+        true ->
+            Token = barrel_query_cursor:create(
+                StoreRef, DbName, pure_prefix, LastCollectedKey, Snapshot),
+            {ok, FinalResults, #{last_seq => LastSeq, has_more => true, continuation => Token}};
+        false ->
+            maybe_release_snapshot(Snapshot),
+            {ok, FinalResults, #{last_seq => LastSeq, has_more => false}}
+    end.
+
+%% @private Process DocIds for chunked exists query
+process_exists_docids_chunked([], _Key, Seen, Count, LastKey, Acc, _MaxCollect) ->
+    {ok, {Seen, Count, LastKey, Acc}};
+process_exists_docids_chunked([DocId | Rest], Key, Seen, Count, _LastKey, Acc, MaxCollect) ->
+    case maps:is_key(DocId, Seen) of
+        true ->
+            process_exists_docids_chunked(Rest, Key, Seen, Count, Key, Acc, MaxCollect);
+        false ->
+            NewSeen = Seen#{DocId => true},
+            NewCount = Count + 1,
+            NewAcc = [#{<<"id">> => DocId} | Acc],
+            case NewCount >= MaxCollect of
+                true ->
+                    {stop, {NewSeen, NewCount, Key, NewAcc}};
+                false ->
+                    process_exists_docids_chunked(Rest, Key, NewSeen, NewCount, Key, NewAcc, MaxCollect)
+            end
+    end.
+
+%% @private Process DocIds for chunked prefix query
+process_prefix_docids_chunked([], _Key, Seen, Count, LastKey, Acc, _MaxCollect) ->
+    {ok, {Seen, Count, LastKey, Acc}};
+process_prefix_docids_chunked([DocId | Rest], Key, Seen, Count, _LastKey, Acc, MaxCollect) ->
+    case maps:is_key(DocId, Seen) of
+        true ->
+            process_prefix_docids_chunked(Rest, Key, Seen, Count, Key, Acc, MaxCollect);
+        false ->
+            NewSeen = Seen#{DocId => true},
+            NewCount = Count + 1,
+            NewAcc = [#{<<"id">> => DocId} | Acc],
+            case NewCount >= MaxCollect of
+                true ->
+                    {stop, {NewSeen, NewCount, Key, NewAcc}};
+                false ->
+                    process_prefix_docids_chunked(Rest, Key, NewSeen, NewCount, Key, NewAcc, MaxCollect)
+            end
+    end.
+
+%% @private Release snapshot if present
+maybe_release_snapshot(undefined) -> ok;
+maybe_release_snapshot(Snapshot) ->
+    catch barrel_store_rocksdb:release_snapshot(Snapshot),
+    ok.
+
+%% @private Convert cursor record to map for pattern matching
+cursor_to_map(Cursor) ->
+    %% Cursor is a record, extract fields
+    #{
+        snapshot => element(5, Cursor),    %% #cursor.snapshot
+        last_key => element(6, Cursor),    %% #cursor.last_key
+        query_type => element(7, Cursor)   %% #cursor.query_type
+    }.
+
+%% @private Validate cursor matches current query plan
+validate_cursor_for_plan(_QueryType, _Plan) ->
+    %% For now, just accept - could add stricter validation
+    ok.
 
 %% @doc Execute query with a snapshot for read consistency
 execute_with_snapshot(StoreRef, DbName, Plan, Snapshot) ->
@@ -579,58 +929,75 @@ select_read_profile(_, _) ->
 %% @doc Execute using direct index key lookup (fastest)
 %% Uses prefix bloom filters for O(1) skip of non-matching SST blocks.
 execute_index_seek(StoreRef, DbName, Plan, Snapshot) ->
-    #query_plan{conditions = Conditions, order = Order, limit = Limit, offset = Offset} = Plan,
+    #query_plan{conditions = Conditions, include_docs = IncludeDocs,
+                projections = Projections} = Plan,
 
     %% Find the first equality condition to use for index lookup
     case find_first_equality(Conditions) of
         {ok, {path, Path, Value} = IndexCond} ->
             FullPath = Path ++ [Value],
 
-            %% O(1) cardinality check - skip iteration if no matches
-            Cardinality = case barrel_ars_index:get_path_cardinality(StoreRef, DbName, FullPath) of
-                {ok, C} -> C;
-                {error, _} -> 1  %% Assume at least 1 if error
-            end,
-            case Cardinality of
-                0 ->
-                    %% No matches - skip iteration entirely
-                    filter_and_project(StoreRef, DbName, [], Plan, Snapshot);
+            %% Compute remaining conditions (index condition already satisfied by iteration)
+            RemainingConds = Conditions -- [IndexCond],
+
+            %% Check for pure equality: single condition, no doc body needed
+            NeedsBody = IncludeDocs orelse needs_body_for_projection(Projections),
+            case {RemainingConds, NeedsBody} of
+                {[], false} ->
+                    %% Pure equality - return DocIds directly from posting list
+                    execute_pure_equality(StoreRef, DbName, Path, Value, Plan, Snapshot);
                 _ ->
-                    %% Compute remaining conditions (index condition already satisfied by iteration)
-                    RemainingConds = Conditions -- [IndexCond],
-                    %% Index condition already satisfied - use remaining conditions only
-                    FilterPlan = Plan#query_plan{conditions = RemainingConds},
-                    case Limit of
-                        undefined ->
-                            %% Unbounded query - use adaptive chunked execution
-                            execute_index_seek_chunked(StoreRef, DbName, FullPath, FilterPlan, Snapshot);
-                        _ when is_integer(Limit) ->
-                            %% Limited query - check streaming vs batch
-                            case should_use_streaming(Limit, Cardinality) of
-                                true ->
-                                    %% Streaming: fetch/match documents one-by-one
-                                    execute_index_seek_streaming(StoreRef, DbName, FullPath, FilterPlan, Snapshot);
-                                false ->
-                                    %% Batch: collect DocIds then fetch/filter
-                                    %% PROFILING: Index iteration
-                                    T0 = erlang:monotonic_time(microsecond),
-                                    EarlyLimitResult = can_use_early_limit(Order, RemainingConds, Limit),
-                                    DocIds = case EarlyLimitResult of
-                                        {true, MaxCollect} ->
-                                            collect_docids_for_path_limited(StoreRef, DbName, FullPath, MaxCollect + Offset);
-                                        false ->
-                                            collect_docids_for_path(StoreRef, DbName, FullPath)
-                                    end,
-                                    T1 = erlang:monotonic_time(microsecond),
-                                    put(profile_index_iter, pdict_get(profile_index_iter, 0) + (T1 - T0)),
-                                    put(profile_doc_count, length(DocIds)),
-                                    filter_and_project(StoreRef, DbName, DocIds, FilterPlan, Snapshot)
-                            end
-                    end
+                    %% Need doc fetch - original path
+                    execute_index_seek_with_fetch(StoreRef, DbName, FullPath, RemainingConds, Plan, Snapshot)
             end;
         not_found ->
             %% Fallback to scan
             execute_index_scan(StoreRef, DbName, Plan, Snapshot)
+    end.
+
+%% @doc Execute index seek that requires document fetching
+execute_index_seek_with_fetch(StoreRef, DbName, FullPath, RemainingConds, Plan, Snapshot) ->
+    #query_plan{order = Order, limit = Limit, offset = Offset} = Plan,
+
+    %% O(1) cardinality check - skip iteration if no matches
+    Cardinality = case barrel_ars_index:get_path_cardinality(StoreRef, DbName, FullPath) of
+        {ok, C} -> C;
+        {error, _} -> 1  %% Assume at least 1 if error
+    end,
+    case Cardinality of
+        0 ->
+            %% No matches - skip iteration entirely
+            filter_and_project(StoreRef, DbName, [], Plan, Snapshot);
+        _ ->
+            %% Index condition already satisfied - use remaining conditions only
+            FilterPlan = Plan#query_plan{conditions = RemainingConds},
+            case Limit of
+                undefined ->
+                    %% Unbounded query - use adaptive chunked execution
+                    execute_index_seek_chunked(StoreRef, DbName, FullPath, FilterPlan, Snapshot);
+                _ when is_integer(Limit) ->
+                    %% Limited query - check streaming vs batch
+                    case should_use_streaming(Limit, Cardinality) of
+                        true ->
+                            %% Streaming: fetch/match documents one-by-one
+                            execute_index_seek_streaming(StoreRef, DbName, FullPath, FilterPlan, Snapshot);
+                        false ->
+                            %% Batch: collect DocIds then fetch/filter
+                            %% PROFILING: Index iteration
+                            T0 = erlang:monotonic_time(microsecond),
+                            EarlyLimitResult = can_use_early_limit(Order, RemainingConds, Limit),
+                            DocIds = case EarlyLimitResult of
+                                {true, MaxCollect} ->
+                                    collect_docids_for_path_limited(StoreRef, DbName, FullPath, MaxCollect + Offset);
+                                false ->
+                                    collect_docids_for_path(StoreRef, DbName, FullPath)
+                            end,
+                            T1 = erlang:monotonic_time(microsecond),
+                            put(profile_index_iter, pdict_get(profile_index_iter, 0) + (T1 - T0)),
+                            put(profile_doc_count, length(DocIds)),
+                            filter_and_project(StoreRef, DbName, DocIds, FilterPlan, Snapshot)
+                    end
+            end
     end.
 
 %% @doc Execute index seek using streaming approach
@@ -912,6 +1279,8 @@ execute_index_scan(StoreRef, DbName, Plan, Snapshot) ->
     #query_plan{conditions = Conditions} = Plan,
     %% Classify query for pure index execution (no doc fetch)
     case classify_scan_query(Conditions, Plan) of
+        {pure_equality, Path, Value} ->
+            execute_pure_equality(StoreRef, DbName, Path, Value, Plan, Snapshot);
         {pure_exists, Path} ->
             execute_pure_exists(StoreRef, DbName, Path, Plan, Snapshot);
         {pure_prefix, Path, Prefix} ->
@@ -923,10 +1292,12 @@ execute_index_scan(StoreRef, DbName, Plan, Snapshot) ->
 
 %% @doc Classify scan query for pure index execution.
 %% Returns:
+%%   {pure_equality, Path, Value} - exact match, return DocIds from posting list
 %%   {pure_exists, Path} - exists check, return DocIds from posting lists
 %%   {pure_prefix, Path, Prefix} - prefix match, return DocIds from posting lists
 %%   needs_body - requires doc body fetch for filtering/projection
 -spec classify_scan_query([condition()], query_plan()) ->
+    {pure_equality, [term()], term()} |
     {pure_exists, [term()]} |
     {pure_prefix, [term()], binary()} |
     needs_body.
@@ -934,6 +1305,12 @@ classify_scan_query(Conditions, Plan) ->
     #query_plan{include_docs = IncludeDocs, projections = Projections} = Plan,
     NeedsBody = IncludeDocs orelse needs_body_for_projection(Projections),
     case {Conditions, NeedsBody} of
+        {[{path, Path, Value}], false} ->
+            %% Pure equality - only if value is concrete (not a logic var)
+            case is_logic_var(Value) of
+                true -> needs_body;
+                false -> {pure_equality, Path, Value}
+            end;
         {[{exists, Path}], false} ->
             {pure_exists, Path};
         {[{prefix, Path, Prefix}], false} ->
@@ -997,7 +1374,7 @@ process_exists_docids([DocId | Rest], Seen, Count, Acc, MaxCollect) ->
             %% New doc
             NewSeen = Seen#{DocId => true},
             NewCount = Count + 1,
-            NewAcc = [#{id => DocId} | Acc],
+            NewAcc = [#{<<"id">> => DocId} | Acc],
             case MaxCollect =/= undefined andalso NewCount >= MaxCollect of
                 true ->
                     {stop, {NewSeen, NewCount, NewAcc}};
@@ -1042,6 +1419,44 @@ execute_pure_prefix(StoreRef, DbName, Path, Prefix, Plan, Snapshot) ->
 
     {ok, Results2, LastSeq}.
 
+%% @doc Execute pure equality query - iterates value-first index with early termination
+%% Uses prefix scan on individual keys, stops after collecting enough results
+execute_pure_equality(StoreRef, DbName, Path, Value, Plan, Snapshot) ->
+    #query_plan{
+        limit = Limit,
+        offset = Offset
+    } = Plan,
+
+    %% Calculate how many docs we need to collect
+    MaxCollect = case Limit of
+        undefined -> undefined;
+        L -> L + Offset
+    end,
+
+    %% Fold over value-first index with early termination
+    %% Path is the field path, Value is what we're searching for
+    FoldFun = fun(DocId, {Count, Acc}) ->
+        NewCount = Count + 1,
+        NewAcc = [#{<<"id">> => DocId} | Acc],
+        case MaxCollect =/= undefined andalso NewCount >= MaxCollect of
+            true ->
+                %% Collected enough, stop iteration
+                {stop, {NewCount, NewAcc}};
+            false ->
+                {ok, {NewCount, NewAcc}}
+        end
+    end,
+    {_, Results} = barrel_ars_index:fold_value_index(
+        StoreRef, DbName, Value, Path, FoldFun, {0, []}, Snapshot),
+
+    %% Results are in reverse order, fix and apply offset
+    FinalResults = apply_offset_limit(lists:reverse(Results), Offset, Limit),
+
+    %% Get last sequence
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    {ok, FinalResults, LastSeq}.
+
 %% @private Process DocIds from a posting list for prefix query
 process_prefix_docids([], Seen, Count, Acc, _MaxCollect) ->
     {ok, {Seen, Count, Acc}};
@@ -1054,7 +1469,7 @@ process_prefix_docids([DocId | Rest], Seen, Count, Acc, MaxCollect) ->
             %% New doc
             NewSeen = Seen#{DocId => true},
             NewCount = Count + 1,
-            NewAcc = [#{id => DocId} | Acc],
+            NewAcc = [#{<<"id">> => DocId} | Acc],
             case MaxCollect =/= undefined andalso NewCount >= MaxCollect of
                 true ->
                     {stop, {NewSeen, NewCount, NewAcc}};
