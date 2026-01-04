@@ -899,18 +899,44 @@ fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) 
 %% @doc Execute using index prefix scan
 execute_index_scan(StoreRef, DbName, Plan) ->
     #query_plan{conditions = Conditions} = Plan,
-    %% Fast path for pure exists queries - no doc body fetch needed
-    case is_pure_exists_query(Conditions) of
-        {true, Path} ->
+    %% Classify query for pure index execution (no doc fetch)
+    case classify_scan_query(Conditions, Plan) of
+        {pure_exists, Path} ->
             execute_pure_exists(StoreRef, DbName, Path, Plan);
-        false ->
+        {pure_prefix, Path, Prefix} ->
+            execute_pure_prefix(StoreRef, DbName, Path, Prefix, Plan);
+        needs_body ->
             DocIds = collect_scan_docids(StoreRef, DbName, Conditions),
             filter_and_project(StoreRef, DbName, DocIds, Plan)
     end.
 
-%% @doc Check if query is a pure exists condition (nothing else)
-is_pure_exists_query([{exists, Path}]) -> {true, Path};
-is_pure_exists_query(_) -> false.
+%% @doc Classify scan query for pure index execution.
+%% Returns:
+%%   {pure_exists, Path} - exists check, return DocIds from posting lists
+%%   {pure_prefix, Path, Prefix} - prefix match, return DocIds from posting lists
+%%   needs_body - requires doc body fetch for filtering/projection
+-spec classify_scan_query([condition()], query_plan()) ->
+    {pure_exists, [term()]} |
+    {pure_prefix, [term()], binary()} |
+    needs_body.
+classify_scan_query(Conditions, Plan) ->
+    #query_plan{include_docs = IncludeDocs, projections = Projections} = Plan,
+    NeedsBody = IncludeDocs orelse needs_body_for_projection(Projections),
+    case {Conditions, NeedsBody} of
+        {[{exists, Path}], false} ->
+            {pure_exists, Path};
+        {[{prefix, Path, Prefix}], false} ->
+            {pure_prefix, Path, Prefix};
+        _ ->
+            needs_body
+    end.
+
+%% @doc Check if projections require document body
+needs_body_for_projection(['*']) -> false;
+needs_body_for_projection([]) -> false;
+needs_body_for_projection(Projections) ->
+    %% Projections require body if they include path references
+    lists:any(fun(P) -> is_list(P) end, Projections).
 
 %% @doc Execute pure exists query - iterate posting lists directly
 %% Path index only contains non-deleted docs, so no doc_current check needed
@@ -965,6 +991,62 @@ process_exists_docids([DocId | Rest], Seen, Count, Acc, MaxCollect) ->
                     {stop, {NewSeen, NewCount, NewAcc}};
                 false ->
                     process_exists_docids(Rest, NewSeen, NewCount, NewAcc, MaxCollect)
+            end
+    end.
+
+%% @doc Execute pure prefix query - iterate posting lists directly
+%% No doc_current check needed since path index only contains non-deleted docs
+%% Uses fold_prefix_posting which gets raw DocId lists per posting list key
+execute_pure_prefix(StoreRef, DbName, Path, Prefix, Plan) ->
+    #query_plan{
+        limit = Limit,
+        offset = Offset
+    } = Plan,
+
+    %% Calculate how many unique docs we need
+    MaxCollect = case Limit of
+        undefined -> undefined;
+        L -> L + Offset
+    end,
+
+    %% Iterate posting lists directly - each key contains a list of DocIds
+    %% Much more efficient than fold_prefix which expands to individual tuples
+    {_, _, Results} = barrel_ars_index:fold_prefix_posting(
+        StoreRef, DbName, Path, Prefix,
+        fun(_Key, DocIds, {Seen, Count, Acc}) ->
+            %% Process all DocIds from this posting list
+            process_prefix_docids(DocIds, Seen, Count, Acc, MaxCollect)
+        end,
+        {#{}, 0, []}
+    ),
+
+    %% Apply offset and limit (results are in reverse order)
+    Results1 = lists:reverse(Results),
+    Results2 = apply_offset_limit(Results1, Offset, Limit),
+
+    %% Get last sequence
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    {ok, Results2, LastSeq}.
+
+%% @private Process DocIds from a posting list for prefix query
+process_prefix_docids([], Seen, Count, Acc, _MaxCollect) ->
+    {ok, {Seen, Count, Acc}};
+process_prefix_docids([DocId | Rest], Seen, Count, Acc, MaxCollect) ->
+    case maps:is_key(DocId, Seen) of
+        true ->
+            %% Already seen this doc, skip
+            process_prefix_docids(Rest, Seen, Count, Acc, MaxCollect);
+        false ->
+            %% New doc
+            NewSeen = Seen#{DocId => true},
+            NewCount = Count + 1,
+            NewAcc = [#{id => DocId} | Acc],
+            case MaxCollect =/= undefined andalso NewCount >= MaxCollect of
+                true ->
+                    {stop, {NewSeen, NewCount, NewAcc}};
+                false ->
+                    process_prefix_docids(Rest, NewSeen, NewCount, NewAcc, MaxCollect)
             end
     end.
 

@@ -47,8 +47,14 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running prefix queries...~n"),
     PrefixQ = barrel_bench_metrics:summarize(bench_query(Db, prefix_query(), Iterations)),
 
+    io:format("  Running prefix with LIMIT 10...~n"),
+    PrefixLimit = barrel_bench_metrics:summarize(bench_query(Db, prefix_limit_query(), Iterations)),
+
     io:format("  Running exists queries...~n"),
     ExistsQ = barrel_bench_metrics:summarize(bench_query(Db, exists_query(), Iterations)),
+
+    io:format("  Running exists with LIMIT 10...~n"),
+    ExistsLimit = barrel_bench_metrics:summarize(bench_query(Db, exists_limit_query(), Iterations)),
 
     #{
         simple_eq => SimpleEq,
@@ -59,7 +65,9 @@ run(Db, NumDocs, Iterations) ->
         order_by_limit => TopK,
         pure_topk => PureTopK,
         prefix => PrefixQ,
-        exists => ExistsQ
+        prefix_limit => PrefixLimit,
+        exists => ExistsQ,
+        exists_limit => ExistsLimit
     }.
 
 %%====================================================================
@@ -103,12 +111,24 @@ pure_order_limit_query() ->
 prefix_query() ->
     %% Prefix query: find all users whose name starts with "User 1"
     %% Uses optimized interval scan instead of full scan + regex
-    #{where => [{prefix, [<<"name">>], <<"User 1">>}]}.
+    %% include_docs => false enables pure index path (no doc body fetch)
+    #{where => [{prefix, [<<"name">>], <<"User 1">>}], include_docs => false}.
+
+prefix_limit_query() ->
+    %% Prefix query with LIMIT - tests early termination
+    %% Should be very fast regardless of how many docs match
+    #{where => [{prefix, [<<"name">>], <<"User 1">>}], limit => 10, include_docs => false}.
 
 exists_query() ->
     %% Exists query: find all docs that have a "profile" field
     %% Uses path index scan without fetching full documents
-    #{where => [{exists, [<<"profile">>]}]}.
+    %% include_docs => false enables pure index path (no doc body fetch)
+    #{where => [{exists, [<<"profile">>]}], include_docs => false}.
+
+exists_limit_query() ->
+    %% Exists query with LIMIT - tests early termination
+    %% Should be very fast regardless of how many docs have the field
+    #{where => [{exists, [<<"profile">>]}], limit => 10, include_docs => false}.
 
 %%====================================================================
 %% Internal functions

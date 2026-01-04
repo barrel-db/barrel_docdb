@@ -24,6 +24,7 @@
     fold_path_values_reverse/5, fold_path_values_reverse/6,
     fold_prefix/6, fold_prefix/7,
     fold_posting/5, fold_posting/6,
+    fold_prefix_posting/6,
     get_posting_list/3
 ]).
 
@@ -476,6 +477,21 @@ fold_prefix(StoreRef, DbName, Path, Prefix, Fun, Acc0, _Profile) when is_binary(
 -spec fold_posting(store_ref(), db_name(), [term()], fun(), term()) -> term().
 fold_posting(StoreRef, DbName, PathPrefix, Fun, Acc0) ->
     fold_posting(StoreRef, DbName, PathPrefix, Fun, Acc0, short_range).
+
+%% @doc Fold over posting lists matching a value prefix.
+%% Like fold_prefix but returns raw DocId lists instead of expanding to tuples.
+%% Much more efficient for pure prefix queries with early termination.
+%% The callback receives (DocIds, Acc) for each posting list.
+%% Example: fold_prefix_posting(S, Db, [<<"name">>], <<"John">>, Fun, Acc)
+%%   matches: John, Johnny, Johnson, etc.
+-spec fold_prefix_posting(store_ref(), db_name(), [term()], binary(), fun(), term()) -> term().
+fold_prefix_posting(StoreRef, DbName, Path, Prefix, Fun, Acc0) when is_binary(Prefix) ->
+    StartPath = Path ++ [Prefix],
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, StartPath),
+    EndPrefix = <<Prefix/binary, 16#FF>>,
+    EndPath = Path ++ [EndPrefix],
+    EndKey = barrel_store_keys:path_posting_prefix(DbName, EndPath),
+    barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, Fun, Acc0).
 
 %% @doc Fold over posting lists with explicit read profile.
 -spec fold_posting(store_ref(), db_name(), [term()], fun(), term(), read_profile()) -> term().
