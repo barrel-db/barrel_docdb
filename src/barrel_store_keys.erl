@@ -21,7 +21,7 @@
 %% Column-wide document keys (CBOR codec)
 -export([doc_current/2, doc_current_prefix/1, doc_current_end/1]).
 -export([doc_tree/2]).
--export([doc_body/3, doc_body_prefix/2]).
+-export([doc_body/2, doc_body_rev/3]).
 
 %% Wide column document keys (entity storage)
 -export([doc_entity/2, doc_entity_prefix/1, doc_entity_end/1]).
@@ -108,7 +108,7 @@
 %% Column-wide document storage prefixes (for CBOR codec integration)
 -define(PREFIX_DOC_CURRENT, 16#11).  %% DbName + DocId → {rev, deleted, hlc}
 -define(PREFIX_DOC_TREE, 16#12).     %% DbName + DocId → revtree (term_to_binary)
--define(PREFIX_DOC_BODY, 16#13).     %% DbName + DocId + Rev → CBOR body
+-define(PREFIX_DOC_BODY, 16#13).     %% DbName + DocId → CBOR body (current only)
 
 %% Path component type tags (for ordered encoding)
 -define(PATH_TYPE_NULL, 16#01).
@@ -321,15 +321,17 @@ doc_current_end(DbName) ->
 doc_tree(DbName, DocId) ->
     <<?PREFIX_DOC_TREE, (encode_name(DbName))/binary, DocId/binary>>.
 
-%% @doc Document body key (stores CBOR-encoded body for specific revision)
--spec doc_body(db_name(), docid(), revid()) -> binary().
-doc_body(DbName, DocId, RevId) ->
-    <<?PREFIX_DOC_BODY, (encode_name(DbName))/binary, DocId/binary, $:, RevId/binary>>.
+%% @doc Document body key for current revision (no revision in key).
+%% This enables direct body fetch without knowing the revision.
+-spec doc_body(db_name(), docid()) -> binary().
+doc_body(DbName, DocId) ->
+    <<?PREFIX_DOC_BODY, (encode_name(DbName))/binary, DocId/binary>>.
 
-%% @doc Prefix for all body revisions of a document
--spec doc_body_prefix(db_name(), docid()) -> binary().
-doc_body_prefix(DbName, DocId) ->
-    <<?PREFIX_DOC_BODY, (encode_name(DbName))/binary, DocId/binary, $:>>.
+%% @doc Document body key for a specific (non-current) revision.
+%% Used to store old revision bodies when updating a document.
+-spec doc_body_rev(db_name(), docid(), revid()) -> binary().
+doc_body_rev(DbName, DocId, RevId) ->
+    <<?PREFIX_DOC_BODY, (encode_name(DbName))/binary, DocId/binary, $:, RevId/binary>>.
 
 %%====================================================================
 %% Wide Column Document Keys (Entity Storage)

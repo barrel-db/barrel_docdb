@@ -1587,44 +1587,23 @@ execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan, _Snapshot) ->
 
     {ok, FinalResults, LastSeq}.
 
-%% @doc Fetch a document and check if it matches conditions (wide column entity)
-%% Returns {ok, Doc, BoundVars} or {ok_cbor, CborBin, BoundVars} or skip
-%% When IncludeDocs is false, returns CBOR binary to avoid full decode
-fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) ->
-    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
-    case barrel_store_rocksdb:get(StoreRef, DocEntityKey) of
-        {ok, EntityBin} ->
-            Columns = binary_to_term(EntityBin),
-            Rev = proplists:get_value(<<"rev">>, Columns),
-            DeletedBin = proplists:get_value(<<"del">>, Columns, <<"false">>),
-            Deleted = DeletedBin =:= <<"true">>,
-            case Deleted of
-                true ->
-                    skip;
+%% @doc Fetch a document and check if it matches conditions (direct body fetch)
+%% Returns {ok, Doc, BoundVars} or skip
+%% No entity lookup needed - body is stored at doc_body(DbName, DocId)
+fetch_and_match_doc(_StoreRef, DbName, DocId, Conditions, Bindings, _IncludeDocs) ->
+    %% Direct body fetch - no entity lookup needed!
+    case barrel_doc_body_store:get_current_body(DbName, DocId) of
+        {ok, CborBin} ->
+            %% Decode to map for condition matching
+            Doc = barrel_docdb_codec_cbor:decode_any(CborBin),
+            case matches_conditions(Doc, Conditions, Bindings) of
+                {true, BoundVars} ->
+                    {ok, Doc, BoundVars};
                 false ->
-                    %% Fetch doc body from body store (BlobDB)
-                    case barrel_doc_body_store:get_body(DbName, DocId, Rev) of
-                        {ok, CborBin} ->
-                            %% Decode to map for condition matching
-                            %% Plain CBOR or indexed - decode_any handles both
-                            Doc = barrel_docdb_codec_cbor:decode_any(CborBin),
-                            case matches_conditions(Doc, Conditions, Bindings) of
-                                {true, BoundVars} ->
-                                    case IncludeDocs of
-                                        true ->
-                                            {ok, Doc, BoundVars};
-                                        false ->
-                                            %% Return decoded map for projection
-                                            {ok, Doc, BoundVars}
-                                    end;
-                                false ->
-                                    skip
-                            end;
-                        _ ->
-                            skip
-                    end
+                    skip
             end;
         _ ->
+            %% Doc deleted or not found
             skip
     end.
 
@@ -2487,85 +2466,47 @@ filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot) ->
 
     {ok, Results2, LastSeq}.
 
-%% @doc Batch fetch documents using multi_get (wide column entity storage)
-%% Decodes documents to maps for condition matching and projection
-batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs, Snapshot) ->
+%% @doc Batch fetch documents using direct body fetch (no entity lookup needed).
+%% With current body stored without revision key, we can skip the entity fetch entirely
+%% for include_docs queries, providing a major performance improvement.
+batch_fetch_and_filter(_StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs, _Snapshot) ->
     case DocIds of
         [] -> [];
         _ ->
-            %% PROFILING: Doc entity fetch
+            %% Direct body fetch - no entity lookup needed!
+            %% Current body is stored at doc_body(DbName, DocId) without revision
             T0 = erlang:monotonic_time(microsecond),
-            DocEntityKeys = [barrel_store_keys:doc_entity(DbName, Id) || Id <- DocIds],
-            DocEntityResults = barrel_store_rocksdb:multi_get_with_snapshot(StoreRef, DocEntityKeys, Snapshot),
+            DocBodyResults = barrel_doc_body_store:multi_get_current_bodies(DbName, DocIds),
             T1 = erlang:monotonic_time(microsecond),
-            put(profile_docinfo_fetch, pdict_get(profile_docinfo_fetch, 0) + (T1 - T0)),
+            put(profile_docbody_fetch, pdict_get(profile_docbody_fetch, 0) + (T1 - T0)),
 
-            %% Step 2: Filter deleted docs, collect {DocId, Rev} pairs for body fetch
-            {ActiveDocIdRevs, ActiveDocIds} = lists:foldl(
-                fun({DocId, Result}, {AccPairs, AccDocs}) ->
-                    case Result of
-                        {ok, EntityBin} ->
-                            %% Decode entity columns (stored as term_to_binary proplist)
-                            Columns = binary_to_term(EntityBin),
-                            Rev = proplists:get_value(<<"rev">>, Columns),
-                            DeletedBin = proplists:get_value(<<"del">>, Columns, <<"false">>),
-                            Deleted = DeletedBin =:= <<"true">>,
-                            case Deleted of
-                                true ->
-                                    {AccPairs, AccDocs};
+            %% Decode and condition matching + projection
+            T2 = erlang:monotonic_time(microsecond),
+            Results = lists:filtermap(
+                fun({DocId, BodyResult}) ->
+                    case BodyResult of
+                        {ok, CborBin} ->
+                            %% Decode to map (handles both indexed and plain CBOR)
+                            Doc = barrel_docdb_codec_cbor:decode_any(CborBin),
+                            case matches_conditions(Doc, Conditions, Bindings) of
+                                {true, BoundVars} ->
+                                    Result = project_result(Doc, DocId, Projections, BoundVars, IncludeDocs),
+                                    {true, Result};
                                 false ->
-                                    {[{DocId, Rev} | AccPairs], [DocId | AccDocs]}
+                                    false
                             end;
                         not_found ->
-                            {AccPairs, AccDocs};
+                            %% Doc was deleted or doesn't exist
+                            false;
                         {error, _} ->
-                            {AccPairs, AccDocs}
+                            false
                     end
                 end,
-                {[], []},
-                lists:zip(DocIds, DocEntityResults)
+                lists:zip(DocIds, DocBodyResults)
             ),
-
-            %% Step 3: Batch fetch all CBOR doc bodies from body store (BlobDB)
-            case ActiveDocIdRevs of
-                [] -> [];
-                _ ->
-                    %% PROFILING: Doc body fetch
-                    T2 = erlang:monotonic_time(microsecond),
-                    ReversedDocIds = lists:reverse(ActiveDocIds),
-                    ReversedDocIdRevs = lists:reverse(ActiveDocIdRevs),
-                    DocBodyResults = barrel_doc_body_store:multi_get_bodies(DbName, ReversedDocIdRevs, #{}),
-                    T3 = erlang:monotonic_time(microsecond),
-                    put(profile_docbody_fetch, pdict_get(profile_docbody_fetch, 0) + (T3 - T2)),
-
-                    %% PROFILING: Decode and condition matching + projection
-                    T4 = erlang:monotonic_time(microsecond),
-                    Results = lists:filtermap(
-                        fun({DocId, BodyResult}) ->
-                            case BodyResult of
-                                {ok, CborBin} ->
-                                    %% Decode to map (handles both indexed and plain CBOR)
-                                    Doc = barrel_docdb_codec_cbor:decode_any(CborBin),
-                                    case matches_conditions(Doc, Conditions, Bindings) of
-                                        {true, BoundVars} ->
-                                            Result = project_result(Doc, DocId, Projections, BoundVars, IncludeDocs),
-                                            {true, Result};
-                                        false ->
-                                            false
-                                    end;
-                                not_found ->
-                                    false;
-                                {error, _} ->
-                                    false
-                            end
-                        end,
-                        lists:zip(ReversedDocIds, DocBodyResults)
-                    ),
-                    T5 = erlang:monotonic_time(microsecond),
-                    put(profile_deser_match, pdict_get(profile_deser_match, 0) + (T5 - T4)),
-                    _ = Snapshot,  %% Snapshot is used for doc_current, body store has its own consistency
-                    Results
-            end
+            T3 = erlang:monotonic_time(microsecond),
+            put(profile_deser_match, pdict_get(profile_deser_match, 0) + (T3 - T2)),
+            Results
     end.
 
 %% @doc Check if a document matches all conditions

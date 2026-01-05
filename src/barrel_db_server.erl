@@ -460,7 +460,7 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
 
     %% Check for existing document (wide column entity)
     DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
-    {OldHlc, OldRevTree, OldDocBody} = case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
+    {OldHlc, OldRev, OldRevTree, OldDocBody} = case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
         {ok, Columns} ->
             ExistingRev = proplists:get_value(?COL_REV, Columns),
             ExistingHlc = barrel_hlc:decode(proplists:get_value(?COL_HLC, Columns)),
@@ -468,15 +468,15 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
                 undefined -> #{};
                 TreeBin -> binary_to_term(TreeBin)
             end,
-            %% Get old doc body for path index diff from body CF
+            %% Get old doc body for path index diff from body CF (current body, no rev in key)
             OldBody = case barrel_store_rocksdb:body_get(StoreRef,
-                            barrel_store_keys:doc_body(DbName, DocId, ExistingRev)) of
+                            barrel_store_keys:doc_body(DbName, DocId)) of
                 {ok, OldCborBin} -> OldCborBin;
                 not_found -> undefined
             end,
-            {ExistingHlc, OldTree, OldBody};
+            {ExistingHlc, ExistingRev, OldTree, OldBody};
         not_found ->
-            {undefined, #{}, undefined}
+            {undefined, undefined, #{}, undefined}
     end,
 
     %% Build revision tree (merge with existing)
@@ -556,9 +556,21 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
 
     %% Write batch atomically (metadata + indexes + body)
     CborBody = barrel_docdb_codec_cbor:encode_cbor(DocBody),
-    BodyKey = barrel_store_keys:doc_body(DbName, DocId, NewRev),
+
+    %% Archive old body to revision-keyed location if updating
+    ArchiveOps = case {OldRev, OldDocBody} of
+        {undefined, _} -> [];  %% New document, no archive needed
+        {_, undefined} -> [];  %% No old body to archive
+        {_, OldCbor} ->
+            %% Move old body to revision-keyed location
+            OldBodyKey = barrel_store_keys:doc_body_rev(DbName, DocId, OldRev),
+            [{body_put, OldBodyKey, OldCbor}]
+    end,
+
+    %% Write new body to current location (no revision in key)
+    BodyKey = barrel_store_keys:doc_body(DbName, DocId),
     BodyOp = {body_put, BodyKey, CborBody},
-    AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps ++ [BodyOp],
+    AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps ++ ArchiveOps ++ [BodyOp],
     Sync = maps:get(sync, Opts, false),
     WriteOpts = #{sync => Sync},
     ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps, WriteOpts),
@@ -628,7 +640,7 @@ prepare_doc_ops(StoreRef, DbName, Doc) ->
 
         %% Check for existing document (wide column entity)
         DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
-        {OldHlc, OldRevTree, OldDocBody} = case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
+        {OldHlc, OldRev, OldRevTree, OldDocBody, OldCborBody} = case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
             {ok, Columns} ->
                 ExistingRev = proplists:get_value(?COL_REV, Columns),
                 ExistingHlc = barrel_hlc:decode(proplists:get_value(?COL_HLC, Columns)),
@@ -636,15 +648,15 @@ prepare_doc_ops(StoreRef, DbName, Doc) ->
                     undefined -> #{};
                     TreeBin -> binary_to_term(TreeBin)
                 end,
-                %% Get old doc body from body CF
-                OldBody = case barrel_store_rocksdb:body_get(StoreRef,
-                                barrel_store_keys:doc_body(DbName, DocId, ExistingRev)) of
-                    {ok, OldCborBin} -> barrel_docdb_codec_cbor:decode_any(OldCborBin);
-                    not_found -> #{}
+                %% Get old doc body from body CF (current body, no rev in key)
+                {OldBody, OldCbor} = case barrel_store_rocksdb:body_get(StoreRef,
+                                barrel_store_keys:doc_body(DbName, DocId)) of
+                    {ok, OldCborBin} -> {barrel_docdb_codec_cbor:decode_any(OldCborBin), OldCborBin};
+                    not_found -> {#{}, undefined}
                 end,
-                {ExistingHlc, OldTree, OldBody};
+                {ExistingHlc, ExistingRev, OldTree, OldBody, OldCbor};
             not_found ->
-                {undefined, #{}, undefined}
+                {undefined, undefined, #{}, undefined, undefined}
         end,
 
         %% Build revision tree (merge with existing)
@@ -710,9 +722,20 @@ prepare_doc_ops(StoreRef, DbName, Doc) ->
         end,
 
         CborBody = barrel_docdb_codec_cbor:encode_cbor(DocBody),
-        BodyKey = barrel_store_keys:doc_body(DbName, DocId, NewRev),
+
+        %% Archive old body to revision-keyed location if updating
+        ArchiveOps = case {OldRev, OldCborBody} of
+            {undefined, _} -> [];
+            {_, undefined} -> [];
+            _ ->
+                OldBodyKey = barrel_store_keys:doc_body_rev(DbName, DocId, OldRev),
+                [{body_put, OldBodyKey, OldCborBody}]
+        end,
+
+        %% Write new body to current location (no revision in key)
+        BodyKey = barrel_store_keys:doc_body(DbName, DocId),
         BodyOp = {body_put, BodyKey, CborBody},
-        AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps ++ [BodyOp],
+        AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps ++ ArchiveOps ++ [BodyOp],
         NotifyInfo = {DocId, NewRev, NextHlc, Deleted, DocBody},
         {ok, AllOps, NotifyInfo}
     catch
@@ -733,8 +756,8 @@ do_get_doc(StoreRef, DbName, DocId, Opts) ->
                 {true, false} ->
                     {error, not_found};
                 _ ->
-                    %% Get document body from body CF
-                    BodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
+                    %% Get document body from body CF (current body, no rev in key)
+                    BodyKey = barrel_store_keys:doc_body(DbName, DocId),
                     case barrel_store_rocksdb:body_get(StoreRef, BodyKey) of
                         {ok, CborBin} ->
                             %% Decode CBOR to get document body
@@ -757,62 +780,42 @@ do_get_doc(StoreRef, DbName, DocId, Opts) ->
             {error, not_found}
     end.
 
-%% @doc Get multiple documents by ID (batch read using wide column entity)
+%% @doc Get multiple documents by ID (batch read - parallel entity + body fetch)
 do_get_docs(StoreRef, DbName, DocIds, Opts) ->
     IncludeDeleted = maps:get(include_deleted, Opts, false),
-    %% Build doc_entity keys
+
+    %% Build keys for both entity and body (no rev needed for body)
     DocEntityKeys = [barrel_store_keys:doc_entity(DbName, DocId) || DocId <- DocIds],
-    %% Batch fetch entities
+    BodyKeys = [barrel_store_keys:doc_body(DbName, DocId) || DocId <- DocIds],
+
+    %% Batch fetch entities and bodies in parallel (same batch)
     DocEntityResults = barrel_store_rocksdb:multi_get_entity(StoreRef, DocEntityKeys),
-    %% Process each result and build list of body keys for batch fetch
-    {BodyKeys, IndexMap} = lists:foldl(
-        fun({DocId, EntityResult}, {Keys, Map}) ->
-            case EntityResult of
-                {ok, Columns} ->
+    DocBodyResults = barrel_store_rocksdb:body_multi_get(StoreRef, BodyKeys),
+
+    %% Combine results
+    DocBodyMap = lists:foldl(
+        fun({DocId, EntityResult, BodyResult}, Map) ->
+            case {EntityResult, BodyResult} of
+                {{ok, Columns}, {ok, CborBin}} ->
                     Rev = proplists:get_value(?COL_REV, Columns),
                     Deleted = bin_to_deleted(proplists:get_value(?COL_DELETED, Columns, <<"false">>)),
                     case {Deleted, IncludeDeleted} of
                         {true, false} ->
-                            %% Skip deleted docs
-                            {Keys, Map};
+                            Map;  %% Skip deleted
                         _ ->
-                            BodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
-                            Idx = length(Keys),
-                            {[BodyKey | Keys], Map#{Idx => {DocId, Rev, Deleted}}}
+                            DocBody = barrel_docdb_codec_cbor:decode_any(CborBin),
+                            Result = DocBody#{<<"id">> => DocId, <<"_rev">> => Rev},
+                            Result2 = case Deleted of
+                                true -> Result#{<<"_deleted">> => true};
+                                false -> Result
+                            end,
+                            Map#{DocId => {ok, Result2}}
                     end;
-                not_found ->
-                    {Keys, Map};
-                {error, _} ->
-                    {Keys, Map}
-            end
-        end,
-        {[], #{}},
-        lists:zip(DocIds, DocEntityResults)
-    ),
-    %% Batch fetch doc bodies from body CF
-    DocBodyResults = case BodyKeys of
-        [] -> [];
-        _ -> barrel_store_rocksdb:body_multi_get(StoreRef, lists:reverse(BodyKeys))
-    end,
-    %% Build final result maintaining order
-    DocBodyMap = lists:foldl(
-        fun({Idx, BodyResult}, Map) ->
-            case {maps:get(Idx, IndexMap, undefined), BodyResult} of
-                {undefined, _} -> Map;
-                {{DocId, Rev, Deleted}, {ok, CborBin}} ->
-                    %% Decode CBOR body
-                    DocBody = barrel_docdb_codec_cbor:decode_any(CborBin),
-                    Result = DocBody#{<<"id">> => DocId, <<"_rev">> => Rev},
-                    Result2 = case Deleted of
-                        true -> Result#{<<"_deleted">> => true};
-                        false -> Result
-                    end,
-                    Map#{DocId => {ok, Result2}};
-                {_, _} -> Map
+                _ -> Map
             end
         end,
         #{},
-        lists:zip(lists:seq(0, length(DocBodyResults) - 1), DocBodyResults)
+        lists:zip3(DocIds, DocEntityResults, DocBodyResults)
     ),
     %% Return results in original order
     [maps:get(DocId, DocBodyMap, {error, not_found}) || DocId <- DocIds].
@@ -885,9 +888,9 @@ do_delete_doc(StoreRef, DbName, DocId, Opts) ->
             ChangeOps = barrel_changes:write_change_ops(DbName, NextHlc, NewDocInfo),
 
             %% Path-indexed change operations for delete
-            %% Get old doc body from body CF to remove old path entries
+            %% Get old doc body from body CF (current body, no rev in key)
             OldDocBody = case barrel_store_rocksdb:body_get(StoreRef,
-                                barrel_store_keys:doc_body(DbName, DocId, CurrentRev)) of
+                                barrel_store_keys:doc_body(DbName, DocId)) of
                 {ok, OldCborBin} -> barrel_docdb_codec_cbor:decode_any(OldCborBin);
                 not_found -> undefined
             end,
@@ -928,8 +931,8 @@ do_fold_docs(StoreRef, DbName, Fun, Acc) ->
                         %% Skip deleted documents
                         {ok, AccIn};
                     false ->
-                        %% Get document body from body CF
-                        BodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
+                        %% Get document body from body CF (current body, no rev in key)
+                        BodyKey = barrel_store_keys:doc_body(DbName, DocId),
                         DocBody = case barrel_store_rocksdb:body_get(StoreRef, BodyKey) of
                             {ok, CborBin} -> barrel_docdb_codec_cbor:decode_any(CborBin);
                             not_found -> #{}
@@ -964,7 +967,7 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
 
     %% Check for existing document (wide column entity)
     DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
-    {ExistingRevTree, OldHlc, OldDocBody} = case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
+    {ExistingRevTree, OldRev, OldHlc, OldDocBody, OldCborBody} = case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
         {ok, Columns} ->
             ExistingRev = proplists:get_value(?COL_REV, Columns),
             ExistingHlc = barrel_hlc:decode(proplists:get_value(?COL_HLC, Columns)),
@@ -972,15 +975,15 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
                 undefined -> #{};
                 TreeBin -> binary_to_term(TreeBin)
             end,
-            %% Get old doc body from body CF for path index diff
-            OldBody = case barrel_store_rocksdb:body_get(StoreRef,
-                            barrel_store_keys:doc_body(DbName, DocId, ExistingRev)) of
-                {ok, OldCborBin} -> barrel_docdb_codec_cbor:decode_any(OldCborBin);
-                not_found -> #{}
+            %% Get old doc body from body CF (current body, no rev in key)
+            {OldBody, OldCbor} = case barrel_store_rocksdb:body_get(StoreRef,
+                            barrel_store_keys:doc_body(DbName, DocId)) of
+                {ok, OldCborBin} -> {barrel_docdb_codec_cbor:decode_any(OldCborBin), OldCborBin};
+                not_found -> {#{}, undefined}
             end,
-            {OldTree, ExistingHlc, OldBody};
+            {OldTree, ExistingRev, ExistingHlc, OldBody, OldCbor};
         not_found ->
-            {#{}, undefined, undefined}
+            {#{}, undefined, undefined, undefined, undefined}
     end,
 
     %% Build revision tree from history
@@ -1049,9 +1052,20 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
 
     %% Write batch atomically (metadata + indexes + body)
     CborBody = barrel_docdb_codec_cbor:encode_cbor(DocBody),
-    BodyKey = barrel_store_keys:doc_body(DbName, DocId, NewRev),
+
+    %% Archive old body to revision-keyed location if updating
+    ArchiveOps = case {OldRev, OldCborBody} of
+        {undefined, _} -> [];
+        {_, undefined} -> [];
+        _ ->
+            OldBodyKey = barrel_store_keys:doc_body_rev(DbName, DocId, OldRev),
+            [{body_put, OldBodyKey, OldCborBody}]
+    end,
+
+    %% Write new body to current location (no revision in key)
+    BodyKey = barrel_store_keys:doc_body(DbName, DocId),
     BodyOp = {body_put, BodyKey, CborBody},
-    AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps ++ [BodyOp],
+    AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps ++ ArchiveOps ++ [BodyOp],
     ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps),
 
     %% Notify path subscribers
