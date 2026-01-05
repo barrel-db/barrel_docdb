@@ -2245,43 +2245,50 @@ execute_multi_index(StoreRef, DbName, Plan, Snapshot) ->
                             {ok, Results, LastSeq};
                         true ->
                             %% Need body fetch for remaining conditions or include_docs
-                            filter_and_project(StoreRef, DbName, IntersectedDocIds, Plan, Snapshot)
+                            %% Create a new plan with only remaining conditions (index already verified the rest)
+                            FilterPlan = Plan#query_plan{conditions = RemainingConds},
+                            filter_and_project(StoreRef, DbName, IntersectedDocIds, FilterPlan, Snapshot)
                     end
             end
     end.
 
 %% @doc Execute multi-condition query using bitmap filtering
 %% Tries to use bitmaps for fast pre-filtering, falls back to sorted intersection
-execute_with_bitmap_filter(StoreRef, DbName, [First | Rest] = Conditions, Plan, Snapshot) ->
+execute_with_bitmap_filter(StoreRef, DbName, [First | Rest] = IndexConditions, Plan, Snapshot) ->
     {path, Path1, Value1} = First,
     FullPath1 = Path1 ++ [Value1],
 
-    %% Check if all conditions have same bitmap size (same path depth category)
-    AllSameSize = all_same_bitmap_size(Conditions),
+    %% Remaining conditions not verified by index (e.g., OR, logic vars)
+    #query_plan{conditions = AllConditions} = Plan,
+    RemainingConds = AllConditions -- IndexConditions,
+    FilterPlan = Plan#query_plan{conditions = RemainingConds},
 
-    case AllSameSize andalso length(Conditions) > 1 of
+    %% Check if all conditions have same bitmap size (same path depth category)
+    AllSameSize = all_same_bitmap_size(IndexConditions),
+
+    case AllSameSize andalso length(IndexConditions) > 1 of
         true ->
             %% Try to get bitmaps for all conditions
-            FullPaths = [Path ++ [Value] || {path, Path, Value} <- Conditions],
+            FullPaths = [Path ++ [Value] || {path, Path, Value} <- IndexConditions],
             BitmapKeys = [barrel_store_keys:path_bitmap_key(DbName, FP) || FP <- FullPaths],
             BitmapResults = barrel_store_rocksdb:multi_get_bitmap(StoreRef, BitmapKeys),
 
             %% Check if all bitmaps are available and non-empty
             AllBitmaps = [B || {ok, B} <- BitmapResults, byte_size(B) > 0],
-            case length(AllBitmaps) =:= length(Conditions) of
+            case length(AllBitmaps) =:= length(IndexConditions) of
                 true ->
                     %% All bitmaps available - use bitmap intersection for filtering
                     FilterBitmap = barrel_ars_index:bitmap_intersect(AllBitmaps),
                     %% Collect DocIds from first condition, filtered by bitmap
                     DocIds = collect_docids_with_bitmap_filter(StoreRef, DbName, FullPath1, FilterBitmap),
-                    filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot);
+                    filter_and_project(StoreRef, DbName, DocIds, FilterPlan, Snapshot);
                 false ->
                     %% Fallback: some bitmaps missing
-                    execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan, Snapshot)
+                    execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, FilterPlan, Snapshot)
             end;
         false ->
             %% Fallback: different bitmap sizes or single condition
-            execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan, Snapshot)
+            execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, FilterPlan, Snapshot)
     end.
 
 %% @doc Check if all conditions use the same bitmap size.
@@ -2289,10 +2296,10 @@ execute_with_bitmap_filter(StoreRef, DbName, [First | Rest] = Conditions, Plan, 
 all_same_bitmap_size(_Conditions) -> true.
 
 %% @doc Execute using sorted intersection (fallback)
-execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan, Snapshot) ->
+execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, FilterPlan, Snapshot) ->
     InitialDocIds = collect_docids_for_path(StoreRef, DbName, FullPath1),
     FinalDocIds = intersect_conditions(StoreRef, DbName, Rest, InitialDocIds),
-    filter_and_project(StoreRef, DbName, FinalDocIds, Plan, Snapshot).
+    filter_and_project(StoreRef, DbName, FinalDocIds, FilterPlan, Snapshot).
 
 %% @doc Collect DocIds from a path, filtering by bitmap
 collect_docids_with_bitmap_filter(StoreRef, DbName, FullPath, FilterBitmap) ->
