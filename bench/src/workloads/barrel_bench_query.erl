@@ -53,6 +53,12 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running multi-index range (type=user AND age>50)...~n"),
     MultiIndexRange = barrel_bench_metrics:summarize(bench_query(Db, multi_index_range_query(), Iterations)),
 
+    io:format("  Running 3-condition query (type=user AND status=active AND age>50)...~n"),
+    ThreeCond = barrel_bench_metrics:summarize(bench_query(Db, three_condition_query(), Iterations)),
+
+    io:format("  Running 3-condition with LIMIT 10...~n"),
+    ThreeCondLimit = barrel_bench_metrics:summarize(bench_query(Db, three_condition_limit_query(), Iterations)),
+
     io:format("  Running multi-index with LIMIT 10...~n"),
     MultiIndexLimit = barrel_bench_metrics:summarize(bench_query(Db, multi_index_limit_query(), Iterations)),
 
@@ -103,6 +109,8 @@ run(Db, NumDocs, Iterations) ->
         multi_condition => MultiCond,
         multi_index => MultiIndex,
         multi_index_range => MultiIndexRange,
+        three_cond => ThreeCond,
+        three_cond_limit => ThreeCondLimit,
         multi_index_limit => MultiIndexLimit,
         multi_index_range_limit => MultiIndexRangeLimit,
         nested_path => NestedPath,
@@ -207,6 +215,23 @@ multi_index_range_limit_query() ->
     %% Multi-condition range with LIMIT - tests early termination
     #{where => [
         {path, [<<"type">>], <<"user">>},
+        {compare, [<<"age">>], '>', 50}
+    ], limit => 10, include_docs => false}.
+
+three_condition_query() ->
+    %% 3 conditions - triggers parallel collection
+    %% type=user AND status=active AND age>50
+    #{where => [
+        {path, [<<"type">>], <<"user">>},
+        {path, [<<"status">>], <<"active">>},
+        {compare, [<<"age">>], '>', 50}
+    ], include_docs => false}.
+
+three_condition_limit_query() ->
+    %% 3 conditions with LIMIT
+    #{where => [
+        {path, [<<"type">>], <<"user">>},
+        {path, [<<"status">>], <<"active">>},
         {compare, [<<"age">>], '>', 50}
     ], limit => 10, include_docs => false}.
 
