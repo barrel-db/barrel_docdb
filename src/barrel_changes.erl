@@ -833,7 +833,7 @@ check_recent_buckets(_StoreRef, _DbName, _Since, _Bucket, _Count) ->
 
 %% @private Batch fetch doc bodies using multi_get for efficiency.
 %% Takes a list of {DocId, Change} pairs and returns changes with doc bodies added.
-%% Uses two multi_get calls: first for doc_current (to get revs), then for doc_body.
+%% Uses multi_get: first for doc_current (to get revs), then for doc_body from body store.
 -spec batch_fetch_doc_bodies(barrel_store_rocksdb:db_ref(), db_name(),
                               [{docid(), change()}]) -> [change()].
 batch_fetch_doc_bodies(_StoreRef, _DbName, []) ->
@@ -846,39 +846,37 @@ batch_fetch_doc_bodies(StoreRef, DbName, DocChangePairs) ->
     %% Step 2: Batch fetch doc_current entries
     CurrentResults = barrel_store_rocksdb:multi_get(StoreRef, CurrentKeys),
 
-    %% Step 3: Parse results and build doc_body keys for non-deleted docs
-    {BodyKeyMap, DeletedSet} = lists:foldl(
-        fun({DocId, Result}, {BodyKeys, Deleted}) ->
+    %% Step 3: Parse results and build {DocId, Rev} pairs for non-deleted docs
+    {DocIdRevPairs, DeletedSet} = lists:foldl(
+        fun({DocId, Result}, {Pairs, Deleted}) ->
             case Result of
                 {ok, CurrentBin} ->
                     {Rev, IsDeleted, _Hlc} = binary_to_term(CurrentBin),
                     case IsDeleted of
                         true ->
-                            {BodyKeys, sets:add_element(DocId, Deleted)};
+                            {Pairs, sets:add_element(DocId, Deleted)};
                         false ->
-                            BodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
-                            {maps:put(DocId, BodyKey, BodyKeys), Deleted}
+                            {[{DocId, Rev} | Pairs], Deleted}
                     end;
                 not_found ->
-                    {BodyKeys, Deleted};
+                    {Pairs, Deleted};
                 {error, _} ->
-                    {BodyKeys, Deleted}
+                    {Pairs, Deleted}
             end
         end,
-        {#{}, sets:new()},
+        {[], sets:new()},
         lists:zip(DocIds, CurrentResults)
     ),
 
-    %% Step 4: Batch fetch doc bodies
-    BodyKeys = maps:values(BodyKeyMap),
-    BodyDocIds = maps:keys(BodyKeyMap),
-    DocBodies = case BodyKeys of
+    %% Step 4: Batch fetch doc bodies from body store (BlobDB)
+    DocBodies = case DocIdRevPairs of
         [] ->
             #{};
         _ ->
-            BodyResults = barrel_store_rocksdb:multi_get(StoreRef, BodyKeys),
+            ReversedPairs = lists:reverse(DocIdRevPairs),
+            BodyResults = barrel_doc_body_store:multi_get_bodies(DbName, ReversedPairs, #{}),
             lists:foldl(
-                fun({DocId, Result}, Acc) ->
+                fun({{DocId, _Rev}, Result}, Acc) ->
                     case Result of
                         {ok, CborBin} ->
                             DocBody = barrel_docdb_codec_cbor:decode(CborBin),
@@ -888,7 +886,7 @@ batch_fetch_doc_bodies(StoreRef, DbName, DocChangePairs) ->
                     end
                 end,
                 #{},
-                lists:zip(BodyDocIds, BodyResults)
+                lists:zip(ReversedPairs, BodyResults)
             )
     end,
 

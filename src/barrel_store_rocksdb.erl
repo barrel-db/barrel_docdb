@@ -31,6 +31,9 @@
 -export([fold_range_posting/5, fold_range_posting_reverse/5]).
 -export([fold_range_posting_prefix/5, fold_range_posting_prefix_with_snapshot/6]).
 
+%% Body column family operations (BlobDB enabled)
+-export([body_put/3, body_put/4, body_get/2, body_multi_get/2, body_delete/2]).
+
 %%====================================================================
 %% Types
 %%====================================================================
@@ -40,7 +43,8 @@
     path := string(),
     default_cf := rocksdb:cf_handle(),
     bitmap_cf := rocksdb:cf_handle(),
-    posting_cf := rocksdb:cf_handle()
+    posting_cf := rocksdb:cf_handle(),
+    body_cf := rocksdb:cf_handle()
 }.
 
 -type snapshot() :: rocksdb:snapshot_handle().
@@ -56,80 +60,35 @@
 %% Column family names
 -define(BITMAP_CF_NAME, "bitmap").
 -define(POSTING_CF_NAME, "posting").
+-define(BODY_CF_NAME, "bodies").
 
 %%====================================================================
 %% barrel_store callbacks
 %%====================================================================
 
 %% @doc Open a RocksDB database with column families
+%% Uses create_missing_column_families to auto-create any missing CFs on existing DBs.
 -spec open(string(), map()) -> {ok, db_ref()} | {error, term()}.
 open(Path, Options) ->
     ok = filelib:ensure_dir(Path ++ "/"),
     DbOpts = build_db_options(Options),
     BitmapSize = maps:get(bitmap_size, Options, 1048576),  %% 1M bits default
 
-    %% Column family descriptors
-    DefaultCFOpts = [{merge_operator, counter_merge_operator}],
-    BitmapCFOpts = [{merge_operator, {bitset_merge_operator, BitmapSize}}],
-    PostingCFOpts = [{merge_operator, posting_list_merge_operator}],
-
+    %% Column family descriptors with their options
     CFDescriptors = [
-        {"default", DefaultCFOpts},
-        {?BITMAP_CF_NAME, BitmapCFOpts},
-        {?POSTING_CF_NAME, PostingCFOpts}
+        {"default", [{merge_operator, counter_merge_operator}]},
+        {?BITMAP_CF_NAME, [{merge_operator, {bitset_merge_operator, BitmapSize}}]},
+        {?POSTING_CF_NAME, [{merge_operator, posting_list_merge_operator}]},
+        {?BODY_CF_NAME, build_body_cf_options(Options)}
     ],
 
     case rocksdb:open(Path, DbOpts, CFDescriptors) of
-        {ok, Ref, [DefaultCF, BitmapCF, PostingCF]} ->
+        {ok, Ref, [DefaultCF, BitmapCF, PostingCF, BodyCF]} ->
             {ok, #{ref => Ref, path => Path,
                    default_cf => DefaultCF, bitmap_cf => BitmapCF,
-                   posting_cf => PostingCF}};
-        {error, {db_open, _Msg}} ->
-            %% Database might not have all CFs yet, try to create them
-            open_and_create_cfs(Path, DbOpts, BitmapCFOpts, PostingCFOpts);
+                   posting_cf => PostingCF, body_cf => BodyCF}};
         {error, Reason} ->
             {error, {db_open_failed, Reason}}
-    end.
-
-%% @private Open database and create missing column families
-open_and_create_cfs(Path, DbOpts, BitmapCFOpts, PostingCFOpts) ->
-    %% Try opening with just bitmap CF (for existing databases)
-    case rocksdb:open(Path, DbOpts, [{"default", []}, {?BITMAP_CF_NAME, BitmapCFOpts}]) of
-        {ok, Ref, [DefaultCF, BitmapCF]} ->
-            %% Add posting CF
-            case rocksdb:create_column_family(Ref, ?POSTING_CF_NAME, PostingCFOpts) of
-                {ok, PostingCF} ->
-                    {ok, #{ref => Ref, path => Path,
-                           default_cf => DefaultCF, bitmap_cf => BitmapCF,
-                           posting_cf => PostingCF}};
-                {error, CFErr} ->
-                    rocksdb:close(Ref),
-                    {error, {cf_create_failed, CFErr}}
-            end;
-        {error, _} ->
-            %% Try opening with no CFs (new database or very old)
-            case rocksdb:open(Path, DbOpts) of
-                {ok, Ref} ->
-                    %% Create both bitmap and posting CFs
-                    case rocksdb:create_column_family(Ref, ?BITMAP_CF_NAME, BitmapCFOpts) of
-                        {ok, BitmapCF} ->
-                            case rocksdb:create_column_family(Ref, ?POSTING_CF_NAME, PostingCFOpts) of
-                                {ok, PostingCF} ->
-                                    {ok, #{ref => Ref, path => Path,
-                                           default_cf => default_column_family,
-                                           bitmap_cf => BitmapCF,
-                                           posting_cf => PostingCF}};
-                                {error, CFErr} ->
-                                    rocksdb:close(Ref),
-                                    {error, {cf_create_failed, CFErr}}
-                            end;
-                        {error, CFErr} ->
-                            rocksdb:close(Ref),
-                            {error, {cf_create_failed, CFErr}}
-                    end;
-                {error, Reason} ->
-                    {error, {db_open_failed, Reason}}
-            end
     end.
 
 %% @doc Close the database
@@ -183,8 +142,11 @@ write_batch(DbRef, Operations) ->
 %%   - {bitmap_unset, Key, Position} - unset bit in bitmap CF
 %%   - {posting_append, Key, DocId} - append DocId to posting list
 %%   - {posting_remove, Key, DocId} - remove DocId from posting list
+%%   - {body_put, Key, Value} - put to body CF (BlobDB)
+%%   - {body_delete, Key} - delete from body CF
 -spec write_batch(db_ref(), list(), map()) -> ok | {error, term()}.
-write_batch(#{ref := Ref, bitmap_cf := BitmapCF, posting_cf := PostingCF}, Operations, Opts) ->
+write_batch(#{ref := Ref, bitmap_cf := BitmapCF, posting_cf := PostingCF,
+              body_cf := BodyCF}, Operations, Opts) ->
     Sync = maps:get(sync, Opts, false),
     {ok, Batch} = rocksdb:batch(),
     try
@@ -204,7 +166,11 @@ write_batch(#{ref := Ref, bitmap_cf := BitmapCF, posting_cf := PostingCF}, Opera
                ({posting_append, Key, DocId}) ->
                 ok = rocksdb:batch_merge(Batch, PostingCF, Key, {posting_add, DocId});
                ({posting_remove, Key, DocId}) ->
-                ok = rocksdb:batch_merge(Batch, PostingCF, Key, {posting_delete, DocId})
+                ok = rocksdb:batch_merge(Batch, PostingCF, Key, {posting_delete, DocId});
+               ({body_put, Key, Value}) ->
+                ok = rocksdb:batch_put(Batch, BodyCF, Key, Value);
+               ({body_delete, Key}) ->
+                ok = rocksdb:batch_delete(Batch, BodyCF, Key)
             end,
             Operations
         ),
@@ -461,6 +427,8 @@ build_db_options(Options) ->
     }),
 
     BaseOpts = [
+        %% Auto-create missing column families on existing databases
+        {create_missing_column_families, true},
         {create_if_missing, true},
         {max_open_files, maps:get(max_open_files, Options, 1000)},
 
@@ -696,4 +664,50 @@ fold_posting_loop_reverse({ok, Key, Value}, Iter, Fun, Acc) ->
             %% Support non-wrapped return values
             fold_posting_loop_reverse(rocksdb:iterator_move(Iter, prev), Iter, Fun, NewAcc)
     end.
+
+%%====================================================================
+%% Body Column Family Operations (BlobDB enabled)
+%%====================================================================
+
+%% @doc Build column family options for document bodies with BlobDB enabled
+%% Bodies are stored as blobs for values larger than min_blob_size (4KB default).
+%% This keeps the LSM tree lean and enables efficient garbage collection.
+-spec build_body_cf_options(map()) -> list().
+build_body_cf_options(Options) ->
+    [
+        {enable_blob_files, true},
+        {min_blob_size, maps:get(min_blob_size, Options, 4096)},        % 4KB threshold
+        {blob_file_size, maps:get(blob_file_size, Options, 268435456)}, % 256MB
+        {blob_compression_type, maps:get(blob_compression, Options, snappy)},
+        {enable_blob_garbage_collection, true},
+        {blob_garbage_collection_age_cutoff,
+            maps:get(blob_gc_age_cutoff, Options, 0.25)},
+        {blob_garbage_collection_force_threshold,
+            maps:get(blob_gc_force_threshold, Options, 0.5)}
+    ].
+
+%% @doc Put a value in the body column family
+-spec body_put(db_ref(), binary(), binary()) -> ok | {error, term()}.
+body_put(DbRef, Key, Value) ->
+    body_put(DbRef, Key, Value, []).
+
+%% @doc Put a value in the body column family with options
+-spec body_put(db_ref(), binary(), binary(), list()) -> ok | {error, term()}.
+body_put(#{ref := Ref, body_cf := BodyCF}, Key, Value, Opts) ->
+    rocksdb:put(Ref, BodyCF, Key, Value, Opts).
+
+%% @doc Get a value from the body column family
+-spec body_get(db_ref(), binary()) -> {ok, binary()} | not_found | {error, term()}.
+body_get(#{ref := Ref, body_cf := BodyCF}, Key) ->
+    rocksdb:get(Ref, BodyCF, Key, []).
+
+%% @doc Get multiple values from the body column family (batch read)
+-spec body_multi_get(db_ref(), [binary()]) -> [{ok, binary()} | not_found | {error, term()}].
+body_multi_get(#{ref := Ref, body_cf := BodyCF}, Keys) ->
+    rocksdb:multi_get(Ref, BodyCF, Keys, []).
+
+%% @doc Delete a value from the body column family
+-spec body_delete(db_ref(), binary()) -> ok | {error, term()}.
+body_delete(#{ref := Ref, body_cf := BodyCF}, Key) ->
+    rocksdb:delete(Ref, BodyCF, Key, []).
 

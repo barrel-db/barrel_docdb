@@ -705,53 +705,18 @@ collect_condition_docids(StoreRef, DbName, {compare, Path, Op, Value}) ->
     barrel_ars_index:fold_path_values_compare(StoreRef, DbName, Path, Op, Value,
         fun({_P, DocId}, Acc) -> {ok, [DocId | Acc]} end, []).
 
-%% @private Intersect multiple DocId sets using bitmap acceleration
-%% Uses bitmap intersection for fast filtering, then verifies with posting lists
+%% @private Intersect multiple DocId sets using optimized intersection
+%% First collects from most selective condition, then filters against others
 intersect_docid_sets(StoreRef, DbName, Conditions) ->
-    %% Get bitmaps for all conditions
-    Bitmaps = get_condition_bitmaps(StoreRef, DbName, Conditions),
-    case Bitmaps of
-        [] ->
-            %% No bitmaps available, fall back to posting list intersection
-            intersect_docid_sets_slow(StoreRef, DbName, Conditions);
-        _ ->
-            %% Intersect bitmaps for fast pre-filtering
-            IntersectedBitmap = barrel_ars_index:bitmap_intersect(Bitmaps),
+    %% Find the most selective condition (smallest posting list)
+    {SmallestCond, _SmallestPath} = find_most_selective_condition(StoreRef, DbName, Conditions),
 
-            %% Find the most selective condition (smallest posting list)
-            {SmallestCond, SmallestPath} = find_most_selective_condition(StoreRef, DbName, Conditions),
+    %% Get docids from the smallest posting list
+    DocIds = collect_condition_docids(StoreRef, DbName, SmallestCond),
 
-            %% Get docids from the smallest posting list
-            DocIds = collect_condition_docids(StoreRef, DbName, SmallestCond),
-
-            %% Filter using the intersected bitmap
-            FilteredDocIds = lists:filter(fun(DocId) ->
-                Position = barrel_ars_index:doc_position(DocId, SmallestPath),
-                barrel_ars_index:bitmap_test_position(IntersectedBitmap, Position)
-            end, DocIds),
-
-            %% Verify remaining conditions (bitmap may have false positives)
-            OtherConditions = Conditions -- [SmallestCond],
-            verify_conditions(StoreRef, DbName, FilteredDocIds, OtherConditions)
-    end.
-
-%% @private Get bitmaps for conditions (only equality conditions have bitmaps)
-get_condition_bitmaps(StoreRef, DbName, Conditions) ->
-    lists:filtermap(fun(Cond) ->
-        case condition_to_path(Cond) of
-            {ok, FullPath} ->
-                case barrel_ars_index:get_path_bitmap(StoreRef, DbName, FullPath) of
-                    {ok, Bitmap} -> {true, Bitmap};
-                    _ -> false
-                end;
-            error -> false
-        end
-    end, Conditions).
-
-%% @private Convert condition to full path
-condition_to_path({path, Path, Value}) -> {ok, Path ++ [Value]};
-condition_to_path({exists, Path}) -> {ok, Path};
-condition_to_path(_) -> error.
+    %% Verify remaining conditions using posting lists
+    OtherConditions = Conditions -- [SmallestCond],
+    verify_conditions(StoreRef, DbName, DocIds, OtherConditions).
 
 %% @private Find the most selective condition based on cardinality
 find_most_selective_condition(StoreRef, DbName, Conditions) ->
@@ -768,9 +733,29 @@ find_most_selective_condition(StoreRef, DbName, Conditions) ->
                     {ok, C} -> {C, P};
                     _ -> {999999999, P}
                 end;
-            {compare, P, _, _} ->
-                %% Compare conditions are typically less selective
-                {999999998, P};
+            {compare, P, Op, Value} ->
+                %% Estimate compare cardinality by sampling the index
+                %% For '>' or '<', estimate roughly half the values match
+                %% This is a heuristic - actual count would require full scan
+                case barrel_ars_index:get_path_cardinality(StoreRef, DbName, P) of
+                    {ok, TotalCard} ->
+                        %% Assume 50% selectivity for range queries
+                        EstCard = case Op of
+                            '>' -> TotalCard div 2;
+                            '<' -> TotalCard div 2;
+                            '>=' -> (TotalCard div 2) + 1;
+                            '=<' -> (TotalCard div 2) + 1
+                        end,
+                        {EstCard, P ++ [Value]};
+                    _ ->
+                        {999999998, P}
+                end;
+            {prefix, P, Prefix} ->
+                %% Estimate prefix matches ~10% of path values
+                case barrel_ars_index:get_path_cardinality(StoreRef, DbName, P) of
+                    {ok, TotalCard} -> {TotalCard div 10, P ++ [Prefix]};
+                    _ -> {999999997, P}
+                end;
             _ ->
                 {999999999, []}
         end,
@@ -788,21 +773,6 @@ verify_conditions(StoreRef, DbName, DocIds, [Cond | Rest]) ->
         sets:is_element(DocId, CondDocIds)
     end, DocIds),
     verify_conditions(StoreRef, DbName, FilteredDocIds, Rest).
-
-%% @private Slow path: intersect using sets (no bitmap acceleration)
-intersect_docid_sets_slow(StoreRef, DbName, Conditions) ->
-    DocIdSets = [collect_condition_docids(StoreRef, DbName, Cond) || Cond <- Conditions],
-    intersect_docid_lists(DocIdSets).
-
-%% @private Intersect multiple DocId lists
-intersect_docid_lists([]) -> [];
-intersect_docid_lists([First]) -> lists:usort(First);
-intersect_docid_lists([First | Rest]) ->
-    FirstSet = sets:from_list(First),
-    FinalSet = lists:foldl(fun(DocIds, AccSet) ->
-        sets:intersection(AccSet, sets:from_list(DocIds))
-    end, FirstSet, Rest),
-    lists:sort(sets:to_list(FinalSet)).
 
 %% @private Release snapshot if present
 maybe_release_snapshot(undefined) -> ok;
@@ -1557,8 +1527,8 @@ fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) 
                 true ->
                     skip;
                 false ->
-                    DocBodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
-                    case barrel_store_rocksdb:get(StoreRef, DocBodyKey) of
+                    %% Fetch doc body from body store (BlobDB)
+                    case barrel_doc_body_store:get_body(DbName, DocId, Rev) of
                         {ok, CborBin} ->
                             %% Use CBOR iterator for condition matching
                             case matches_conditions_cbor(CborBin, Conditions, Bindings) of
@@ -2011,26 +1981,47 @@ process_prefix_docids([DocId | Rest], Seen, Count, Acc, MaxCollect) ->
     end.
 
 %% @doc Collect DocIds for scan-based execution
-%% Tries optimized paths: exists/prefix first, then path prefix scan, then full scan
+%% Tries optimized paths: multi-index intersection, exists/prefix, then path prefix scan
 collect_scan_docids(StoreRef, DbName, Conditions, _Snapshot) ->
-    case find_exists_condition(Conditions) of
-        {ok, Path} ->
-            %% Exists check: collect all docs that have any value at this path
-            collect_docids_for_path_exists(StoreRef, DbName, Path);
-        not_found ->
-            case find_prefix_condition(Conditions) of
-                {ok, Path, Prefix} ->
-                    %% Optimized interval scan for prefix queries
-                    collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix);
+    %% First check if we have multiple index-friendly conditions for intersection
+    IndexConditions = [C || C <- Conditions, is_index_condition(C)],
+    case IndexConditions of
+        [_, _ | _] ->
+            %% Multiple index conditions - use bitmap intersection for efficiency
+            intersect_docid_sets(StoreRef, DbName, IndexConditions);
+        _ ->
+            %% Single or no index conditions - use existing path
+            case find_exists_condition(Conditions) of
+                {ok, Path} ->
+                    %% Exists check: collect all docs that have any value at this path
+                    collect_docids_for_path_exists(StoreRef, DbName, Path);
                 not_found ->
-                    case find_best_scan_path(Conditions) of
-                        {ok, Path} ->
-                            collect_docids_for_prefix(StoreRef, DbName, Path);
+                    case find_prefix_condition(Conditions) of
+                        {ok, Path, Prefix} ->
+                            %% Optimized interval scan for prefix queries
+                            collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix);
                         not_found ->
-                            collect_all_docids(StoreRef, DbName)
+                            case find_best_scan_path(Conditions) of
+                                {ok, Path} ->
+                                    collect_docids_for_prefix(StoreRef, DbName, Path);
+                                not_found ->
+                                    collect_all_docids(StoreRef, DbName)
+                            end
                     end
             end
     end.
+
+%% @private Check if a condition can use index for intersection
+is_index_condition({path, _Path, Value}) ->
+    not is_logic_var(Value);
+is_index_condition({compare, _Path, _Op, Value}) ->
+    not is_logic_var(Value);
+is_index_condition({prefix, _Path, _Prefix}) ->
+    true;
+is_index_condition({exists, _Path}) ->
+    true;
+is_index_condition(_) ->
+    false.
 
 %% @doc Find an exists condition for optimized path scan
 find_exists_condition([]) ->
@@ -2337,38 +2328,37 @@ batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projectio
             T1 = erlang:monotonic_time(microsecond),
             put(profile_docinfo_fetch, pdict_get(profile_docinfo_fetch, 0) + (T1 - T0)),
 
-            %% Step 2: Filter deleted docs, collect doc_body keys for non-deleted
-            {ActiveDocs, BodyKeys} = lists:foldl(
-                fun({DocId, Result}, {AccDocs, AccKeys}) ->
+            %% Step 2: Filter deleted docs, collect {DocId, Rev} pairs for body fetch
+            {ActiveDocIdRevs, ActiveDocIds} = lists:foldl(
+                fun({DocId, Result}, {AccPairs, AccDocs}) ->
                     case Result of
                         {ok, CurrentBin} ->
                             {Rev, Deleted, _Hlc} = binary_to_term(CurrentBin),
                             case Deleted of
                                 true ->
-                                    {AccDocs, AccKeys};
+                                    {AccPairs, AccDocs};
                                 false ->
-                                    BodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
-                                    {[DocId | AccDocs], [BodyKey | AccKeys]}
+                                    {[{DocId, Rev} | AccPairs], [DocId | AccDocs]}
                             end;
                         not_found ->
-                            {AccDocs, AccKeys};
+                            {AccPairs, AccDocs};
                         {error, _} ->
-                            {AccDocs, AccKeys}
+                            {AccPairs, AccDocs}
                     end
                 end,
                 {[], []},
                 lists:zip(DocIds, DocCurrentResults)
             ),
 
-            %% Step 3: Batch fetch all CBOR doc bodies
-            case BodyKeys of
+            %% Step 3: Batch fetch all CBOR doc bodies from body store (BlobDB)
+            case ActiveDocIdRevs of
                 [] -> [];
                 _ ->
                     %% PROFILING: Doc body fetch
                     T2 = erlang:monotonic_time(microsecond),
-                    ReversedDocIds = lists:reverse(ActiveDocs),
-                    ReversedBodyKeys = lists:reverse(BodyKeys),
-                    DocBodyResults = barrel_store_rocksdb:multi_get_with_snapshot(StoreRef, ReversedBodyKeys, Snapshot),
+                    ReversedDocIds = lists:reverse(ActiveDocIds),
+                    ReversedDocIdRevs = lists:reverse(ActiveDocIdRevs),
+                    DocBodyResults = barrel_doc_body_store:multi_get_bodies(DbName, ReversedDocIdRevs, #{}),
                     T3 = erlang:monotonic_time(microsecond),
                     put(profile_docbody_fetch, pdict_get(profile_docbody_fetch, 0) + (T3 - T2)),
 
@@ -2397,6 +2387,7 @@ batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projectio
                     ),
                     T5 = erlang:monotonic_time(microsecond),
                     put(profile_deser_match, pdict_get(profile_deser_match, 0) + (T5 - T4)),
+                    _ = Snapshot,  %% Snapshot is used for doc_current, body store has its own consistency
                     Results
             end
     end.

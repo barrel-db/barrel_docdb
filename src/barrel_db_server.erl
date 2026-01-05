@@ -85,6 +85,7 @@ get_store_ref(Pid) ->
 get_att_ref(Pid) ->
     gen_server:call(Pid, get_att_ref).
 
+
 %% @doc Stop the database server
 -spec stop(pid()) -> ok.
 stop(Pid) ->
@@ -194,12 +195,12 @@ init([Name, Config]) ->
     DataDir = maps:get(data_dir, Config, "/tmp/barrel_data"),
     DbPath = filename:join([DataDir, binary_to_list(Name)]),
 
-    %% Open document store (regular RocksDB)
+    %% Open document store (RocksDB with column families including body CF with BlobDB)
     DocStorePath = filename:join(DbPath, "docs"),
     StoreOpts = maps:get(store_opts, Config, #{}),
     case barrel_store_rocksdb:open(DocStorePath, StoreOpts) of
         {ok, StoreRef} ->
-            %% Open attachment store (RocksDB with BlobDB)
+            %% Open attachment store (separate RocksDB with BlobDB)
             AttStorePath = filename:join(DbPath, "attachments"),
             AttOpts = maps:get(att_opts, Config, #{}),
             case barrel_att_store:open(AttStorePath, AttOpts) of
@@ -211,7 +212,9 @@ init([Name, Config]) ->
                     Views = start_registered_views(Name, StoreRef, ViewSup),
 
                     %% Register in persistent_term for lookup
+                    %% barrel_store is used by barrel_doc_body_store for body CF access
                     persistent_term:put({barrel_db, Name}, self()),
+                    persistent_term:put({barrel_store, Name}, StoreRef),
                     logger:info("Database ~s started at ~s", [Name, DbPath]),
                     {ok, #state{
                         name = Name,
@@ -372,7 +375,8 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 %% @doc Clean up when terminating
-terminate(_Reason, #state{name = Name, store_ref = StoreRef, att_ref = AttRef, view_sup = ViewSup}) ->
+terminate(_Reason, #state{name = Name, store_ref = StoreRef, att_ref = AttRef,
+                          view_sup = ViewSup}) ->
     %% Stop view supervisor (will stop all views)
     case ViewSup of
         undefined -> ok;
@@ -383,13 +387,14 @@ terminate(_Reason, #state{name = Name, store_ref = StoreRef, att_ref = AttRef, v
         undefined -> ok;
         _ -> barrel_att_store:close(AttRef)
     end,
-    %% Close document store
+    %% Close document store (includes body CF)
     case StoreRef of
         undefined -> ok;
         _ -> barrel_store_rocksdb:close(StoreRef)
     end,
     %% Unregister
     persistent_term:erase({barrel_db, Name}),
+    persistent_term:erase({barrel_store, Name}),
     logger:info("Database ~s stopped", [Name]),
     ok.
 
@@ -455,8 +460,8 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
                 {ok, TreeBin} -> binary_to_term(TreeBin);
                 not_found -> #{}
             end,
-            %% Get old doc body for path index diff (decode CBOR)
-            OldBody = case barrel_store_rocksdb:get(StoreRef,
+            %% Get old doc body for path index diff from body CF
+            OldBody = case barrel_store_rocksdb:body_get(StoreRef,
                             barrel_store_keys:doc_body(DbName, DocId, ExistingRev)) of
                 {ok, OldCborBin} -> barrel_docdb_codec_cbor:decode(OldCborBin);
                 not_found -> #{}
@@ -483,15 +488,12 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
     %% Generate new HLC timestamp for this change
     NextHlc = barrel_hlc:new_hlc(),
 
-    %% Prepare column-wide storage operations
+    %% Prepare metadata storage operations (no doc body in main store)
     DocOps = [
         %% Column 1: Current state (rev, deleted, hlc)
         {put, DocCurrentKey, term_to_binary({NewRev, Deleted, NextHlc})},
         %% Column 2: Revision tree
-        {put, barrel_store_keys:doc_tree(DbName, DocId), term_to_binary(RevTree)},
-        %% Column 3: CBOR-encoded body (keyed by DocId + Rev)
-        {put, barrel_store_keys:doc_body(DbName, DocId, NewRev),
-              barrel_docdb_codec_cbor:encode(DocBody)}
+        {put, barrel_store_keys:doc_tree(DbName, DocId), term_to_binary(RevTree)}
     ],
 
     %% Build DocInfo for change tracking (compatible with existing change feed)
@@ -543,9 +545,13 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
                                                   OldHlc, OldDocBody)
     end,
 
-    %% Write batch atomically (doc + path index + change + path_hlc in single batch)
-    AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps,
-    WriteOpts = #{sync => maps:get(sync, Opts, false)},
+    %% Write batch atomically (metadata + indexes + body)
+    CborBody = barrel_docdb_codec_cbor:encode(DocBody),
+    BodyKey = barrel_store_keys:doc_body(DbName, DocId, NewRev),
+    BodyOp = {body_put, BodyKey, CborBody},
+    AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps ++ [BodyOp],
+    Sync = maps:get(sync, Opts, false),
+    WriteOpts = #{sync => Sync},
     ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps, WriteOpts),
 
     %% Notify path subscribers
@@ -563,6 +569,7 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
 %% Options:
 %%   - sync: boolean() - if true, sync to disk before returning (default: false)
 do_put_docs(StoreRef, DbName, Docs, Opts) ->
+    Sync = maps:get(sync, Opts, false),
     %% Process each document to build operations and metadata
     {AllOps, Notifications} = lists:foldl(
         fun(Doc, {OpsAcc, NotifyAcc}) ->
@@ -578,11 +585,11 @@ do_put_docs(StoreRef, DbName, Docs, Opts) ->
         Docs
     ),
 
-    %% Write all operations in a single batch
+    %% Write all operations in a single batch (includes body CF writes)
     case AllOps of
         [] -> ok;
         _ ->
-            WriteOpts = #{sync => maps:get(sync, Opts, false)},
+            WriteOpts = #{sync => Sync},
             ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps, WriteOpts)
     end,
 
@@ -617,7 +624,8 @@ prepare_doc_ops(StoreRef, DbName, Doc) ->
                     {ok, TreeBin} -> binary_to_term(TreeBin);
                     not_found -> #{}
                 end,
-                OldBody = case barrel_store_rocksdb:get(StoreRef,
+                %% Get old doc body from body CF
+                OldBody = case barrel_store_rocksdb:body_get(StoreRef,
                                 barrel_store_keys:doc_body(DbName, DocId, ExistingRev)) of
                     {ok, OldCborBin} -> barrel_docdb_codec_cbor:decode(OldCborBin);
                     not_found -> #{}
@@ -642,12 +650,10 @@ prepare_doc_ops(StoreRef, DbName, Doc) ->
         %% Generate new HLC timestamp
         NextHlc = barrel_hlc:new_hlc(),
 
-        %% Prepare column-wide storage operations
+        %% Prepare metadata storage operations (no doc body in main store)
         DocOps = [
             {put, DocCurrentKey, term_to_binary({NewRev, Deleted, NextHlc})},
-            {put, barrel_store_keys:doc_tree(DbName, DocId), term_to_binary(RevTree)},
-            {put, barrel_store_keys:doc_body(DbName, DocId, NewRev),
-                  barrel_docdb_codec_cbor:encode(DocBody)}
+            {put, barrel_store_keys:doc_tree(DbName, DocId), term_to_binary(RevTree)}
         ],
 
         %% Build DocInfo for change tracking
@@ -688,7 +694,10 @@ prepare_doc_ops(StoreRef, DbName, Doc) ->
                                                       OldHlc, OldDocBody)
         end,
 
-        AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps,
+        CborBody = barrel_docdb_codec_cbor:encode(DocBody),
+        BodyKey = barrel_store_keys:doc_body(DbName, DocId, NewRev),
+        BodyOp = {body_put, BodyKey, CborBody},
+        AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps ++ [BodyOp],
         NotifyInfo = {DocId, NewRev, NextHlc, Deleted, DocBody},
         {ok, AllOps, NotifyInfo}
     catch
@@ -708,9 +717,9 @@ do_get_doc(StoreRef, DbName, DocId, Opts) ->
                 {true, false} ->
                     {error, not_found};
                 _ ->
-                    %% Get CBOR document body
-                    DocBodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
-                    case barrel_store_rocksdb:get(StoreRef, DocBodyKey) of
+                    %% Get document body from body CF
+                    BodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
+                    case barrel_store_rocksdb:body_get(StoreRef, BodyKey) of
                         {ok, CborBin} ->
                             %% Decode CBOR to get document body
                             DocBody = barrel_docdb_codec_cbor:decode(CborBin),
@@ -739,8 +748,8 @@ do_get_docs(StoreRef, DbName, DocIds, Opts) ->
     DocCurrentKeys = [barrel_store_keys:doc_current(DbName, DocId) || DocId <- DocIds],
     %% Batch fetch current state
     DocCurrentResults = barrel_store_rocksdb:multi_get(StoreRef, DocCurrentKeys),
-    %% Process each result and fetch doc bodies for found documents
-    {DocBodyKeys, IndexMap} = lists:foldl(
+    %% Process each result and build list of body keys for batch fetch
+    {BodyKeys, IndexMap} = lists:foldl(
         fun({DocId, CurrentResult}, {Keys, Map}) ->
             case CurrentResult of
                 {ok, CurrentBin} ->
@@ -750,9 +759,9 @@ do_get_docs(StoreRef, DbName, DocIds, Opts) ->
                             %% Skip deleted docs
                             {Keys, Map};
                         _ ->
-                            DocBodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
+                            BodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
                             Idx = length(Keys),
-                            {[DocBodyKey | Keys], Map#{Idx => {DocId, Rev, Deleted}}}
+                            {[BodyKey | Keys], Map#{Idx => {DocId, Rev, Deleted}}}
                     end;
                 not_found ->
                     {Keys, Map};
@@ -763,10 +772,10 @@ do_get_docs(StoreRef, DbName, DocIds, Opts) ->
         {[], #{}},
         lists:zip(DocIds, DocCurrentResults)
     ),
-    %% Batch fetch CBOR doc bodies
-    DocBodyResults = case DocBodyKeys of
+    %% Batch fetch doc bodies from body CF
+    DocBodyResults = case BodyKeys of
         [] -> [];
-        _ -> barrel_store_rocksdb:multi_get(StoreRef, lists:reverse(DocBodyKeys))
+        _ -> barrel_store_rocksdb:body_multi_get(StoreRef, lists:reverse(BodyKeys))
     end,
     %% Build final result maintaining order
     DocBodyMap = lists:foldl(
@@ -858,9 +867,9 @@ do_delete_doc(StoreRef, DbName, DocId, Opts) ->
             ChangeOps = barrel_changes:write_change_ops(DbName, NextHlc, NewDocInfo),
 
             %% Path-indexed change operations for delete
-            %% Get old CBOR doc body to remove old path entries
-            OldDocBody = case barrel_store_rocksdb:get(StoreRef,
-                              barrel_store_keys:doc_body(DbName, DocId, CurrentRev)) of
+            %% Get old doc body from body CF to remove old path entries
+            OldDocBody = case barrel_store_rocksdb:body_get(StoreRef,
+                                barrel_store_keys:doc_body(DbName, DocId, CurrentRev)) of
                 {ok, OldCborBin} -> barrel_docdb_codec_cbor:decode(OldCborBin);
                 not_found -> undefined
             end,
@@ -896,9 +905,9 @@ do_fold_docs(StoreRef, DbName, Fun, Acc) ->
             false ->
                 %% Extract DocId from key (after prefix)
                 DocId = binary:part(Key, PrefixLen, byte_size(Key) - PrefixLen),
-                %% Get CBOR document body
-                DocBodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
-                DocBody = case barrel_store_rocksdb:get(StoreRef, DocBodyKey) of
+                %% Get document body from body CF
+                BodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
+                DocBody = case barrel_store_rocksdb:body_get(StoreRef, BodyKey) of
                     {ok, CborBin} -> barrel_docdb_codec_cbor:decode(CborBin);
                     not_found -> #{}
                 end,
@@ -938,8 +947,8 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
                 {ok, TreeBin} -> binary_to_term(TreeBin);
                 not_found -> #{}
             end,
-            %% Get old CBOR doc body for path index diff
-            OldBody = case barrel_store_rocksdb:get(StoreRef,
+            %% Get old doc body from body CF for path index diff
+            OldBody = case barrel_store_rocksdb:body_get(StoreRef,
                             barrel_store_keys:doc_body(DbName, DocId, ExistingRev)) of
                 {ok, OldCborBin} -> barrel_docdb_codec_cbor:decode(OldCborBin);
                 not_found -> #{}
@@ -955,15 +964,12 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
     %% Generate new HLC timestamp for this change
     NextHlc = barrel_hlc:new_hlc(),
 
-    %% Prepare column-wide storage operations
+    %% Prepare metadata storage operations (no doc body in main store)
     DocOps = [
         %% Column 1: Current state
         {put, DocCurrentKey, term_to_binary({NewRev, Deleted, NextHlc})},
         %% Column 2: Revision tree
-        {put, barrel_store_keys:doc_tree(DbName, DocId), term_to_binary(NewRevTree)},
-        %% Column 3: CBOR-encoded body
-        {put, barrel_store_keys:doc_body(DbName, DocId, NewRev),
-              barrel_docdb_codec_cbor:encode(DocBody)}
+        {put, barrel_store_keys:doc_tree(DbName, DocId), term_to_binary(NewRevTree)}
     ],
 
     %% Build DocInfo for change tracking
@@ -1015,8 +1021,11 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
                                                   OldHlc, OldDocBody)
     end,
 
-    %% Write batch atomically
-    AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps,
+    %% Write batch atomically (metadata + indexes + body)
+    CborBody = barrel_docdb_codec_cbor:encode(DocBody),
+    BodyKey = barrel_store_keys:doc_body(DbName, DocId, NewRev),
+    BodyOp = {body_put, BodyKey, CborBody},
+    AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps ++ [BodyOp],
     ok = barrel_store_rocksdb:write_batch(StoreRef, AllOps),
 
     %% Notify path subscribers
