@@ -836,30 +836,40 @@ refresh_view(Db, ViewId) ->
 %%
 %% @param Db Database name or pid
 %% @param QuerySpec Query specification map
-%% @returns `{ok, [Document]}' or `{error, Reason}'
+%% @returns `{ok, [Document], Meta}' or `{error, Reason}'
+%%          where Meta = #{has_more => boolean(), continuation => binary(), last_seq => seq()}
 %% @see find/3
 %% @see explain/2
--spec find(binary() | pid(), map()) -> {ok, [map()]} | {error, term()}.
+-spec find(binary() | pid(), map()) -> {ok, [map()], map()} | {error, term()}.
 find(Db, QuerySpec) ->
     find(Db, QuerySpec, #{}).
 
 %% @doc Find documents with additional options.
 %%
 %% Same as `find/2' but allows merging additional options into the query.
+%% Supports chunked execution with continuation tokens for large result sets.
 %%
 %% == Example ==
 %% ```
-%% {ok, Results} = barrel_docdb:find(<<"mydb">>,
+%% %% Basic query
+%% {ok, Results, Meta} = barrel_docdb:find(<<"mydb">>,
 %%     #{where => [{path, [<<"type">>], <<"user">>}]},
 %%     #{limit => 10, include_docs => false}
 %% ).
+%%
+%% %% Chunked iteration
+%% {ok, R1, #{has_more := true, continuation := Token}} =
+%%     barrel_docdb:find(Db, Query, #{chunk_size => 100}),
+%% {ok, R2, #{has_more := false}} =
+%%     barrel_docdb:find(Db, Query, #{continuation => Token}).
 %% '''
 %%
 %% @param Db Database name or pid
 %% @param QuerySpec Query specification map
-%% @param Opts Additional options to merge
-%% @returns `{ok, [Document]}' or `{error, Reason}'
--spec find(binary() | pid(), map(), map()) -> {ok, [map()]} | {error, term()}.
+%% @param Opts Additional options: chunk_size, continuation, include_docs, limit, etc.
+%% @returns `{ok, [Document], Meta}' or `{error, Reason}'
+%%          where Meta = #{has_more => boolean(), continuation => binary(), last_seq => seq()}
+-spec find(binary() | pid(), map(), map()) -> {ok, [map()], map()} | {error, term()}.
 find(Db, QuerySpec, Opts) ->
     with_db(Db, fun(Pid) ->
         {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
@@ -870,8 +880,13 @@ find(Db, QuerySpec, Opts) ->
         MergedSpec = maps:merge(maps:merge(DefaultOpts, QuerySpec), Opts),
         case barrel_query:compile(MergedSpec) of
             {ok, Plan} ->
-                {ok, Results, _LastSeq} = barrel_query:execute(StoreRef, DbName, Plan),
-                {ok, Results};
+                %% Use chunked execution with configurable chunk_size
+                ChunkSize = maps:get(chunk_size, Opts, 1000),
+                ChunkOpts = case maps:get(continuation, Opts, undefined) of
+                    undefined -> #{chunk_size => ChunkSize};
+                    Token -> #{chunk_size => ChunkSize, continuation => Token}
+                end,
+                barrel_query:execute(StoreRef, DbName, Plan, ChunkOpts);
             {error, _} = Error ->
                 Error
         end
