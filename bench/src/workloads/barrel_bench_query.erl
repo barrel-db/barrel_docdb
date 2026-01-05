@@ -303,7 +303,8 @@ bench_query(Db, Query, Iterations) ->
     Metrics = barrel_bench_metrics:new(),
     lists:foldl(fun(_I, Acc) ->
         {Time, _Result} = timer:tc(fun() ->
-            barrel_docdb:find(Db, Query)
+            {ok, _Results, _Meta} = barrel_docdb:find(Db, Query),
+            ok
         end),
         barrel_bench_metrics:record(Acc, Time)
     end, Metrics, lists:seq(1, Iterations)).

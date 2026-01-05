@@ -432,6 +432,13 @@ execute_pure_exists_chunked(StoreRef, DbName, Path, Plan, ChunkSize, StartKey, S
     %% Collect ChunkSize + 1 to detect if there are more
     MaxCollect = ChunkSize + 1,
 
+    %% Use provided snapshot or create a temporary one
+    ActualSnapshot = case Snapshot of
+        undefined ->
+            {ok, S} = barrel_store_rocksdb:snapshot(StoreRef),
+            S;
+        S -> S
+    end,
     %% Fold over posting lists
     FoldResult = barrel_store_rocksdb:fold_range_posting_with_snapshot(
         StoreRef, ActualStartKey, EndKey,
@@ -439,7 +446,7 @@ execute_pure_exists_chunked(StoreRef, DbName, Path, Plan, ChunkSize, StartKey, S
             process_exists_docids_chunked(DocIds, Key, Seen, Count, LastK, Acc, MaxCollect)
         end,
         {#{}, 0, undefined, []},
-        case Snapshot of undefined -> barrel_store_rocksdb:snapshot(StoreRef); S -> {ok, S} end
+        ActualSnapshot
     ),
 
     {_, CollectedCount, LastCollectedKey, Results} = FoldResult,
@@ -481,13 +488,20 @@ execute_pure_prefix_chunked(StoreRef, DbName, Path, Prefix, Plan, ChunkSize, Sta
 
     MaxCollect = ChunkSize + 1,
 
+    %% Use provided snapshot or create a temporary one
+    ActualSnapshot = case Snapshot of
+        undefined ->
+            {ok, S} = barrel_store_rocksdb:snapshot(StoreRef),
+            S;
+        S -> S
+    end,
     FoldResult = barrel_store_rocksdb:fold_range_posting_with_snapshot(
         StoreRef, ActualStartKey, EndKey,
         fun(Key, DocIds, {Seen, Count, LastK, Acc}) ->
             process_prefix_docids_chunked(DocIds, Key, Seen, Count, LastK, Acc, MaxCollect)
         end,
         {#{}, 0, undefined, []},
-        case Snapshot of undefined -> barrel_store_rocksdb:snapshot(StoreRef); S -> {ok, S} end
+        ActualSnapshot
     ),
 
     {_, CollectedCount, LastCollectedKey, Results} = FoldResult,
