@@ -533,15 +533,21 @@ replicate(Source, Target)
 
 ```
 barrel_docdb_sup (one_for_one)
-├── barrel_db_sup (simple_one_for_one)
-│   ├── barrel_db_server (db1)
-│   │   └── barrel_view_sup (simple_one_for_one)
-│   │       ├── barrel_view (view1)
-│   │       └── barrel_view (view2)
-│   ├── barrel_db_server (db2)
-│   │   └── ...
-│   └── ...
-└── (future: replication manager)
+├── barrel_cache              # Shared RocksDB block cache
+├── barrel_hlc_clock          # Global HLC clock
+├── barrel_sub                # Path subscriptions manager
+├── barrel_query_sub          # Query subscriptions manager
+├── barrel_path_dict          # Path ID interning for posting lists
+├── barrel_query_cursor       # Chunked query cursor management
+├── barrel_parallel           # Worker pool for parallel queries
+└── barrel_db_sup (simple_one_for_one)
+    ├── barrel_db_server (db1)
+    │   └── barrel_view_sup (simple_one_for_one)
+    │       ├── barrel_view (view1)
+    │       └── barrel_view (view2)
+    ├── barrel_db_server (db2)
+    │   └── ...
+    └── ...
 ```
 
 ## Performance Considerations
@@ -583,43 +589,50 @@ barrel_docdb_sup (one_for_one)
 
 ```
 src/
-├── barrel_docdb_app.erl      # Application callbacks
-├── barrel_docdb_sup.erl      # Top-level supervisor
-├── barrel_docdb.erl          # Public API
+├── barrel_docdb_app.erl        # Application callbacks
+├── barrel_docdb_sup.erl        # Top-level supervisor
+├── barrel_docdb.erl            # Public API
 │
-├── barrel_db_server.erl      # Per-database gen_server
-├── barrel_db_sup.erl         # Database supervisor
+├── barrel_db_server.erl        # Per-database gen_server
+├── barrel_db_sup.erl           # Database supervisor
 │
-├── barrel_doc.erl            # Document utilities
-├── barrel_revtree.erl        # Revision tree operations
+├── barrel_doc.erl              # Document utilities
+├── barrel_revtree_bin.erl      # Revision tree (compact binary encoding)
 │
-├── barrel_hlc.erl            # HLC clock management
+├── barrel_hlc.erl              # HLC clock management
 │
-├── barrel_att.erl            # Attachment API
-├── barrel_att_store.erl      # Attachment storage
+├── barrel_att.erl              # Attachment API
+├── barrel_att_store.erl        # Attachment storage
 │
-├── barrel_changes.erl        # Changes feed API (HLC-based)
-├── barrel_changes_stream.erl # Streaming changes
+├── barrel_changes.erl          # Changes feed API (HLC-based)
+├── barrel_changes_stream.erl   # Streaming changes
 │
-├── barrel_sub.erl            # Path subscriptions manager
-├── barrel_sub_sup.erl        # Subscription supervisor
-├── barrel_query_sub.erl      # Query subscriptions manager
+├── barrel_sub.erl              # Path subscriptions manager
+├── barrel_sub_sup.erl          # Subscription supervisor
+├── barrel_query_sub.erl        # Query subscriptions manager
 │
-├── barrel_query.erl          # Declarative query compiler
-├── barrel_ars.erl            # Path index for queries
+├── barrel_query.erl            # Declarative query compiler & executor
+├── barrel_query_cursor.erl     # Chunked query cursor management
+├── barrel_ars.erl              # Path index API
+├── barrel_ars_index.erl        # Path index implementation
+├── barrel_path_dict.erl        # Path ID interning for posting lists
 │
-├── barrel_view.erl           # View gen_statem
-├── barrel_view_index.erl     # View index storage (HLC-tracked)
-├── barrel_view_sup.erl       # View supervisor
+├── barrel_parallel.erl         # Parallel map/filtermap with worker pool
+├── barrel_doc_body_store.erl   # Batch document body operations
 │
-├── barrel_cache.erl          # Shared RocksDB block cache
-├── barrel_store_rocksdb.erl  # RocksDB storage (optimized)
-├── barrel_store_keys.erl     # Key encoding (doc_hlc, path_hlc, ars)
+├── barrel_view.erl             # View gen_statem
+├── barrel_view_index.erl       # View index storage (HLC-tracked)
+├── barrel_view_sup.erl         # View supervisor
 │
-├── barrel_rep.erl            # Replication API (filtered)
-├── barrel_rep_alg.erl        # Replication algorithm (HLC sync)
-├── barrel_rep_checkpoint.erl # Checkpoint management (HLC-based)
-├── barrel_rep_transport.erl  # Transport behaviour
+├── barrel_cache.erl            # Shared RocksDB block cache
+├── barrel_store_rocksdb.erl    # RocksDB storage (optimized)
+├── barrel_store_keys.erl       # Key encoding (doc_hlc, path_hlc, ars)
+├── barrel_docdb_codec_cbor.erl # CBOR encoding/decoding
+│
+├── barrel_rep.erl              # Replication API (filtered)
+├── barrel_rep_alg.erl          # Replication algorithm (HLC sync)
+├── barrel_rep_checkpoint.erl   # Checkpoint management (HLC-based)
+├── barrel_rep_transport.erl    # Transport behaviour
 └── barrel_rep_transport_local.erl  # Local transport
 ```
 

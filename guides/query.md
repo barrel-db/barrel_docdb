@@ -236,6 +236,76 @@ Use `explain/2` to understand how a query will execute:
 3. **Avoid NOT on large sets**: Negation requires scanning excluded documents
 4. **Limit results**: Always use `limit` for large datasets
 
+## Chunked Query Execution
+
+For large result sets, use chunked execution with continuation tokens to iterate through all matching documents without loading everything into memory.
+
+### Basic Usage
+
+```erlang
+%% Get store reference and database name
+{ok, StoreRef} = barrel_db_server:get_store_ref(Db),
+{ok, Info} = barrel_db_server:info(Db),
+DbName = maps:get(name, Info),
+
+%% Compile query once
+{ok, Plan} = barrel_query:compile(#{
+    where => [{compare, [<<"age">>], '>', 50}],
+    include_docs => false
+}).
+
+%% First chunk
+{ok, Results1, Meta1} = barrel_query:execute(StoreRef, DbName, Plan, #{chunk_size => 100}).
+%% Meta1 = #{has_more => true, continuation => Token, last_seq => Seq}
+
+%% Next chunk
+Token = maps:get(continuation, Meta1),
+{ok, Results2, Meta2} = barrel_query:execute(StoreRef, DbName, Plan, #{continuation => Token}).
+%% Continue until has_more => false
+```
+
+### Chunk Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `chunk_size` | integer | 1000 | Max results per chunk |
+| `continuation` | binary | - | Token from previous chunk |
+| `eventual_consistency` | boolean | false | Skip snapshot for faster reads |
+
+### Iterating All Results
+
+```erlang
+%% Helper to iterate through all matching documents
+iterate_all(StoreRef, DbName, Plan) ->
+    iterate_loop(StoreRef, DbName, Plan, #{chunk_size => 500}, []).
+
+iterate_loop(StoreRef, DbName, Plan, Opts, Acc) ->
+    case barrel_query:execute(StoreRef, DbName, Plan, Opts) of
+        {ok, Results, #{has_more := false}} ->
+            lists:flatten(lists:reverse([Results | Acc]));
+        {ok, Results, #{has_more := true, continuation := Token}} ->
+            iterate_loop(StoreRef, DbName, Plan,
+                        #{chunk_size => 500, continuation => Token},
+                        [Results | Acc])
+    end.
+```
+
+### Cursor Management
+
+- Cursors expire after 60 seconds of inactivity
+- Each access extends TTL by 60 seconds
+- Cursors hold RocksDB snapshots for consistent reads
+- Snapshots are released when `has_more => false` or cursor expires
+
+### When to Use Chunked Execution
+
+| Scenario | API | Reason |
+|----------|-----|--------|
+| Small result sets (<1000 docs) | `barrel_docdb:find/2` | Simpler, returns all at once |
+| Large result sets | `barrel_query:execute/4` | Memory efficient, streaming |
+| Pagination in HTTP API | `barrel_query:execute/4` | Natural page boundaries |
+| Background processing | `barrel_query:execute/4` | Process in batches |
+
 ## Materialized Views from Queries
 
 For frequently-used queries, create a materialized view:

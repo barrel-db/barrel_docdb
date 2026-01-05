@@ -520,7 +520,7 @@ api_put_docs(_Config) ->
     ?assertEqual(<<"Charlie">>, maps:get(<<"name">>, Doc3)),
 
     %% Verify path index was updated for all docs
-    {ok, QueryResults} = barrel_docdb:find(DbName, #{
+    {ok, QueryResults, _} = barrel_docdb:find(DbName, #{
         where => [{path, [<<"type">>], <<"user">>}]
     }),
     ?assertEqual(3, length(QueryResults)),
@@ -954,7 +954,7 @@ api_find_simple(_Config) ->
     {ok, _} = barrel_docdb:put_doc(DbName, #{<<"id">> => <<"post1">>, <<"type">> => <<"post">>, <<"title">> => <<"Hello">>}),
 
     %% Find all users
-    {ok, Results} = barrel_docdb:find(DbName, #{
+    {ok, Results, _} = barrel_docdb:find(DbName, #{
         where => [{path, [<<"type">>], <<"user">>}]
     }),
 
@@ -964,7 +964,7 @@ api_find_simple(_Config) ->
     ?assert(lists:member(<<"user2">>, Ids)),
 
     %% Find posts
-    {ok, PostResults} = barrel_docdb:find(DbName, #{
+    {ok, PostResults, _} = barrel_docdb:find(DbName, #{
         where => [{path, [<<"type">>], <<"post">>}]
     }),
     ?assertEqual(1, length(PostResults)),
@@ -995,14 +995,14 @@ api_find_with_options(_Config) ->
     ),
 
     %% Find with limit
-    {ok, LimitResults} = barrel_docdb:find(DbName,
+    {ok, LimitResults, _} = barrel_docdb:find(DbName,
         #{where => [{path, [<<"type">>], <<"item">>}]},
         #{limit => 3}
     ),
     ?assertEqual(3, length(LimitResults)),
 
     %% Find without docs
-    {ok, NoDocs} = barrel_docdb:find(DbName,
+    {ok, NoDocs, _} = barrel_docdb:find(DbName,
         #{where => [{path, [<<"type">>], <<"item">>}]},
         #{include_docs => false, limit => 5}
     ),
@@ -1034,7 +1034,7 @@ api_find_multiple_conditions(_Config) ->
     {ok, _} = barrel_docdb:put_doc(DbName, #{<<"id">> => <<"u3">>, <<"type">> => <<"user">>, <<"org">> => <<"other">>, <<"status">> => <<"active">>}),
 
     %% Find active users in acme org
-    {ok, Results} = barrel_docdb:find(DbName, #{
+    {ok, Results, _} = barrel_docdb:find(DbName, #{
         where => [
             {path, [<<"type">>], <<"user">>},
             {path, [<<"org">>], <<"acme">>},
@@ -1047,7 +1047,7 @@ api_find_multiple_conditions(_Config) ->
     ?assertEqual(<<"u1">>, Id),
 
     %% Find all acme users
-    {ok, AcmeResults} = barrel_docdb:find(DbName, #{
+    {ok, AcmeResults, _} = barrel_docdb:find(DbName, #{
         where => [
             {path, [<<"org">>], <<"acme">>}
         ]

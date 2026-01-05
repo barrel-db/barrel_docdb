@@ -881,10 +881,16 @@ find(Db, QuerySpec, Opts) ->
         case barrel_query:compile(MergedSpec) of
             {ok, Plan} ->
                 %% Use chunked execution with configurable chunk_size
-                ChunkSize = maps:get(chunk_size, Opts, 1000),
+                %% If query has a limit, use min(limit, chunk_size) to respect it
+                DefaultChunkSize = maps:get(chunk_size, Opts, 1000),
+                EffectiveChunkSize = case maps:get(limit, MergedSpec, undefined) of
+                    undefined -> DefaultChunkSize;
+                    Limit when Limit < DefaultChunkSize -> Limit;
+                    _ -> DefaultChunkSize
+                end,
                 ChunkOpts = case maps:get(continuation, Opts, undefined) of
-                    undefined -> #{chunk_size => ChunkSize};
-                    Token -> #{chunk_size => ChunkSize, continuation => Token}
+                    undefined -> #{chunk_size => EffectiveChunkSize};
+                    Token -> #{chunk_size => EffectiveChunkSize, continuation => Token}
                 end,
                 barrel_query:execute(StoreRef, DbName, Plan, ChunkOpts);
             {error, _} = Error ->
