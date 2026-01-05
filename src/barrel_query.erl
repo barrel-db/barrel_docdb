@@ -1205,6 +1205,14 @@ select_read_profile(_Limit, Cardinality) when Cardinality =< 200 ->
 select_read_profile(_, _) ->
     long_scan.
 
+%% @doc Select read profile based on limit only (for collectors)
+select_read_profile(MaxCount) when is_integer(MaxCount), MaxCount =< 10 ->
+    point;
+select_read_profile(MaxCount) when is_integer(MaxCount), MaxCount =< 200 ->
+    short_range;
+select_read_profile(_) ->
+    long_scan.
+
 %% @doc Execute using direct index key lookup (fastest)
 %% Uses prefix bloom filters for O(1) skip of non-matching SST blocks.
 execute_index_seek(StoreRef, DbName, Plan, Snapshot) ->
@@ -1583,7 +1591,13 @@ execute_index_scan(StoreRef, DbName, Plan, Snapshot) ->
             %% Multi-condition with all index-friendly conditions
             execute_multi_index(StoreRef, DbName, IndexConditions, Plan, Snapshot);
         needs_body ->
-            DocIds = collect_scan_docids(StoreRef, DbName, Conditions, Snapshot),
+            %% Extract limit from Plan for early termination
+            #query_plan{limit = Limit, offset = Offset} = Plan,
+            MaxCount = case Limit of
+                undefined -> infinity;
+                L when is_integer(L) -> (L + Offset) * 3  %% Over-collect to handle filtering
+            end,
+            DocIds = collect_scan_docids(StoreRef, DbName, Conditions, Snapshot, MaxCount),
             filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot)
     end.
 
@@ -1982,7 +1996,8 @@ process_prefix_docids([DocId | Rest], Seen, Count, Acc, MaxCollect) ->
 
 %% @doc Collect DocIds for scan-based execution
 %% Tries optimized paths: multi-index intersection, exists/prefix, then path prefix scan
-collect_scan_docids(StoreRef, DbName, Conditions, _Snapshot) ->
+%% MaxCount limits collection for early termination (use infinity for no limit)
+collect_scan_docids(StoreRef, DbName, Conditions, _Snapshot, MaxCount) ->
     %% First check if we have multiple index-friendly conditions for intersection
     IndexConditions = [C || C <- Conditions, is_index_condition(C)],
     case IndexConditions of
@@ -1993,19 +2008,19 @@ collect_scan_docids(StoreRef, DbName, Conditions, _Snapshot) ->
             %% Single or no index conditions - use existing path
             case find_exists_condition(Conditions) of
                 {ok, Path} ->
-                    %% Exists check: collect all docs that have any value at this path
-                    collect_docids_for_path_exists(StoreRef, DbName, Path);
+                    %% Exists check: collect docs that have any value at this path
+                    collect_docids_for_path_exists(StoreRef, DbName, Path, MaxCount);
                 not_found ->
                     case find_prefix_condition(Conditions) of
                         {ok, Path, Prefix} ->
                             %% Optimized interval scan for prefix queries
-                            collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix);
+                            collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix, MaxCount);
                         not_found ->
                             case find_best_scan_path(Conditions) of
                                 {ok, Path} ->
-                                    collect_docids_for_prefix(StoreRef, DbName, Path);
+                                    collect_docids_for_prefix(StoreRef, DbName, Path, MaxCount);
                                 not_found ->
-                                    collect_all_docids(StoreRef, DbName)
+                                    collect_all_docids(StoreRef, DbName, MaxCount)
                             end
                     end
             end
@@ -2038,17 +2053,34 @@ find_exists_condition([_ | Rest]) ->
 
 %% @doc Collect all DocIds that have any value at the given path
 %% Uses the path index to find docs with the path without fetching full docs
-collect_docids_for_path_exists(StoreRef, DbName, Path) ->
+%% MaxCount limits collection for early termination (use infinity for no limit)
+collect_docids_for_path_exists(StoreRef, DbName, Path, infinity) ->
     %% Use long_scan profile since exists queries typically return many docs
     barrel_ars_index:fold_path_values(
         StoreRef, DbName, Path,
         fun({_FullPath, DocId}, Acc) -> {ok, [DocId | Acc]} end,
         [],
         long_scan
-    ).
+    );
+collect_docids_for_path_exists(StoreRef, DbName, Path, MaxCount) when is_integer(MaxCount) ->
+    %% Limited collection with early termination
+    Profile = select_read_profile(MaxCount),
+    {_, DocIds} = barrel_ars_index:fold_path_values(
+        StoreRef, DbName, Path,
+        fun({_FullPath, DocId}, {Count, Acc}) ->
+            case Count >= MaxCount of
+                true -> {stop, {Count, Acc}};
+                false -> {ok, {Count + 1, [DocId | Acc]}}
+            end
+        end,
+        {0, []},
+        Profile
+    ),
+    DocIds.
 
 %% @doc Collect all document IDs (for full scan fallback)
-collect_all_docids(StoreRef, DbName) ->
+%% MaxCount limits collection for early termination (use infinity for no limit)
+collect_all_docids(StoreRef, DbName, infinity) ->
     %% Use long_scan profile for full table scans (prefetch, avoid cache pollution)
     barrel_store_rocksdb:fold_range(
         StoreRef,
@@ -2060,7 +2092,26 @@ collect_all_docids(StoreRef, DbName) ->
         end,
         [],
         long_scan
-    ).
+    );
+collect_all_docids(StoreRef, DbName, MaxCount) when is_integer(MaxCount) ->
+    %% Limited full scan with early termination
+    Profile = select_read_profile(MaxCount),
+    {_, DocIds} = barrel_store_rocksdb:fold_range(
+        StoreRef,
+        barrel_store_keys:doc_info_prefix(DbName),
+        barrel_store_keys:doc_info_end(DbName),
+        fun(Key, _Value, {Count, Acc}) ->
+            case Count >= MaxCount of
+                true -> {stop, {Count, Acc}};
+                false ->
+                    DocId = barrel_store_keys:decode_doc_info_key(DbName, Key),
+                    {ok, {Count + 1, [DocId | Acc]}}
+            end
+        end,
+        {0, []},
+        Profile
+    ),
+    DocIds.
 
 %% @doc Find a prefix condition for optimized interval scan
 find_prefix_condition([]) ->
@@ -2076,14 +2127,30 @@ find_prefix_condition([_ | Rest]) ->
     find_prefix_condition(Rest).
 
 %% @doc Collect DocIds using optimized prefix interval scan
-collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix) ->
+%% MaxCount limits collection for early termination (use infinity for no limit)
+collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix, infinity) ->
     %% Use short_range profile - prefix queries typically have moderate selectivity
     barrel_ars_index:fold_prefix(
         StoreRef, DbName, Path, Prefix,
         fun({_FullPath, DocId}, Acc) -> {ok, [DocId | Acc]} end,
         [],
         short_range
-    ).
+    );
+collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix, MaxCount) when is_integer(MaxCount) ->
+    %% Limited prefix scan with early termination
+    Profile = select_read_profile(MaxCount),
+    {_, DocIds} = barrel_ars_index:fold_prefix(
+        StoreRef, DbName, Path, Prefix,
+        fun({_FullPath, DocId}, {Count, Acc}) ->
+            case Count >= MaxCount of
+                true -> {stop, {Count, Acc}};
+                false -> {ok, {Count + 1, [DocId | Acc]}}
+            end
+        end,
+        {0, []},
+        Profile
+    ),
+    DocIds.
 
 %% @doc Execute using multiple index lookups with intersection
 %% Uses cardinality-ordered intersection for efficient multi-condition queries.
@@ -2269,14 +2336,30 @@ collect_docids_for_path_limited(StoreRef, DbName, FullPath, MaxCount) ->
     lists:sublist(AllDocIds, MaxCount).
 
 %% @doc Collect document IDs matching a path prefix
-collect_docids_for_prefix(StoreRef, DbName, PathPrefix) ->
+%% MaxCount limits collection for early termination (use infinity for no limit)
+collect_docids_for_prefix(StoreRef, DbName, PathPrefix, infinity) ->
     %% Use short_range profile - prefix scans have unknown but typically moderate size
     barrel_ars_index:fold_path(
         StoreRef, DbName, PathPrefix,
         fun({_Path, DocId}, Acc) -> {ok, [DocId | Acc]} end,
         [],
         short_range
-    ).
+    );
+collect_docids_for_prefix(StoreRef, DbName, PathPrefix, MaxCount) when is_integer(MaxCount) ->
+    %% Limited prefix scan with early termination
+    Profile = select_read_profile(MaxCount),
+    {_, DocIds} = barrel_ars_index:fold_path(
+        StoreRef, DbName, PathPrefix,
+        fun({_Path, DocId}, {Count, Acc}) ->
+            case Count >= MaxCount of
+                true -> {stop, {Count, Acc}};
+                false -> {ok, {Count + 1, [DocId | Acc]}}
+            end
+        end,
+        {0, []},
+        Profile
+    ),
+    DocIds.
 
 %% @doc Filter results by remaining conditions and apply projections
 filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot) ->
