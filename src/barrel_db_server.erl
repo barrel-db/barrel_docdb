@@ -464,10 +464,7 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
         {ok, Columns} ->
             ExistingRev = proplists:get_value(?COL_REV, Columns),
             ExistingHlc = barrel_hlc:decode(proplists:get_value(?COL_HLC, Columns)),
-            OldTree = case proplists:get_value(?COL_REVTREE, Columns) of
-                undefined -> #{};
-                TreeBin -> binary_to_term(TreeBin)
-            end,
+            OldTree = decode_revtree(proplists:get_value(?COL_REVTREE, Columns)),
             %% Get old doc body for path index diff from body CF (current body, no rev in key)
             OldBody = case barrel_store_rocksdb:body_get(StoreRef,
                             barrel_store_keys:doc_body(DbName, DocId)) of
@@ -501,7 +498,7 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
         {?COL_REV, NewRev},
         {?COL_DELETED, deleted_to_bin(Deleted)},
         {?COL_HLC, barrel_hlc:encode(NextHlc)},
-        {?COL_REVTREE, term_to_binary(RevTree)}
+        {?COL_REVTREE, encode_revtree(RevTree)}
     ],
     DocOps = [{entity_put, DocEntityKey, DocColumns}],
 
@@ -644,10 +641,7 @@ prepare_doc_ops(StoreRef, DbName, Doc) ->
             {ok, Columns} ->
                 ExistingRev = proplists:get_value(?COL_REV, Columns),
                 ExistingHlc = barrel_hlc:decode(proplists:get_value(?COL_HLC, Columns)),
-                OldTree = case proplists:get_value(?COL_REVTREE, Columns) of
-                    undefined -> #{};
-                    TreeBin -> binary_to_term(TreeBin)
-                end,
+                OldTree = decode_revtree(proplists:get_value(?COL_REVTREE, Columns)),
                 %% Get old doc body from body CF (current body, no rev in key)
                 {OldBody, OldCbor} = case barrel_store_rocksdb:body_get(StoreRef,
                                 barrel_store_keys:doc_body(DbName, DocId)) of
@@ -679,7 +673,7 @@ prepare_doc_ops(StoreRef, DbName, Doc) ->
             {?COL_REV, NewRev},
             {?COL_DELETED, deleted_to_bin(Deleted)},
             {?COL_HLC, barrel_hlc:encode(NextHlc)},
-            {?COL_REVTREE, term_to_binary(RevTree)}
+            {?COL_REVTREE, encode_revtree(RevTree)}
         ],
         DocOps = [{entity_put, DocEntityKey, DocColumns}],
 
@@ -831,10 +825,7 @@ do_delete_doc(StoreRef, DbName, DocId, Opts) ->
         {ok, Columns} ->
             CurrentRev = proplists:get_value(?COL_REV, Columns),
             OldHlc = barrel_hlc:decode(proplists:get_value(?COL_HLC, Columns)),
-            RevTree = case proplists:get_value(?COL_REVTREE, Columns) of
-                undefined -> #{};
-                TreeBin -> binary_to_term(TreeBin)
-            end,
+            RevTree = decode_revtree(proplists:get_value(?COL_REVTREE, Columns)),
 
             %% Verify revision if provided
             ExpectedRev = maps:get(rev, Opts, undefined),
@@ -860,7 +851,7 @@ do_delete_doc(StoreRef, DbName, DocId, Opts) ->
                 {?COL_REV, NewRev},
                 {?COL_DELETED, <<"true">>},
                 {?COL_HLC, barrel_hlc:encode(NextHlc)},
-                {?COL_REVTREE, term_to_binary(NewRevTree)}
+                {?COL_REVTREE, encode_revtree(NewRevTree)}
             ],
             DocOps = [{entity_put, DocEntityKey, DocColumns}],
 
@@ -971,10 +962,7 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
         {ok, Columns} ->
             ExistingRev = proplists:get_value(?COL_REV, Columns),
             ExistingHlc = barrel_hlc:decode(proplists:get_value(?COL_HLC, Columns)),
-            OldTree = case proplists:get_value(?COL_REVTREE, Columns) of
-                undefined -> #{};
-                TreeBin -> binary_to_term(TreeBin)
-            end,
+            OldTree = decode_revtree(proplists:get_value(?COL_REVTREE, Columns)),
             %% Get old doc body from body CF (current body, no rev in key)
             {OldBody, OldCbor} = case barrel_store_rocksdb:body_get(StoreRef,
                             barrel_store_keys:doc_body(DbName, DocId)) of
@@ -997,7 +985,7 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
         {?COL_REV, NewRev},
         {?COL_DELETED, deleted_to_bin(Deleted)},
         {?COL_HLC, barrel_hlc:encode(NextHlc)},
-        {?COL_REVTREE, term_to_binary(NewRevTree)}
+        {?COL_REVTREE, encode_revtree(NewRevTree)}
     ],
     DocOps = [{entity_put, DocEntityKey, DocColumns}],
 
@@ -1092,10 +1080,7 @@ do_revsdiff(StoreRef, DbName, DocId, RevIds) ->
     DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
     case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
         {ok, Columns} ->
-            RevTree = case proplists:get_value(?COL_REVTREE, Columns) of
-                undefined -> #{};
-                TreeBin -> binary_to_term(TreeBin)
-            end,
+            RevTree = decode_revtree(proplists:get_value(?COL_REVTREE, Columns)),
 
             %% Find missing revisions and possible ancestors
             {Missing, PossibleAncestors} = lists:foldl(
@@ -1221,3 +1206,17 @@ deleted_to_bin(false) -> <<"false">>.
 bin_to_deleted(<<"true">>) -> true;
 bin_to_deleted(<<"false">>) -> false;
 bin_to_deleted(_) -> false.
+
+%% @doc Encode revision tree to compact binary format
+-spec encode_revtree(map()) -> binary().
+encode_revtree(RevTree) when is_map(RevTree) ->
+    RT = barrel_revtree_bin:from_map(RevTree),
+    barrel_revtree_bin:encode(RT).
+
+%% @doc Decode revision tree from compact binary format
+-spec decode_revtree(binary() | undefined) -> map().
+decode_revtree(undefined) -> #{};
+decode_revtree(<<>>) -> #{};
+decode_revtree(Bin) ->
+    RT = barrel_revtree_bin:decode(Bin),
+    barrel_revtree_bin:to_map(RT).

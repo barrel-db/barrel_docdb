@@ -992,7 +992,7 @@ encode_change(DocInfo) ->
     end.
 
 count_conflicts(#{revtree := RevTree}) when is_map(RevTree) ->
-    length(barrel_revtree:conflicts(RevTree));
+    length(barrel_revtree_bin:conflicts_from_map(RevTree));
 count_conflicts(_) ->
     0.
 

@@ -200,9 +200,8 @@ write_batch(#{ref := Ref, bitmap_cf := BitmapCF, posting_cf := PostingCF,
                ({body_delete, Key}) ->
                 ok = rocksdb:batch_delete(Batch, BodyCF, Key);
                ({entity_put, Key, Columns}) ->
-                %% Encode columns as binary for batch write
-                %% (rocksdb doesn't have batch_put_entity)
-                ok = rocksdb:batch_put(Batch, Key, term_to_binary(Columns));
+                %% Encode columns to fixed binary format (fast decode)
+                ok = rocksdb:batch_put(Batch, Key, encode_entity(Columns));
                ({entity_delete, Key}) ->
                 ok = rocksdb:batch_delete(Batch, Key)
             end,
@@ -749,46 +748,87 @@ body_delete(#{ref := Ref, body_cf := BodyCF}, Key) ->
 %% Wide Column (Entity) Operations
 %%====================================================================
 
-%% @doc Put a wide-column entity in the default column family
+%% @doc Put an entity in the default column family
 %% Columns is a list of {Name, Value} tuples where Name and Value are binaries.
+%% Uses fixed binary format encoding for performance.
 -spec put_entity(db_ref(), binary(), [{binary(), binary()}]) -> ok | {error, term()}.
 put_entity(DbRef, Key, Columns) ->
     put_entity(DbRef, Key, Columns, []).
 
-%% @doc Put a wide-column entity with options
+%% @doc Put an entity with options
+%% Uses fixed binary format encoding for performance.
 -spec put_entity(db_ref(), binary(), [{binary(), binary()}], list()) -> ok | {error, term()}.
 put_entity(#{ref := Ref}, Key, Columns, Opts) ->
-    rocksdb:put_entity(Ref, Key, Columns, Opts).
+    rocksdb:put(Ref, Key, encode_entity(Columns), Opts).
+
+%% Entity column names (matching barrel_db_server)
+-define(COL_REV, <<"rev">>).
+-define(COL_DELETED, <<"del">>).
+-define(COL_HLC, <<"hlc">>).
+-define(COL_REVTREE, <<"revtree">>).
+
+%% @doc Encode entity columns to fixed binary format
+%% Format: <<RevLen:16, Rev/binary, Deleted:8, HlcLen:16, Hlc/binary, TreeLen:32, Tree/binary>>
+%% This avoids the overhead of term_to_binary on every entity read/write.
+-spec encode_entity([{binary(), term()}]) -> binary().
+encode_entity(Columns) ->
+    Rev = proplists:get_value(?COL_REV, Columns, <<>>),
+    Del = proplists:get_value(?COL_DELETED, Columns, <<"false">>),
+    Hlc = proplists:get_value(?COL_HLC, Columns, <<>>),
+    %% Tree is already term_to_binary'd by barrel_db_server
+    TreeBin = proplists:get_value(?COL_REVTREE, Columns, <<>>),
+
+    DelByte = case Del of
+        true -> 1;
+        <<"true">> -> 1;
+        _ -> 0
+    end,
+
+    <<(byte_size(Rev)):16, Rev/binary,
+      DelByte:8,
+      (byte_size(Hlc)):16, Hlc/binary,
+      (byte_size(TreeBin)):32, TreeBin/binary>>.
+
+%% @doc Decode entity from fixed binary format
+-spec decode_entity(binary()) -> [{binary(), term()}].
+decode_entity(<<RevLen:16, Rev:RevLen/binary,
+                DelByte:8,
+                HlcLen:16, Hlc:HlcLen/binary,
+                TreeLen:32, TreeBin:TreeLen/binary>>) ->
+    Del = case DelByte of 1 -> <<"true">>; 0 -> <<"false">> end,
+    [{?COL_REV, Rev}, {?COL_DELETED, Del}, {?COL_HLC, Hlc}, {?COL_REVTREE, TreeBin}].
 
 %% @doc Get a wide-column entity from the default column family
 %% Returns {ok, [{Name, Value}]} or not_found
-%% Note: Entities are stored as term_to_binary of proplist for batch compatibility
+%% Uses fast binary decoding instead of term_to_binary.
 -spec get_entity(db_ref(), binary()) -> {ok, [{binary(), binary()}]} | not_found | {error, term()}.
 get_entity(#{ref := Ref}, Key) ->
     case rocksdb:get(Ref, Key, []) of
-        {ok, Bin} -> {ok, binary_to_term(Bin)};
+        {ok, Bin} -> {ok, decode_entity(Bin)};
         not_found -> not_found;
         {error, _} = Err -> Err
     end.
 
 %% @doc Get multiple wide-column entities (batch read)
+%% Uses fast binary decoding instead of term_to_binary.
 -spec multi_get_entity(db_ref(), [binary()]) -> [{ok, [{binary(), binary()}]} | not_found | {error, term()}].
 multi_get_entity(#{ref := Ref}, Keys) ->
     Results = rocksdb:multi_get(Ref, Keys, []),
     [case R of
-        {ok, Bin} -> {ok, binary_to_term(Bin)};
+        {ok, Bin} -> {ok, decode_entity(Bin)};
         not_found -> not_found;
         {error, _} = Err -> Err
     end || R <- Results].
 
-%% @doc Delete a wide-column entity (same as regular delete)
+%% @doc Delete an entity
 -spec delete_entity(db_ref(), binary()) -> ok | {error, term()}.
 delete_entity(#{ref := Ref}, Key) ->
-    rocksdb:delete_entity(Ref, Key, []).
+    rocksdb:delete(Ref, Key, []).
 
 %% @doc Add entity put to a batch
 %% Helper for building batch operations with entities
+%% Uses fixed binary format encoding for performance.
 -spec batch_put_entity(rocksdb:batch_handle(), binary(), [{binary(), binary()}]) -> ok.
 batch_put_entity(Batch, Key, Columns) ->
-    rocksdb:batch_put_entity(Batch, Key, Columns).
+    rocksdb:batch_put(Batch, Key, encode_entity(Columns)).
 

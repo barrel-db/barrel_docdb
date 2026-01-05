@@ -1,7 +1,7 @@
 %%%-------------------------------------------------------------------
 %%% @doc Test suite for barrel_docdb document core
 %%%
-%%% Tests barrel_doc and barrel_revtree modules.
+%%% Tests barrel_doc module.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_doc_SUITE).
@@ -59,26 +59,13 @@
     cbor_filter/1
 ]).
 
-%% Test cases - barrel_revtree
--export([
-    revtree_new/1,
-    revtree_add/1,
-    revtree_contains/1,
-    revtree_parent/1,
-    revtree_history/1,
-    revtree_leaves/1,
-    revtree_is_leaf/1,
-    revtree_winning_revision/1,
-    revtree_conflicts/1,
-    revtree_prune/1
-]).
 
 %%====================================================================
 %% CT Callbacks
 %%====================================================================
 
 all() ->
-    [{group, doc}, {group, cbor}, {group, cbor_api}, {group, revtree}].
+    [{group, doc}, {group, cbor}, {group, cbor_api}].
 
 groups() ->
     [
@@ -122,18 +109,6 @@ groups() ->
             cbor_fold,
             cbor_map,
             cbor_filter
-        ]},
-        {revtree, [sequence], [
-            revtree_new,
-            revtree_add,
-            revtree_contains,
-            revtree_parent,
-            revtree_history,
-            revtree_leaves,
-            revtree_is_leaf,
-            revtree_winning_revision,
-            revtree_conflicts,
-            revtree_prune
         ]}
     ].
 
@@ -745,183 +720,3 @@ cbor_filter(_Config) ->
 
     ok.
 
-%%====================================================================
-%% Test Cases - barrel_revtree
-%%====================================================================
-
-revtree_new(_Config) ->
-    %% Empty tree
-    Tree1 = barrel_revtree:new(),
-    ?assertEqual(#{}, Tree1),
-
-    %% Tree with initial revision
-    RevInfo = #{id => <<"1-abc">>, parent => undefined, deleted => false},
-    Tree2 = barrel_revtree:new(RevInfo),
-    ?assertEqual(1, maps:size(Tree2)),
-    ?assert(barrel_revtree:contains(<<"1-abc">>, Tree2)),
-
-    ok.
-
-revtree_add(_Config) ->
-    %% Start with root
-    Root = #{id => <<"1-aaa">>, parent => undefined, deleted => false},
-    Tree1 = barrel_revtree:new(Root),
-
-    %% Add child
-    Child = #{id => <<"2-bbb">>, parent => <<"1-aaa">>, deleted => false},
-    Tree2 = barrel_revtree:add(Child, Tree1),
-
-    ?assertEqual(2, maps:size(Tree2)),
-    ?assert(barrel_revtree:contains(<<"2-bbb">>, Tree2)),
-
-    %% Can't add duplicate
-    ?assertExit({badrev, already_exists}, barrel_revtree:add(Child, Tree2)),
-
-    %% Can't add with missing parent
-    Orphan = #{id => <<"3-ccc">>, parent => <<"2-xxx">>, deleted => false},
-    ?assertExit({badrev, missing_parent}, barrel_revtree:add(Orphan, Tree2)),
-
-    ok.
-
-revtree_contains(_Config) ->
-    Tree = flat_tree(),
-
-    ?assert(barrel_revtree:contains(<<"1-one">>, Tree)),
-    ?assert(barrel_revtree:contains(<<"2-two">>, Tree)),
-    ?assert(barrel_revtree:contains(<<"3-three">>, Tree)),
-    ?assertNot(barrel_revtree:contains(<<"4-four">>, Tree)),
-
-    ok.
-
-revtree_parent(_Config) ->
-    Tree = flat_tree(),
-
-    ?assertEqual(undefined, barrel_revtree:parent(<<"1-one">>, Tree)),
-    ?assertEqual(<<"1-one">>, barrel_revtree:parent(<<"2-two">>, Tree)),
-    ?assertEqual(<<"2-two">>, barrel_revtree:parent(<<"3-three">>, Tree)),
-
-    %% Non-existent revision
-    ?assertEqual(undefined, barrel_revtree:parent(<<"4-four">>, Tree)),
-
-    ok.
-
-revtree_history(_Config) ->
-    Tree = flat_tree(),
-
-    History = barrel_revtree:history(<<"3-three">>, Tree),
-    ?assertEqual([<<"3-three">>, <<"2-two">>, <<"1-one">>], History),
-
-    %% With limit
-    HistoryLimit = barrel_revtree:history(<<"3-three">>, Tree, 2),
-    ?assertEqual([<<"3-three">>, <<"2-two">>], HistoryLimit),
-
-    ok.
-
-revtree_leaves(_Config) ->
-    %% Flat tree has one leaf
-    Tree1 = flat_tree(),
-    Leaves1 = barrel_revtree:leaves(Tree1),
-    ?assertEqual([<<"3-three">>], Leaves1),
-
-    %% Branched tree has two leaves
-    Tree2 = branched_tree(),
-    Leaves2 = lists:sort(barrel_revtree:leaves(Tree2)),
-    ?assertEqual([<<"3-three">>, <<"3-three-2">>], Leaves2),
-
-    ok.
-
-revtree_is_leaf(_Config) ->
-    Tree = branched_tree(),
-
-    ?assert(barrel_revtree:is_leaf(<<"3-three">>, Tree)),
-    ?assert(barrel_revtree:is_leaf(<<"3-three-2">>, Tree)),
-    ?assertNot(barrel_revtree:is_leaf(<<"2-two">>, Tree)),
-    ?assertNot(barrel_revtree:is_leaf(<<"1-one">>, Tree)),
-
-    ok.
-
-revtree_winning_revision(_Config) ->
-    %% Branched tree with conflict
-    Tree1 = branched_tree(),
-    {WinRev1, Branched1, Conflict1} = barrel_revtree:winning_revision(Tree1),
-    ?assertEqual(<<"3-three-2">>, WinRev1),  % Higher hash wins
-    ?assert(Branched1),
-    ?assert(Conflict1),
-
-    %% Add a higher generation
-    Rev4 = #{id => <<"4-four">>, parent => <<"3-three">>, deleted => false},
-    Tree2 = barrel_revtree:add(Rev4, Tree1),
-    {WinRev2, _, _} = barrel_revtree:winning_revision(Tree2),
-    ?assertEqual(<<"4-four">>, WinRev2),
-
-    %% Delete one branch
-    Rev5 = #{id => <<"5-five">>, parent => <<"4-four">>, deleted => true},
-    Tree3 = barrel_revtree:add(Rev5, Tree2),
-    {WinRev3, Branched3, Conflict3} = barrel_revtree:winning_revision(Tree3),
-    ?assertEqual(<<"3-three-2">>, WinRev3),  % Active branch wins
-    ?assert(Branched3),
-    ?assertNot(Conflict3),  % Only one active branch
-
-    ok.
-
-revtree_conflicts(_Config) ->
-    Tree = branched_tree(),
-
-    Conflicts = barrel_revtree:conflicts(Tree),
-    ?assertEqual(2, length(Conflicts)),
-
-    %% Sorted by descending {not deleted, rev}
-    [First | _] = Conflicts,
-    ?assertEqual(<<"3-three-2">>, maps:get(id, First)),
-
-    ok.
-
-revtree_prune(_Config) ->
-    %% Build a longer tree
-    Tree0 = flat_tree(),
-    Rev4 = #{id => <<"4-four">>, parent => <<"3-three">>, deleted => false},
-    Rev5 = #{id => <<"5-five">>, parent => <<"4-four">>, deleted => false},
-    Tree1 = barrel_revtree:add(Rev4, Tree0),
-    Tree2 = barrel_revtree:add(Rev5, Tree1),
-
-    ?assertEqual(5, maps:size(Tree2)),
-
-    %% Prune to keep 3 revisions
-    {Pruned, Tree3} = barrel_revtree:prune(3, Tree2),
-    ?assertEqual(2, Pruned),
-    ?assertEqual(3, maps:size(Tree3)),
-
-    %% Root should now be at generation 3
-    ?assertNot(barrel_revtree:contains(<<"1-one">>, Tree3)),
-    ?assertNot(barrel_revtree:contains(<<"2-two">>, Tree3)),
-    ?assert(barrel_revtree:contains(<<"3-three">>, Tree3)),
-
-    %% New root has no parent
-    ?assertEqual(undefined, barrel_revtree:parent(<<"3-three">>, Tree3)),
-
-    ok.
-
-%%====================================================================
-%% Test Fixtures
-%%====================================================================
-
-%% 1-one -> 2-two -> 3-three
-flat_tree() ->
-    #{
-        <<"1-one">> => #{id => <<"1-one">>, parent => undefined, deleted => false},
-        <<"2-two">> => #{id => <<"2-two">>, parent => <<"1-one">>, deleted => false},
-        <<"3-three">> => #{id => <<"3-three">>, parent => <<"2-two">>, deleted => false}
-    }.
-
-%%                  3-three
-%%                /
-%% 1-one -> 2-two
-%%                \
-%%                  3-three-2
-branched_tree() ->
-    #{
-        <<"1-one">> => #{id => <<"1-one">>, parent => undefined, deleted => false},
-        <<"2-two">> => #{id => <<"2-two">>, parent => <<"1-one">>, deleted => false},
-        <<"3-three">> => #{id => <<"3-three">>, parent => <<"2-two">>, deleted => false},
-        <<"3-three-2">> => #{id => <<"3-three-2">>, parent => <<"2-two">>, deleted => false}
-    }.
