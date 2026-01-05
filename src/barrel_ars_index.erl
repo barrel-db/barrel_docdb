@@ -29,6 +29,8 @@
     fold_posting_with_snapshot/6,
     fold_prefix_posting_with_snapshot/7,
     get_posting_list/3,
+    get_posting_list_sorted/3,
+    get_bucketed_posting_list/4,
     fold_value_index/7
 ]).
 
@@ -157,12 +159,14 @@ remove_doc_ops(DbName, DocId, Paths) ->
                   || {Path, _} <- Paths],
     %% Remove DocId from value-first index
     ValueIndexOps = make_value_index_remove_ops(DbName, DocId, Paths),
+    %% Remove DocId from bucketed posting lists
+    BucketedOps = make_bucketed_posting_remove_ops(DbName, DocId, Paths),
     %% Decrement counters for each path
     DecrOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), -1}
                || {Path, _} <- Paths],
     %% Delete reverse index
     ReverseKey = barrel_store_keys:doc_paths_key(DbName, DocId),
-    PostingOps ++ ValueIndexOps ++ DecrOps ++ [{delete, ReverseKey}].
+    PostingOps ++ ValueIndexOps ++ BucketedOps ++ DecrOps ++ [{delete, ReverseKey}].
 
 %% @private Create value-first index remove operations (individual key deletes)
 make_value_index_remove_ops(_DbName, _DocId, []) ->
@@ -620,6 +624,49 @@ get_posting_list(StoreRef, DbName, FullPath) ->
         {error, _} -> []
     end.
 
+%% @doc Get posting list for an exact path+value, returning SORTED DocIds.
+%% Unlike get_posting_list which decodes a merged blob, this iterates
+%% value_index keys which are naturally sorted. No separate sort needed.
+%% FullPath format: [field1, field2, value] where value is the last element.
+-spec get_posting_list_sorted(store_ref(), db_name(), [term()]) -> [binary()].
+get_posting_list_sorted(StoreRef, DbName, FullPath) ->
+    %% Extract value (last element) and field path (rest)
+    case split_path_value(FullPath) of
+        {[], _Value} ->
+            %% Single element path - fall back to unsorted
+            lists:sort(get_posting_list(StoreRef, DbName, FullPath));
+        {FieldPath, Value} ->
+            %% Iterate value_index keys in sorted order
+            StartKey = barrel_store_keys:value_index_prefix(DbName, Value, FieldPath),
+            EndKey = barrel_store_keys:value_index_end(DbName, Value, FieldPath),
+            PrefixLen = byte_size(StartKey),
+            FoldFun = fun(Key, _Val, Acc) ->
+                <<_:PrefixLen/binary, DocId/binary>> = Key,
+                {ok, [DocId | Acc]}
+            end,
+            DocIds = barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, []),
+            lists:reverse(DocIds)
+    end.
+
+%% @doc Get DocIds from bucketed posting lists in sorted order.
+%% Iterates buckets (each ~20-100 DocIds) in sorted bucket order.
+%% Within each bucket, DocIds are merged and sorted.
+%% FullPath format: [field1, field2, value] where value is the last element.
+-spec get_bucketed_posting_list(store_ref(), db_name(), term(), [term()]) -> [binary()].
+get_bucketed_posting_list(StoreRef, DbName, Value, FieldPath) ->
+    StartKey = barrel_store_keys:value_posting_bucket_prefix(DbName, Value, FieldPath),
+    EndKey = barrel_store_keys:value_posting_bucket_end(DbName, Value, FieldPath),
+    %% Iterate buckets in sorted order (by bucket prefix = first 2 bytes of DocId)
+    %% fold_range_posting already decodes posting lists, so BucketDocIds is a list
+    FoldFun = fun(_Key, BucketDocIds, Acc) ->
+        %% BucketDocIds is already decoded by fold_range_posting
+        %% Merge into accumulator
+        {ok, Acc ++ BucketDocIds}
+    end,
+    AllDocIds = barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, FoldFun, []),
+    %% Sort the collected DocIds
+    lists:sort(AllDocIds).
+
 %% @doc Fold over value-first index with early termination support.
 %% Iterates over individual keys (one per DocId) allowing bounded queries
 %% to stop after collecting enough results.
@@ -662,6 +709,10 @@ make_index_ops(DbName, DocId, Paths) ->
     %% Key: [prefix, db, value_prefix, field_path, DocId] -> Value: empty
     ValueIndexOps = make_value_index_ops(DbName, DocId, Paths),
 
+    %% Create bucketed posting list operations for sorted bulk iteration
+    %% Key: [prefix, db, value_prefix, field_path, bucket] -> posting list
+    BucketedPostingOps = make_bucketed_posting_ops(DbName, DocId, Paths),
+
     %% Increment counters for each path
     StatsOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), 1}
                 || {Path, _} <- Paths],
@@ -677,7 +728,7 @@ make_index_ops(DbName, DocId, Paths) ->
                  barrel_store_keys:doc_paths_key(DbName, DocId),
                  term_to_binary(Paths)},
 
-    PostingOps ++ ValueIndexOps ++ StatsOps ++ BitmapOps ++ [ReverseOp].
+    PostingOps ++ ValueIndexOps ++ BucketedPostingOps ++ StatsOps ++ BitmapOps ++ [ReverseOp].
 
 %% @private Create value-first index operations for equality queries
 %% Path format: [field1, field2, value] -> value_index_key(DbName, value, [field1, field2], DocId)
@@ -706,6 +757,43 @@ split_path_value(Path) ->
     ReversedPath = lists:reverse(Path),
     [Value | ReversedFieldPath] = ReversedPath,
     {lists:reverse(ReversedFieldPath), Value}.
+
+%% @private Create bucketed posting list operations
+%% Each path+value combination gets a posting append to its bucket key.
+%% Buckets are based on DocId prefix for sorted iteration.
+make_bucketed_posting_ops(_DbName, _DocId, []) ->
+    [];
+make_bucketed_posting_ops(DbName, DocId, [{Path, _Type} | Rest]) ->
+    case Path of
+        [] ->
+            make_bucketed_posting_ops(DbName, DocId, Rest);
+        [_Single] ->
+            %% Single element path - skip bucketed posting
+            make_bucketed_posting_ops(DbName, DocId, Rest);
+        _ ->
+            %% Extract value (last element) and field path (rest)
+            {FieldPath, Value} = split_path_value(Path),
+            %% Bucketed posting key includes DocId bucket for sorted iteration
+            Key = barrel_store_keys:value_posting_bucket_key(DbName, Value, FieldPath, DocId),
+            Op = {posting_append, Key, DocId},
+            [Op | make_bucketed_posting_ops(DbName, DocId, Rest)]
+    end.
+
+%% @private Create bucketed posting list remove operations
+make_bucketed_posting_remove_ops(_DbName, _DocId, []) ->
+    [];
+make_bucketed_posting_remove_ops(DbName, DocId, [{Path, _Type} | Rest]) ->
+    case Path of
+        [] ->
+            make_bucketed_posting_remove_ops(DbName, DocId, Rest);
+        [_Single] ->
+            make_bucketed_posting_remove_ops(DbName, DocId, Rest);
+        _ ->
+            {FieldPath, Value} = split_path_value(Path),
+            Key = barrel_store_keys:value_posting_bucket_key(DbName, Value, FieldPath, DocId),
+            Op = {posting_remove, Key, DocId},
+            [Op | make_bucketed_posting_remove_ops(DbName, DocId, Rest)]
+    end.
 
 %% @private Convert DocId to a bitmap position using deterministic hash.
 %% Uses a global bitmap size so positions are consistent across all paths,

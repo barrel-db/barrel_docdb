@@ -2397,10 +2397,24 @@ execute_full_scan(StoreRef, DbName, Plan, Snapshot) ->
     filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot).
 
 %% @doc Collect document IDs matching an exact path+value
-%% Uses direct posting list lookup - O(1) key fetch instead of iteration
-%% Returns sorted list for intersection operations
+%% Returns SORTED list for intersection operations.
+%% Uses bucketed posting lists for efficient sorted iteration.
 collect_docids_for_path(StoreRef, DbName, FullPath) ->
-    lists:sort(barrel_ars_index:get_posting_list(StoreRef, DbName, FullPath)).
+    %% Extract value (last element) and field path (rest)
+    case split_path_value(FullPath) of
+        {[], _} ->
+            %% Single element path - fall back to regular posting list
+            lists:sort(barrel_ars_index:get_posting_list(StoreRef, DbName, FullPath));
+        {FieldPath, Value} ->
+            %% Use bucketed posting list for sorted iteration
+            barrel_ars_index:get_bucketed_posting_list(StoreRef, DbName, Value, FieldPath)
+    end.
+
+%% @private Split path into field path and value
+split_path_value(Path) ->
+    ReversedPath = lists:reverse(Path),
+    [Value | ReversedFieldPath] = ReversedPath,
+    {lists:reverse(ReversedFieldPath), Value}.
 
 %% @doc Collect document IDs with early termination at MaxCount
 %% For LIMIT pushdown optimization

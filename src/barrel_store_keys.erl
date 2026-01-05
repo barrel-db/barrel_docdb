@@ -46,6 +46,10 @@
 -export([value_posting_key/3, value_posting_prefix/2, value_posting_end/2]).
 -export([truncate_value/1]).
 
+%% Bucketed posting keys (split by DocId prefix for sorted iteration)
+-export([value_posting_bucket_key/4, value_posting_bucket_prefix/3, value_posting_bucket_end/3]).
+-export([docid_bucket/1]).
+
 %% Value-first index keys (for iterable equality queries with early termination)
 -export([value_index_key/4, value_index_prefix/3, value_index_end/3]).
 
@@ -98,6 +102,7 @@
 -define(PREFIX_PATH_BITMAP, 16#10).
 -define(PREFIX_PATH_POSTING, 16#14).  %% Posting lists: path → [DocId, ...]
 -define(PREFIX_VALUE_POSTING, 16#15). %% Value-first posting: [value_prefix, path] → [DocId, ...]
+-define(PREFIX_VALUE_POSTING_BUCKET, 16#19). %% Bucketed posting: [value_prefix, path, bucket] → [DocId, ...]
 -define(PREFIX_VALUE_INDEX, 16#16).   %% Value-first index: [value_prefix, path, DocId] → marker (for iteration)
 -define(PREFIX_CHANGE_BUCKET, 16#17). %% Change bucket: DbName + BucketTs → {min_hlc, max_hlc, count}
 -define(PREFIX_DOC_ENTITY, 16#18).    %% Wide-column doc entity: DbName + DocId → entity with columns
@@ -591,6 +596,51 @@ truncate_value(Bin) when is_binary(Bin), byte_size(Bin) > ?VALUE_PREFIX_MAX_LEN 
     Prefix;
 truncate_value(Value) ->
     Value.
+
+%%====================================================================
+%% Bucketed Posting List Keys
+%%====================================================================
+
+%% @doc Bucketed posting list key for sorted iteration.
+%% Format: [value_prefix, path, bucket] where bucket is first 2 bytes of DocId.
+%% This splits posting lists by DocId prefix, enabling:
+%% - Sorted iteration (buckets are in lexicographic order)
+%% - Smaller chunks (faster decode per bucket)
+%% - Early termination in intersection
+-spec value_posting_bucket_key(db_name(), term(), [term()], docid()) -> binary().
+value_posting_bucket_key(DbName, Value, Path, DocId) ->
+    TruncatedValue = truncate_value(Value),
+    EncodedValue = encode_path_component(TruncatedValue),
+    EncodedPath = encode_path(Path),
+    Bucket = docid_bucket(DocId),
+    <<?PREFIX_VALUE_POSTING_BUCKET, (encode_name(DbName))/binary,
+      EncodedValue/binary, EncodedPath/binary, Bucket/binary>>.
+
+%% @doc Prefix for scanning bucketed posting lists for a path+value.
+%% Use this to iterate all buckets in sorted order.
+-spec value_posting_bucket_prefix(db_name(), term(), [term()]) -> binary().
+value_posting_bucket_prefix(DbName, Value, Path) ->
+    TruncatedValue = truncate_value(Value),
+    EncodedValue = encode_path_component(TruncatedValue),
+    EncodedPath = encode_path(Path),
+    <<?PREFIX_VALUE_POSTING_BUCKET, (encode_name(DbName))/binary,
+      EncodedValue/binary, EncodedPath/binary>>.
+
+%% @doc End marker for bucketed posting list range scan.
+-spec value_posting_bucket_end(db_name(), term(), [term()]) -> binary().
+value_posting_bucket_end(DbName, Value, Path) ->
+    Prefix = value_posting_bucket_prefix(DbName, Value, Path),
+    <<Prefix/binary, 16#FF>>.
+
+%% @doc Extract bucket (first 2 bytes) from DocId.
+%% Short DocIds are padded with zeros.
+-spec docid_bucket(docid()) -> binary().
+docid_bucket(DocId) when byte_size(DocId) >= 2 ->
+    binary:part(DocId, 0, 2);
+docid_bucket(DocId) ->
+    %% Pad short DocIds with zeros
+    Padding = 2 - byte_size(DocId),
+    <<DocId/binary, 0:Padding/unit:8>>.
 
 %%====================================================================
 %% Value-First Index Keys (Iterable)
