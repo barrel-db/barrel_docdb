@@ -71,6 +71,7 @@
     execute_variable_binding/1,
     execute_multi_index_intersection/1,
     execute_multi_index_zero_cardinality/1,
+    execute_multi_index_with_limit/1,
     execute_chunked_query/1
 ]).
 
@@ -133,6 +134,7 @@ groups() ->
             execute_variable_binding,
             execute_multi_index_intersection,
             execute_multi_index_zero_cardinality,
+            execute_multi_index_with_limit,
             execute_chunked_query
         ]}
     ].
@@ -743,6 +745,45 @@ execute_multi_index_zero_cardinality(Config) ->
     {ok, Results, _} = barrel_query:execute(StoreRef, DbName, Plan),
 
     ?assertEqual(0, length(Results)),
+    ok.
+
+%% Test multi-index intersection with limit for early termination
+execute_multi_index_with_limit(Config) ->
+    DbName = proplists:get_value(db_name, Config),
+    StoreRef = proplists:get_value(store_ref, Config),
+
+    %% Query with multiple conditions and limit
+    %% Should use early termination in intersection
+    Spec = #{
+        where => [
+            {path, [<<"type">>], <<"user">>},
+            {path, [<<"status">>], <<"active">>}
+        ],
+        limit => 1
+    },
+    {ok, Plan} = barrel_query:compile(Spec),
+    {ok, Results, _} = barrel_query:execute(StoreRef, DbName, Plan),
+
+    %% Should return exactly 1 result due to limit
+    ?assertEqual(1, length(Results)),
+
+    %% Verify the result is a valid user with active status
+    [Result] = Results,
+    DocId = maps:get(<<"id">>, Result),
+    ?assert(is_binary(DocId)),
+
+    %% Test with limit 2
+    Spec2 = #{
+        where => [
+            {path, [<<"type">>], <<"user">>},
+            {path, [<<"status">>], <<"active">>}
+        ],
+        limit => 2
+    },
+    {ok, Plan2} = barrel_query:compile(Spec2),
+    {ok, Results2, _} = barrel_query:execute(StoreRef, DbName, Plan2),
+    ?assertEqual(2, length(Results2)),
+
     ok.
 
 %% Test chunked query execution with continuation tokens

@@ -53,6 +53,12 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running multi-index range (type=user AND age>50)...~n"),
     MultiIndexRange = barrel_bench_metrics:summarize(bench_query(Db, multi_index_range_query(), Iterations)),
 
+    io:format("  Running multi-index with LIMIT 10...~n"),
+    MultiIndexLimit = barrel_bench_metrics:summarize(bench_query(Db, multi_index_limit_query(), Iterations)),
+
+    io:format("  Running multi-index range with LIMIT 10...~n"),
+    MultiIndexRangeLimit = barrel_bench_metrics:summarize(bench_query(Db, multi_index_range_limit_query(), Iterations)),
+
     io:format("  Running nested path queries...~n"),
     NestedPath = barrel_bench_metrics:summarize(bench_query(Db, nested_path_query(), Iterations)),
 
@@ -85,6 +91,8 @@ run(Db, NumDocs, Iterations) ->
         multi_condition => MultiCond,
         multi_index => MultiIndex,
         multi_index_range => MultiIndexRange,
+        multi_index_limit => MultiIndexLimit,
+        multi_index_range_limit => MultiIndexRangeLimit,
         nested_path => NestedPath,
         order_by_limit => TopK,
         pure_topk => PureTopK,
@@ -154,6 +162,21 @@ multi_index_range_query() ->
         {path, [<<"type">>], <<"user">>},
         {compare, [<<"age">>], '>', 50}
     ], include_docs => false}.
+
+multi_index_limit_query() ->
+    %% Multi-condition with LIMIT - tests early termination in intersection
+    %% Should be much faster than unbounded multi_index_query
+    #{where => [
+        {path, [<<"type">>], <<"user">>},
+        {path, [<<"status">>], <<"active">>}
+    ], limit => 10, include_docs => false}.
+
+multi_index_range_limit_query() ->
+    %% Multi-condition range with LIMIT - tests early termination
+    #{where => [
+        {path, [<<"type">>], <<"user">>},
+        {compare, [<<"age">>], '>', 50}
+    ], limit => 10, include_docs => false}.
 
 nested_path_query() ->
     #{where => [{path, [<<"profile">>, <<"city">>], <<"Paris">>}]}.

@@ -691,19 +691,55 @@ execute_multi_index_chunked(StoreRef, DbName, Conditions, Plan, ChunkSize, Start
     end.
 
 %% @private Collect DocIds for a single condition using index
-collect_condition_docids(StoreRef, DbName, {path, Path, Value}) ->
+collect_condition_docids(StoreRef, DbName, Cond) ->
+    collect_condition_docids(StoreRef, DbName, Cond, infinity).
+
+collect_condition_docids(StoreRef, DbName, {path, Path, Value}, infinity) ->
     FullPath = Path ++ [Value],
     barrel_ars_index:get_posting_list(StoreRef, DbName, FullPath);
-collect_condition_docids(StoreRef, DbName, {exists, Path}) ->
+collect_condition_docids(StoreRef, DbName, {path, Path, Value}, MaxCount) when is_integer(MaxCount) ->
+    FullPath = Path ++ [Value],
+    AllDocIds = barrel_ars_index:get_posting_list(StoreRef, DbName, FullPath),
+    lists:sublist(AllDocIds, MaxCount);
+collect_condition_docids(StoreRef, DbName, {exists, Path}, infinity) ->
     %% Collect all DocIds that have this path
     barrel_ars_index:fold_path(StoreRef, DbName, Path,
         fun({_P, DocId}, Acc) -> {ok, [DocId | Acc]} end, [], short_range);
-collect_condition_docids(StoreRef, DbName, {prefix, Path, Prefix}) ->
+collect_condition_docids(StoreRef, DbName, {exists, Path}, MaxCount) when is_integer(MaxCount) ->
+    Profile = select_read_profile(MaxCount),
+    {_, DocIds} = barrel_ars_index:fold_path(StoreRef, DbName, Path,
+        fun({_P, DocId}, {Count, Acc}) ->
+            case Count >= MaxCount of
+                true -> {stop, {Count, Acc}};
+                false -> {ok, {Count + 1, [DocId | Acc]}}
+            end
+        end, {0, []}, Profile),
+    DocIds;
+collect_condition_docids(StoreRef, DbName, {prefix, Path, Prefix}, infinity) ->
     barrel_ars_index:fold_prefix(StoreRef, DbName, Path, Prefix,
         fun({_P, DocId}, Acc) -> {ok, [DocId | Acc]} end, [], short_range);
-collect_condition_docids(StoreRef, DbName, {compare, Path, Op, Value}) ->
+collect_condition_docids(StoreRef, DbName, {prefix, Path, Prefix}, MaxCount) when is_integer(MaxCount) ->
+    Profile = select_read_profile(MaxCount),
+    {_, DocIds} = barrel_ars_index:fold_prefix(StoreRef, DbName, Path, Prefix,
+        fun({_P, DocId}, {Count, Acc}) ->
+            case Count >= MaxCount of
+                true -> {stop, {Count, Acc}};
+                false -> {ok, {Count + 1, [DocId | Acc]}}
+            end
+        end, {0, []}, Profile),
+    DocIds;
+collect_condition_docids(StoreRef, DbName, {compare, Path, Op, Value}, infinity) ->
     barrel_ars_index:fold_path_values_compare(StoreRef, DbName, Path, Op, Value,
-        fun({_P, DocId}, Acc) -> {ok, [DocId | Acc]} end, []).
+        fun({_P, DocId}, Acc) -> {ok, [DocId | Acc]} end, []);
+collect_condition_docids(StoreRef, DbName, {compare, Path, Op, Value}, MaxCount) when is_integer(MaxCount) ->
+    {_, DocIds} = barrel_ars_index:fold_path_values_compare(StoreRef, DbName, Path, Op, Value,
+        fun({_P, DocId}, {Count, Acc}) ->
+            case Count >= MaxCount of
+                true -> {stop, {Count, Acc}};
+                false -> {ok, {Count + 1, [DocId | Acc]}}
+            end
+        end, {0, []}),
+    DocIds.
 
 %% @private Intersect multiple DocId sets using optimized intersection
 %% First collects from most selective condition, then filters against others
@@ -1888,22 +1924,14 @@ execute_multi_index(StoreRef, DbName, Conditions, Plan, Snapshot) ->
         offset = Offset
     } = Plan,
 
-    %% Collect DocIds using bitmap-accelerated intersection
+    %% Collect DocIds using posting list intersection
     IntersectedDocIds = intersect_docid_sets(StoreRef, DbName, Conditions),
 
-    %% Calculate how many docs we need
-    MaxCollect = case Limit of
-        undefined -> undefined;
-        L -> L + Offset
-    end,
-
-    %% Apply limit to intersected results
-    LimitedDocIds = case MaxCollect of
+    %% Build results with limit applied
+    LimitedDocIds = case Limit of
         undefined -> IntersectedDocIds;
-        Max -> lists:sublist(IntersectedDocIds, Max)
+        L -> lists:sublist(IntersectedDocIds, L + Offset)
     end,
-
-    %% Build results
     Results0 = [#{<<"id">> => DocId} || DocId <- LimitedDocIds],
     Results = apply_offset_limit(Results0, Offset, Limit),
 
