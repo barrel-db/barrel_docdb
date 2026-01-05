@@ -336,26 +336,35 @@ from_cbor(CborBin) when is_binary(CborBin) ->
 %%====================================================================
 
 %% @doc Export to Erlang map (full decode)
+%% Handles both indexed CBOR and plain CBOR
 -spec to_map(doc_input()) -> map().
 to_map(Doc) when is_map(Doc) ->
     Doc;
 to_map(Doc) when is_binary(Doc) ->
-    barrel_docdb_codec_cbor:decode(Doc).
+    barrel_docdb_codec_cbor:decode_any(Doc).
 
 %% @doc Export to JSON binary
 -spec to_json(doc_input()) -> binary().
 to_json(Doc) when is_map(Doc) ->
     iolist_to_binary(json:encode(Doc));
+to_json(<<"CB", _/binary>> = Doc) ->
+    %% Indexed CBOR - use optimized to_json
+    barrel_docdb_codec_cbor:to_json(Doc);
 to_json(Doc) when is_binary(Doc) ->
-    barrel_docdb_codec_cbor:to_json(Doc).
+    %% Plain CBOR - decode then encode as JSON
+    iolist_to_binary(json:encode(barrel_docdb_codec_cbor:decode_cbor(Doc))).
 
 %% @doc Export to plain CBOR (without index)
 %% Use when sending to external clients
 -spec to_cbor(doc_input()) -> binary().
 to_cbor(Doc) when is_map(Doc) ->
     barrel_docdb_codec_cbor:encode_cbor(Doc);
+to_cbor(<<"CB", _/binary>> = Doc) ->
+    %% Indexed CBOR - extract payload
+    barrel_docdb_codec_cbor:payload(Doc);
 to_cbor(Doc) when is_binary(Doc) ->
-    barrel_docdb_codec_cbor:payload(Doc).
+    %% Already plain CBOR
+    Doc.
 
 %%====================================================================
 %% CBOR Map-like API

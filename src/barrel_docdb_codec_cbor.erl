@@ -23,7 +23,7 @@
 -export([encode/1, encode/2]).
 
 %% Decoding API
--export([decode/1]).
+-export([decode/1, decode_any/1]).
 
 %% Record Info
 -export([hash/1, payload/1, index_bin/1]).
@@ -696,6 +696,14 @@ cbor_type_to_byte(null) -> 10.
 decode(RecordBin) ->
     {_Header, _IndexBin, PayloadBin} = parse_record(RecordBin),
     decode_cbor(PayloadBin).
+
+%% @doc Decode any CBOR binary (indexed or plain) to Erlang term.
+%% Auto-detects format: indexed CBOR (starts with "CB") or plain CBOR.
+-spec decode_any(binary()) -> term().
+decode_any(<<"CB", _/binary>> = RecordBin) ->
+    decode(RecordBin);
+decode_any(CborBin) ->
+    decode_cbor(CborBin).
 
 %% Parse record into components
 parse_record(<<"CB", Version, Flags, HashLen,

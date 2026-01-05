@@ -464,10 +464,11 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
                 not_found -> #{}
             end,
             %% Get old doc body for path index diff from body CF
+            %% Keep as indexed CBOR - barrel_ars:analyze handles it directly
             OldBody = case barrel_store_rocksdb:body_get(StoreRef,
                             barrel_store_keys:doc_body(DbName, DocId, ExistingRev)) of
-                {ok, OldCborBin} -> barrel_docdb_codec_cbor:decode(OldCborBin);
-                not_found -> #{}
+                {ok, OldCborBin} -> OldCborBin;
+                not_found -> undefined
             end,
             {ExistingHlc, OldTree, OldBody};
         not_found ->
@@ -549,7 +550,7 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
     end,
 
     %% Write batch atomically (metadata + indexes + body)
-    CborBody = barrel_docdb_codec_cbor:encode(DocBody),
+    CborBody = barrel_docdb_codec_cbor:encode_cbor(DocBody),
     BodyKey = barrel_store_keys:doc_body(DbName, DocId, NewRev),
     BodyOp = {body_put, BodyKey, CborBody},
     AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps ++ [BodyOp],
@@ -633,7 +634,7 @@ prepare_doc_ops(StoreRef, DbName, Doc) ->
                 %% Get old doc body from body CF
                 OldBody = case barrel_store_rocksdb:body_get(StoreRef,
                                 barrel_store_keys:doc_body(DbName, DocId, ExistingRev)) of
-                    {ok, OldCborBin} -> barrel_docdb_codec_cbor:decode(OldCborBin);
+                    {ok, OldCborBin} -> barrel_docdb_codec_cbor:decode_any(OldCborBin);
                     not_found -> #{}
                 end,
                 {ExistingHlc, OldTree, OldBody};
@@ -700,7 +701,7 @@ prepare_doc_ops(StoreRef, DbName, Doc) ->
                                                       OldHlc, OldDocBody)
         end,
 
-        CborBody = barrel_docdb_codec_cbor:encode(DocBody),
+        CborBody = barrel_docdb_codec_cbor:encode_cbor(DocBody),
         BodyKey = barrel_store_keys:doc_body(DbName, DocId, NewRev),
         BodyOp = {body_put, BodyKey, CborBody},
         AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps ++ [BodyOp],
@@ -728,7 +729,7 @@ do_get_doc(StoreRef, DbName, DocId, Opts) ->
                     case barrel_store_rocksdb:body_get(StoreRef, BodyKey) of
                         {ok, CborBin} ->
                             %% Decode CBOR to get document body
-                            DocBody = barrel_docdb_codec_cbor:decode(CborBin),
+                            DocBody = barrel_docdb_codec_cbor:decode_any(CborBin),
                             %% Add metadata
                             Result = DocBody#{
                                 <<"id">> => DocId,
@@ -790,7 +791,7 @@ do_get_docs(StoreRef, DbName, DocIds, Opts) ->
                 {undefined, _} -> Map;
                 {{DocId, Rev, Deleted}, {ok, CborBin}} ->
                     %% Decode CBOR body
-                    DocBody = barrel_docdb_codec_cbor:decode(CborBin),
+                    DocBody = barrel_docdb_codec_cbor:decode_any(CborBin),
                     Result = DocBody#{<<"id">> => DocId, <<"_rev">> => Rev},
                     Result2 = case Deleted of
                         true -> Result#{<<"_deleted">> => true};
@@ -876,7 +877,7 @@ do_delete_doc(StoreRef, DbName, DocId, Opts) ->
             %% Get old doc body from body CF to remove old path entries
             OldDocBody = case barrel_store_rocksdb:body_get(StoreRef,
                                 barrel_store_keys:doc_body(DbName, DocId, CurrentRev)) of
-                {ok, OldCborBin} -> barrel_docdb_codec_cbor:decode(OldCborBin);
+                {ok, OldCborBin} -> barrel_docdb_codec_cbor:decode_any(OldCborBin);
                 not_found -> undefined
             end,
             PathHlcOps = barrel_changes:update_path_index_ops(DbName, NextHlc, NewDocInfo,
@@ -914,7 +915,7 @@ do_fold_docs(StoreRef, DbName, Fun, Acc) ->
                 %% Get document body from body CF
                 BodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
                 DocBody = case barrel_store_rocksdb:body_get(StoreRef, BodyKey) of
-                    {ok, CborBin} -> barrel_docdb_codec_cbor:decode(CborBin);
+                    {ok, CborBin} -> barrel_docdb_codec_cbor:decode_any(CborBin);
                     not_found -> #{}
                 end,
                 Doc = DocBody#{
@@ -956,7 +957,7 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
             %% Get old doc body from body CF for path index diff
             OldBody = case barrel_store_rocksdb:body_get(StoreRef,
                             barrel_store_keys:doc_body(DbName, DocId, ExistingRev)) of
-                {ok, OldCborBin} -> barrel_docdb_codec_cbor:decode(OldCborBin);
+                {ok, OldCborBin} -> barrel_docdb_codec_cbor:decode_any(OldCborBin);
                 not_found -> #{}
             end,
             {OldTree, ExistingHlc, OldBody};
@@ -1028,7 +1029,7 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
     end,
 
     %% Write batch atomically (metadata + indexes + body)
-    CborBody = barrel_docdb_codec_cbor:encode(DocBody),
+    CborBody = barrel_docdb_codec_cbor:encode_cbor(DocBody),
     BodyKey = barrel_store_keys:doc_body(DbName, DocId, NewRev),
     BodyOp = {body_put, BodyKey, CborBody},
     AllOps = DocOps ++ HlcDeleteOps ++ PathIndexOps ++ ChangeOps ++ PathHlcOps ++ [BodyOp],

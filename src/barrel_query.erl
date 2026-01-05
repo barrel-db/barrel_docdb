@@ -81,7 +81,9 @@
     order_by => order_spec() | [order_spec()],
     limit => pos_integer(),
     offset => non_neg_integer(),
-    include_docs => boolean()
+    include_docs => boolean(),
+    doc_format => binary | map | json,
+    decoder_fun => fun((binary()) -> term())
 }.
 
 -record(query_plan, {
@@ -99,6 +101,10 @@
     offset :: non_neg_integer(),
     %% Include full documents
     include_docs :: boolean(),
+    %% Document format for include_docs: map (default) | binary | json
+    doc_format :: binary | map | json,
+    %% Custom decoder function for documents
+    decoder_fun :: undefined | fun((binary()) -> term()),
     %% Index strategy hint
     strategy :: index_seek | index_scan | multi_index | full_scan
 }).
@@ -973,6 +979,14 @@ do_compile(Spec) ->
     Limit = maps:get(limit, Spec, undefined),
     Offset = maps:get(offset, Spec, 0),
     IncludeDocs = maps:get(include_docs, Spec, false),
+    %% Default doc_format is 'map' for backwards compatibility
+    DocFormat = maps:get(doc_format, Spec, map),
+
+    %% Convert doc_format to decoder_fun at compile time for simpler execution
+    DecoderFun = case maps:get(decoder_fun, Spec, undefined) of
+        undefined -> make_decoder_fun(DocFormat);
+        CustomFun -> CustomFun
+    end,
 
     %% Normalize conditions
     NormalizedConditions = [normalize_condition(C) || C <- Where],
@@ -997,9 +1011,17 @@ do_compile(Spec) ->
         limit = Limit,
         offset = Offset,
         include_docs = IncludeDocs,
+        doc_format = DocFormat,
+        decoder_fun = DecoderFun,
         strategy = Strategy
     },
     {ok, Plan}.
+
+%% @doc Create a decoder function from doc_format option
+-spec make_decoder_fun(binary | map | json) -> fun((binary()) -> term()).
+make_decoder_fun(binary) -> fun(Bin) -> Bin end;
+make_decoder_fun(map) -> fun barrel_docdb_codec_cbor:decode/1;
+make_decoder_fun(json) -> fun barrel_docdb_codec_cbor:to_json/1.
 
 %% @doc Normalize a condition to canonical form
 normalize_condition({path, Path, Value}) when is_list(Path) ->
@@ -1343,7 +1365,8 @@ execute_index_seek_streaming(StoreRef, DbName, FullPath, Plan, _Snapshot) ->
         projections = Projections,
         limit = Limit,
         offset = Offset,
-        include_docs = IncludeDocs
+        include_docs = IncludeDocs,
+        decoder_fun = _DecoderFun
     } = Plan,
 
     %% Calculate how many results we need
@@ -1359,15 +1382,10 @@ execute_index_seek_streaming(StoreRef, DbName, FullPath, Plan, _Snapshot) ->
                 true ->
                     {stop, {Count, Acc}};
                 false ->
-                    %% Fetch and filter document using CBOR iterator
+                    %% Fetch and filter document
                     case fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) of
                         {ok, Doc, BoundVars} ->
-                            %% Full doc decoded (include_docs=true)
                             Result = project_result(Doc, DocId, Projections, BoundVars, IncludeDocs),
-                            {ok, {Count + 1, [Result | Acc]}};
-                        {ok_cbor, CborBin, BoundVars} ->
-                            %% CBOR binary (include_docs=false) - use iterator projection
-                            Result = project_result_cbor(CborBin, DocId, Projections, BoundVars, IncludeDocs),
                             {ok, {Count + 1, [Result | Acc]}};
                         skip ->
                             {ok, {Count, Acc}}
@@ -1399,7 +1417,8 @@ execute_index_seek_chunked(StoreRef, DbName, FullPath, Plan, Snapshot) ->
         projections = Projections,
         order = Order,
         offset = Offset,
-        include_docs = IncludeDocs
+        include_docs = IncludeDocs,
+        decoder_fun = _DecoderFun
     } = Plan,
 
     %% Fold index in chunks, batch-fetch and filter each chunk
@@ -1516,7 +1535,8 @@ execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan, _Snapshot) ->
         projections = Projections,
         limit = Limit,
         offset = Offset,
-        include_docs = IncludeDocs
+        include_docs = IncludeDocs,
+        decoder_fun = _DecoderFun
     } = Plan,
 
     %% Calculate how many results we need (accounting for filtering)
@@ -1540,15 +1560,10 @@ execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan, _Snapshot) ->
                 true ->
                     {stop, {Count, Acc}};
                 false ->
-                    %% Fetch and filter document using CBOR iterator
+                    %% Fetch and filter document
                     case fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) of
                         {ok, Doc, BoundVars} ->
-                            %% Full doc decoded (include_docs=true)
                             Result = project_result(Doc, DocId, Projections, BoundVars, IncludeDocs),
-                            {ok, {Count + 1, [Result | Acc]}};
-                        {ok_cbor, CborBin, BoundVars} ->
-                            %% CBOR binary (include_docs=false) - use iterator projection
-                            Result = project_result_cbor(CborBin, DocId, Projections, BoundVars, IncludeDocs),
                             {ok, {Count + 1, [Result | Acc]}};
                         skip ->
                             {ok, {Count, Acc}}
@@ -1587,17 +1602,17 @@ fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) 
                     %% Fetch doc body from body store (BlobDB)
                     case barrel_doc_body_store:get_body(DbName, DocId, Rev) of
                         {ok, CborBin} ->
-                            %% Use CBOR iterator for condition matching
-                            case matches_conditions_cbor(CborBin, Conditions, Bindings) of
+                            %% Decode to map for condition matching
+                            %% Plain CBOR or indexed - decode_any handles both
+                            Doc = barrel_docdb_codec_cbor:decode_any(CborBin),
+                            case matches_conditions(Doc, Conditions, Bindings) of
                                 {true, BoundVars} ->
                                     case IncludeDocs of
                                         true ->
-                                            %% Full decode needed for include_docs
-                                            Doc = barrel_docdb_codec_cbor:decode(CborBin),
                                             {ok, Doc, BoundVars};
                                         false ->
-                                            %% Keep CBOR binary for projection
-                                            {ok_cbor, CborBin, BoundVars}
+                                            %% Return decoded map for projection
+                                            {ok, Doc, BoundVars}
                                     end;
                                 false ->
                                     skip
@@ -2447,7 +2462,8 @@ filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot) ->
         order = Order,
         limit = Limit,
         offset = Offset,
-        include_docs = IncludeDocs
+        include_docs = IncludeDocs,
+        decoder_fun = _DecoderFun
     } = Plan,
 
     %% Remove duplicates
@@ -2468,8 +2484,8 @@ filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot) ->
 
     {ok, Results2, LastSeq}.
 
-%% @doc Batch fetch documents using multi_get (column-wide storage with CBOR iterator)
-%% Uses find_path for condition matching and projection - no full decode unless include_docs=true
+%% @doc Batch fetch documents using multi_get (column-wide storage)
+%% Decodes documents to maps for condition matching and projection
 batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs, Snapshot) ->
     case DocIds of
         [] -> [];
@@ -2515,17 +2531,17 @@ batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projectio
                     T3 = erlang:monotonic_time(microsecond),
                     put(profile_docbody_fetch, pdict_get(profile_docbody_fetch, 0) + (T3 - T2)),
 
-                    %% PROFILING: CBOR iterator-based condition matching + projection
+                    %% PROFILING: Decode and condition matching + projection
                     T4 = erlang:monotonic_time(microsecond),
                     Results = lists:filtermap(
                         fun({DocId, BodyResult}) ->
                             case BodyResult of
                                 {ok, CborBin} ->
-                                    %% Use CBOR iterator for condition matching (no full decode)
-                                    case matches_conditions_cbor(CborBin, Conditions, Bindings) of
+                                    %% Decode to map (handles both indexed and plain CBOR)
+                                    Doc = barrel_docdb_codec_cbor:decode_any(CborBin),
+                                    case matches_conditions(Doc, Conditions, Bindings) of
                                         {true, BoundVars} ->
-                                            %% Use CBOR iterator for projection (only decodes needed fields)
-                                            Result = project_result_cbor(CborBin, DocId, Projections, BoundVars, IncludeDocs),
+                                            Result = project_result(Doc, DocId, Projections, BoundVars, IncludeDocs),
                                             {true, Result};
                                         false ->
                                             false
@@ -2852,197 +2868,6 @@ find_best_scan_path([{'and', Nested} | Rest]) ->
 find_best_scan_path([_ | Rest]) ->
     find_best_scan_path(Rest).
 
-%%====================================================================
-%% CBOR Iterator-Based Condition Matching
-%%====================================================================
-
-%% @doc Check if a CBOR document matches all conditions using find_path
-%% This avoids full document decode - only decodes values needed for matching
--spec matches_conditions_cbor(binary(), [condition()], map()) ->
-    {true, map()} | false.
-matches_conditions_cbor(CborBin, Conditions, InitialBindings) ->
-    matches_conditions_cbor(CborBin, Conditions, InitialBindings, #{}).
-
-matches_conditions_cbor(_CborBin, [], _Bindings, BoundVars) ->
-    {true, BoundVars};
-matches_conditions_cbor(CborBin, [Condition | Rest], Bindings, BoundVars) ->
-    case match_condition_cbor(CborBin, Condition, Bindings, BoundVars) of
-        {true, NewBoundVars} ->
-            matches_conditions_cbor(CborBin, Rest, Bindings, NewBoundVars);
-        false ->
-            false
-    end.
-
-%% @doc Match a single condition using CBOR find_path
-match_condition_cbor(CborBin, {path, Path, Value}, _Bindings, BoundVars) ->
-    case barrel_docdb_codec_cbor:find_path(CborBin, Path) of
-        {ok, {_Type, VRef}} ->
-            {ok, DocValue} = barrel_docdb_codec_cbor:decode_value(CborBin, VRef),
-            case is_logic_var(Value) of
-                true ->
-                    %% Bind the variable
-                    {true, BoundVars#{Value => DocValue}};
-                false ->
-                    case DocValue =:= Value of
-                        true -> {true, BoundVars};
-                        false -> false
-                    end
-            end;
-        not_found ->
-            false
-    end;
-
-match_condition_cbor(CborBin, {compare, Path, Op, Value}, _Bindings, BoundVars) ->
-    case barrel_docdb_codec_cbor:find_path(CborBin, Path) of
-        {ok, {_Type, VRef}} ->
-            {ok, DocValue} = barrel_docdb_codec_cbor:decode_value(CborBin, VRef),
-            CompareValue = case is_logic_var(Value) of
-                true -> maps:get(Value, BoundVars, undefined);
-                false -> Value
-            end,
-            case compare_values(DocValue, Op, CompareValue) of
-                true -> {true, BoundVars};
-                false -> false
-            end;
-        not_found ->
-            false
-    end;
-
-match_condition_cbor(CborBin, {'and', Conditions}, Bindings, BoundVars) ->
-    matches_conditions_cbor(CborBin, Conditions, Bindings, BoundVars);
-
-match_condition_cbor(CborBin, {'or', Conditions}, Bindings, BoundVars) ->
-    match_any_cbor(CborBin, Conditions, Bindings, BoundVars);
-
-match_condition_cbor(CborBin, {'not', Condition}, Bindings, BoundVars) ->
-    case match_condition_cbor(CborBin, Condition, Bindings, BoundVars) of
-        {true, _} -> false;
-        false -> {true, BoundVars}
-    end;
-
-match_condition_cbor(CborBin, {in, Path, Values}, _Bindings, BoundVars) ->
-    case barrel_docdb_codec_cbor:find_path(CborBin, Path) of
-        {ok, {_Type, VRef}} ->
-            {ok, DocValue} = barrel_docdb_codec_cbor:decode_value(CborBin, VRef),
-            case lists:member(DocValue, Values) of
-                true -> {true, BoundVars};
-                false -> false
-            end;
-        not_found ->
-            false
-    end;
-
-match_condition_cbor(CborBin, {contains, Path, Value}, _Bindings, BoundVars) ->
-    case barrel_docdb_codec_cbor:find_path(CborBin, Path) of
-        {ok, {array, VRef}} ->
-            {ok, DocValue} = barrel_docdb_codec_cbor:decode_value(CborBin, VRef),
-            case lists:member(Value, DocValue) of
-                true -> {true, BoundVars};
-                false -> false
-            end;
-        _ ->
-            false
-    end;
-
-match_condition_cbor(CborBin, {exists, Path}, _Bindings, BoundVars) ->
-    case barrel_docdb_codec_cbor:find_path(CborBin, Path) of
-        {ok, _} -> {true, BoundVars};
-        not_found -> false
-    end;
-
-match_condition_cbor(CborBin, {missing, Path}, _Bindings, BoundVars) ->
-    case barrel_docdb_codec_cbor:find_path(CborBin, Path) of
-        {ok, _} -> false;
-        not_found -> {true, BoundVars}
-    end;
-
-match_condition_cbor(CborBin, {regex, Path, Pattern}, _Bindings, BoundVars) ->
-    case barrel_docdb_codec_cbor:find_path(CborBin, Path) of
-        {ok, {text, VRef}} ->
-            {ok, DocValue} = barrel_docdb_codec_cbor:decode_value(CborBin, VRef),
-            case re:run(DocValue, Pattern) of
-                {match, _} -> {true, BoundVars};
-                nomatch -> false
-            end;
-        _ ->
-            false
-    end;
-
-match_condition_cbor(CborBin, {prefix, Path, Prefix}, _Bindings, BoundVars) ->
-    case barrel_docdb_codec_cbor:find_path(CborBin, Path) of
-        {ok, {text, VRef}} ->
-            {ok, DocValue} = barrel_docdb_codec_cbor:decode_value(CborBin, VRef),
-            PrefixLen = byte_size(Prefix),
-            case DocValue of
-                <<Prefix:PrefixLen/binary, _/binary>> -> {true, BoundVars};
-                _ -> false
-            end;
-        _ ->
-            false
-    end;
-
-match_condition_cbor(_CborBin, {error, _}, _Bindings, _BoundVars) ->
-    false.
-
-match_any_cbor(_CborBin, [], _Bindings, _BoundVars) ->
-    false;
-match_any_cbor(CborBin, [Condition | Rest], Bindings, BoundVars) ->
-    case match_condition_cbor(CborBin, Condition, Bindings, BoundVars) of
-        {true, NewBoundVars} -> {true, NewBoundVars};
-        false -> match_any_cbor(CborBin, Rest, Bindings, BoundVars)
-    end.
-
-%%====================================================================
-%% CBOR Iterator-Based Projection
-%%====================================================================
-
-%% @doc Project result fields from CBOR binary without full decode
-%% Only decodes the specific paths needed for projection
--spec project_result_cbor(binary(), binary(), [projection()], map(), boolean()) -> map().
-project_result_cbor(CborBin, DocId, Projections, BoundVars, IncludeDocs) ->
-    Result0 = #{<<"id">> => DocId},
-
-    Result1 = case IncludeDocs of
-        true ->
-            %% Full decode needed - decode once
-            Doc = barrel_docdb_codec_cbor:decode(CborBin),
-            Result0#{<<"doc">> => Doc};
-        false ->
-            Result0
-    end,
-
-    %% Add projected fields/variables using find_path
-    lists:foldl(
-        fun('*', Acc) ->
-            %% Include all bound variables
-            maps:fold(fun(Var, Val, A) ->
-                VarName = atom_to_binary(Var, utf8),
-                A#{VarName => Val}
-            end, Acc, BoundVars);
-           (Var, Acc) when is_atom(Var) ->
-            case is_logic_var(Var) of
-                true ->
-                    VarName = atom_to_binary(Var, utf8),
-                    case maps:find(Var, BoundVars) of
-                        {ok, Val} -> Acc#{VarName => Val};
-                        error -> Acc
-                    end;
-                false ->
-                    Acc
-            end;
-           (Path, Acc) when is_list(Path) ->
-            case barrel_docdb_codec_cbor:find_path(CborBin, Path) of
-                {ok, {_Type, VRef}} ->
-                    {ok, Val} = barrel_docdb_codec_cbor:decode_value(CborBin, VRef),
-                    PathKey = path_to_key(Path),
-                    Acc#{PathKey => Val};
-                not_found ->
-                    Acc
-            end
-        end,
-        Result1,
-        Projections
-    ).
 
 %%====================================================================
 %% Profiling Functions (temporary)

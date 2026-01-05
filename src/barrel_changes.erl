@@ -879,7 +879,7 @@ batch_fetch_doc_bodies(StoreRef, DbName, DocChangePairs) ->
                 fun({{DocId, _Rev}, Result}, Acc) ->
                     case Result of
                         {ok, CborBin} ->
-                            DocBody = barrel_docdb_codec_cbor:decode(CborBin),
+                            DocBody = barrel_docdb_codec_cbor:decode_any(CborBin),
                             maps:put(DocId, DocBody, Acc);
                         _ ->
                             Acc
