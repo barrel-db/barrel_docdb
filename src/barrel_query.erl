@@ -1460,8 +1460,12 @@ can_use_early_limit([], [], Limit) when is_integer(Limit), Limit > 0 ->
     %% No ORDER BY and no remaining conditions - safe to limit early
     %% Collect limit + small buffer to account for deleted docs (reduced from 2x)
     {true, max(Limit + 5, round(Limit * 1.2))};
+can_use_early_limit([], RemainingConds, Limit) when is_integer(Limit), Limit > 0, RemainingConds =/= [] ->
+    %% No ORDER BY but has remaining conditions - over-collect to handle filter losses
+    %% Use 3x multiplier to account for filtering (conservative estimate)
+    {true, Limit * 3};
 can_use_early_limit(_, _, _) ->
-    %% Either has ORDER BY or remaining conditions that need full scan
+    %% Has ORDER BY - need full scan to sort candidates
     false.
 
 %% @doc Check if streaming execution should be used for index seek
@@ -2183,28 +2187,57 @@ collect_docids_for_value_prefix(StoreRef, DbName, Path, Prefix, MaxCount) when i
 %% @doc Execute using multiple index lookups with intersection
 %% Uses cardinality-ordered intersection for efficient multi-condition queries.
 execute_multi_index(StoreRef, DbName, Plan, Snapshot) ->
-    #query_plan{conditions = Conditions} = Plan,
+    #query_plan{conditions = Conditions, limit = Limit, offset = Offset,
+                include_docs = IncludeDocs, projections = Projections} = Plan,
 
-    %% Find all indexable conditions
-    IndexConditions = find_all_equality_conditions(Conditions),
+    %% Find all indexable conditions (including compare, exists, prefix)
+    IndexConditions = find_all_index_conditions(Conditions),
 
     case IndexConditions of
         [] ->
             execute_full_scan(StoreRef, DbName, Plan, Snapshot);
         _ ->
-            %% Order by cardinality (smallest first) for efficient intersection
-            case order_by_cardinality(StoreRef, DbName, IndexConditions) of
-                [] ->
-                    %% At least one condition has 0 cardinality - no results
-                    filter_and_project(StoreRef, DbName, [], Plan, Snapshot);
-                OrderedConditions when length(OrderedConditions) =< 2 ->
-                    %% Few conditions - use bitmap filter
-                    execute_with_bitmap_filter(StoreRef, DbName, OrderedConditions, Plan, Snapshot);
-                OrderedConditions ->
-                    %% Many conditions - use sorted intersection
-                    [{path, Path1, Value1} | Rest] = OrderedConditions,
-                    FullPath1 = Path1 ++ [Value1],
-                    execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan, Snapshot)
+            %% Check if all conditions are equality (can use bitmap optimization)
+            AllEquality = lists:all(fun({path, _, _}) -> true; (_) -> false end, IndexConditions),
+
+            case AllEquality of
+                true ->
+                    %% All equality - use bitmap/sorted intersection path
+                    case order_by_cardinality(StoreRef, DbName, IndexConditions) of
+                        [] ->
+                            filter_and_project(StoreRef, DbName, [], Plan, Snapshot);
+                        OrderedConditions when length(OrderedConditions) =< 2 ->
+                            execute_with_bitmap_filter(StoreRef, DbName, OrderedConditions, Plan, Snapshot);
+                        OrderedConditions ->
+                            [{path, Path1, Value1} | Rest] = OrderedConditions,
+                            FullPath1 = Path1 ++ [Value1],
+                            execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan, Snapshot)
+                    end;
+                false ->
+                    %% Mixed conditions (equality + compare/exists/prefix)
+                    %% Use intersect_docid_sets which handles all condition types via index
+                    IntersectedDocIds = intersect_docid_sets(StoreRef, DbName, IndexConditions),
+
+                    %% Check if remaining conditions need body fetch
+                    RemainingConds = Conditions -- IndexConditions,
+                    NeedsBody = IncludeDocs orelse needs_body_for_projection(Projections)
+                                orelse RemainingConds =/= [],
+
+                    case NeedsBody of
+                        false ->
+                            %% Pure index query - no body fetch needed
+                            LimitedDocIds = case Limit of
+                                undefined -> IntersectedDocIds;
+                                L -> lists:sublist(IntersectedDocIds, L + Offset)
+                            end,
+                            Results0 = [#{<<"id">> => DocId} || DocId <- LimitedDocIds],
+                            Results = apply_offset_limit(Results0, Offset, Limit),
+                            LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+                            {ok, Results, LastSeq};
+                        true ->
+                            %% Need body fetch for remaining conditions or include_docs
+                            filter_and_project(StoreRef, DbName, IntersectedDocIds, Plan, Snapshot)
+                    end
             end
     end.
 
@@ -2755,24 +2788,36 @@ find_first_equality([{'and', Nested} | Rest]) ->
 find_first_equality([_ | Rest]) ->
     find_first_equality(Rest).
 
-%% @doc Find all equality conditions
-find_all_equality_conditions(Conditions) ->
-    find_all_equality_conditions(Conditions, []).
+%% @doc Find all index-friendly conditions (equality, compare, exists, prefix)
+find_all_index_conditions(Conditions) ->
+    find_all_index_conditions(Conditions, []).
 
-find_all_equality_conditions([], Acc) ->
+find_all_index_conditions([], Acc) ->
     lists:reverse(Acc);
-find_all_equality_conditions([{path, Path, Value} | Rest], Acc) ->
+find_all_index_conditions([{path, Path, Value} | Rest], Acc) ->
     case is_logic_var(Value) of
         false ->
-            find_all_equality_conditions(Rest, [{path, Path, Value} | Acc]);
+            find_all_index_conditions(Rest, [{path, Path, Value} | Acc]);
         true ->
-            find_all_equality_conditions(Rest, Acc)
+            find_all_index_conditions(Rest, Acc)
     end;
-find_all_equality_conditions([{'and', Nested} | Rest], Acc) ->
-    NestedEqs = find_all_equality_conditions(Nested),
-    find_all_equality_conditions(Rest, NestedEqs ++ Acc);
-find_all_equality_conditions([_ | Rest], Acc) ->
-    find_all_equality_conditions(Rest, Acc).
+find_all_index_conditions([{compare, Path, Op, Value} | Rest], Acc)
+  when Op =:= '>' orelse Op =:= '<' orelse Op =:= '>=' orelse Op =:= '=<' ->
+    case is_logic_var(Value) of
+        false ->
+            find_all_index_conditions(Rest, [{compare, Path, Op, Value} | Acc]);
+        true ->
+            find_all_index_conditions(Rest, Acc)
+    end;
+find_all_index_conditions([{exists, Path} | Rest], Acc) ->
+    find_all_index_conditions(Rest, [{exists, Path} | Acc]);
+find_all_index_conditions([{prefix, Path, Prefix} | Rest], Acc) ->
+    find_all_index_conditions(Rest, [{prefix, Path, Prefix} | Acc]);
+find_all_index_conditions([{'and', Nested} | Rest], Acc) ->
+    NestedConds = find_all_index_conditions(Nested),
+    find_all_index_conditions(Rest, NestedConds ++ Acc);
+find_all_index_conditions([_ | Rest], Acc) ->
+    find_all_index_conditions(Rest, Acc).
 
 %% @doc Find best path for scanning
 find_best_scan_path([]) ->

@@ -80,6 +80,12 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running exists with LIMIT 10...~n"),
     ExistsLimit = barrel_bench_metrics:summarize(bench_query(Db, exists_limit_query(), Iterations)),
 
+    io:format("  Running OR condition queries...~n"),
+    OrCond = barrel_bench_metrics:summarize(bench_query(Db, or_condition_query(), Iterations)),
+
+    io:format("  Running OR condition with LIMIT 10...~n"),
+    OrCondLimit = barrel_bench_metrics:summarize(bench_query(Db, or_condition_limit_query(), Iterations)),
+
     #{
         simple_eq => SimpleEq,
         simple_eq_limit => SimpleEqLimit,
@@ -99,7 +105,9 @@ run(Db, NumDocs, Iterations) ->
         prefix => PrefixQ,
         prefix_limit => PrefixLimit,
         exists => ExistsQ,
-        exists_limit => ExistsLimit
+        exists_limit => ExistsLimit,
+        or_condition => OrCond,
+        or_condition_limit => OrCondLimit
     }.
 
 %%====================================================================
@@ -215,6 +223,22 @@ exists_limit_query() ->
     %% Exists query with LIMIT - tests early termination
     %% Should be very fast regardless of how many docs have the field
     #{where => [{exists, [<<"profile">>]}], limit => 10, include_docs => false}.
+
+or_condition_query() ->
+    %% OR condition query: find docs with type=user OR type=admin
+    %% Tests full scan with OR filter
+    #{where => [{'or', [
+        {path, [<<"type">>], <<"user">>},
+        {path, [<<"status">>], <<"active">>}
+    ]}], include_docs => false}.
+
+or_condition_limit_query() ->
+    %% OR condition with LIMIT - tests relaxed early limit with remaining conditions
+    %% Uses over-collection to handle filter losses
+    #{where => [{'or', [
+        {path, [<<"type">>], <<"user">>},
+        {path, [<<"status">>], <<"active">>}
+    ]}], limit => 10, include_docs => false}.
 
 %%====================================================================
 %% Internal functions

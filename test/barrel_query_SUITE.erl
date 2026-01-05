@@ -500,6 +500,36 @@ execute_or_condition(Config) ->
     {ok, Results, _} = barrel_query:execute(StoreRef, DbName, Plan),
 
     ?assertEqual(5, length(Results)),  % 3 users + 2 posts
+
+    %% Test OR condition with LIMIT - uses relaxed early limit
+    Spec2 = #{
+        where => [
+            {'or', [
+                {path, [<<"type">>], <<"user">>},
+                {path, [<<"type">>], <<"post">>}
+            ]}
+        ],
+        limit => 2
+    },
+    {ok, Plan2} = barrel_query:compile(Spec2),
+    {ok, Results2, _} = barrel_query:execute(StoreRef, DbName, Plan2),
+    ?assertEqual(2, length(Results2)),
+
+    %% Test equality + OR with LIMIT - remaining OR condition uses early limit
+    Spec3 = #{
+        where => [
+            {path, [<<"type">>], <<"user">>},
+            {'or', [
+                {path, [<<"status">>], <<"active">>},
+                {path, [<<"status">>], <<"inactive">>}
+            ]}
+        ],
+        limit => 1
+    },
+    {ok, Plan3} = barrel_query:compile(Spec3),
+    {ok, Results3, _} = barrel_query:execute(StoreRef, DbName, Plan3),
+    ?assertEqual(1, length(Results3)),
+
     ok.
 
 execute_not_condition(Config) ->
