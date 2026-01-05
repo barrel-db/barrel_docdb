@@ -31,6 +31,9 @@
 %% Iterator API
 -export([new_iterator/1, next/1, peek/2, find_path/2, decode_value/2]).
 
+%% Map-like API (lazy access without full decode)
+-export([get/2, get/3, get_value/2, set/3, to_map/1]).
+
 %% JSON Conversion
 -export([to_json/1, to_json_iolist/1]).
 -export([from_json/1]).
@@ -1039,3 +1042,66 @@ from_json(JsonBin) ->
     %% The current approach is straightforward and performs well.
     Term = json:decode(JsonBin),
     encode(Term).
+
+%%====================================================================
+%% Map-like API
+%%====================================================================
+
+%% @doc Get a value at path without full decode, returns undefined if not found.
+%% Works like maps:get/2 but for CBOR records.
+-spec get(record_bin(), path()) -> term() | undefined.
+get(RecordBin, Path) ->
+    get(RecordBin, Path, undefined).
+
+%% @doc Get a value at path without full decode, returns Default if not found.
+%% Works like maps:get/3 but for CBOR records.
+-spec get(record_bin(), path(), term()) -> term().
+get(RecordBin, Path, Default) ->
+    case find_path(RecordBin, Path) of
+        {ok, {_Type, VRef}} ->
+            case decode_value(RecordBin, VRef) of
+                {ok, Value} -> Value;
+                {error, _} -> Default
+            end;
+        not_found ->
+            Default;
+        {error, _} ->
+            Default
+    end.
+
+%% @doc Get and decode value at path in one call.
+%% Returns {ok, Value} or not_found.
+-spec get_value(record_bin(), path()) -> {ok, term()} | not_found | {error, term()}.
+get_value(RecordBin, Path) ->
+    case find_path(RecordBin, Path) of
+        {ok, {_Type, VRef}} ->
+            decode_value(RecordBin, VRef);
+        not_found ->
+            not_found;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% @doc Set a value at path, returns new CBOR record.
+%% Note: This requires decode → modify → re-encode, so it's not optimized.
+%% Use for occasional updates, not bulk operations.
+-spec set(record_bin(), path(), term()) -> record_bin().
+set(RecordBin, Path, Value) ->
+    Map = decode(RecordBin),
+    NewMap = set_path(Map, Path, Value),
+    encode(NewMap).
+
+%% @doc Convert CBOR record to Erlang map (full decode).
+%% Alias for decode/1.
+-spec to_map(record_bin()) -> map().
+to_map(RecordBin) ->
+    decode(RecordBin).
+
+%% Internal: set value at path in nested map
+set_path(Map, [Key], Value) when is_map(Map) ->
+    Map#{Key => Value};
+set_path(Map, [Key | Rest], Value) when is_map(Map) ->
+    SubMap = maps:get(Key, Map, #{}),
+    Map#{Key => set_path(SubMap, Rest, Value)};
+set_path(_, [], _Value) ->
+    error(empty_path).
