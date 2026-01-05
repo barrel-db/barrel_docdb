@@ -1018,10 +1018,14 @@ do_compile(Spec) ->
     {ok, Plan}.
 
 %% @doc Create a decoder function from doc_format option
+%% Uses decode_any/1 which handles both indexed CBOR and plain CBOR
 -spec make_decoder_fun(binary | map | json) -> fun((binary()) -> term()).
 make_decoder_fun(binary) -> fun(Bin) -> Bin end;
-make_decoder_fun(map) -> fun barrel_docdb_codec_cbor:decode/1;
-make_decoder_fun(json) -> fun barrel_docdb_codec_cbor:to_json/1.
+make_decoder_fun(map) -> fun barrel_docdb_codec_cbor:decode_any/1;
+make_decoder_fun(json) -> fun(Bin) ->
+    Map = barrel_docdb_codec_cbor:decode_any(Bin),
+    json:encode(Map)
+end.
 
 %% @doc Normalize a condition to canonical form
 normalize_condition({path, Path, Value}) when is_list(Path) ->
@@ -1366,7 +1370,7 @@ execute_index_seek_streaming(StoreRef, DbName, FullPath, Plan, _Snapshot) ->
         limit = Limit,
         offset = Offset,
         include_docs = IncludeDocs,
-        decoder_fun = _DecoderFun
+        decoder_fun = DecoderFun
     } = Plan,
 
     %% Calculate how many results we need
@@ -1384,8 +1388,8 @@ execute_index_seek_streaming(StoreRef, DbName, FullPath, Plan, _Snapshot) ->
                 false ->
                     %% Fetch and filter document
                     case fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) of
-                        {ok, Doc, BoundVars} ->
-                            Result = project_result(Doc, DocId, Projections, BoundVars, IncludeDocs),
+                        {ok, CborBin, Doc, BoundVars} ->
+                            Result = project_result(CborBin, Doc, DocId, Projections, BoundVars, IncludeDocs, DecoderFun),
                             {ok, {Count + 1, [Result | Acc]}};
                         skip ->
                             {ok, {Count, Acc}}
@@ -1418,7 +1422,7 @@ execute_index_seek_chunked(StoreRef, DbName, FullPath, Plan, Snapshot) ->
         order = Order,
         offset = Offset,
         include_docs = IncludeDocs,
-        decoder_fun = _DecoderFun
+        decoder_fun = DecoderFun
     } = Plan,
 
     %% Fold index in chunks, batch-fetch and filter each chunk
@@ -1428,7 +1432,7 @@ execute_index_seek_chunked(StoreRef, DbName, FullPath, Plan, Snapshot) ->
         fun(DocIdChunk, {Acc, TotalBytes, ChunkCount}) ->
             {ChunkResults, ChunkBytes} = batch_fetch_and_filter_with_size(
                 StoreRef, DbName, DocIdChunk,
-                Conditions, Bindings, Projections, IncludeDocs, Snapshot),
+                Conditions, Bindings, Projections, IncludeDocs, DecoderFun, Snapshot),
 
             %% Calculate new chunk size based on average doc size
             NewTotalBytes = TotalBytes + ChunkBytes,
@@ -1469,8 +1473,8 @@ calculate_chunk_size(_) ->
     ?INITIAL_CHUNK_SIZE.
 
 %% @doc Batch fetch with size tracking for adaptive chunking
-batch_fetch_and_filter_with_size(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs, Snapshot) ->
-    Results = batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs, Snapshot),
+batch_fetch_and_filter_with_size(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs, DecoderFun, Snapshot) ->
+    Results = batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs, DecoderFun, Snapshot),
     %% Estimate bytes from doc count (conservative ~500 bytes avg per doc)
     EstimatedBytes = length(DocIds) * 500,
     {Results, EstimatedBytes}.
@@ -1536,7 +1540,7 @@ execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan, _Snapshot) ->
         limit = Limit,
         offset = Offset,
         include_docs = IncludeDocs,
-        decoder_fun = _DecoderFun
+        decoder_fun = DecoderFun
     } = Plan,
 
     %% Calculate how many results we need (accounting for filtering)
@@ -1562,8 +1566,8 @@ execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan, _Snapshot) ->
                 false ->
                     %% Fetch and filter document
                     case fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) of
-                        {ok, Doc, BoundVars} ->
-                            Result = project_result(Doc, DocId, Projections, BoundVars, IncludeDocs),
+                        {ok, CborBin, Doc, BoundVars} ->
+                            Result = project_result(CborBin, Doc, DocId, Projections, BoundVars, IncludeDocs, DecoderFun),
                             {ok, {Count + 1, [Result | Acc]}};
                         skip ->
                             {ok, {Count, Acc}}
@@ -1588,7 +1592,8 @@ execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan, _Snapshot) ->
     {ok, FinalResults, LastSeq}.
 
 %% @doc Fetch a document and check if it matches conditions (direct body fetch)
-%% Returns {ok, Doc, BoundVars} or skip
+%% Returns {ok, CborBin, Doc, BoundVars} or skip
+%% Returns both raw binary (for doc_format=binary) and decoded doc (for matching/projections)
 %% No entity lookup needed - body is stored at doc_body(DbName, DocId)
 fetch_and_match_doc(_StoreRef, DbName, DocId, Conditions, Bindings, _IncludeDocs) ->
     %% Direct body fetch - no entity lookup needed!
@@ -1598,7 +1603,7 @@ fetch_and_match_doc(_StoreRef, DbName, DocId, Conditions, Bindings, _IncludeDocs
             Doc = barrel_docdb_codec_cbor:decode_any(CborBin),
             case matches_conditions(Doc, Conditions, Bindings) of
                 {true, BoundVars} ->
-                    {ok, Doc, BoundVars};
+                    {ok, CborBin, Doc, BoundVars};
                 false ->
                     skip
             end;
@@ -2459,7 +2464,7 @@ filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot) ->
         limit = Limit,
         offset = Offset,
         include_docs = IncludeDocs,
-        decoder_fun = _DecoderFun
+        decoder_fun = DecoderFun
     } = Plan,
 
     %% Remove duplicates
@@ -2467,7 +2472,7 @@ filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot) ->
 
     %% Batch fetch documents using multi_get with snapshot for consistency
     Results0 = batch_fetch_and_filter(StoreRef, DbName, UniqueDocIds,
-                                       Conditions, Bindings, Projections, IncludeDocs, Snapshot),
+                                       Conditions, Bindings, Projections, IncludeDocs, DecoderFun, Snapshot),
 
     %% Apply ordering
     Results1 = apply_order(Results0, Order),
@@ -2483,7 +2488,7 @@ filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot) ->
 %% @doc Batch fetch documents using direct body fetch (no entity lookup needed).
 %% With current body stored without revision key, we can skip the entity fetch entirely
 %% for include_docs queries, providing a major performance improvement.
-batch_fetch_and_filter(_StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs, _Snapshot) ->
+batch_fetch_and_filter(_StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs, DecoderFun, _Snapshot) ->
     case DocIds of
         [] -> [];
         _ ->
@@ -2504,7 +2509,7 @@ batch_fetch_and_filter(_StoreRef, DbName, DocIds, Conditions, Bindings, Projecti
                             Doc = barrel_docdb_codec_cbor:decode_any(CborBin),
                             case matches_conditions(Doc, Conditions, Bindings) of
                                 {true, BoundVars} ->
-                                    Result = project_result(Doc, DocId, Projections, BoundVars, IncludeDocs),
+                                    Result = project_result(CborBin, Doc, DocId, Projections, BoundVars, IncludeDocs, DecoderFun),
                                     {true, Result};
                                 false ->
                                     false
@@ -2682,11 +2687,15 @@ compare_values(A, '=<', B) when is_binary(A), is_binary(B) -> A =< B;
 compare_values(_, _, _) -> false.
 
 %% @doc Project result fields from document
-project_result(Doc, DocId, Projections, BoundVars, IncludeDocs) ->
+%% CborBin is the raw binary, Doc is decoded map (for projections)
+%% DecoderFun formats the doc for include_docs output
+project_result(CborBin, Doc, DocId, Projections, BoundVars, IncludeDocs, DecoderFun) ->
     Result0 = #{<<"id">> => DocId},
 
     Result1 = case IncludeDocs of
-        true -> Result0#{<<"doc">> => Doc};
+        true ->
+            FormattedDoc = DecoderFun(CborBin),
+            Result0#{<<"doc">> => FormattedDoc};
         false -> Result0
     end,
 
