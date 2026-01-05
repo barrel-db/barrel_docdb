@@ -32,6 +32,10 @@ run(Db, NumDocs, _Iterations) ->
     io:format("  Testing incremental changes...~n"),
     Incremental = bench_incremental_changes(Db, 100),
 
+    %% Benchmark wildcard path matching
+    io:format("  Testing wildcard path matching...~n"),
+    WildcardPath = bench_wildcard_path_changes(Db),
+
     %% Benchmark subscription latency
     SubCount = min(100, NumDocs div 10),
     io:format("  Testing subscription latency (~p docs)...~n", [SubCount]),
@@ -40,6 +44,7 @@ run(Db, NumDocs, _Iterations) ->
     #{
         full_scan => barrel_bench_metrics:summarize(FullScan),
         incremental => barrel_bench_metrics:summarize(Incremental),
+        wildcard_path => barrel_bench_metrics:summarize(WildcardPath),
         subscription => barrel_bench_metrics:summarize(SubLatency)
     }.
 
@@ -75,6 +80,25 @@ bench_incremental_loop(Db, Since, BatchSize, Metrics) ->
             NewMetrics = barrel_bench_metrics:record(Metrics, Time),
             bench_incremental_loop(Db, LastHlc, BatchSize, NewMetrics)
     end.
+
+%% Benchmark wildcard path matching with # pattern
+bench_wildcard_path_changes(Db) ->
+    Metrics = barrel_bench_metrics:new(),
+
+    %% Test various wildcard patterns
+    %% Documents are structured like: #{<<"type">> => <<"user">>, <<"data">> => ...}
+    Patterns = [
+        <<"type/#">>,      %% Match all with type field
+        <<"data/#">>,      %% Match all with data field
+        <<"user/#">>       %% Match user-specific paths (if any)
+    ],
+
+    lists:foldl(fun(Pattern, Acc) ->
+        {Time, _Result} = timer:tc(fun() ->
+            barrel_docdb:get_changes(Db, first, #{paths => [Pattern]})
+        end),
+        barrel_bench_metrics:record(Acc, Time)
+    end, Metrics, Patterns).
 
 bench_subscription_latency(Count) ->
     %% Subscribe to a path pattern that matches our test documents

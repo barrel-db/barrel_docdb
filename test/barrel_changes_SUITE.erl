@@ -33,6 +33,7 @@
     changes_doc_ids_filter/1,
     changes_path_filter/1,
     changes_path_filter_wildcard/1,
+    changes_path_hlc_wildcard_prefix/1,
     changes_path_and_docid_filter/1,
     changes_query_filter/1,
     changes_query_filter_compare/1,
@@ -74,6 +75,7 @@ groups() ->
             changes_doc_ids_filter,
             changes_path_filter,
             changes_path_filter_wildcard,
+            changes_path_hlc_wildcard_prefix,
             changes_path_and_docid_filter,
             changes_query_filter,
             changes_query_filter_compare,
@@ -428,6 +430,100 @@ changes_path_filter_wildcard(Config) ->
     ?assertEqual(2, length(Changes)),
     Ids = lists:sort([maps:get(id, C) || C <- Changes]),
     ?assertEqual([<<"u1">>, <<"u2">>], Ids),
+
+    barrel_store_rocksdb:close(StoreRef),
+    ok.
+
+%% @doc Test path_hlc wildcard prefix matching via get_changes_by_path.
+%% This tests the fix for the bug where "users/#" pattern would only match
+%% exact topic "users" instead of all topics starting with "users".
+changes_path_hlc_wildcard_prefix(Config) ->
+    TestDir = case proplists:get_value(test_dir, Config) of
+        undefined -> "/tmp/barrel_changes_test_" ++ integer_to_list(erlang:system_time(millisecond));
+        Dir -> Dir
+    end,
+    DbPath = TestDir ++ "/changes_path_hlc_wildcard",
+
+    {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
+    DbName = <<"testdb">>,
+
+    %% Write changes with path index entries for hierarchical topics.
+    %% Path analyzer generates topics from leaf values, so documents need actual values.
+    %% Topics generated:
+    %% - doc1: "type/user" -> topic "type"
+    %% - doc2: "users/123/name/Alice" -> topics "users", "users/123", "users/123/name"
+    %% - doc3: "users/123/profile/age/30" -> topics "users", "users/123", "users/123/profile", etc.
+    %% - doc4: "users/456/name/Bob" -> topics "users", "users/456", "users/456/name"
+    %% - doc5: "orders/789/total/100" -> topics "orders", "orders/789", etc.
+    DocInfos = [
+        {<<"doc1">>, 1, #{<<"type">> => <<"user">>}},
+        {<<"doc2">>, 2, #{<<"users">> => #{<<"123">> => #{<<"name">> => <<"Alice">>}}}},
+        {<<"doc3">>, 3, #{<<"users">> => #{<<"123">> => #{<<"profile">> => #{<<"age">> => 30}}}}},
+        {<<"doc4">>, 4, #{<<"users">> => #{<<"456">> => #{<<"name">> => <<"Bob">>}}}},
+        {<<"doc5">>, 5, #{<<"orders">> => #{<<"789">> => #{<<"total">> => 100}}}}
+    ],
+
+    %% Write both change entries and path index entries
+    lists:foreach(
+        fun({DocId, N, Doc}) ->
+            Hlc = make_test_hlc(1000, N),
+            DocInfo = #{id => DocId, rev => <<"1-abc">>, deleted => false, doc => Doc},
+            %% Write change entry
+            ChangeOps = barrel_changes:write_change_ops(DbName, Hlc, DocInfo),
+            %% Write path index entries
+            PathOps = barrel_changes:write_path_index_ops(DbName, Hlc, DocInfo),
+            ok = barrel_store_rocksdb:write_batch(StoreRef, ChangeOps ++ PathOps)
+        end,
+        DocInfos
+    ),
+
+    %% Test 1: Exact topic match - "users" should match docs with topic prefix "users"
+    %% doc2, doc3, doc4 all have topics starting with "users"
+    {ok, ExactChanges, _} = barrel_changes:get_changes_by_path(
+        StoreRef, DbName, <<"users">>, first, #{}
+    ),
+    ExactIds = lists:sort([maps:get(id, C) || C <- ExactChanges]),
+    %% All docs with "users" in their path hierarchy should match
+    ?assertEqual([<<"doc2">>, <<"doc3">>, <<"doc4">>], ExactIds),
+
+    %% Test 2: Wildcard prefix match - "users/#" should match all docs with topics
+    %% starting with "users" (including "users", "users/123", "users/123/profile", etc.)
+    {ok, WildcardChanges, _} = barrel_changes:get_changes_by_path(
+        StoreRef, DbName, <<"users/#">>, first, #{}
+    ),
+    WildcardIds = lists:sort([maps:get(id, C) || C <- WildcardChanges]),
+    %% Should match doc2, doc3, doc4 (all with users* topics)
+    ?assertEqual([<<"doc2">>, <<"doc3">>, <<"doc4">>], WildcardIds),
+
+    %% Test 3: More specific wildcard - "users/123/#" should match docs with
+    %% topics like "users/123", "users/123/name", "users/123/profile", etc.
+    {ok, NestedChanges, _} = barrel_changes:get_changes_by_path(
+        StoreRef, DbName, <<"users/123/#">>, first, #{}
+    ),
+    NestedIds = lists:sort([maps:get(id, C) || C <- NestedChanges]),
+    %% Should match doc2 and doc3 (topics "users/123/..." )
+    ?assertEqual([<<"doc2">>, <<"doc3">>], NestedIds),
+
+    %% Test 4: Non-matching wildcard - "products/#" should return empty
+    {ok, NoMatchChanges, _} = barrel_changes:get_changes_by_path(
+        StoreRef, DbName, <<"products/#">>, first, #{}
+    ),
+    ?assertEqual([], NoMatchChanges),
+
+    %% Test 5: "orders/#" should only match doc5
+    {ok, OrdersChanges, _} = barrel_changes:get_changes_by_path(
+        StoreRef, DbName, <<"orders/#">>, first, #{}
+    ),
+    OrdersIds = [maps:get(id, C) || C <- OrdersChanges],
+    ?assertEqual([<<"doc5">>], OrdersIds),
+
+    %% Test 6: Verify that wildcard captures more than exact match for nested topics
+    %% "users/456" exact should find doc4
+    {ok, User456Changes, _} = barrel_changes:get_changes_by_path(
+        StoreRef, DbName, <<"users/456">>, first, #{}
+    ),
+    User456Ids = [maps:get(id, C) || C <- User456Changes],
+    ?assertEqual([<<"doc4">>], User456Ids),
 
     barrel_store_rocksdb:close(StoreRef),
     ok.

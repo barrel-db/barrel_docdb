@@ -1007,6 +1007,12 @@ decode_change_compact(<<DocIdLen:16, DocId:DocIdLen/binary,
                         Deleted:8, NumConflicts:16, _Rest/binary>>, Hlc) ->
     {DocId, Hlc, Rev, Deleted =:= 1, NumConflicts}.
 
+%% @doc Extract just DocId from encoded change binary (for cheap dedup).
+%% Avoids full decode when only DocId is needed.
+-spec decode_docid(binary()) -> docid().
+decode_docid(<<DocIdLen:16, DocId:DocIdLen/binary, _Rest/binary>>) ->
+    DocId.
+
 %% @doc Decode change to full map format for API responses.
 %% Includes doc body if present in the change record.
 -spec decode_change(binary(), barrel_hlc:timestamp()) -> change().
@@ -1061,8 +1067,9 @@ write_path_index_ops(DbName, Hlc, DocInfo) ->
             end
     end,
 
-    %% Create index entry value: {doc_id, rev, deleted}
-    Value = term_to_binary({DocId, Rev, Deleted}),
+    %% Create index entry value using compact binary format (same as change feed)
+    %% Format: <<DocIdLen:16, DocId, RevLen:16, Rev, Deleted:8, NumConflicts:16, HasDoc:8>>
+    Value = encode_change(#{id => DocId, rev => Rev, deleted => Deleted}),
 
     %% Create index entry for each topic and all its prefixes
     AllPrefixes = lists:usort(lists:flatmap(fun topic_prefixes/1, Topics)),
@@ -1157,13 +1164,8 @@ scan_path_hlc(StoreRef, DbName, Topic, Since, Limit) ->
                         true ->
                             {ok, {CurrentHlc, Count, Acc}};
                         false ->
-                            {DocId, Rev, Deleted} = binary_to_term(Value),
-                            Change = #{
-                                id => DocId,
-                                rev => Rev,
-                                hlc => ChangeHlc,
-                                deleted => Deleted
-                            },
+                            %% Decode from compact binary format
+                            Change = decode_path_hlc_value(Value, ChangeHlc),
                             {ok, {ChangeHlc, Count + 1, [Change | Acc]}}
                     end
             end
@@ -1174,7 +1176,8 @@ scan_path_hlc(StoreRef, DbName, Topic, Since, Limit) ->
     {ok, lists:reverse(Changes), LastHlc}.
 
 %% @private Scan path_hlc index with prefix (for # wildcard)
-%% This scans all topics that start with the prefix
+%% This scans all topics that start with the prefix.
+%% Deduplicates by DocId since a document may have multiple topic prefixes indexed.
 scan_path_hlc_prefix(StoreRef, DbName, TopicPrefix, Since, Limit) ->
     %% For prefix scan, we need to scan all keys with the topic prefix
     %% and filter by HLC afterward
@@ -1183,40 +1186,58 @@ scan_path_hlc_prefix(StoreRef, DbName, TopicPrefix, Since, Limit) ->
         Hlc -> Hlc
     end,
 
-    %% We'll use the topic prefix as the scan range
-    %% Note: This is less efficient than exact topic scan, but handles # wildcard
-    StartKey = barrel_store_keys:path_hlc_prefix(DbName, TopicPrefix),
-    %% End at the next byte after prefix
-    EndKey = <<StartKey/binary, 16#FF>>,
+    %% Use wildcard range keys (without null terminator) to capture all topics
+    %% that START with TopicPrefix, e.g. "users" matches "users", "users/123", etc.
+    StartKey = barrel_store_keys:path_hlc_wildcard_start(DbName, TopicPrefix),
+    EndKey = barrel_store_keys:path_hlc_wildcard_end(DbName, TopicPrefix),
 
-    {LastHlc, _Count, Changes} = barrel_store_rocksdb:fold_range(
+    %% Track seen DocIds to deduplicate (a doc may have multiple topic prefixes)
+    {LastHlc, _Count, _Seen, Changes} = barrel_store_rocksdb:fold_range(
         StoreRef, StartKey, EndKey,
-        fun(Key, Value, {CurrentHlc, Count, Acc}) ->
+        fun(Key, Value, {CurrentHlc, Count, Seen, Acc}) ->
             case Limit =/= infinity andalso Count >= Limit of
                 true ->
-                    {stop, {CurrentHlc, Count, Acc}};
+                    {stop, {CurrentHlc, Count, Seen, Acc}};
                 false ->
                     {_KeyTopic, ChangeHlc} = barrel_store_keys:decode_path_hlc_key(DbName, Key),
                     %% Filter by HLC (exclusive of Since)
                     case barrel_hlc:compare(ChangeHlc, SinceHlc) of
-                        lt -> {ok, {CurrentHlc, Count, Acc}};
-                        eq when Since =/= first -> {ok, {CurrentHlc, Count, Acc}};
+                        lt -> {ok, {CurrentHlc, Count, Seen, Acc}};
+                        eq when Since =/= first -> {ok, {CurrentHlc, Count, Seen, Acc}};
                         _ ->
-                            {DocId, Rev, Deleted} = binary_to_term(Value),
-                            Change = #{
-                                id => DocId,
-                                rev => Rev,
-                                hlc => ChangeHlc,
-                                deleted => Deleted
-                            },
-                            {ok, {ChangeHlc, Count + 1, [Change | Acc]}}
+                            %% Extract DocId cheaply for dedup check
+                            DocId = decode_docid(Value),
+                            case maps:is_key(DocId, Seen) of
+                                true ->
+                                    %% Already seen this doc, skip
+                                    {ok, {ChangeHlc, Count, Seen, Acc}};
+                                false ->
+                                    %% Decode full change and add
+                                    Change = decode_path_hlc_value(Value, ChangeHlc),
+                                    {ok, {ChangeHlc, Count + 1, Seen#{DocId => true}, [Change | Acc]}}
+                            end
                     end
             end
         end,
-        {SinceHlc, 0, []}
+        {SinceHlc, 0, #{}, []}
     ),
 
     {ok, lists:reverse(Changes), LastHlc}.
+
+%% @private Decode path_hlc index value to change map.
+%% Uses same compact binary format as change feed.
+decode_path_hlc_value(<<DocIdLen:16, DocId:DocIdLen/binary,
+                        RevLen:16, Rev:RevLen/binary,
+                        Deleted:8, _Rest/binary>>, Hlc) ->
+    Change = #{
+        id => DocId,
+        rev => Rev,
+        hlc => Hlc
+    },
+    case Deleted =:= 1 of
+        true -> Change#{deleted => true};
+        false -> Change
+    end.
 
 %% @private Generate topic prefixes for hierarchical matching
 %% "users/123/name" -> ["users", "users/123", "users/123/name"]

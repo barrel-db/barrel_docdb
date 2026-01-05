@@ -57,6 +57,7 @@
 
 %% Path-HLC keys (for path-indexed change feeds)
 -export([path_hlc/3, path_hlc_prefix/2, path_hlc_end/2]).
+-export([path_hlc_wildcard_start/2, path_hlc_wildcard_end/2]).  %% For # wildcard matching
 -export([encode_topic/1, decode_path_hlc_key/2]).
 
 %% Attachment keys
@@ -240,6 +241,21 @@ path_hlc_end(DbName, Topic) ->
     <<?PREFIX_PATH_HLC, (encode_name(DbName))/binary, (encode_topic(Topic))/binary,
       16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF,
       16#FF, 16#FF, 16#FF, 16#FF>>.
+
+%% @doc Start key for wildcard topic prefix matching (# patterns).
+%% Unlike path_hlc_prefix, this does NOT include the null terminator,
+%% allowing the range to capture all topics that START with the prefix.
+%% Example: prefix "users" matches topics "users", "users/123", "users/abc/def", etc.
+-spec path_hlc_wildcard_start(db_name(), binary()) -> binary().
+path_hlc_wildcard_start(DbName, TopicPrefix) ->
+    <<?PREFIX_PATH_HLC, (encode_name(DbName))/binary, TopicPrefix/binary>>.
+
+%% @doc End key for wildcard topic prefix matching (# patterns).
+%% Use with path_hlc_wildcard_start for bounded range scans matching all
+%% topics that start with the given prefix.
+-spec path_hlc_wildcard_end(db_name(), binary()) -> binary().
+path_hlc_wildcard_end(DbName, TopicPrefix) ->
+    <<?PREFIX_PATH_HLC, (encode_name(DbName))/binary, TopicPrefix/binary, 16#FF>>.
 
 %% @doc Encode topic for null-terminated storage.
 %% Topics are MQTT-style paths like "users/123/name"
