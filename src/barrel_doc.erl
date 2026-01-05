@@ -61,9 +61,19 @@
 -export([
     get/2, get/3,
     set/3,
+    remove/2,
+    update/3,
     is_key/2,
     keys/1,
-    size/1
+    size/1,
+    find/2,
+    values/1,
+    to_list/1,
+    take/2,
+    merge/2,
+    fold/3,
+    map/2,
+    filter/2
 ]).
 
 %% Index utilities
@@ -410,6 +420,90 @@ size(Doc) when is_map(Doc) ->
     maps:size(Doc);
 size(Doc) when is_binary(Doc) ->
     barrel_docdb_codec_cbor:size(Doc).
+
+%% @doc Remove a key from the document (returns indexed binary)
+-spec remove(doc_input(), binary()) -> cbor_doc().
+remove(Doc, Key) when is_map(Doc) ->
+    barrel_docdb_codec_cbor:encode(maps:remove(Key, Doc));
+remove(Doc, Key) when is_binary(Doc) ->
+    Map = to_map(Doc),
+    barrel_docdb_codec_cbor:encode(maps:remove(Key, Map)).
+
+%% @doc Update value at path using a function (returns indexed binary)
+%% Fun is called with current value (or undefined if not present)
+-spec update(doc_input(), path(), fun((term()) -> term())) -> cbor_doc().
+update(Doc, Path, Fun) when is_function(Fun, 1) ->
+    CurrentValue = get(Doc, Path, undefined),
+    NewValue = Fun(CurrentValue),
+    set(Doc, Path, NewValue).
+
+%% @doc Find a key (like maps:find/2)
+%% Returns {ok, Value} if found, error if not
+-spec find(doc_input(), binary()) -> {ok, term()} | error.
+find(Doc, Key) when is_map(Doc) ->
+    maps:find(Key, Doc);
+find(Doc, Key) when is_binary(Doc) ->
+    case get(Doc, [Key], '$barrel_not_found$') of
+        '$barrel_not_found$' -> error;
+        Value -> {ok, Value}
+    end.
+
+%% @doc Get all values (top-level only)
+-spec values(doc_input()) -> [term()].
+values(Doc) when is_map(Doc) ->
+    maps:values(Doc);
+values(Doc) when is_binary(Doc) ->
+    maps:values(to_map(Doc)).
+
+%% @doc Convert to list of {Key, Value} tuples (top-level only)
+-spec to_list(doc_input()) -> [{binary(), term()}].
+to_list(Doc) when is_map(Doc) ->
+    maps:to_list(Doc);
+to_list(Doc) when is_binary(Doc) ->
+    maps:to_list(to_map(Doc)).
+
+%% @doc Remove and return value at key
+%% Returns {Value, UpdatedDoc} or error if key not found
+-spec take(doc_input(), binary()) -> {term(), cbor_doc()} | error.
+take(Doc, Key) ->
+    Map = to_map(Doc),
+    case maps:take(Key, Map) of
+        {Value, NewMap} ->
+            {Value, barrel_docdb_codec_cbor:encode(NewMap)};
+        error ->
+            error
+    end.
+
+%% @doc Merge two documents (second overwrites first)
+%% Returns indexed binary
+-spec merge(doc_input(), doc_input()) -> cbor_doc().
+merge(Doc1, Doc2) ->
+    Map1 = to_map(Doc1),
+    Map2 = to_map(Doc2),
+    barrel_docdb_codec_cbor:encode(maps:merge(Map1, Map2)).
+
+%% @doc Fold over top-level key-value pairs
+-spec fold(fun((binary(), term(), Acc) -> Acc), Acc, doc_input()) -> Acc.
+fold(Fun, Init, Doc) when is_map(Doc) ->
+    maps:fold(Fun, Init, Doc);
+fold(Fun, Init, Doc) when is_binary(Doc) ->
+    maps:fold(Fun, Init, to_map(Doc)).
+
+%% @doc Map a function over all top-level values
+%% Returns indexed binary
+-spec map(fun((binary(), term()) -> term()), doc_input()) -> cbor_doc().
+map(Fun, Doc) when is_function(Fun, 2) ->
+    Map = to_map(Doc),
+    NewMap = maps:map(Fun, Map),
+    barrel_docdb_codec_cbor:encode(NewMap).
+
+%% @doc Filter key-value pairs using a predicate
+%% Returns indexed binary
+-spec filter(fun((binary(), term()) -> boolean()), doc_input()) -> cbor_doc().
+filter(Pred, Doc) when is_function(Pred, 2) ->
+    Map = to_map(Doc),
+    NewMap = maps:filter(Pred, Map),
+    barrel_docdb_codec_cbor:encode(NewMap).
 
 %%====================================================================
 %% Index Utilities

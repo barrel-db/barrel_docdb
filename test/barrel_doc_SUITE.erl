@@ -40,6 +40,25 @@
     cbor_normalize/1
 ]).
 
+%% Test cases - CBOR map-like API
+-export([
+    cbor_get/1,
+    cbor_set/1,
+    cbor_is_key/1,
+    cbor_keys/1,
+    cbor_size/1,
+    cbor_remove/1,
+    cbor_update/1,
+    cbor_find/1,
+    cbor_values/1,
+    cbor_to_list/1,
+    cbor_take/1,
+    cbor_merge/1,
+    cbor_fold/1,
+    cbor_map/1,
+    cbor_filter/1
+]).
+
 %% Test cases - barrel_revtree
 -export([
     revtree_new/1,
@@ -59,7 +78,7 @@
 %%====================================================================
 
 all() ->
-    [{group, doc}, {group, cbor}, {group, revtree}].
+    [{group, doc}, {group, cbor}, {group, cbor_api}, {group, revtree}].
 
 groups() ->
     [
@@ -86,6 +105,23 @@ groups() ->
             cbor_to_cbor,
             cbor_is_indexed,
             cbor_normalize
+        ]},
+        {cbor_api, [sequence], [
+            cbor_get,
+            cbor_set,
+            cbor_is_key,
+            cbor_keys,
+            cbor_size,
+            cbor_remove,
+            cbor_update,
+            cbor_find,
+            cbor_values,
+            cbor_to_list,
+            cbor_take,
+            cbor_merge,
+            cbor_fold,
+            cbor_map,
+            cbor_filter
         ]},
         {revtree, [sequence], [
             revtree_new,
@@ -444,6 +480,268 @@ cbor_normalize(_Config) ->
     %% ensure_indexed is alias
     Doc4 = barrel_doc:ensure_indexed(Map),
     ?assert(barrel_doc:is_indexed(Doc4)),
+
+    ok.
+
+%%====================================================================
+%% Test Cases - CBOR Map-like API
+%%====================================================================
+
+cbor_get(_Config) ->
+    Map = #{<<"name">> => <<"test">>, <<"nested">> => #{<<"key">> => <<"value">>}},
+    Doc = barrel_doc:from_map(Map),
+
+    %% Get with path from binary doc
+    ?assertEqual(<<"test">>, barrel_doc:get(Doc, [<<"name">>])),
+    ?assertEqual(<<"value">>, barrel_doc:get(Doc, [<<"nested">>, <<"key">>])),
+
+    %% Get with default
+    ?assertEqual(undefined, barrel_doc:get(Doc, [<<"missing">>])),
+    ?assertEqual(42, barrel_doc:get(Doc, [<<"missing">>], 42)),
+
+    %% Get from map
+    ?assertEqual(<<"test">>, barrel_doc:get(Map, [<<"name">>])),
+    ?assertEqual(<<"default">>, barrel_doc:get(Map, [<<"missing">>], <<"default">>)),
+
+    ok.
+
+cbor_set(_Config) ->
+    Map = #{<<"name">> => <<"test">>},
+    Doc = barrel_doc:from_map(Map),
+
+    %% Set on binary doc
+    Doc2 = barrel_doc:set(Doc, [<<"count">>], 42),
+    ?assert(is_binary(Doc2)),
+    ?assert(barrel_doc:is_indexed(Doc2)),
+    ?assertEqual(42, barrel_doc:get(Doc2, [<<"count">>])),
+    ?assertEqual(<<"test">>, barrel_doc:get(Doc2, [<<"name">>])),
+
+    %% Set nested path
+    Doc3 = barrel_doc:set(Doc, [<<"nested">>, <<"key">>], <<"value">>),
+    ?assertEqual(<<"value">>, barrel_doc:get(Doc3, [<<"nested">>, <<"key">>])),
+
+    %% Set on map
+    Doc4 = barrel_doc:set(Map, [<<"new">>], <<"field">>),
+    ?assert(is_binary(Doc4)),
+    ?assertEqual(<<"field">>, barrel_doc:get(Doc4, [<<"new">>])),
+
+    ok.
+
+cbor_is_key(_Config) ->
+    Map = #{<<"name">> => <<"test">>, <<"count">> => 42},
+    Doc = barrel_doc:from_map(Map),
+
+    %% On binary doc
+    ?assert(barrel_doc:is_key(Doc, <<"name">>)),
+    ?assert(barrel_doc:is_key(Doc, <<"count">>)),
+    ?assertNot(barrel_doc:is_key(Doc, <<"missing">>)),
+
+    %% On map
+    ?assert(barrel_doc:is_key(Map, <<"name">>)),
+    ?assertNot(barrel_doc:is_key(Map, <<"missing">>)),
+
+    ok.
+
+cbor_keys(_Config) ->
+    Map = #{<<"a">> => 1, <<"b">> => 2, <<"c">> => 3},
+    Doc = barrel_doc:from_map(Map),
+
+    %% From binary doc
+    Keys1 = lists:sort(barrel_doc:keys(Doc)),
+    ?assertEqual([<<"a">>, <<"b">>, <<"c">>], Keys1),
+
+    %% From map
+    Keys2 = lists:sort(barrel_doc:keys(Map)),
+    ?assertEqual([<<"a">>, <<"b">>, <<"c">>], Keys2),
+
+    ok.
+
+cbor_size(_Config) ->
+    Map = #{<<"a">> => 1, <<"b">> => 2, <<"c">> => 3},
+    Doc = barrel_doc:from_map(Map),
+
+    %% From binary doc
+    ?assertEqual(3, barrel_doc:size(Doc)),
+
+    %% From map
+    ?assertEqual(3, barrel_doc:size(Map)),
+
+    %% Empty
+    ?assertEqual(0, barrel_doc:size(barrel_doc:new())),
+    ?assertEqual(0, barrel_doc:size(#{})),
+
+    ok.
+
+cbor_remove(_Config) ->
+    Map = #{<<"a">> => 1, <<"b">> => 2, <<"c">> => 3},
+    Doc = barrel_doc:from_map(Map),
+
+    %% Remove from binary doc
+    Doc2 = barrel_doc:remove(Doc, <<"b">>),
+    ?assert(is_binary(Doc2)),
+    ?assert(barrel_doc:is_indexed(Doc2)),
+    ?assertEqual(2, barrel_doc:size(Doc2)),
+    ?assertNot(barrel_doc:is_key(Doc2, <<"b">>)),
+    ?assert(barrel_doc:is_key(Doc2, <<"a">>)),
+
+    %% Remove from map
+    Doc3 = barrel_doc:remove(Map, <<"a">>),
+    ?assert(is_binary(Doc3)),
+    ?assertNot(barrel_doc:is_key(Doc3, <<"a">>)),
+
+    %% Remove non-existent key (no error)
+    Doc4 = barrel_doc:remove(Doc, <<"missing">>),
+    ?assertEqual(3, barrel_doc:size(Doc4)),
+
+    ok.
+
+cbor_update(_Config) ->
+    Map = #{<<"count">> => 10},
+    Doc = barrel_doc:from_map(Map),
+
+    %% Update existing value
+    Doc2 = barrel_doc:update(Doc, [<<"count">>], fun(V) -> V * 2 end),
+    ?assertEqual(20, barrel_doc:get(Doc2, [<<"count">>])),
+
+    %% Update non-existent (gets undefined)
+    Doc3 = barrel_doc:update(Doc, [<<"missing">>], fun(undefined) -> <<"created">> end),
+    ?assertEqual(<<"created">>, barrel_doc:get(Doc3, [<<"missing">>])),
+
+    ok.
+
+cbor_find(_Config) ->
+    Map = #{<<"name">> => <<"test">>, <<"count">> => 42},
+    Doc = barrel_doc:from_map(Map),
+
+    %% Find existing key from binary doc
+    ?assertEqual({ok, <<"test">>}, barrel_doc:find(Doc, <<"name">>)),
+    ?assertEqual({ok, 42}, barrel_doc:find(Doc, <<"count">>)),
+
+    %% Find missing key
+    ?assertEqual(error, barrel_doc:find(Doc, <<"missing">>)),
+
+    %% Find from map
+    ?assertEqual({ok, <<"test">>}, barrel_doc:find(Map, <<"name">>)),
+    ?assertEqual(error, barrel_doc:find(Map, <<"missing">>)),
+
+    ok.
+
+cbor_values(_Config) ->
+    Map = #{<<"a">> => 1, <<"b">> => 2, <<"c">> => 3},
+    Doc = barrel_doc:from_map(Map),
+
+    %% From binary doc
+    Values1 = lists:sort(barrel_doc:values(Doc)),
+    ?assertEqual([1, 2, 3], Values1),
+
+    %% From map
+    Values2 = lists:sort(barrel_doc:values(Map)),
+    ?assertEqual([1, 2, 3], Values2),
+
+    ok.
+
+cbor_to_list(_Config) ->
+    Map = #{<<"a">> => 1, <<"b">> => 2},
+    Doc = barrel_doc:from_map(Map),
+
+    %% From binary doc
+    List1 = lists:sort(barrel_doc:to_list(Doc)),
+    ?assertEqual([{<<"a">>, 1}, {<<"b">>, 2}], List1),
+
+    %% From map
+    List2 = lists:sort(barrel_doc:to_list(Map)),
+    ?assertEqual([{<<"a">>, 1}, {<<"b">>, 2}], List2),
+
+    ok.
+
+cbor_take(_Config) ->
+    Map = #{<<"a">> => 1, <<"b">> => 2, <<"c">> => 3},
+    Doc = barrel_doc:from_map(Map),
+
+    %% Take existing key
+    {Value, Doc2} = barrel_doc:take(Doc, <<"b">>),
+    ?assertEqual(2, Value),
+    ?assert(is_binary(Doc2)),
+    ?assertEqual(2, barrel_doc:size(Doc2)),
+    ?assertNot(barrel_doc:is_key(Doc2, <<"b">>)),
+
+    %% Take non-existent key
+    ?assertEqual(error, barrel_doc:take(Doc, <<"missing">>)),
+
+    ok.
+
+cbor_merge(_Config) ->
+    Map1 = #{<<"a">> => 1, <<"b">> => 2},
+    Map2 = #{<<"b">> => 20, <<"c">> => 3},
+    Doc1 = barrel_doc:from_map(Map1),
+    Doc2 = barrel_doc:from_map(Map2),
+
+    %% Merge two binary docs
+    Merged1 = barrel_doc:merge(Doc1, Doc2),
+    ?assert(is_binary(Merged1)),
+    ?assertEqual(1, barrel_doc:get(Merged1, [<<"a">>])),
+    ?assertEqual(20, barrel_doc:get(Merged1, [<<"b">>])),  % Second wins
+    ?assertEqual(3, barrel_doc:get(Merged1, [<<"c">>])),
+
+    %% Merge map + binary
+    Merged2 = barrel_doc:merge(Map1, Doc2),
+    ?assert(is_binary(Merged2)),
+    ?assertEqual(20, barrel_doc:get(Merged2, [<<"b">>])),
+
+    %% Merge binary + map
+    Merged3 = barrel_doc:merge(Doc1, Map2),
+    ?assert(is_binary(Merged3)),
+    ?assertEqual(20, barrel_doc:get(Merged3, [<<"b">>])),
+
+    ok.
+
+cbor_fold(_Config) ->
+    Map = #{<<"a">> => 1, <<"b">> => 2, <<"c">> => 3},
+    Doc = barrel_doc:from_map(Map),
+
+    %% Sum all values from binary doc
+    Sum1 = barrel_doc:fold(fun(_K, V, Acc) -> Acc + V end, 0, Doc),
+    ?assertEqual(6, Sum1),
+
+    %% Collect keys from map
+    Keys = barrel_doc:fold(fun(K, _V, Acc) -> [K | Acc] end, [], Map),
+    ?assertEqual(3, length(Keys)),
+
+    ok.
+
+cbor_map(_Config) ->
+    Map = #{<<"a">> => 1, <<"b">> => 2, <<"c">> => 3},
+    Doc = barrel_doc:from_map(Map),
+
+    %% Double all values
+    Doc2 = barrel_doc:map(fun(_K, V) -> V * 2 end, Doc),
+    ?assert(is_binary(Doc2)),
+    ?assertEqual(2, barrel_doc:get(Doc2, [<<"a">>])),
+    ?assertEqual(4, barrel_doc:get(Doc2, [<<"b">>])),
+    ?assertEqual(6, barrel_doc:get(Doc2, [<<"c">>])),
+
+    %% Map over map input
+    Doc3 = barrel_doc:map(fun(K, _V) -> K end, Map),
+    ?assert(is_binary(Doc3)),
+    ?assertEqual(<<"a">>, barrel_doc:get(Doc3, [<<"a">>])),
+
+    ok.
+
+cbor_filter(_Config) ->
+    Map = #{<<"a">> => 1, <<"b">> => 2, <<"c">> => 3, <<"d">> => 4},
+    Doc = barrel_doc:from_map(Map),
+
+    %% Keep only even values
+    Doc2 = barrel_doc:filter(fun(_K, V) -> V rem 2 == 0 end, Doc),
+    ?assert(is_binary(Doc2)),
+    ?assertEqual(2, barrel_doc:size(Doc2)),
+    ?assertEqual(2, barrel_doc:get(Doc2, [<<"b">>])),
+    ?assertEqual(4, barrel_doc:get(Doc2, [<<"d">>])),
+    ?assertNot(barrel_doc:is_key(Doc2, <<"a">>)),
+
+    %% Filter by key
+    Doc3 = barrel_doc:filter(fun(K, _V) -> K < <<"c">> end, Map),
+    ?assertEqual(2, barrel_doc:size(Doc3)),
 
     ok.
 
