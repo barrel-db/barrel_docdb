@@ -578,7 +578,7 @@ execute_pure_compare_chunked(StoreRef, DbName, Path, Op, Value, Plan, ChunkSize,
             process_compare_docids_chunked(DocIds, Key, Seen, Count, LastK, Acc, MaxCollect)
         end,
         {#{}, 0, undefined, []},
-        {ok, ActualSnapshot}
+        ActualSnapshot
     ),
 
     {_, CollectedCount, LastCollectedKey, Results} = FoldResult,

@@ -86,6 +86,12 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running OR condition with LIMIT 10...~n"),
     OrCondLimit = barrel_bench_metrics:summarize(bench_query(Db, or_condition_limit_query(), Iterations)),
 
+    io:format("  Running range with continuation (100 per page, ~~48% of docs)...~n"),
+    RangeContinuation = barrel_bench_metrics:summarize(bench_range_continuation(Db, 100)),
+
+    io:format("  Running range with continuation (500 per page)...~n"),
+    RangeContinuation500 = barrel_bench_metrics:summarize(bench_range_continuation(Db, 500)),
+
     #{
         simple_eq => SimpleEq,
         simple_eq_limit => SimpleEqLimit,
@@ -107,15 +113,29 @@ run(Db, NumDocs, Iterations) ->
         exists => ExistsQ,
         exists_limit => ExistsLimit,
         or_condition => OrCond,
-        or_condition_limit => OrCondLimit
+        or_condition_limit => OrCondLimit,
+        range_cont_100 => RangeContinuation,
+        range_cont_500 => RangeContinuation500
     }.
 
 %%====================================================================
 %% Query definitions
 %%====================================================================
+%%
+%% Result counts for 5000 documents:
+%% - simple_eq (type=user): ALL 5000 docs
+%% - selective_eq (status=active): ~1666 docs (1/3)
+%% - very_selective_eq (city=Paris): ~625 docs (1/8)
+%% - pure_compare (age>50): ~2380 docs (48%, ages 51-80 of 18-80 range)
+%% - range (type=user AND age>50): ~2380 docs (same as pure_compare since all are users)
+%% - multi_index (type=user AND status=active): ~1666 docs
+%% - prefix (name starts "User 1"): ~1111 docs (1 + 10-19 + 100-199 + 1000-1999)
+%% - exists (profile field): ALL 5000 docs
+%%====================================================================
 
 simple_eq_query() ->
     %% Simple equality: find all users with type=user
+    %% Returns ALL 5000 docs - all test docs have type=user
     %% include_docs => false enables pure index path (no doc body fetch)
     #{where => [{path, [<<"type">>], <<"user">>}], include_docs => false}.
 
@@ -133,6 +153,10 @@ very_selective_eq_query() ->
     #{where => [{path, [<<"profile">>, <<"city">>], <<"Paris">>}], include_docs => false}.
 
 range_query() ->
+    %% Multi-condition range query: type=user AND age > 50
+    %% Returns ~2380 docs (48% of 5000) with include_docs=true (default)
+    %% Ages cycle 18-80, so age>50 matches ages 51-80 = 30 values out of 63
+    %% This is SLOW because it fetches ~2380 document bodies
     #{where => [
         {path, [<<"type">>], <<"user">>},
         {compare, [<<"age">>], '>', 50}
@@ -258,3 +282,44 @@ bench_query(Db, Query, Iterations) ->
         end),
         barrel_bench_metrics:record(Acc, Time)
     end, Metrics, lists:seq(1, Iterations)).
+
+%% @doc Benchmark range query with continuation pattern.
+%% Pages through all results using continuation tokens.
+%% Each call to execute returns at most PageSize results.
+%% Measures time per page, not total time for all pages.
+%%
+%% NOTE: Uses include_docs=false because chunked body-fetch queries
+%% are not yet implemented. This tests pure index pagination performance.
+bench_range_continuation(Db, PageSize) ->
+    %% Query: age > 50, returns ~2380 docs (48% of 5000)
+    %% Uses include_docs=false for pure index pagination benchmark
+    {ok, StoreRef} = barrel_db_server:get_store_ref(Db),
+    {ok, Info} = barrel_db_server:info(Db),
+    DbName = maps:get(name, Info),
+    QuerySpec = #{
+        where => [{compare, [<<"age">>], '>', 50}],
+        include_docs => false
+    },
+    {ok, Plan} = barrel_query:compile(QuerySpec),
+    Metrics = barrel_bench_metrics:new(),
+    bench_range_continuation_loop(StoreRef, DbName, Plan, PageSize, undefined, Metrics).
+
+bench_range_continuation_loop(StoreRef, DbName, Plan, PageSize, Continuation, Metrics) ->
+    ChunkOpts = case Continuation of
+        undefined -> #{chunk_size => PageSize};
+        Token -> #{chunk_size => PageSize, continuation => Token}
+    end,
+    {Time, Result} = timer:tc(fun() ->
+        barrel_query:execute(StoreRef, DbName, Plan, ChunkOpts)
+    end),
+    Metrics1 = barrel_bench_metrics:record(Metrics, Time),
+    case Result of
+        {ok, _Results, #{has_more := true, continuation := NextToken}} ->
+            bench_range_continuation_loop(StoreRef, DbName, Plan, PageSize, NextToken, Metrics1);
+        {ok, _Results, #{has_more := false}} ->
+            %% No more pages
+            Metrics1;
+        {error, Reason} ->
+            io:format("Range continuation error: ~p~n", [Reason]),
+            Metrics1
+    end.
