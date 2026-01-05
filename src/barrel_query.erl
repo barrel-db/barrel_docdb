@@ -801,9 +801,18 @@ find_most_selective_condition(StoreRef, DbName, Conditions) ->
     {BestCond, BestPath}.
 
 %% @private Verify that docids match remaining conditions using posting lists
+%% Uses point lookups for equality conditions (O(1) per docid) and set membership
+%% for other condition types (O(m) to collect, then O(1) lookups).
 verify_conditions(_StoreRef, _DbName, DocIds, []) ->
     lists:usort(DocIds);
+verify_conditions(StoreRef, DbName, DocIds, [{path, Path, Value} | Rest]) ->
+    %% Use point lookup for equality - O(1) per docid via value-first index
+    FilteredDocIds = lists:filter(fun(DocId) ->
+        barrel_ars_index:docid_has_value(StoreRef, DbName, Path, Value, DocId)
+    end, DocIds),
+    verify_conditions(StoreRef, DbName, FilteredDocIds, Rest);
 verify_conditions(StoreRef, DbName, DocIds, [Cond | Rest]) ->
+    %% For other conditions (compare, exists, prefix), use set-based approach
     CondDocIds = sets:from_list(collect_condition_docids(StoreRef, DbName, Cond)),
     FilteredDocIds = lists:filter(fun(DocId) ->
         sets:is_element(DocId, CondDocIds)

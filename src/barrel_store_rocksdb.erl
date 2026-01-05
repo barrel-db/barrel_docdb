@@ -9,7 +9,7 @@
 
 %% barrel_store callbacks
 -export([open/2, close/1]).
--export([put/3, put/4, get/2, multi_get/2, delete/2]).
+-export([put/3, put/4, get/2, key_exists/2, multi_get/2, delete/2]).
 -export([merge/3]).
 -export([write_batch/2, write_batch/3]).
 -export([fold/4, fold_range/5, fold_range/6, fold_range_reverse/5, fold_range_reverse/6]).
@@ -110,6 +110,28 @@ put(#{ref := Ref}, Key, Value, Opts) ->
 -spec get(db_ref(), binary()) -> {ok, binary()} | not_found | {error, term()}.
 get(#{ref := Ref}, Key) ->
     rocksdb:get(Ref, Key, []).
+
+%% @doc Check if a key exists without loading the value.
+%% Uses iterator seek which is more efficient than get for existence checks.
+%% Compares only up to the length of the lookup key since values may be truncated.
+-spec key_exists(db_ref(), binary()) -> boolean().
+key_exists(#{ref := Ref}, Key) ->
+    KeyLen = byte_size(Key),
+    {ok, Itr} = rocksdb:iterator(Ref, []),
+    try
+        case rocksdb:iterator_move(Itr, Key) of
+            {ok, FoundKey, _Value} ->
+                %% Check if the found key starts with the lookup key (prefix match)
+                case FoundKey of
+                    <<Key:KeyLen/binary, _/binary>> -> true;
+                    Key -> true;
+                    _ -> false
+                end;
+            {error, invalid_iterator} -> false
+        end
+    after
+        rocksdb:iterator_close(Itr)
+    end.
 
 %% @doc Get multiple values by keys (batch read)
 -spec multi_get(db_ref(), [binary()]) -> [{ok, binary()} | not_found | {error, term()}].

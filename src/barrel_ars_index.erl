@@ -45,6 +45,11 @@
     get_path_cardinality/3
 ]).
 
+%% Point lookup for condition verification
+-export([
+    docid_has_value/5
+]).
+
 %% Bitmap utilities
 -export([
     get_path_bitmap/3,
@@ -205,6 +210,14 @@ get_path_cardinality(StoreRef, DbName, Path) ->
         {error, _} = Error ->
             Error
     end.
+
+%% @doc Check if a docid has a specific value at a path via point lookup.
+%% Uses the value-first index for O(1) verification instead of collecting
+%% the entire posting list. Uses key_exists which doesn't load the value.
+-spec docid_has_value(store_ref(), db_name(), [term()], term(), docid()) -> boolean().
+docid_has_value(StoreRef, DbName, Path, Value, DocId) ->
+    Key = barrel_store_keys:value_index_key(DbName, Value, Path, DocId),
+    barrel_store_rocksdb:key_exists(StoreRef, Key).
 
 %% @doc Get the bitmap for a path+value.
 %% Returns the raw bitmap binary from the bitmap column family.
