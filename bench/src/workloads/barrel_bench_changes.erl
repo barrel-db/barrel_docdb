@@ -25,27 +25,28 @@ run(Db, NumDocs, _Iterations) ->
     end,
 
     %% Benchmark full changes scan
+    %% Note: summarize immediately to avoid including other benchmark times
     io:format("  Scanning all changes...~n"),
-    FullScan = bench_full_changes(Db),
+    FullScanResult = barrel_bench_metrics:summarize(bench_full_changes(Db)),
 
     %% Benchmark incremental changes (batched reads)
     io:format("  Testing incremental changes...~n"),
-    Incremental = bench_incremental_changes(Db, 100),
+    IncrementalResult = barrel_bench_metrics:summarize(bench_incremental_changes(Db, 100)),
 
     %% Benchmark wildcard path matching
     io:format("  Testing wildcard path matching...~n"),
-    WildcardPath = bench_wildcard_path_changes(Db),
+    WildcardPathResult = barrel_bench_metrics:summarize(bench_wildcard_path_changes(Db)),
 
     %% Benchmark subscription latency
     SubCount = min(100, NumDocs div 10),
     io:format("  Testing subscription latency (~p docs)...~n", [SubCount]),
-    SubLatency = bench_subscription_latency(SubCount),
+    SubLatencyResult = barrel_bench_metrics:summarize(bench_subscription_latency(SubCount)),
 
     #{
-        full_scan => barrel_bench_metrics:summarize(FullScan),
-        incremental => barrel_bench_metrics:summarize(Incremental),
-        wildcard_path => barrel_bench_metrics:summarize(WildcardPath),
-        subscription => barrel_bench_metrics:summarize(SubLatency)
+        full_scan => FullScanResult,
+        incremental => IncrementalResult,
+        wildcard_path => WildcardPathResult,
+        subscription => SubLatencyResult
     }.
 
 %%====================================================================
