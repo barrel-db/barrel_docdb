@@ -26,6 +26,7 @@
     analyze_arrays_with_objects/1,
     analyze_mixed_types/1,
     analyze_complex_doc/1,
+    analyze_indexed_cbor/1,
     short_truncates_long_binary/1,
     short_preserves_short_binary/1,
     short_preserves_non_binary/1,
@@ -57,7 +58,8 @@ groups() ->
             analyze_arrays,
             analyze_arrays_with_objects,
             analyze_mixed_types,
-            analyze_complex_doc
+            analyze_complex_doc,
+            analyze_indexed_cbor
         ]},
         {short, [parallel], [
             short_truncates_long_binary,
@@ -202,6 +204,37 @@ analyze_complex_doc(_Config) ->
         {[<<"e">>, 1, <<"c">>, 3], <<>>}
     ]),
     ?assertEqual(Expected, lists:sort(Paths)).
+
+analyze_indexed_cbor(_Config) ->
+    %% Test that analyze works with indexed CBOR binary (not just maps)
+    Map = #{
+        <<"type">> => <<"user">>,
+        <<"name">> => <<"Alice">>,
+        <<"profile">> => #{
+            <<"city">> => <<"Paris">>,
+            <<"age">> => 30
+        }
+    },
+
+    %% Analyze the map directly
+    MapPaths = barrel_ars:analyze(Map),
+
+    %% Convert to indexed CBOR and analyze
+    IndexedCbor = barrel_doc:from_map(Map),
+    ?assert(barrel_doc:is_indexed(IndexedCbor)),
+    CborPaths = barrel_ars:analyze(IndexedCbor),
+
+    %% Both should produce the same paths
+    ?assertEqual(lists:sort(MapPaths), lists:sort(CborPaths)),
+
+    %% Verify expected paths
+    Expected = lists:sort([
+        {[<<"type">>, <<"user">>], <<>>},
+        {[<<"name">>, <<"Alice">>], <<>>},
+        {[<<"profile">>, <<"city">>, <<"Paris">>], <<>>},
+        {[<<"profile">>, <<"age">>, 30], <<>>}
+    ]),
+    ?assertEqual(Expected, lists:sort(CborPaths)).
 
 %%====================================================================
 %% short tests

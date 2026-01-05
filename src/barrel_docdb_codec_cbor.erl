@@ -33,6 +33,7 @@
 
 %% Map-like API (lazy access without full decode)
 -export([get/2, get/3, get_value/2, set/3, to_map/1]).
+-export([keys/1, size/1, is_key/2]).
 
 %% JSON Conversion
 -export([to_json/1, to_json_iolist/1]).
@@ -1096,6 +1097,27 @@ set(RecordBin, Path, Value) ->
 -spec to_map(record_bin()) -> map().
 to_map(RecordBin) ->
     decode(RecordBin).
+
+%% @doc Get all top-level keys without full decode.
+%% Uses the index for O(1) access to key list.
+-spec keys(record_bin()) -> [binary()].
+keys(RecordBin) ->
+    Index = parse_index(RecordBin),
+    maps:keys(Index#parsed_index.top_keys).
+
+%% @doc Get number of top-level entries without full decode.
+%% Uses the index for O(1) access.
+-spec size(record_bin()) -> non_neg_integer().
+size(RecordBin) ->
+    Index = parse_index(RecordBin),
+    maps:size(Index#parsed_index.top_keys).
+
+%% @doc Check if a key exists at top level without full decode.
+%% Uses the index for O(1) lookup.
+-spec is_key(record_bin(), binary()) -> boolean().
+is_key(RecordBin, Key) ->
+    Index = parse_index(RecordBin),
+    maps:is_key(Key, Index#parsed_index.top_keys).
 
 %% Internal: set value at path in nested map
 set_path(Map, [Key], Value) when is_map(Map) ->

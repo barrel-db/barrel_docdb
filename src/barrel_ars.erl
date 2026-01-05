@@ -38,12 +38,30 @@
 %%====================================================================
 
 %% @doc Extract all paths from a document.
+%% Accepts both Erlang maps and indexed CBOR binaries.
 %% Returns a list of `{Path, Value}' tuples where Path is a list of
 %% field names/indices ending with the value.
--spec analyze(map()) -> [{Path :: [term()], binary()}].
+-spec analyze(map() | binary()) -> [{Path :: [term()], binary()}].
 analyze(Doc) when is_map(Doc) ->
     %% Build paths in reverse for O(n) complexity, then reverse each path
     analyze_doc(Doc, [], []);
+analyze(Doc) when is_binary(Doc) ->
+    %% Indexed CBOR - use barrel_doc API to access values via index
+    case barrel_doc:is_indexed(Doc) of
+        true ->
+            Keys = barrel_doc:keys(Doc),
+            lists:foldl(
+                fun(K, Acc) ->
+                    V = barrel_doc:get(Doc, [K]),
+                    analyze_value(V, [K], Acc)
+                end,
+                [],
+                Keys
+            );
+        false ->
+            %% Plain CBOR - decode first (will be indexed during storage)
+            analyze(barrel_doc:to_map(Doc))
+    end;
 analyze(_) ->
     [].
 

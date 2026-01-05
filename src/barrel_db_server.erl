@@ -441,11 +441,14 @@ find_view_by_pid(Pid, Views) ->
 %%====================================================================
 
 %% @doc Put a document (create or update)
+%% Accepts: Erlang map, indexed CBOR binary, or plain CBOR binary
 %% Options:
 %%   - sync: boolean() - if true, sync to disk before returning (default: false)
 do_put_doc(StoreRef, DbName, Doc, Opts) ->
+    %% Normalize input: map, indexed binary, or plain CBOR -> map for processing
+    DocMap = barrel_doc:to_map(Doc),
     %% Build document record from input
-    DocRecord = barrel_doc:make_doc_record(Doc),
+    DocRecord = barrel_doc:make_doc_record(DocMap),
     #{id := DocId, revs := Revs, deleted := Deleted, doc := DocBody} = DocRecord,
     [NewRev | _] = Revs,
 
@@ -606,11 +609,14 @@ do_put_docs(StoreRef, DbName, Docs, Opts) ->
     Results.
 
 %% @doc Prepare document operations without writing (using column-wide storage)
+%% Accepts: Erlang map, indexed CBOR binary, or plain CBOR binary
 %% Returns {ok, Ops, NotifyInfo} or {error, Reason}
 prepare_doc_ops(StoreRef, DbName, Doc) ->
     try
+        %% Normalize input: map, indexed binary, or plain CBOR -> map for processing
+        DocMap = barrel_doc:to_map(Doc),
         %% Build document record from input
-        DocRecord = barrel_doc:make_doc_record(Doc),
+        DocRecord = barrel_doc:make_doc_record(DocMap),
         #{id := DocId, revs := Revs, deleted := Deleted, doc := DocBody} = DocRecord,
         [NewRev | _] = Revs,
 
