@@ -457,9 +457,12 @@ compact_to_change(DocId, Hlc, Rev, Deleted, NumConflicts, _Style) ->
         false -> Change
     end.
 
+%% Batch size for chunked doc fetching
+-define(DOC_FETCH_BATCH_SIZE, 100).
+
 %% @private Filtered scan (needs full change format)
+%% Uses chunked batch processing for efficient doc fetching.
 get_changes_filtered(StoreRef, DbName, Since, Opts) ->
-    Limit = maps:get(limit, Opts, infinity),
     DocIds = maps:get(doc_ids, Opts, undefined),
     Style = maps:get(style, Opts, all_docs),
     PathPatterns = maps:get(paths, Opts, undefined),
@@ -481,50 +484,161 @@ get_changes_filtered(StoreRef, DbName, Since, Opts) ->
     %% Do we need doc body for filtering?
     NeedsDoc = PathMatcher =/= undefined orelse CompiledQuery =/= undefined,
 
-    FoldFun = fun(Change, {Count, Changes}) ->
-        %% Check doc_ids filter
+    %% Use chunked processing with batch doc fetching for efficiency
+    case NeedsDoc of
+        true ->
+            %% Chunked batch processing when docs are needed
+            get_changes_filtered_chunked(StoreRef, DbName, Since, Opts,
+                                          DocIds, Style, PathMatcher, CompiledQuery);
+        false ->
+            %% Simple fold when no doc fetching needed (doc_ids filter only)
+            get_changes_filtered_simple(StoreRef, DbName, Since, Opts,
+                                         DocIds, Style)
+    end.
+
+%% @private Chunked processing with batch doc fetching
+get_changes_filtered_chunked(StoreRef, DbName, Since, Opts,
+                              DocIds, Style, PathMatcher, CompiledQuery) ->
+    Limit = maps:get(limit, Opts, infinity),
+
+    %% Collect changes in chunks, batch fetch docs, apply filters
+    FoldFun = fun(Change, {Chunk, ChunkSize, Results, ResultCount, _LastHlc}) ->
+        DocId = maps:get(id, Change),
+
+        %% Pre-filter by doc_ids before adding to chunk
         IncludeByDocId = case DocIds of
             undefined -> true;
-            Ids when is_list(Ids) -> lists:member(maps:get(id, Change), Ids)
+            Ids -> lists:member(DocId, Ids)
         end,
 
-        %% Fetch doc body if needed for path/query filtering
-        ChangeWithDoc = case NeedsDoc andalso IncludeByDocId of
-            true ->
-                DocId = maps:get(id, Change),
-                case fetch_doc_body(StoreRef, DbName, DocId) of
-                    {ok, Doc} -> Change#{doc => Doc};
-                    _ -> Change
-                end;
+        case IncludeByDocId of
             false ->
-                Change
-        end,
+                %% Skip this change entirely
+                {ok, {Chunk, ChunkSize, Results, ResultCount, maps:get(hlc, Change)}};
+            true ->
+                NewChunk = [{DocId, Change} | Chunk],
+                NewChunkSize = ChunkSize + 1,
+                NewLastHlc = maps:get(hlc, Change),
 
-        %% Check path patterns filter
-        IncludeByPath = case PathMatcher of
-            undefined ->
-                true;
-            MatchTrie ->
-                case maps:get(doc, ChangeWithDoc, undefined) of
-                    undefined ->
-                        false;
-                    DocBody when is_map(DocBody) ->
-                        DocPaths = barrel_ars:analyze(DocBody),
-                        Topics = barrel_ars:paths_to_topics(DocPaths),
-                        matches_any_pattern(MatchTrie, Topics);
-                    _ ->
-                        false
+                %% Process chunk when it reaches batch size
+                case NewChunkSize >= ?DOC_FETCH_BATCH_SIZE of
+                    true ->
+                        {NewResults, NewResultCount, Done} =
+                            process_change_chunk(StoreRef, DbName, lists:reverse(NewChunk),
+                                                  PathMatcher, CompiledQuery, Style,
+                                                  Results, ResultCount, Limit),
+                        case Done of
+                            true ->
+                                {stop, {[], 0, NewResults, NewResultCount, NewLastHlc}};
+                            false ->
+                                {ok, {[], 0, NewResults, NewResultCount, NewLastHlc}}
+                        end;
+                    false ->
+                        {ok, {NewChunk, NewChunkSize, Results, ResultCount, NewLastHlc}}
                 end
+        end
+    end,
+
+    StartHlc = case Since of first -> barrel_hlc:min(); H -> H end,
+
+    %% Use long_scan optimization for full unbounded scans
+    FoldChanges = case {Since, Limit} of
+        {first, infinity} -> fun fold_changes_long_scan/5;
+        _ -> fun fold_changes/5
+    end,
+
+    {ok, {FinalChunk, _, RevResults, FinalCount, LastHlc}, _FoldHlc} =
+        FoldChanges(StoreRef, DbName, Since, FoldFun, {[], 0, [], 0, StartHlc}),
+
+    %% Process any remaining chunk
+    {AllResults, _FinalResultCount, _} = case FinalChunk of
+        [] ->
+            {RevResults, FinalCount, false};
+        _ ->
+            process_change_chunk(StoreRef, DbName, lists:reverse(FinalChunk),
+                                  PathMatcher, CompiledQuery, Style,
+                                  RevResults, FinalCount, Limit)
+    end,
+
+    %% Cleanup the trie if we created one
+    case PathMatcher of
+        undefined -> ok;
+        CleanupTrie -> match_trie:delete(CleanupTrie)
+    end,
+
+    Changes = case maps:get(descending, Opts, false) of
+        true -> AllResults;
+        false -> lists:reverse(AllResults)
+    end,
+
+    {ok, Changes, LastHlc}.
+
+%% @private Process a chunk of changes with batch doc fetching
+process_change_chunk(StoreRef, DbName, DocChangePairs,
+                      PathMatcher, CompiledQuery, Style,
+                      Results, ResultCount, Limit) ->
+    %% Batch fetch doc bodies for all changes in chunk
+    ChangesWithDocs = batch_fetch_doc_bodies(StoreRef, DbName, DocChangePairs),
+
+    %% Apply filters to each change
+    lists:foldl(
+        fun(ChangeWithDoc, {Acc, Count, Done}) ->
+            case Done of
+                true ->
+                    {Acc, Count, true};
+                false ->
+                    %% Check path patterns filter
+                    IncludeByPath = case PathMatcher of
+                        undefined ->
+                            true;
+                        MatchTrie ->
+                            case maps:get(doc, ChangeWithDoc, undefined) of
+                                undefined ->
+                                    false;
+                                DocBody when is_map(DocBody) ->
+                                    DocPaths = barrel_ars:analyze(DocBody),
+                                    Topics = barrel_ars:paths_to_topics(DocPaths),
+                                    matches_any_pattern(MatchTrie, Topics);
+                                _ ->
+                                    false
+                            end
+                    end,
+
+                    %% Check query filter
+                    IncludeByQuery = maybe_match_query(CompiledQuery, ChangeWithDoc),
+
+                    case IncludeByPath andalso IncludeByQuery of
+                        false ->
+                            {Acc, Count, false};
+                        true ->
+                            FilteredChange = apply_style(Style, ChangeWithDoc),
+                            NewCount = Count + 1,
+                            NewAcc = [FilteredChange | Acc],
+                            IsDone = Limit =/= infinity andalso NewCount >= Limit,
+                            {NewAcc, NewCount, IsDone}
+                    end
+            end
+        end,
+        {Results, ResultCount, false},
+        ChangesWithDocs
+    ).
+
+%% @private Simple filtered scan (doc_ids filter only, no doc fetching)
+get_changes_filtered_simple(StoreRef, DbName, Since, Opts, DocIds, Style) ->
+    Limit = maps:get(limit, Opts, infinity),
+
+    FoldFun = fun(Change, {Count, Changes}) ->
+        DocId = maps:get(id, Change),
+        IncludeByDocId = case DocIds of
+            undefined -> true;
+            Ids -> lists:member(DocId, Ids)
         end,
 
-        %% Check query filter
-        IncludeByQuery = maybe_match_query(CompiledQuery, ChangeWithDoc),
-
-        case IncludeByDocId andalso IncludeByPath andalso IncludeByQuery of
+        case IncludeByDocId of
             false ->
                 {ok, {Count, Changes}};
             true ->
-                FilteredChange = apply_style(Style, ChangeWithDoc),
+                FilteredChange = apply_style(Style, Change),
                 NewCount = Count + 1,
                 NewChanges = [FilteredChange | Changes],
                 case Limit of
@@ -538,18 +652,11 @@ get_changes_filtered(StoreRef, DbName, Since, Opts) ->
         end
     end,
 
-    %% Use long_scan optimization for full unbounded scans
     FoldChanges = case {Since, Limit} of
         {first, infinity} -> fun fold_changes_long_scan/5;
         _ -> fun fold_changes/5
     end,
     {ok, {_Count, RevChanges}, LastHlc} = FoldChanges(StoreRef, DbName, Since, FoldFun, {0, []}),
-
-    %% Cleanup the trie if we created one
-    case PathMatcher of
-        undefined -> ok;
-        CleanupTrie -> match_trie:delete(CleanupTrie)
-    end,
 
     Changes = case maps:get(descending, Opts, false) of
         true -> RevChanges;
@@ -724,28 +831,77 @@ check_recent_buckets(_StoreRef, _DbName, _Since, _Bucket, _Count) ->
     %% Bucket < 0, shouldn't happen in practice
     true.
 
-%% @private Fetch doc body for path/query filtering
-fetch_doc_body(StoreRef, DbName, DocId) ->
-    DocCurrentKey = barrel_store_keys:doc_current(DbName, DocId),
-    case barrel_store_rocksdb:get(StoreRef, DocCurrentKey) of
-        {ok, CurrentBin} ->
-            {Rev, Deleted, _Hlc} = binary_to_term(CurrentBin),
-            case Deleted of
-                true ->
-                    {error, deleted};
-                false ->
-                    DocBodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
-                    case barrel_store_rocksdb:get(StoreRef, DocBodyKey) of
+%% @private Batch fetch doc bodies using multi_get for efficiency.
+%% Takes a list of {DocId, Change} pairs and returns changes with doc bodies added.
+%% Uses two multi_get calls: first for doc_current (to get revs), then for doc_body.
+-spec batch_fetch_doc_bodies(barrel_store_rocksdb:db_ref(), db_name(),
+                              [{docid(), change()}]) -> [change()].
+batch_fetch_doc_bodies(_StoreRef, _DbName, []) ->
+    [];
+batch_fetch_doc_bodies(StoreRef, DbName, DocChangePairs) ->
+    %% Step 1: Build keys for doc_current lookup
+    DocIds = [DocId || {DocId, _Change} <- DocChangePairs],
+    CurrentKeys = [barrel_store_keys:doc_current(DbName, DocId) || DocId <- DocIds],
+
+    %% Step 2: Batch fetch doc_current entries
+    CurrentResults = barrel_store_rocksdb:multi_get(StoreRef, CurrentKeys),
+
+    %% Step 3: Parse results and build doc_body keys for non-deleted docs
+    {BodyKeyMap, DeletedSet} = lists:foldl(
+        fun({DocId, Result}, {BodyKeys, Deleted}) ->
+            case Result of
+                {ok, CurrentBin} ->
+                    {Rev, IsDeleted, _Hlc} = binary_to_term(CurrentBin),
+                    case IsDeleted of
+                        true ->
+                            {BodyKeys, sets:add_element(DocId, Deleted)};
+                        false ->
+                            BodyKey = barrel_store_keys:doc_body(DbName, DocId, Rev),
+                            {maps:put(DocId, BodyKey, BodyKeys), Deleted}
+                    end;
+                not_found ->
+                    {BodyKeys, Deleted};
+                {error, _} ->
+                    {BodyKeys, Deleted}
+            end
+        end,
+        {#{}, sets:new()},
+        lists:zip(DocIds, CurrentResults)
+    ),
+
+    %% Step 4: Batch fetch doc bodies
+    BodyKeys = maps:values(BodyKeyMap),
+    BodyDocIds = maps:keys(BodyKeyMap),
+    DocBodies = case BodyKeys of
+        [] ->
+            #{};
+        _ ->
+            BodyResults = barrel_store_rocksdb:multi_get(StoreRef, BodyKeys),
+            lists:foldl(
+                fun({DocId, Result}, Acc) ->
+                    case Result of
                         {ok, CborBin} ->
                             DocBody = barrel_docdb_codec_cbor:decode(CborBin),
-                            {ok, DocBody};
-                        not_found ->
-                            {error, not_found}
+                            maps:put(DocId, DocBody, Acc);
+                        _ ->
+                            Acc
                     end
-            end;
-        not_found ->
-            {error, not_found}
-    end.
+                end,
+                #{},
+                lists:zip(BodyDocIds, BodyResults)
+            )
+    end,
+
+    %% Step 5: Merge doc bodies back into changes
+    [case sets:is_element(DocId, DeletedSet) of
+        true ->
+            Change;  %% Deleted doc, no body to add
+        false ->
+            case maps:get(DocId, DocBodies, undefined) of
+                undefined -> Change;
+                DocBody -> Change#{doc => DocBody}
+            end
+    end || {DocId, Change} <- DocChangePairs].
 
 %%====================================================================
 %% Internal API - for barrel_db_writer
