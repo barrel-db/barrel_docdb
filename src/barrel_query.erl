@@ -2147,16 +2147,9 @@ execute_with_bitmap_filter(StoreRef, DbName, [First | Rest] = Conditions, Plan, 
             execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan, Snapshot)
     end.
 
-%% @doc Check if all conditions use the same bitmap size
-all_same_bitmap_size([]) -> true;
-all_same_bitmap_size([{path, Path, Value} | Rest]) ->
-    FirstSize = barrel_ars_index:bitmap_size_for_path(Path ++ [Value]),
-    lists:all(
-        fun({path, P, V}) ->
-            barrel_ars_index:bitmap_size_for_path(P ++ [V]) =:= FirstSize
-        end,
-        Rest
-    ).
+%% @doc Check if all conditions use the same bitmap size.
+%% With global bitmap size, this always returns true.
+all_same_bitmap_size(_Conditions) -> true.
 
 %% @doc Execute using sorted intersection (fallback)
 execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan, Snapshot) ->

@@ -48,7 +48,7 @@
 %% Bitmap utilities
 -export([
     get_path_bitmap/3,
-    bitmap_size_for_path/1,
+    bitmap_size/0,
     bitmap_intersect/1,
     bitmap_test_position/2,
     doc_position/2
@@ -59,13 +59,10 @@
 -type store_ref() :: barrel_store_rocksdb:db_ref().
 -type read_profile() :: barrel_store_rocksdb:read_profile().
 
-%% Bitmap sizes based on path depth
-%% Top-level paths (depth 1-2): 1M bits - many docs likely match
-%% Mid-level paths (depth 3-4): 256K bits - fewer docs match
-%% Deep paths (depth 5+): 64K bits - very selective
--define(BITMAP_SIZE_SHALLOW, 1048576).   %% 1M bits for depth 1-2
--define(BITMAP_SIZE_MEDIUM, 262144).     %% 256K bits for depth 3-4
--define(BITMAP_SIZE_DEEP, 65536).        %% 64K bits for depth 5+
+%% Global bitmap size for all paths.
+%% Using a single size enables cross-path bitmap intersection.
+%% 1M bits = 128KB per bitmap, good balance of space vs false positive rate.
+-define(BITMAP_SIZE, 1048576).
 
 %%====================================================================
 %% API
@@ -697,27 +694,20 @@ split_path_value(Path) ->
     [Value | ReversedFieldPath] = ReversedPath,
     {lists:reverse(ReversedFieldPath), Value}.
 
-%% @private Convert DocId to a bitmap position using deterministic hash
-%% Uses path depth to determine bitmap size for better space efficiency
-doc_to_position(DocId, Path) ->
-    BitmapSize = bitmap_size_for_path(Path),
-    erlang:phash2(DocId, BitmapSize).
+%% @private Convert DocId to a bitmap position using deterministic hash.
+%% Uses a global bitmap size so positions are consistent across all paths,
+%% enabling cross-path bitmap intersection for multi-condition queries.
+doc_to_position(DocId, _Path) ->
+    erlang:phash2(DocId, ?BITMAP_SIZE).
 
-%% @doc Get bitmap size based on path depth.
-%% Deeper paths are more selective, so we can use smaller bitmaps.
-%% This is used for consistent position calculation across read/write.
--spec bitmap_size_for_path([term()]) -> pos_integer().
-bitmap_size_for_path(Path) when is_list(Path) ->
-    %% Path includes the value at the end, so actual depth = length - 1
-    Depth = length(Path) - 1,
-    if
-        Depth =< 2 -> ?BITMAP_SIZE_SHALLOW;
-        Depth =< 4 -> ?BITMAP_SIZE_MEDIUM;
-        true -> ?BITMAP_SIZE_DEEP
-    end.
+%% @doc Get the global bitmap size.
+%% All paths use the same size to enable cross-path intersection.
+-spec bitmap_size() -> pos_integer().
+bitmap_size() ->
+    ?BITMAP_SIZE.
 
-%% @doc Get the bitmap position for a document ID and path.
-%% This is the public version of doc_to_position/2.
+%% @doc Get the bitmap position for a document ID.
+%% Path is ignored - all paths use the same position for a given DocId.
 -spec doc_position(docid(), [term()]) -> non_neg_integer().
 doc_position(DocId, Path) ->
     doc_to_position(DocId, Path).

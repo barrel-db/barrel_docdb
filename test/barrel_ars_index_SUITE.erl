@@ -494,26 +494,10 @@ bitmap_basic(Config) ->
 
     ok.
 
-bitmap_size_by_depth(Config) ->
-    _StoreRef = proplists:get_value(store_ref, Config),
-
-    %% Test that bitmap size varies by path depth
-    %% Shallow paths (depth 1-2) use larger bitmaps
-    Size1 = barrel_ars_index:bitmap_size_for_path([<<"type">>, <<"user">>]),
-    ?assertEqual(1048576, Size1),  %% 1M bits
-
-    Size2 = barrel_ars_index:bitmap_size_for_path([<<"a">>, <<"b">>, <<"c">>]),
-    ?assertEqual(1048576, Size2),  %% Still shallow (depth 2)
-
-    %% Medium depth (3-4) uses smaller bitmaps
-    Size3 = barrel_ars_index:bitmap_size_for_path([<<"a">>, <<"b">>, <<"c">>, <<"d">>]),
-    ?assertEqual(262144, Size3),  %% 256K bits (depth 3)
-
-    Size4 = barrel_ars_index:bitmap_size_for_path([<<"a">>, <<"b">>, <<"c">>, <<"d">>, <<"e">>]),
-    ?assertEqual(262144, Size4),  %% Still medium (depth 4)
-
-    %% Deep paths (5+) use smallest bitmaps
-    Size5 = barrel_ars_index:bitmap_size_for_path([<<"a">>, <<"b">>, <<"c">>, <<"d">>, <<"e">>, <<"f">>]),
-    ?assertEqual(65536, Size5),  %% 64K bits (depth 5)
+bitmap_size_by_depth(_Config) ->
+    %% Test that bitmap size is global (same for all paths)
+    %% This enables cross-path bitmap intersection
+    Size = barrel_ars_index:bitmap_size(),
+    ?assertEqual(1048576, Size),  %% 1M bits global
 
     ok.
