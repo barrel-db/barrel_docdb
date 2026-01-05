@@ -47,6 +47,12 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running multi-condition queries...~n"),
     MultiCond = barrel_bench_metrics:summarize(bench_query(Db, multi_condition_query(), Iterations)),
 
+    io:format("  Running multi-index intersection (type=user AND status=active)...~n"),
+    MultiIndex = barrel_bench_metrics:summarize(bench_query(Db, multi_index_query(), Iterations)),
+
+    io:format("  Running multi-index range (type=user AND age>50)...~n"),
+    MultiIndexRange = barrel_bench_metrics:summarize(bench_query(Db, multi_index_range_query(), Iterations)),
+
     io:format("  Running nested path queries...~n"),
     NestedPath = barrel_bench_metrics:summarize(bench_query(Db, nested_path_query(), Iterations)),
 
@@ -77,6 +83,8 @@ run(Db, NumDocs, Iterations) ->
         pure_compare => PureCompare,
         pure_compare_limit => PureCompareLimit,
         multi_condition => MultiCond,
+        multi_index => MultiIndex,
+        multi_index_range => MultiIndexRange,
         nested_path => NestedPath,
         order_by_limit => TopK,
         pure_topk => PureTopK,
@@ -129,6 +137,23 @@ multi_condition_query() ->
         {path, [<<"type">>], <<"user">>},
         {path, [<<"status">>], <<"active">>}
     ]}.
+
+multi_index_query() ->
+    %% Multi-condition query using posting list intersection
+    %% Uses optimized index intersection instead of full scan + filter
+    %% include_docs => false enables pure index path (no doc body fetch)
+    #{where => [
+        {path, [<<"type">>], <<"user">>},
+        {path, [<<"status">>], <<"active">>}
+    ], include_docs => false}.
+
+multi_index_range_query() ->
+    %% Multi-condition with equality + compare using index intersection
+    %% Tests intersection of equality posting list with range scan
+    #{where => [
+        {path, [<<"type">>], <<"user">>},
+        {compare, [<<"age">>], '>', 50}
+    ], include_docs => false}.
 
 nested_path_query() ->
     #{where => [{path, [<<"profile">>, <<"city">>], <<"Paris">>}]}.

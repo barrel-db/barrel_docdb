@@ -329,6 +329,8 @@ execute_chunked_with_snapshot(StoreRef, DbName, Plan, ChunkSize, StartKey, Snaps
             execute_pure_prefix_chunked(StoreRef, DbName, Path, Prefix, Plan, ChunkSize, StartKey, Snapshot);
         {pure_compare, Path, Op, Value} ->
             execute_pure_compare_chunked(StoreRef, DbName, Path, Op, Value, Plan, ChunkSize, StartKey, Snapshot);
+        {multi_index, IndexConditions} ->
+            execute_multi_index_chunked(StoreRef, DbName, IndexConditions, Plan, ChunkSize, StartKey, Snapshot);
         needs_body ->
             %% For body-fetch queries, fall back to non-chunked for now
             %% TODO: Implement chunked body-fetch queries
@@ -634,6 +636,173 @@ process_compare_docids_chunked([DocId | Rest], Key, Seen, Count, _LastKey, Acc, 
                     process_compare_docids_chunked(Rest, Key, NewSeen, NewCount, Key, NewAcc, MaxCollect)
             end
     end.
+
+%% @private Execute chunked multi-index query (intersection of posting lists)
+execute_multi_index_chunked(StoreRef, DbName, Conditions, Plan, ChunkSize, StartKey, Snapshot) ->
+    #query_plan{offset = Offset} = Plan,
+
+    %% Get snapshot if not already present
+    ActualSnapshot = case Snapshot of
+        undefined ->
+            {ok, S} = barrel_store_rocksdb:snapshot(StoreRef),
+            S;
+        S -> S
+    end,
+
+    %% Collect DocIds using bitmap-accelerated intersection
+    IntersectedDocIds = intersect_docid_sets(StoreRef, DbName, Conditions),
+
+    %% Apply pagination using StartKey
+    PaginatedDocIds = case StartKey of
+        undefined -> IntersectedDocIds;
+        Key ->
+            %% Skip until we pass the start key
+            lists:dropwhile(fun(DocId) -> DocId =< Key end, IntersectedDocIds)
+    end,
+
+    %% Collect ChunkSize + 1 for has_more detection
+    MaxCollect = ChunkSize + 1,
+    {CollectedDocIds, HasMore} = case length(PaginatedDocIds) > MaxCollect of
+        true ->
+            {lists:sublist(PaginatedDocIds, MaxCollect), true};
+        false ->
+            {PaginatedDocIds, false}
+    end,
+
+    %% Build results
+    Results0 = [#{<<"id">> => DocId} || DocId <- CollectedDocIds],
+    FinalResults0 = case HasMore of
+        true -> lists:droplast(Results0);
+        false -> Results0
+    end,
+    FinalResults = apply_offset_limit(FinalResults0, Offset, ChunkSize),
+
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    case HasMore of
+        true ->
+            LastDocId = lists:last(CollectedDocIds),
+            Token = barrel_query_cursor:create(
+                StoreRef, DbName, multi_index, LastDocId, ActualSnapshot),
+            {ok, FinalResults, #{last_seq => LastSeq, has_more => true, continuation => Token}};
+        false ->
+            maybe_release_snapshot(ActualSnapshot),
+            {ok, FinalResults, #{last_seq => LastSeq, has_more => false}}
+    end.
+
+%% @private Collect DocIds for a single condition using index
+collect_condition_docids(StoreRef, DbName, {path, Path, Value}) ->
+    FullPath = Path ++ [Value],
+    barrel_ars_index:get_posting_list(StoreRef, DbName, FullPath);
+collect_condition_docids(StoreRef, DbName, {exists, Path}) ->
+    %% Collect all DocIds that have this path
+    barrel_ars_index:fold_path(StoreRef, DbName, Path,
+        fun({_P, DocId}, Acc) -> {ok, [DocId | Acc]} end, [], short_range);
+collect_condition_docids(StoreRef, DbName, {prefix, Path, Prefix}) ->
+    barrel_ars_index:fold_prefix(StoreRef, DbName, Path, Prefix,
+        fun({_P, DocId}, Acc) -> {ok, [DocId | Acc]} end, [], short_range);
+collect_condition_docids(StoreRef, DbName, {compare, Path, Op, Value}) ->
+    barrel_ars_index:fold_path_values_compare(StoreRef, DbName, Path, Op, Value,
+        fun({_P, DocId}, Acc) -> {ok, [DocId | Acc]} end, []).
+
+%% @private Intersect multiple DocId sets using bitmap acceleration
+%% Uses bitmap intersection for fast filtering, then verifies with posting lists
+intersect_docid_sets(StoreRef, DbName, Conditions) ->
+    %% Get bitmaps for all conditions
+    Bitmaps = get_condition_bitmaps(StoreRef, DbName, Conditions),
+    case Bitmaps of
+        [] ->
+            %% No bitmaps available, fall back to posting list intersection
+            intersect_docid_sets_slow(StoreRef, DbName, Conditions);
+        _ ->
+            %% Intersect bitmaps for fast pre-filtering
+            IntersectedBitmap = barrel_ars_index:bitmap_intersect(Bitmaps),
+
+            %% Find the most selective condition (smallest posting list)
+            {SmallestCond, SmallestPath} = find_most_selective_condition(StoreRef, DbName, Conditions),
+
+            %% Get docids from the smallest posting list
+            DocIds = collect_condition_docids(StoreRef, DbName, SmallestCond),
+
+            %% Filter using the intersected bitmap
+            FilteredDocIds = lists:filter(fun(DocId) ->
+                Position = barrel_ars_index:doc_position(DocId, SmallestPath),
+                barrel_ars_index:bitmap_test_position(IntersectedBitmap, Position)
+            end, DocIds),
+
+            %% Verify remaining conditions (bitmap may have false positives)
+            OtherConditions = Conditions -- [SmallestCond],
+            verify_conditions(StoreRef, DbName, FilteredDocIds, OtherConditions)
+    end.
+
+%% @private Get bitmaps for conditions (only equality conditions have bitmaps)
+get_condition_bitmaps(StoreRef, DbName, Conditions) ->
+    lists:filtermap(fun(Cond) ->
+        case condition_to_path(Cond) of
+            {ok, FullPath} ->
+                case barrel_ars_index:get_path_bitmap(StoreRef, DbName, FullPath) of
+                    {ok, Bitmap} -> {true, Bitmap};
+                    _ -> false
+                end;
+            error -> false
+        end
+    end, Conditions).
+
+%% @private Convert condition to full path
+condition_to_path({path, Path, Value}) -> {ok, Path ++ [Value]};
+condition_to_path({exists, Path}) -> {ok, Path};
+condition_to_path(_) -> error.
+
+%% @private Find the most selective condition based on cardinality
+find_most_selective_condition(StoreRef, DbName, Conditions) ->
+    ConditionsWithCard = lists:map(fun(Cond) ->
+        {Card, Path} = case Cond of
+            {path, P, V} ->
+                FullPath = P ++ [V],
+                case barrel_ars_index:get_path_cardinality(StoreRef, DbName, FullPath) of
+                    {ok, C} -> {C, FullPath};
+                    _ -> {999999999, FullPath}
+                end;
+            {exists, P} ->
+                case barrel_ars_index:get_path_cardinality(StoreRef, DbName, P) of
+                    {ok, C} -> {C, P};
+                    _ -> {999999999, P}
+                end;
+            {compare, P, _, _} ->
+                %% Compare conditions are typically less selective
+                {999999998, P};
+            _ ->
+                {999999999, []}
+        end,
+        {Card, Path, Cond}
+    end, Conditions),
+    [{_, BestPath, BestCond} | _] = lists:sort(ConditionsWithCard),
+    {BestCond, BestPath}.
+
+%% @private Verify that docids match remaining conditions using posting lists
+verify_conditions(_StoreRef, _DbName, DocIds, []) ->
+    lists:usort(DocIds);
+verify_conditions(StoreRef, DbName, DocIds, [Cond | Rest]) ->
+    CondDocIds = sets:from_list(collect_condition_docids(StoreRef, DbName, Cond)),
+    FilteredDocIds = lists:filter(fun(DocId) ->
+        sets:is_element(DocId, CondDocIds)
+    end, DocIds),
+    verify_conditions(StoreRef, DbName, FilteredDocIds, Rest).
+
+%% @private Slow path: intersect using sets (no bitmap acceleration)
+intersect_docid_sets_slow(StoreRef, DbName, Conditions) ->
+    DocIdSets = [collect_condition_docids(StoreRef, DbName, Cond) || Cond <- Conditions],
+    intersect_docid_lists(DocIdSets).
+
+%% @private Intersect multiple DocId lists
+intersect_docid_lists([]) -> [];
+intersect_docid_lists([First]) -> lists:usort(First);
+intersect_docid_lists([First | Rest]) ->
+    FirstSet = sets:from_list(First),
+    FinalSet = lists:foldl(fun(DocIds, AccSet) ->
+        sets:intersection(AccSet, sets:from_list(DocIds))
+    end, FirstSet, Rest),
+    lists:sort(sets:to_list(FinalSet)).
 
 %% @private Release snapshot if present
 maybe_release_snapshot(undefined) -> ok;
@@ -1440,6 +1609,9 @@ execute_index_scan(StoreRef, DbName, Plan, Snapshot) ->
         {pure_compare, Path, Op, Value} ->
             %% Range query using index scan
             execute_pure_compare(StoreRef, DbName, Path, Op, Value, Plan, Snapshot);
+        {multi_index, IndexConditions} ->
+            %% Multi-condition with all index-friendly conditions
+            execute_multi_index(StoreRef, DbName, IndexConditions, Plan, Snapshot);
         needs_body ->
             DocIds = collect_scan_docids(StoreRef, DbName, Conditions, Snapshot),
             filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot)
@@ -1456,6 +1628,7 @@ execute_index_scan(StoreRef, DbName, Plan, Snapshot) ->
     {pure_exists, [term()]} |
     {pure_prefix, [term()], binary()} |
     {pure_compare, [term()], compare_op(), term()} |
+    {multi_index, [condition()]} |
     needs_body.
 classify_scan_query(Conditions, Plan) ->
     #query_plan{include_docs = IncludeDocs, projections = Projections} = Plan,
@@ -1478,9 +1651,34 @@ classify_scan_query(Conditions, Plan) ->
                 true -> needs_body;
                 false -> {pure_compare, Path, Op, Value}
             end;
+        {MultiConds, false} when length(MultiConds) > 1 ->
+            %% Multiple conditions - check if all are index-friendly
+            case all_index_conditions(MultiConds) of
+                true -> {multi_index, MultiConds};
+                false -> needs_body
+            end;
         _ ->
             needs_body
     end.
+
+%% @doc Check if all conditions can be evaluated using index
+all_index_conditions([]) -> true;
+all_index_conditions([{path, _, Value} | Rest]) ->
+    case is_logic_var(Value) of
+        true -> false;
+        false -> all_index_conditions(Rest)
+    end;
+all_index_conditions([{exists, _} | Rest]) ->
+    all_index_conditions(Rest);
+all_index_conditions([{prefix, _, _} | Rest]) ->
+    all_index_conditions(Rest);
+all_index_conditions([{compare, _, Op, Value} | Rest])
+  when Op =:= '>' orelse Op =:= '<' orelse Op =:= '>=' orelse Op =:= '=<' ->
+    case is_logic_var(Value) of
+        true -> false;
+        false -> all_index_conditions(Rest)
+    end;
+all_index_conditions(_) -> false.
 
 %% @doc Check if projections require document body
 needs_body_for_projection(['*']) -> false;
@@ -1499,6 +1697,7 @@ needs_body_for_projection(Projections) ->
     {pure_exists, [term()]} |
     {pure_prefix, [term()], binary()} |
     {pure_compare, [term()], compare_op(), term()} |
+    {multi_index, [condition()]} |
     needs_body.
 classify_scan_query_adaptive(StoreRef, DbName, Conditions, Plan) ->
     #query_plan{include_docs = IncludeDocs, projections = Projections} = Plan,
@@ -1521,6 +1720,12 @@ classify_scan_query_adaptive(StoreRef, DbName, Conditions, Plan) ->
             case is_logic_var(Value) of
                 true -> needs_body;
                 false -> {pure_compare, Path, Op, Value}
+            end;
+        {MultiConds, false} when length(MultiConds) > 1 ->
+            %% Multiple conditions - check if all are index-friendly
+            case all_index_conditions(MultiConds) of
+                true -> {multi_index, MultiConds};
+                false -> needs_body
             end;
         _ ->
             needs_body
@@ -1691,6 +1896,38 @@ execute_pure_compare(StoreRef, DbName, Path, Op, Value, Plan, Snapshot) ->
     LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
 
     {ok, Results2, LastSeq}.
+
+%% @doc Execute multi-index query - intersects posting lists from all conditions
+execute_multi_index(StoreRef, DbName, Conditions, Plan, Snapshot) ->
+    #query_plan{
+        limit = Limit,
+        offset = Offset
+    } = Plan,
+
+    %% Collect DocIds using bitmap-accelerated intersection
+    IntersectedDocIds = intersect_docid_sets(StoreRef, DbName, Conditions),
+
+    %% Calculate how many docs we need
+    MaxCollect = case Limit of
+        undefined -> undefined;
+        L -> L + Offset
+    end,
+
+    %% Apply limit to intersected results
+    LimitedDocIds = case MaxCollect of
+        undefined -> IntersectedDocIds;
+        Max -> lists:sublist(IntersectedDocIds, Max)
+    end,
+
+    %% Build results
+    Results0 = [#{<<"id">> => DocId} || DocId <- LimitedDocIds],
+    Results = apply_offset_limit(Results0, Offset, Limit),
+
+    %% Get last sequence
+    _ = Snapshot,  %% Snapshot not used yet for this path
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    {ok, Results, LastSeq}.
 
 %% @doc Execute pure equality query - iterates value-first index with early termination
 %% Uses prefix scan on individual keys, stops after collecting enough results
