@@ -12,7 +12,7 @@
 %% CT callbacks
 -export([all/0, groups/0, init_per_suite/1, end_per_suite/1]).
 
-%% Test cases - barrel_doc
+%% Test cases - barrel_doc metadata
 -export([
     doc_id/1,
     doc_rev/1,
@@ -26,6 +26,18 @@
     doc_without_meta/1,
     make_doc_record/1,
     generate_docid/1
+]).
+
+%% Test cases - CBOR document handling
+-export([
+    cbor_new/1,
+    cbor_from_map/1,
+    cbor_from_json/1,
+    cbor_to_map/1,
+    cbor_to_json/1,
+    cbor_to_cbor/1,
+    cbor_is_indexed/1,
+    cbor_normalize/1
 ]).
 
 %% Test cases - barrel_revtree
@@ -47,7 +59,7 @@
 %%====================================================================
 
 all() ->
-    [{group, doc}, {group, revtree}].
+    [{group, doc}, {group, cbor}, {group, revtree}].
 
 groups() ->
     [
@@ -64,6 +76,16 @@ groups() ->
             doc_without_meta,
             make_doc_record,
             generate_docid
+        ]},
+        {cbor, [sequence], [
+            cbor_new,
+            cbor_from_map,
+            cbor_from_json,
+            cbor_to_map,
+            cbor_to_json,
+            cbor_to_cbor,
+            cbor_is_indexed,
+            cbor_normalize
         ]},
         {revtree, [sequence], [
             revtree_new,
@@ -284,6 +306,144 @@ generate_docid(_Config) ->
 
     %% IDs are hex encoded
     ?assertEqual(32, byte_size(Id1)),  % MD5 = 16 bytes = 32 hex chars
+
+    ok.
+
+%%====================================================================
+%% Test Cases - CBOR Document Handling
+%%====================================================================
+
+cbor_new(_Config) ->
+    %% Empty document
+    Doc1 = barrel_doc:new(),
+    ?assert(is_binary(Doc1)),
+    ?assert(barrel_doc:is_indexed(Doc1)),
+    ?assertEqual(#{}, barrel_doc:to_map(Doc1)),
+
+    %% From map
+    Map = #{<<"name">> => <<"test">>, <<"value">> => 42},
+    Doc2 = barrel_doc:new(Map),
+    ?assert(is_binary(Doc2)),
+    ?assert(barrel_doc:is_indexed(Doc2)),
+    ?assertEqual(Map, barrel_doc:to_map(Doc2)),
+
+    ok.
+
+cbor_from_map(_Config) ->
+    Map = #{<<"id">> => <<"doc1">>, <<"name">> => <<"test">>},
+    Doc = barrel_doc:from_map(Map),
+
+    ?assert(is_binary(Doc)),
+    ?assert(barrel_doc:is_indexed(Doc)),
+    ?assertEqual(Map, barrel_doc:to_map(Doc)),
+
+    ok.
+
+cbor_from_json(_Config) ->
+    Json = <<"{\"id\":\"doc1\",\"name\":\"test\",\"count\":123}">>,
+    Doc = barrel_doc:from_json(Json),
+
+    ?assert(is_binary(Doc)),
+    ?assert(barrel_doc:is_indexed(Doc)),
+
+    Map = barrel_doc:to_map(Doc),
+    ?assertEqual(<<"doc1">>, maps:get(<<"id">>, Map)),
+    ?assertEqual(<<"test">>, maps:get(<<"name">>, Map)),
+    ?assertEqual(123, maps:get(<<"count">>, Map)),
+
+    ok.
+
+cbor_to_map(_Config) ->
+    %% From binary doc
+    Map = #{<<"id">> => <<"doc1">>, <<"nested">> => #{<<"key">> => <<"value">>}},
+    Doc = barrel_doc:from_map(Map),
+
+    Result = barrel_doc:to_map(Doc),
+    ?assertEqual(Map, Result),
+
+    %% Passthrough for maps
+    ?assertEqual(Map, barrel_doc:to_map(Map)),
+
+    ok.
+
+cbor_to_json(_Config) ->
+    Map = #{<<"id">> => <<"doc1">>, <<"name">> => <<"test">>},
+    Doc = barrel_doc:from_map(Map),
+
+    %% From binary doc
+    Json1 = barrel_doc:to_json(Doc),
+    ?assert(is_binary(Json1)),
+    %% Decode to verify
+    Decoded1 = json:decode(Json1),
+    ?assertEqual(<<"doc1">>, maps:get(<<"id">>, Decoded1)),
+    ?assertEqual(<<"test">>, maps:get(<<"name">>, Decoded1)),
+
+    %% From map directly
+    Json2 = barrel_doc:to_json(Map),
+    ?assert(is_binary(Json2)),
+
+    ok.
+
+cbor_to_cbor(_Config) ->
+    Map = #{<<"id">> => <<"doc1">>, <<"name">> => <<"test">>},
+    Doc = barrel_doc:from_map(Map),
+
+    %% Export to plain CBOR (no index)
+    PlainCbor = barrel_doc:to_cbor(Doc),
+    ?assert(is_binary(PlainCbor)),
+    ?assertNot(barrel_doc:is_indexed(PlainCbor)),
+
+    %% Plain CBOR should be smaller (no index overhead)
+    ?assert(byte_size(PlainCbor) < byte_size(Doc)),
+
+    %% From map directly
+    PlainCbor2 = barrel_doc:to_cbor(Map),
+    ?assert(is_binary(PlainCbor2)),
+    ?assertNot(barrel_doc:is_indexed(PlainCbor2)),
+
+    ok.
+
+cbor_is_indexed(_Config) ->
+    Map = #{<<"id">> => <<"doc1">>},
+
+    %% Indexed binary
+    IndexedDoc = barrel_doc:from_map(Map),
+    ?assert(barrel_doc:is_indexed(IndexedDoc)),
+
+    %% Plain CBOR
+    PlainCbor = barrel_doc:to_cbor(Map),
+    ?assertNot(barrel_doc:is_indexed(PlainCbor)),
+
+    %% Map
+    ?assertNot(barrel_doc:is_indexed(Map)),
+
+    %% Random binary
+    ?assertNot(barrel_doc:is_indexed(<<"random">>)),
+
+    ok.
+
+cbor_normalize(_Config) ->
+    Map = #{<<"id">> => <<"doc1">>, <<"name">> => <<"test">>},
+
+    %% From map
+    Doc1 = barrel_doc:normalize(Map),
+    ?assert(is_binary(Doc1)),
+    ?assert(barrel_doc:is_indexed(Doc1)),
+    ?assertEqual(Map, barrel_doc:to_map(Doc1)),
+
+    %% From already indexed binary
+    Doc2 = barrel_doc:normalize(Doc1),
+    ?assertEqual(Doc1, Doc2),
+
+    %% From plain CBOR
+    PlainCbor = barrel_doc:to_cbor(Map),
+    Doc3 = barrel_doc:normalize(PlainCbor),
+    ?assert(barrel_doc:is_indexed(Doc3)),
+    ?assertEqual(Map, barrel_doc:to_map(Doc3)),
+
+    %% ensure_indexed is alias
+    Doc4 = barrel_doc:ensure_indexed(Map),
+    ?assert(barrel_doc:is_indexed(Doc4)),
 
     ok.
 
