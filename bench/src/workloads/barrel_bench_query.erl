@@ -38,6 +38,12 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running range queries...~n"),
     Range = barrel_bench_metrics:summarize(bench_query(Db, range_query(), Iterations)),
 
+    io:format("  Running pure compare queries (age > 50)...~n"),
+    PureCompare = barrel_bench_metrics:summarize(bench_query(Db, pure_compare_query(), Iterations)),
+
+    io:format("  Running pure compare with LIMIT 10...~n"),
+    PureCompareLimit = barrel_bench_metrics:summarize(bench_query(Db, pure_compare_limit_query(), Iterations)),
+
     io:format("  Running multi-condition queries...~n"),
     MultiCond = barrel_bench_metrics:summarize(bench_query(Db, multi_condition_query(), Iterations)),
 
@@ -68,6 +74,8 @@ run(Db, NumDocs, Iterations) ->
         selective_eq => SelectiveEq,
         very_selective_eq => VerySelectiveEq,
         range => Range,
+        pure_compare => PureCompare,
+        pure_compare_limit => PureCompareLimit,
         multi_condition => MultiCond,
         nested_path => NestedPath,
         order_by_limit => TopK,
@@ -105,6 +113,16 @@ range_query() ->
         {path, [<<"type">>], <<"user">>},
         {compare, [<<"age">>], '>', 50}
     ]}.
+
+pure_compare_query() ->
+    %% Pure compare query: find all docs where age > 50
+    %% Uses optimized range scan instead of full scan + filter
+    %% include_docs => false enables pure index path (no doc body fetch)
+    #{where => [{compare, [<<"age">>], '>', 50}], include_docs => false}.
+
+pure_compare_limit_query() ->
+    %% Pure compare with LIMIT - tests early termination on range scans
+    #{where => [{compare, [<<"age">>], '>', 50}], limit => 10, include_docs => false}.
 
 multi_condition_query() ->
     #{where => [

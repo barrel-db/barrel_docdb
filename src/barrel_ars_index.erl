@@ -22,6 +22,7 @@
     fold_path_range/6, fold_path_range/7,
     fold_path_values/5, fold_path_values/6,
     fold_path_values_reverse/5, fold_path_values_reverse/6,
+    fold_path_values_compare/7,
     fold_prefix/6, fold_prefix/7,
     fold_posting/5, fold_posting/6,
     fold_prefix_posting/6,
@@ -446,6 +447,58 @@ fold_path_values_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0, _Profile) ->
     catch
         throw:{stop, Result} -> Result
     end.
+
+%% @doc Fold over path values matching a comparison operator.
+%% Supports: '>' | '<' | '>=' | '=<' for range queries.
+%% Uses posting lists with proper range bounds.
+%% Example: fold_path_values_compare(S, Db, [<<"age">>], '>', 50, Fun, Acc)
+%%   finds all docs where age > 50
+-spec fold_path_values_compare(store_ref(), db_name(), [term()],
+                                '>' | '<' | '>=' | '=<', term(), fun(), term()) -> term().
+fold_path_values_compare(StoreRef, DbName, Path, Op, Value, Fun, Acc0) ->
+    %% Compute start/end keys based on operator
+    {StartKey, EndKey} = compare_range_keys(DbName, Path, Op, Value),
+    FoldFun = fun(Key, DocIds, Acc) ->
+        {ok, FullPath} = decode_posting_key(Key),
+        NewAcc = lists:foldl(
+            fun(DocId, InnerAcc) ->
+                case Fun({FullPath, DocId}, InnerAcc) of
+                    {ok, Updated} -> Updated;
+                    {stop, StopAcc} -> throw({stop, StopAcc})
+                end
+            end,
+            Acc,
+            DocIds
+        ),
+        {ok, NewAcc}
+    end,
+    try
+        barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, FoldFun, Acc0)
+    catch
+        throw:{stop, Result} -> Result
+    end.
+
+%% @private Compute range keys for compare operators
+compare_range_keys(DbName, Path, '>', Value) ->
+    %% > Value: start AFTER value, end at path end
+    StartKey = barrel_store_keys:path_posting_end(DbName, Path ++ [Value]),
+    EndKey = barrel_store_keys:path_posting_end(DbName, Path),
+    {StartKey, EndKey};
+compare_range_keys(DbName, Path, '>=', Value) ->
+    %% >= Value: start AT value, end at path end
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, Path ++ [Value]),
+    EndKey = barrel_store_keys:path_posting_end(DbName, Path),
+    {StartKey, EndKey};
+compare_range_keys(DbName, Path, '<', Value) ->
+    %% < Value: start at path start, end BEFORE value
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, Path),
+    EndKey = barrel_store_keys:path_posting_prefix(DbName, Path ++ [Value]),
+    {StartKey, EndKey};
+compare_range_keys(DbName, Path, '=<', Value) ->
+    %% =< Value: start at path start, end AFTER value
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, Path),
+    EndKey = barrel_store_keys:path_posting_end(DbName, Path ++ [Value]),
+    {StartKey, EndKey}.
 
 %% @doc Fold over path index entries matching a value prefix.
 %% Uses interval scan: [path, prefix] to [path, prefix ++ 0xFF]

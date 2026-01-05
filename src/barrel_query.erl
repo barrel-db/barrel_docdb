@@ -327,6 +327,8 @@ execute_chunked_with_snapshot(StoreRef, DbName, Plan, ChunkSize, StartKey, Snaps
             execute_pure_exists_chunked(StoreRef, DbName, Path, Plan, ChunkSize, StartKey, Snapshot);
         {pure_prefix, Path, Prefix} ->
             execute_pure_prefix_chunked(StoreRef, DbName, Path, Prefix, Plan, ChunkSize, StartKey, Snapshot);
+        {pure_compare, Path, Op, Value} ->
+            execute_pure_compare_chunked(StoreRef, DbName, Path, Op, Value, Plan, ChunkSize, StartKey, Snapshot);
         needs_body ->
             %% For body-fetch queries, fall back to non-chunked for now
             %% TODO: Implement chunked body-fetch queries
@@ -536,6 +538,100 @@ process_prefix_docids_chunked([DocId | Rest], Key, Seen, Count, _LastKey, Acc, M
                     {stop, {NewSeen, NewCount, Key, NewAcc}};
                 false ->
                     process_prefix_docids_chunked(Rest, Key, NewSeen, NewCount, Key, NewAcc, MaxCollect)
+            end
+    end.
+
+%% @private Execute chunked pure compare query (range scan)
+execute_pure_compare_chunked(StoreRef, DbName, Path, Op, Value, Plan, ChunkSize, StartKey, Snapshot) ->
+    #query_plan{offset = Offset} = Plan,
+
+    %% Compute start/end keys for the range based on operator
+    {RangeStart, RangeEnd} = compare_range_keys(DbName, Path, Op, Value),
+
+    %% Use provided StartKey for pagination, otherwise use range start
+    ActualStartKey = case StartKey of
+        undefined -> RangeStart;
+        Key -> <<Key/binary, 0>>
+    end,
+
+    MaxCollect = ChunkSize + 1,
+
+    %% Get snapshot if not already present
+    ActualSnapshot = case Snapshot of
+        undefined ->
+            {ok, S} = barrel_store_rocksdb:snapshot(StoreRef),
+            S;
+        S -> S
+    end,
+
+    FoldResult = barrel_store_rocksdb:fold_range_posting_with_snapshot(
+        StoreRef, ActualStartKey, RangeEnd,
+        fun(Key, DocIds, {Seen, Count, LastK, Acc}) ->
+            process_compare_docids_chunked(DocIds, Key, Seen, Count, LastK, Acc, MaxCollect)
+        end,
+        {#{}, 0, undefined, []},
+        {ok, ActualSnapshot}
+    ),
+
+    {_, CollectedCount, LastCollectedKey, Results} = FoldResult,
+
+    HasMore = CollectedCount > ChunkSize,
+    FinalResults0 = case HasMore of
+        true -> tl(Results);
+        false -> Results
+    end,
+    FinalResults = apply_offset_limit(lists:reverse(FinalResults0), Offset, ChunkSize),
+
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    case HasMore of
+        true ->
+            Token = barrel_query_cursor:create(
+                StoreRef, DbName, pure_compare, LastCollectedKey, ActualSnapshot),
+            {ok, FinalResults, #{last_seq => LastSeq, has_more => true, continuation => Token}};
+        false ->
+            maybe_release_snapshot(ActualSnapshot),
+            {ok, FinalResults, #{last_seq => LastSeq, has_more => false}}
+    end.
+
+%% @private Compute range keys for compare operators
+compare_range_keys(DbName, Path, '>', Value) ->
+    %% > Value: start AFTER value, end at path end
+    StartKey = barrel_store_keys:path_posting_end(DbName, Path ++ [Value]),
+    EndKey = barrel_store_keys:path_posting_end(DbName, Path),
+    {StartKey, EndKey};
+compare_range_keys(DbName, Path, '>=', Value) ->
+    %% >= Value: start AT value, end at path end
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, Path ++ [Value]),
+    EndKey = barrel_store_keys:path_posting_end(DbName, Path),
+    {StartKey, EndKey};
+compare_range_keys(DbName, Path, '<', Value) ->
+    %% < Value: start at path start, end BEFORE value
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, Path),
+    EndKey = barrel_store_keys:path_posting_prefix(DbName, Path ++ [Value]),
+    {StartKey, EndKey};
+compare_range_keys(DbName, Path, '=<', Value) ->
+    %% =< Value: start at path start, end AFTER value
+    StartKey = barrel_store_keys:path_posting_prefix(DbName, Path),
+    EndKey = barrel_store_keys:path_posting_end(DbName, Path ++ [Value]),
+    {StartKey, EndKey}.
+
+%% @private Process DocIds for chunked compare query
+process_compare_docids_chunked([], _Key, Seen, Count, LastKey, Acc, _MaxCollect) ->
+    {ok, {Seen, Count, LastKey, Acc}};
+process_compare_docids_chunked([DocId | Rest], Key, Seen, Count, _LastKey, Acc, MaxCollect) ->
+    case maps:is_key(DocId, Seen) of
+        true ->
+            process_compare_docids_chunked(Rest, Key, Seen, Count, Key, Acc, MaxCollect);
+        false ->
+            NewSeen = Seen#{DocId => true},
+            NewCount = Count + 1,
+            NewAcc = [#{<<"id">> => DocId} | Acc],
+            case NewCount >= MaxCollect of
+                true ->
+                    {stop, {NewSeen, NewCount, Key, NewAcc}};
+                false ->
+                    process_compare_docids_chunked(Rest, Key, NewSeen, NewCount, Key, NewAcc, MaxCollect)
             end
     end.
 
@@ -1341,6 +1437,9 @@ execute_index_scan(StoreRef, DbName, Plan, Snapshot) ->
             execute_pure_exists(StoreRef, DbName, Path, Plan, Snapshot);
         {pure_prefix, Path, Prefix} ->
             execute_pure_prefix(StoreRef, DbName, Path, Prefix, Plan, Snapshot);
+        {pure_compare, Path, Op, Value} ->
+            %% Range query using index scan
+            execute_pure_compare(StoreRef, DbName, Path, Op, Value, Plan, Snapshot);
         needs_body ->
             DocIds = collect_scan_docids(StoreRef, DbName, Conditions, Snapshot),
             filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot)
@@ -1356,6 +1455,7 @@ execute_index_scan(StoreRef, DbName, Plan, Snapshot) ->
     {pure_equality, [term()], term()} |
     {pure_exists, [term()]} |
     {pure_prefix, [term()], binary()} |
+    {pure_compare, [term()], compare_op(), term()} |
     needs_body.
 classify_scan_query(Conditions, Plan) ->
     #query_plan{include_docs = IncludeDocs, projections = Projections} = Plan,
@@ -1371,6 +1471,13 @@ classify_scan_query(Conditions, Plan) ->
             {pure_exists, Path};
         {[{prefix, Path, Prefix}], false} ->
             {pure_prefix, Path, Prefix};
+        {[{compare, Path, Op, Value}], false} when Op =:= '>' orelse Op =:= '<'
+                                                   orelse Op =:= '>=' orelse Op =:= '=<' ->
+            %% Pure compare - use index range scan
+            case is_logic_var(Value) of
+                true -> needs_body;
+                false -> {pure_compare, Path, Op, Value}
+            end;
         _ ->
             needs_body
     end.
@@ -1391,6 +1498,7 @@ needs_body_for_projection(Projections) ->
     {bulk_equality, [term()], term()} |
     {pure_exists, [term()]} |
     {pure_prefix, [term()], binary()} |
+    {pure_compare, [term()], compare_op(), term()} |
     needs_body.
 classify_scan_query_adaptive(StoreRef, DbName, Conditions, Plan) ->
     #query_plan{include_docs = IncludeDocs, projections = Projections} = Plan,
@@ -1408,6 +1516,12 @@ classify_scan_query_adaptive(StoreRef, DbName, Conditions, Plan) ->
             {pure_exists, Path};
         {[{prefix, Path, Prefix}], false} ->
             {pure_prefix, Path, Prefix};
+        {[{compare, Path, Op, Value}], false} when Op =:= '>' orelse Op =:= '<'
+                                                   orelse Op =:= '>=' orelse Op =:= '=<' ->
+            case is_logic_var(Value) of
+                true -> needs_body;
+                false -> {pure_compare, Path, Op, Value}
+            end;
         _ ->
             needs_body
     end.
@@ -1518,6 +1632,55 @@ execute_pure_prefix(StoreRef, DbName, Path, Prefix, Plan, Snapshot) ->
         end,
         {#{}, 0, []},
         Snapshot
+    ),
+
+    %% Apply offset and limit (results are in reverse order)
+    Results1 = lists:reverse(Results),
+    Results2 = apply_offset_limit(Results1, Offset, Limit),
+
+    %% Get last sequence
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    {ok, Results2, LastSeq}.
+
+%% @doc Execute pure compare query - iterates posting lists for range matches
+%% Uses fold_path_values_compare which scans values matching the operator
+execute_pure_compare(StoreRef, DbName, Path, Op, Value, Plan, Snapshot) ->
+    #query_plan{
+        limit = Limit,
+        offset = Offset
+    } = Plan,
+
+    %% Calculate how many unique docs we need
+    MaxCollect = case Limit of
+        undefined -> undefined;
+        L -> L + Offset
+    end,
+
+    %% Iterate posting lists for values matching the compare condition
+    FoldFun = fun({_FullPath, DocId}, {Seen, Count, Acc}) ->
+        case maps:is_key(DocId, Seen) of
+            true ->
+                {ok, {Seen, Count, Acc}};
+            false ->
+                NewSeen = Seen#{DocId => true},
+                NewCount = Count + 1,
+                NewAcc = [#{<<"id">> => DocId} | Acc],
+                case MaxCollect =/= undefined andalso NewCount >= MaxCollect of
+                    true ->
+                        {stop, {NewSeen, NewCount, NewAcc}};
+                    false ->
+                        {ok, {NewSeen, NewCount, NewAcc}}
+                end
+        end
+    end,
+
+    %% Use fold_path_values_compare with snapshot
+    %% For now, use non-snapshot version and handle snapshot separately
+    %% TODO: Add snapshot support to fold_path_values_compare
+    _ = Snapshot,  %% Snapshot not used yet for this path
+    {_, _, Results} = barrel_ars_index:fold_path_values_compare(
+        StoreRef, DbName, Path, Op, Value, FoldFun, {#{}, 0, []}
     ),
 
     %% Apply offset and limit (results are in reverse order)
