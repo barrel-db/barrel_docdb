@@ -23,6 +23,9 @@
 -export([doc_tree/2]).
 -export([doc_body/3, doc_body_prefix/2]).
 
+%% Wide column document keys (entity storage)
+-export([doc_entity/2, doc_entity_prefix/1, doc_entity_end/1]).
+
 %% Local document keys
 -export([local_doc/2]).
 
@@ -97,6 +100,7 @@
 -define(PREFIX_VALUE_POSTING, 16#15). %% Value-first posting: [value_prefix, path] → [DocId, ...]
 -define(PREFIX_VALUE_INDEX, 16#16).   %% Value-first index: [value_prefix, path, DocId] → marker (for iteration)
 -define(PREFIX_CHANGE_BUCKET, 16#17). %% Change bucket: DbName + BucketTs → {min_hlc, max_hlc, count}
+-define(PREFIX_DOC_ENTITY, 16#18).    %% Wide-column doc entity: DbName + DocId → entity with columns
 
 %% Value prefix max length for value-first index (128 bytes)
 -define(VALUE_PREFIX_MAX_LEN, 128).
@@ -326,6 +330,30 @@ doc_body(DbName, DocId, RevId) ->
 -spec doc_body_prefix(db_name(), docid()) -> binary().
 doc_body_prefix(DbName, DocId) ->
     <<?PREFIX_DOC_BODY, (encode_name(DbName))/binary, DocId/binary, $:>>.
+
+%%====================================================================
+%% Wide Column Document Keys (Entity Storage)
+%%====================================================================
+
+%% @doc Document entity key for wide-column storage.
+%% Stores all document metadata as named columns:
+%%   - rev: current revision ID
+%%   - deleted: "true" or "false"
+%%   - hlc: 12-byte encoded HLC timestamp
+%%   - revtree: term_to_binary encoded revision tree
+-spec doc_entity(db_name(), docid()) -> binary().
+doc_entity(DbName, DocId) ->
+    <<?PREFIX_DOC_ENTITY, (encode_name(DbName))/binary, DocId/binary>>.
+
+%% @doc Prefix for all doc_entity keys in a database
+-spec doc_entity_prefix(db_name()) -> binary().
+doc_entity_prefix(DbName) ->
+    <<?PREFIX_DOC_ENTITY, (encode_name(DbName))/binary>>.
+
+%% @doc End marker for doc_entity range scan
+-spec doc_entity_end(db_name()) -> binary().
+doc_entity_end(DbName) ->
+    <<?PREFIX_DOC_ENTITY, (encode_name(DbName))/binary, 16#FF>>.
 
 %%====================================================================
 %% View Keys

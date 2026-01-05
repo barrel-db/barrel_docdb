@@ -34,6 +34,10 @@
 %% Body column family operations (BlobDB enabled)
 -export([body_put/3, body_put/4, body_get/2, body_multi_get/2, body_delete/2]).
 
+%% Wide column (entity) operations
+-export([put_entity/3, put_entity/4, get_entity/2, multi_get_entity/2, delete_entity/2]).
+-export([batch_put_entity/3]).
+
 %%====================================================================
 %% Types
 %%====================================================================
@@ -166,6 +170,8 @@ write_batch(DbRef, Operations) ->
 %%   - {posting_remove, Key, DocId} - remove DocId from posting list
 %%   - {body_put, Key, Value} - put to body CF (BlobDB)
 %%   - {body_delete, Key} - delete from body CF
+%%   - {entity_put, Key, Columns} - put wide-column entity to default CF
+%%   - {entity_delete, Key} - delete entity from default CF
 -spec write_batch(db_ref(), list(), map()) -> ok | {error, term()}.
 write_batch(#{ref := Ref, bitmap_cf := BitmapCF, posting_cf := PostingCF,
               body_cf := BodyCF}, Operations, Opts) ->
@@ -192,7 +198,13 @@ write_batch(#{ref := Ref, bitmap_cf := BitmapCF, posting_cf := PostingCF,
                ({body_put, Key, Value}) ->
                 ok = rocksdb:batch_put(Batch, BodyCF, Key, Value);
                ({body_delete, Key}) ->
-                ok = rocksdb:batch_delete(Batch, BodyCF, Key)
+                ok = rocksdb:batch_delete(Batch, BodyCF, Key);
+               ({entity_put, Key, Columns}) ->
+                %% Encode columns as binary for batch write
+                %% (rocksdb doesn't have batch_put_entity)
+                ok = rocksdb:batch_put(Batch, Key, term_to_binary(Columns));
+               ({entity_delete, Key}) ->
+                ok = rocksdb:batch_delete(Batch, Key)
             end,
             Operations
         ),
@@ -732,4 +744,51 @@ body_multi_get(#{ref := Ref, body_cf := BodyCF}, Keys) ->
 -spec body_delete(db_ref(), binary()) -> ok | {error, term()}.
 body_delete(#{ref := Ref, body_cf := BodyCF}, Key) ->
     rocksdb:delete(Ref, BodyCF, Key, []).
+
+%%====================================================================
+%% Wide Column (Entity) Operations
+%%====================================================================
+
+%% @doc Put a wide-column entity in the default column family
+%% Columns is a list of {Name, Value} tuples where Name and Value are binaries.
+-spec put_entity(db_ref(), binary(), [{binary(), binary()}]) -> ok | {error, term()}.
+put_entity(DbRef, Key, Columns) ->
+    put_entity(DbRef, Key, Columns, []).
+
+%% @doc Put a wide-column entity with options
+-spec put_entity(db_ref(), binary(), [{binary(), binary()}], list()) -> ok | {error, term()}.
+put_entity(#{ref := Ref}, Key, Columns, Opts) ->
+    rocksdb:put_entity(Ref, Key, Columns, Opts).
+
+%% @doc Get a wide-column entity from the default column family
+%% Returns {ok, [{Name, Value}]} or not_found
+%% Note: Entities are stored as term_to_binary of proplist for batch compatibility
+-spec get_entity(db_ref(), binary()) -> {ok, [{binary(), binary()}]} | not_found | {error, term()}.
+get_entity(#{ref := Ref}, Key) ->
+    case rocksdb:get(Ref, Key, []) of
+        {ok, Bin} -> {ok, binary_to_term(Bin)};
+        not_found -> not_found;
+        {error, _} = Err -> Err
+    end.
+
+%% @doc Get multiple wide-column entities (batch read)
+-spec multi_get_entity(db_ref(), [binary()]) -> [{ok, [{binary(), binary()}]} | not_found | {error, term()}].
+multi_get_entity(#{ref := Ref}, Keys) ->
+    Results = rocksdb:multi_get(Ref, Keys, []),
+    [case R of
+        {ok, Bin} -> {ok, binary_to_term(Bin)};
+        not_found -> not_found;
+        {error, _} = Err -> Err
+    end || R <- Results].
+
+%% @doc Delete a wide-column entity (same as regular delete)
+-spec delete_entity(db_ref(), binary()) -> ok | {error, term()}.
+delete_entity(#{ref := Ref}, Key) ->
+    rocksdb:delete_entity(Ref, Key, []).
+
+%% @doc Add entity put to a batch
+%% Helper for building batch operations with entities
+-spec batch_put_entity(rocksdb:batch_handle(), binary(), [{binary(), binary()}]) -> ok.
+batch_put_entity(Batch, Key, Columns) ->
+    rocksdb:batch_put_entity(Batch, Key, Columns).
 

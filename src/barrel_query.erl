@@ -1587,14 +1587,17 @@ execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan, _Snapshot) ->
 
     {ok, FinalResults, LastSeq}.
 
-%% @doc Fetch a document and check if it matches conditions (column-wide storage)
+%% @doc Fetch a document and check if it matches conditions (wide column entity)
 %% Returns {ok, Doc, BoundVars} or {ok_cbor, CborBin, BoundVars} or skip
 %% When IncludeDocs is false, returns CBOR binary to avoid full decode
 fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) ->
-    DocCurrentKey = barrel_store_keys:doc_current(DbName, DocId),
-    case barrel_store_rocksdb:get(StoreRef, DocCurrentKey) of
-        {ok, CurrentBin} ->
-            {Rev, Deleted, _Hlc} = binary_to_term(CurrentBin),
+    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
+    case barrel_store_rocksdb:get(StoreRef, DocEntityKey) of
+        {ok, EntityBin} ->
+            Columns = binary_to_term(EntityBin),
+            Rev = proplists:get_value(<<"rev">>, Columns),
+            DeletedBin = proplists:get_value(<<"del">>, Columns, <<"false">>),
+            Deleted = DeletedBin =:= <<"true">>,
             case Deleted of
                 true ->
                     skip;
@@ -2392,12 +2395,12 @@ sorted_intersection([H1 | T1], [H2 | _] = L2) when H1 < H2 ->
 sorted_intersection(L1, [_ | T2]) ->
     sorted_intersection(L1, T2).
 
-%% @doc Execute full document scan (slowest, last resort, using column-wide storage)
+%% @doc Execute full document scan (slowest, last resort, using wide column entity)
 execute_full_scan(StoreRef, DbName, Plan, Snapshot) ->
-    %% Collect all doc IDs by scanning doc_current keys
+    %% Collect all doc IDs by scanning doc_entity keys
     %% Use long_scan profile for full table scans (prefetch, avoid cache pollution)
-    StartKey = barrel_store_keys:doc_current_prefix(DbName),
-    EndKey = barrel_store_keys:doc_current_end(DbName),
+    StartKey = barrel_store_keys:doc_entity_prefix(DbName),
+    EndKey = barrel_store_keys:doc_entity_end(DbName),
     PrefixLen = byte_size(StartKey),
     DocIds = barrel_store_rocksdb:fold_range(
         StoreRef,
@@ -2484,16 +2487,16 @@ filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot) ->
 
     {ok, Results2, LastSeq}.
 
-%% @doc Batch fetch documents using multi_get (column-wide storage)
+%% @doc Batch fetch documents using multi_get (wide column entity storage)
 %% Decodes documents to maps for condition matching and projection
 batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projections, IncludeDocs, Snapshot) ->
     case DocIds of
         [] -> [];
         _ ->
-            %% PROFILING: Doc current state fetch
+            %% PROFILING: Doc entity fetch
             T0 = erlang:monotonic_time(microsecond),
-            DocCurrentKeys = [barrel_store_keys:doc_current(DbName, Id) || Id <- DocIds],
-            DocCurrentResults = barrel_store_rocksdb:multi_get_with_snapshot(StoreRef, DocCurrentKeys, Snapshot),
+            DocEntityKeys = [barrel_store_keys:doc_entity(DbName, Id) || Id <- DocIds],
+            DocEntityResults = barrel_store_rocksdb:multi_get_with_snapshot(StoreRef, DocEntityKeys, Snapshot),
             T1 = erlang:monotonic_time(microsecond),
             put(profile_docinfo_fetch, pdict_get(profile_docinfo_fetch, 0) + (T1 - T0)),
 
@@ -2501,8 +2504,12 @@ batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projectio
             {ActiveDocIdRevs, ActiveDocIds} = lists:foldl(
                 fun({DocId, Result}, {AccPairs, AccDocs}) ->
                     case Result of
-                        {ok, CurrentBin} ->
-                            {Rev, Deleted, _Hlc} = binary_to_term(CurrentBin),
+                        {ok, EntityBin} ->
+                            %% Decode entity columns (stored as term_to_binary proplist)
+                            Columns = binary_to_term(EntityBin),
+                            Rev = proplists:get_value(<<"rev">>, Columns),
+                            DeletedBin = proplists:get_value(<<"del">>, Columns, <<"false">>),
+                            Deleted = DeletedBin =:= <<"true">>,
                             case Deleted of
                                 true ->
                                     {AccPairs, AccDocs};
@@ -2516,7 +2523,7 @@ batch_fetch_and_filter(StoreRef, DbName, DocIds, Conditions, Bindings, Projectio
                     end
                 end,
                 {[], []},
-                lists:zip(DocIds, DocCurrentResults)
+                lists:zip(DocIds, DocEntityResults)
             ),
 
             %% Step 3: Batch fetch all CBOR doc bodies from body store (BlobDB)
