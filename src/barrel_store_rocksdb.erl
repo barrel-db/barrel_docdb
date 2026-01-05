@@ -15,6 +15,7 @@
 -export([fold/4, fold_range/5, fold_range/6, fold_range_reverse/5, fold_range_reverse/6]).
 -export([fold_range_with_snapshot/6, fold_range_prefix_with_snapshot/6]).
 -export([fold_range_long_scan/5]).
+-export([fold_range_limit/6]).  %% Auto-selects read profile based on limit
 
 %% Additional utilities
 -export([snapshot/1, release_snapshot/1]).
@@ -394,6 +395,25 @@ fold_range_long_scan(#{ref := Ref}, StartKey, EndKey, Fun, Acc0) ->
         rocksdb:iterator_close(Iter)
     end.
 
+%% @doc Fold over a key range with auto-selected read profile based on limit.
+%% Automatically chooses appropriate RocksDB read options:
+%% - Limit <= 10: point profile (fill_cache=true)
+%% - Limit <= 100: short_range profile (fill_cache=true)
+%% - Limit > 100 or infinity: long_scan profile (fill_cache=false, readahead)
+%%
+%% This is the recommended function for range queries with known limits.
+-spec fold_range_limit(db_ref(), binary(), binary(), fun(), term(),
+                       non_neg_integer() | infinity) -> term().
+fold_range_limit(DbRef, StartKey, EndKey, Fun, Acc, Limit) ->
+    Profile = select_profile(Limit),
+    fold_range(DbRef, StartKey, EndKey, Fun, Acc, Profile).
+
+%% @doc Select read profile based on expected result size
+-spec select_profile(non_neg_integer() | infinity) -> read_profile().
+select_profile(L) when is_integer(L), L =< 10 -> point;
+select_profile(L) when is_integer(L), L =< 100 -> short_range;
+select_profile(_) -> long_scan.
+
 %% @doc Fold over posting list entries with snapshot for consistent reads
 -spec fold_range_posting_with_snapshot(db_ref(), binary(), binary(), fun(), term(), snapshot()) -> term().
 fold_range_posting_with_snapshot(#{ref := Ref, posting_cf := PostingCF}, StartKey, EndKey, Fun, Acc0, Snapshot) ->
@@ -412,28 +432,22 @@ fold_range_posting_with_snapshot(#{ref := Ref, posting_cf := PostingCF}, StartKe
 %%====================================================================
 
 %% @doc Convert read profile to RocksDB read options
-%% - point: Use RocksDB defaults (fill_cache=true is default)
-%% - short_range: Use RocksDB defaults, rely on auto-readahead
-%% - long_scan: Same as short_range for now (infrastructure for future tuning)
+%% - point: Small result sets (limit <= 10), keep blocks in cache
+%% - short_range: Medium result sets (limit <= 100), fill cache
+%% - long_scan: Large/unbounded scans, prefetch aggressively, avoid cache pollution
 %%
-%% Note: fill_cache=false, readahead_size, and async_io hurt on small/warm datasets.
-%% These aggressive options should only be enabled when:
-%% - Dataset is large (won't fit in cache anyway)
-%% - Storage is slow (IO-bound, not CPU-bound)
-%% - Scan is truly sequential and long
-%%
-%% Future long_scan options when IO-bound on large cold datasets:
-%%   [{fill_cache, false}, {readahead_size, 65536}, {async_io, true}]
+%% Cache Hygiene Rules:
+%% - long_scan MUST use fill_cache=false to prevent cache eviction by exports/replication
+%% - short_range/point MAY use fill_cache=true for faster repeated access
 -spec read_profile_opts(read_profile()) -> list().
 read_profile_opts(point) ->
-    [];  %% Use RocksDB defaults
+    [{fill_cache, true}];
 read_profile_opts(short_range) ->
-    [];  %% Use RocksDB defaults
+    [{fill_cache, true}];  %% Let RocksDB use automatic readahead
 read_profile_opts(long_scan) ->
-    %% For now, same as short_range. On small/warm datasets, aggressive
-    %% prefetch (readahead_size, async_io) and fill_cache=false hurt more
-    %% than they help. Enable these only after measuring IO-bound workloads.
-    [].
+    [{fill_cache, false}, {readahead_size, 2 * 1024 * 1024}].
+    %% async_io is behind feature flag - disabled by default
+    %% Must benchmark under concurrent writers before enabling
 
 %% Build RocksDB options from config
 build_db_options(Options) ->
