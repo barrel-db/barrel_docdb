@@ -87,8 +87,11 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    %% Start the worker pool for tests
-    {ok, _Pid} = barrel_parallel:start_link(),
+    %% Start the worker pool for tests (may already be started by application)
+    case barrel_parallel:start_link() of
+        {ok, _Pid} -> ok;
+        {error, {already_started, _Pid}} -> ok
+    end,
     Config.
 
 end_per_suite(_Config) ->
