@@ -63,6 +63,7 @@
     close_db/1,
     delete_db/1,
     db_info/1,
+    db_pid/1,
     list_dbs/0
 ]).
 
@@ -124,6 +125,14 @@
     put_local_doc/3,
     get_local_doc/2,
     delete_local_doc/2
+]).
+
+%% System documents (global, not replicated, stored in _barrel_system db)
+-export([
+    put_system_doc/2,
+    get_system_doc/1,
+    delete_system_doc/1,
+    ensure_system_db/0
 ]).
 
 %% HLC (Hybrid Logical Clock) for distributed time synchronization
@@ -288,6 +297,17 @@ db_info(Name) when is_binary(Name) ->
     end;
 db_info(Pid) when is_pid(Pid) ->
     barrel_db_server:info(Pid).
+
+%% @doc Get the pid of a database by name.
+%%
+%% Returns the process identifier for the given database name.
+%% Useful for operations that require direct access to the database server.
+%%
+%% @param Name Database name
+%% @returns `{ok, Pid}' if database exists, `{error, not_found}' otherwise
+-spec db_pid(binary()) -> {ok, pid()} | {error, not_found}.
+db_pid(Name) when is_binary(Name) ->
+    get_db(Name).
 
 %% @doc List all open databases.
 %%
@@ -1189,6 +1209,65 @@ delete_local_doc(Db, DocId) ->
     with_db(Db, fun(Pid) ->
         barrel_db_server:delete_local_doc(Pid, DocId)
     end).
+
+%%====================================================================
+%% System Documents (Global)
+%%====================================================================
+%% System documents are global (not per-database) and stored in a
+%% special _barrel_system database. They're used for global configuration
+%% like replication tasks, node settings, etc.
+
+-define(SYSTEM_DB, <<"_barrel_system">>).
+
+%% @doc Ensure the system database exists.
+%% Called automatically by system_doc operations.
+-spec ensure_system_db() -> ok.
+ensure_system_db() ->
+    case db_info(?SYSTEM_DB) of
+        {ok, _} ->
+            ok;
+        {error, not_found} ->
+            {ok, _} = create_db(?SYSTEM_DB),
+            ok
+    end.
+
+%% @doc Store a global system document.
+%%
+%% System documents are stored in the `_barrel_system' database and are
+%% NOT replicated. They are used for global configuration and state.
+%%
+%% == Example ==
+%% ```
+%% ok = barrel_docdb:put_system_doc(<<"global_config">>, #{
+%%     <<"max_dbs">> => 100
+%% }).
+%% '''
+%%
+%% @param DocId System document ID
+%% @param Doc Document content
+%% @returns `ok'
+-spec put_system_doc(binary(), map()) -> ok | {error, term()}.
+put_system_doc(DocId, Doc) ->
+    ensure_system_db(),
+    put_local_doc(?SYSTEM_DB, DocId, Doc).
+
+%% @doc Get a global system document.
+%%
+%% @param DocId System document ID
+%% @returns `{ok, Document}' or `{error, not_found}'
+-spec get_system_doc(binary()) -> {ok, map()} | {error, not_found}.
+get_system_doc(DocId) ->
+    ensure_system_db(),
+    get_local_doc(?SYSTEM_DB, DocId).
+
+%% @doc Delete a global system document.
+%%
+%% @param DocId System document ID
+%% @returns `ok' or `{error, not_found}'
+-spec delete_system_doc(binary()) -> ok | {error, not_found}.
+delete_system_doc(DocId) ->
+    ensure_system_db(),
+    delete_local_doc(?SYSTEM_DB, DocId).
 
 %%====================================================================
 %% HLC (Hybrid Logical Clock)

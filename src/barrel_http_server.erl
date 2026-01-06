@@ -78,6 +78,8 @@ init(Opts) ->
             %% Static paths BEFORE variable paths
             %% Changes feed
             {"/db/:db/_changes", barrel_http_handler, #{action => changes}},
+            %% Changes SSE stream (separate handler for loop handling)
+            {"/db/:db/_changes/stream", barrel_http_changes_stream, #{}},
 
             %% Bulk operations
             {"/db/:db/_bulk_docs", barrel_http_handler, #{action => bulk_docs}},

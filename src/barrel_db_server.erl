@@ -352,6 +352,45 @@ handle_call({get_view_pid, ViewId}, _From, #state{views = Views} = State) ->
             {reply, {ok, Pid}, State}
     end;
 
+%%--------------------------------------------------------------------
+%% Tier/TTL Operations
+%%--------------------------------------------------------------------
+
+handle_call({set_doc_ttl, DocId, ExpiresAt, _Opts}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_set_doc_ttl(StoreRef, DbName, DocId, ExpiresAt),
+    {reply, Result, State};
+
+handle_call({get_doc_ttl, DocId, _Opts}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_get_doc_ttl(StoreRef, DbName, DocId),
+    {reply, Result, State};
+
+handle_call({get_doc_tier, DocId, _Opts}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_get_doc_tier(StoreRef, DbName, DocId),
+    {reply, Result, State};
+
+handle_call({set_doc_tier, DocId, Tier, _Opts}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_set_doc_tier(StoreRef, DbName, DocId, Tier),
+    {reply, Result, State};
+
+handle_call({classify_by_age, HotCutoff, WarmCutoff, _Opts}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_classify_by_age(StoreRef, DbName, HotCutoff, WarmCutoff),
+    {reply, Result, State};
+
+handle_call({migrate_expired, _Opts}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_migrate_expired(StoreRef, DbName),
+    {reply, Result, State};
+
+handle_call({migrate_to_tier, TargetTier, Filter, _Opts}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_migrate_to_tier(StoreRef, DbName, TargetTier, Filter),
+    {reply, Result, State};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
@@ -445,6 +484,10 @@ find_view_by_pid(Pid, Views) ->
 -define(COL_DELETED, <<"del">>).
 -define(COL_HLC, <<"hlc">>).
 -define(COL_REVTREE, <<"revtree">>).
+%% Tier/TTL columns (for tiered storage)
+-define(COL_CREATED_AT, <<"created_at">>).
+-define(COL_EXPIRES_AT, <<"expires_at">>).
+-define(COL_TIER, <<"tier">>).
 
 %% @doc Put a document (create or update)
 %% Accepts: Erlang map, indexed CBOR binary, or plain CBOR binary
@@ -494,11 +537,30 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
     NextHlc = barrel_hlc:new_hlc(),
 
     %% Prepare entity columns for wide-column storage
+    %% Always track created_at and tier metadata (tiered storage strategy is optional)
+    {CreatedAt, ExistingTier, ExistingExpires} = case OldHlc of
+        undefined ->
+            %% New document - set created_at to now, tier to hot (0)
+            {barrel_hlc:encode(NextHlc), 0, 0};
+        _ ->
+            %% Update - preserve existing tier metadata
+            case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
+                {ok, OldColumns} ->
+                    {proplists:get_value(?COL_CREATED_AT, OldColumns, barrel_hlc:encode(OldHlc)),
+                     proplists:get_value(?COL_TIER, OldColumns, 0),
+                     proplists:get_value(?COL_EXPIRES_AT, OldColumns, 0)};
+                _ ->
+                    {barrel_hlc:encode(OldHlc), 0, 0}
+            end
+    end,
     DocColumns = [
         {?COL_REV, NewRev},
         {?COL_DELETED, deleted_to_bin(Deleted)},
         {?COL_HLC, barrel_hlc:encode(NextHlc)},
-        {?COL_REVTREE, encode_revtree(RevTree)}
+        {?COL_REVTREE, encode_revtree(RevTree)},
+        {?COL_CREATED_AT, CreatedAt},
+        {?COL_EXPIRES_AT, ExistingExpires},
+        {?COL_TIER, ExistingTier}
     ],
     DocOps = [{entity_put, DocEntityKey, DocColumns}],
 
@@ -637,20 +699,26 @@ prepare_doc_ops(StoreRef, DbName, Doc) ->
 
         %% Check for existing document (wide column entity)
         DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
-        {OldHlc, OldRev, OldRevTree, OldDocBody, OldCborBody} = case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
+        {OldHlc, OldRev, OldRevTree, OldDocBody, OldCborBody, OldTierMeta} = case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
             {ok, Columns} ->
                 ExistingRev = proplists:get_value(?COL_REV, Columns),
                 ExistingHlc = barrel_hlc:decode(proplists:get_value(?COL_HLC, Columns)),
                 OldTree = decode_revtree(proplists:get_value(?COL_REVTREE, Columns)),
+                %% Extract tier metadata
+                TierMeta = {
+                    proplists:get_value(?COL_CREATED_AT, Columns, <<>>),
+                    proplists:get_value(?COL_EXPIRES_AT, Columns, 0),
+                    proplists:get_value(?COL_TIER, Columns, 0)
+                },
                 %% Get old doc body from body CF (current body, no rev in key)
                 {OldBody, OldCbor} = case barrel_store_rocksdb:body_get(StoreRef,
                                 barrel_store_keys:doc_body(DbName, DocId)) of
                     {ok, OldCborBin} -> {barrel_docdb_codec_cbor:decode_any(OldCborBin), OldCborBin};
                     not_found -> {#{}, undefined}
                 end,
-                {ExistingHlc, ExistingRev, OldTree, OldBody, OldCbor};
+                {ExistingHlc, ExistingRev, OldTree, OldBody, OldCbor, TierMeta};
             not_found ->
-                {undefined, undefined, #{}, undefined, undefined}
+                {undefined, undefined, #{}, undefined, undefined, {<<>>, 0, 0}}
         end,
 
         %% Build revision tree (merge with existing)
@@ -668,12 +736,19 @@ prepare_doc_ops(StoreRef, DbName, Doc) ->
         %% Generate new HLC timestamp
         NextHlc = barrel_hlc:new_hlc(),
 
-        %% Prepare entity columns for wide-column storage
+        %% Prepare entity columns for wide-column storage (with tier metadata)
+        {CreatedAt, ExpiresAt, Tier} = case OldHlc of
+            undefined -> {barrel_hlc:encode(NextHlc), 0, 0};  %% New doc
+            _ -> OldTierMeta  %% Preserve existing tier metadata
+        end,
         DocColumns = [
             {?COL_REV, NewRev},
             {?COL_DELETED, deleted_to_bin(Deleted)},
             {?COL_HLC, barrel_hlc:encode(NextHlc)},
-            {?COL_REVTREE, encode_revtree(RevTree)}
+            {?COL_REVTREE, encode_revtree(RevTree)},
+            {?COL_CREATED_AT, CreatedAt},
+            {?COL_EXPIRES_AT, ExpiresAt},
+            {?COL_TIER, Tier}
         ],
         DocOps = [{entity_put, DocEntityKey, DocColumns}],
 
@@ -1121,30 +1196,32 @@ do_revsdiff(StoreRef, DbName, DocId, RevIds) ->
 %%====================================================================
 %% Local Document Operations
 %%====================================================================
+%% Local documents are stored in the dedicated local_cf column family.
+%% They use a simple key format: DbName + 0 + DocId (no prefix needed).
 
-%% @doc Put a local document
+%% @doc Put a local document (per-database)
 do_put_local_doc(StoreRef, DbName, DocId, Doc) ->
-    Key = barrel_store_keys:local_doc(DbName, DocId),
+    Key = barrel_store_keys:local_doc_key(DbName, DocId),
     Value = term_to_binary(Doc),
-    ok = barrel_store_rocksdb:put(StoreRef, Key, Value),
+    ok = barrel_store_rocksdb:local_put(StoreRef, Key, Value),
     ok.
 
-%% @doc Get a local document
+%% @doc Get a local document (per-database)
 do_get_local_doc(StoreRef, DbName, DocId) ->
-    Key = barrel_store_keys:local_doc(DbName, DocId),
-    case barrel_store_rocksdb:get(StoreRef, Key) of
+    Key = barrel_store_keys:local_doc_key(DbName, DocId),
+    case barrel_store_rocksdb:local_get(StoreRef, Key) of
         {ok, Value} ->
             {ok, binary_to_term(Value)};
         not_found ->
             {error, not_found}
     end.
 
-%% @doc Delete a local document
+%% @doc Delete a local document (per-database)
 do_delete_local_doc(StoreRef, DbName, DocId) ->
-    Key = barrel_store_keys:local_doc(DbName, DocId),
-    case barrel_store_rocksdb:get(StoreRef, Key) of
+    Key = barrel_store_keys:local_doc_key(DbName, DocId),
+    case barrel_store_rocksdb:local_get(StoreRef, Key) of
         {ok, _} ->
-            ok = barrel_store_rocksdb:delete(StoreRef, Key),
+            ok = barrel_store_rocksdb:local_delete(StoreRef, Key),
             ok;
         not_found ->
             {error, not_found}
@@ -1220,3 +1297,212 @@ decode_revtree(<<>>) -> #{};
 decode_revtree(Bin) ->
     RT = barrel_revtree_bin:decode(Bin),
     barrel_revtree_bin:to_map(RT).
+
+%%====================================================================
+%% Tier/TTL Operations
+%%====================================================================
+
+%% @doc Set TTL (expires_at timestamp) for a document
+do_set_doc_ttl(StoreRef, DbName, DocId, ExpiresAt) ->
+    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
+    case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
+        {ok, Columns} ->
+            %% Update only the expires_at column
+            UpdatedColumns = lists:keyreplace(?COL_EXPIRES_AT, 1, Columns, {?COL_EXPIRES_AT, ExpiresAt}),
+            case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, DocEntityKey, UpdatedColumns}]) of
+                ok -> ok;
+                Error -> Error
+            end;
+        not_found ->
+            {error, not_found}
+    end.
+
+%% @doc Get TTL info for a document
+do_get_doc_ttl(StoreRef, DbName, DocId) ->
+    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
+    case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
+        {ok, Columns} ->
+            ExpiresAt = proplists:get_value(?COL_EXPIRES_AT, Columns, 0),
+            case ExpiresAt of
+                0 ->
+                    {ok, undefined};
+                _ ->
+                    Now = erlang:system_time(millisecond),
+                    Remaining = max(0, (ExpiresAt - Now) div 1000),
+                    {ok, #{expires_at => ExpiresAt, remaining => Remaining}}
+            end;
+        not_found ->
+            {error, not_found}
+    end.
+
+%% @doc Get the current tier of a document
+do_get_doc_tier(StoreRef, DbName, DocId) ->
+    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
+    case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
+        {ok, Columns} ->
+            %% decode_entity already converts tier to atom (hot, warm, cold)
+            Tier = proplists:get_value(?COL_TIER, Columns, hot),
+            {ok, Tier};
+        not_found ->
+            {error, not_found}
+    end.
+
+%% @doc Set the tier for a document
+do_set_doc_tier(StoreRef, DbName, DocId, Tier) ->
+    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
+    case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
+        {ok, Columns} ->
+            TierByte = barrel_tier:tier_to_byte(Tier),
+            UpdatedColumns = lists:keyreplace(?COL_TIER, 1, Columns, {?COL_TIER, TierByte}),
+            case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, DocEntityKey, UpdatedColumns}]) of
+                ok -> ok;
+                Error -> Error
+            end;
+        not_found ->
+            {error, not_found}
+    end.
+
+%% @doc Classify documents by age into tiers
+%% Scans all documents and updates their tier based on created_at timestamp.
+do_classify_by_age(StoreRef, DbName, HotCutoff, WarmCutoff) ->
+    %% Get all document entities in this database
+    StartKey = barrel_store_keys:doc_entity(DbName, <<>>),
+    EndKey = barrel_store_keys:doc_entity_end(DbName),
+
+    Stats = #{classified => 0, errors => 0},
+
+    FoldFun = fun(Key, Value, AccStats) ->
+        case barrel_store_rocksdb:decode_entity(Value) of
+            Columns when is_list(Columns) ->
+                CreatedAtBin = proplists:get_value(?COL_CREATED_AT, Columns, <<>>),
+                %% decode_entity returns tier as atom (hot, warm, cold)
+                CurrentTier = proplists:get_value(?COL_TIER, Columns, hot),
+
+                %% Decode created_at HLC to get timestamp (wall_time in ms)
+                CreatedMs = case CreatedAtBin of
+                    <<>> -> 0;
+                    _ ->
+                        CreatedHlc = barrel_hlc:decode(CreatedAtBin),
+                        barrel_hlc:wall_time(CreatedHlc)
+                end,
+
+                %% Determine new tier based on age (use atoms)
+                NewTier = if
+                    CreatedMs >= HotCutoff -> hot;
+                    CreatedMs >= WarmCutoff -> warm;
+                    true -> cold
+                end,
+
+                %% Update if tier changed
+                case NewTier =/= CurrentTier of
+                    true ->
+                        %% Store as byte value for encoding
+                        NewTierByte = barrel_tier:tier_to_byte(NewTier),
+                        UpdatedColumns = lists:keyreplace(?COL_TIER, 1, Columns, {?COL_TIER, NewTierByte}),
+                        case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, Key, UpdatedColumns}]) of
+                            ok ->
+                                {ok, AccStats#{classified := maps:get(classified, AccStats) + 1}};
+                            _ ->
+                                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
+                        end;
+                    false ->
+                        {ok, AccStats}
+                end;
+            _ ->
+                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
+        end
+    end,
+
+    FinalStats = barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, Stats),
+    {ok, FinalStats}.
+
+%% @doc Migrate expired documents (delete or archive)
+do_migrate_expired(StoreRef, DbName) ->
+    Now = erlang:system_time(millisecond),
+
+    StartKey = barrel_store_keys:doc_entity(DbName, <<>>),
+    EndKey = barrel_store_keys:doc_entity_end(DbName),
+
+    Stats = #{deleted => 0, errors => 0},
+
+    FoldFun = fun(Key, Value, AccStats) ->
+        case barrel_store_rocksdb:decode_entity(Value) of
+            Columns when is_list(Columns) ->
+                ExpiresAt = proplists:get_value(?COL_EXPIRES_AT, Columns, 0),
+
+                case ExpiresAt > 0 andalso Now >= ExpiresAt of
+                    true ->
+                        %% Document has expired - mark as deleted
+                        UpdatedColumns = lists:keyreplace(?COL_DELETED, 1, Columns, {?COL_DELETED, <<"true">>}),
+                        case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, Key, UpdatedColumns}]) of
+                            ok ->
+                                {ok, AccStats#{deleted := maps:get(deleted, AccStats) + 1}};
+                            _ ->
+                                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
+                        end;
+                    false ->
+                        {ok, AccStats}
+                end;
+            _ ->
+                {ok, AccStats}
+        end
+    end,
+
+    FinalStats = barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, Stats),
+    {ok, FinalStats}.
+
+%% @doc Migrate documents matching filter to a target tier
+%% Filter options:
+%%   - min_age: minimum age in milliseconds
+%%   - tier: only documents in this tier
+do_migrate_to_tier(StoreRef, DbName, TargetTier, Filter) ->
+    Now = erlang:system_time(millisecond),
+    MinAge = maps:get(min_age, Filter, 0),
+    SourceTier = maps:get(tier, Filter, undefined),
+    %% Convert target tier to byte for storage
+    TargetTierByte = barrel_tier:tier_to_byte(TargetTier),
+
+    StartKey = barrel_store_keys:doc_entity(DbName, <<>>),
+    EndKey = barrel_store_keys:doc_entity_end(DbName),
+
+    Stats = #{migrated => 0, skipped => 0, errors => 0},
+
+    FoldFun = fun(Key, Value, AccStats) ->
+        case barrel_store_rocksdb:decode_entity(Value) of
+            Columns when is_list(Columns) ->
+                %% decode_entity returns tier as atom (hot, warm, cold)
+                CurrentTier = proplists:get_value(?COL_TIER, Columns, hot),
+                CreatedAtBin = proplists:get_value(?COL_CREATED_AT, Columns, <<>>),
+
+                %% Check source tier filter (compare atoms)
+                TierMatch = (SourceTier =:= undefined) orelse (CurrentTier =:= SourceTier),
+
+                %% Check age filter (calculate document age in ms)
+                AgeMs = case CreatedAtBin of
+                    <<>> -> 0;
+                    _ ->
+                        CreatedHlc = barrel_hlc:decode(CreatedAtBin),
+                        Now - barrel_hlc:wall_time(CreatedHlc)
+                end,
+                AgeMatch = AgeMs >= MinAge,
+
+                case TierMatch andalso AgeMatch andalso CurrentTier =/= TargetTier of
+                    true ->
+                        %% Store as byte value
+                        UpdatedColumns = lists:keyreplace(?COL_TIER, 1, Columns, {?COL_TIER, TargetTierByte}),
+                        case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, Key, UpdatedColumns}]) of
+                            ok ->
+                                {ok, AccStats#{migrated := maps:get(migrated, AccStats) + 1}};
+                            _ ->
+                                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
+                        end;
+                    false ->
+                        {ok, AccStats#{skipped := maps:get(skipped, AccStats) + 1}}
+                end;
+            _ ->
+                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
+        end
+    end,
+
+    FinalStats = barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, Stats),
+    {ok, FinalStats}.

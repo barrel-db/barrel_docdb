@@ -59,6 +59,11 @@
     max/0
 ]).
 
+%% Accessor functions
+-export([
+    wall_time/1
+]).
+
 %% Types
 -export_type([
     clock/0,
@@ -261,3 +266,12 @@ min() ->
 max() ->
     %% Use maximum values that fit in our encoding format
     #timestamp{wall_time = 16#FFFFFFFFFFFFFFFF, logical = 16#FFFFFFFF}.
+
+%%====================================================================
+%% Accessor Functions
+%%====================================================================
+
+%% @doc Extract wall_time (milliseconds since epoch) from a timestamp.
+-spec wall_time(timestamp()) -> non_neg_integer().
+wall_time(#timestamp{wall_time = WallTime}) ->
+    WallTime.

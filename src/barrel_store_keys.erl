@@ -26,8 +26,12 @@
 %% Wide column document keys (entity storage)
 -export([doc_entity/2, doc_entity_prefix/1, doc_entity_end/1]).
 
-%% Local document keys
+%% Local document keys (legacy - stored in default CF with prefix)
 -export([local_doc/2]).
+
+%% Local document keys for local_cf (new - no prefix needed)
+-export([local_doc_key/2, local_doc_prefix/1]).
+-export([system_doc_key/1, system_doc_prefix/0]).
 
 %% View keys
 -export([view_meta/2, view_seq/2, view_index/3, view_index_prefix/2, view_index_end/2]).
@@ -294,13 +298,44 @@ split_on_null(<<B, Rest/binary>>, Acc) ->
     split_on_null(Rest, <<Acc/binary, B>>).
 
 %%====================================================================
-%% Local Document Keys
+%% Local Document Keys (Legacy - Default CF)
 %%====================================================================
 
-%% @doc Local document key (not replicated)
+%% @doc Local document key (not replicated) - legacy format in default CF
 -spec local_doc(db_name(), docid()) -> binary().
 local_doc(DbName, DocId) ->
     <<?PREFIX_LOCAL_DOC, (encode_name(DbName))/binary, DocId/binary>>.
+
+%%====================================================================
+%% Local Document Keys (New - Local CF)
+%%====================================================================
+%% These keys are used with the dedicated local_cf column family.
+%% No prefix needed since they're in their own column family.
+%% Format: DbName + 0 + DocId (per-database) or "_system" + 0 + DocId (global)
+
+%% @doc Local document key for local_cf (per-database)
+%% Key format: DbName + NUL separator + DocId
+-spec local_doc_key(db_name(), docid()) -> binary().
+local_doc_key(DbName, DocId) ->
+    <<DbName/binary, 0, DocId/binary>>.
+
+%% @doc Prefix for all local docs in a database
+%% Use with local_fold to enumerate all local docs for a database.
+-spec local_doc_prefix(db_name()) -> binary().
+local_doc_prefix(DbName) ->
+    <<DbName/binary, 0>>.
+
+%% @doc System (global) document key for local_cf
+%% Key format: "_system" + NUL separator + DocId
+-spec system_doc_key(docid()) -> binary().
+system_doc_key(DocId) ->
+    <<"_system", 0, DocId/binary>>.
+
+%% @doc Prefix for all system docs
+%% Use with local_fold to enumerate all system docs.
+-spec system_doc_prefix() -> binary().
+system_doc_prefix() ->
+    <<"_system", 0>>.
 
 %%====================================================================
 %% Column-Wide Document Keys (CBOR Codec Integration)

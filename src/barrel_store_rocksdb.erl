@@ -34,9 +34,16 @@
 %% Body column family operations (BlobDB enabled)
 -export([body_put/3, body_put/4, body_get/2, body_multi_get/2, body_delete/2]).
 
+%% Local document column family operations (no revtree, config/state storage)
+-export([local_put/3, local_get/2, local_delete/2, local_fold/4]).
+
 %% Wide column (entity) operations
 -export([put_entity/3, put_entity/4, get_entity/2, multi_get_entity/2, delete_entity/2]).
 -export([batch_put_entity/3]).
+-export([decode_entity/1]).  %% Decode entity binary to column list
+
+%% Stats and capacity monitoring
+-export([get_stats/1, get_db_size/1, get_property/2]).
 
 %%====================================================================
 %% Types
@@ -48,7 +55,8 @@
     default_cf := rocksdb:cf_handle(),
     bitmap_cf := rocksdb:cf_handle(),
     posting_cf := rocksdb:cf_handle(),
-    body_cf := rocksdb:cf_handle()
+    body_cf := rocksdb:cf_handle(),
+    local_cf := rocksdb:cf_handle()
 }.
 
 -type snapshot() :: rocksdb:snapshot_handle().
@@ -65,6 +73,7 @@
 -define(BITMAP_CF_NAME, "bitmap").
 -define(POSTING_CF_NAME, "posting").
 -define(BODY_CF_NAME, "bodies").
+-define(LOCAL_CF_NAME, "local").
 
 %%====================================================================
 %% barrel_store callbacks
@@ -83,14 +92,16 @@ open(Path, Options) ->
         {"default", [{merge_operator, counter_merge_operator}]},
         {?BITMAP_CF_NAME, [{merge_operator, {bitset_merge_operator, BitmapSize}}]},
         {?POSTING_CF_NAME, [{merge_operator, posting_list_merge_operator}]},
-        {?BODY_CF_NAME, build_body_cf_options(Options)}
+        {?BODY_CF_NAME, build_body_cf_options(Options)},
+        {?LOCAL_CF_NAME, []}  %% Simple KV storage for local docs (no merge operator)
     ],
 
     case rocksdb:open(Path, DbOpts, CFDescriptors) of
-        {ok, Ref, [DefaultCF, BitmapCF, PostingCF, BodyCF]} ->
+        {ok, Ref, [DefaultCF, BitmapCF, PostingCF, BodyCF, LocalCF]} ->
             {ok, #{ref => Ref, path => Path,
                    default_cf => DefaultCF, bitmap_cf => BitmapCF,
-                   posting_cf => PostingCF, body_cf => BodyCF}};
+                   posting_cf => PostingCF, body_cf => BodyCF,
+                   local_cf => LocalCF}};
         {error, Reason} ->
             {error, {db_open_failed, Reason}}
     end.
@@ -172,9 +183,11 @@ write_batch(DbRef, Operations) ->
 %%   - {body_delete, Key} - delete from body CF
 %%   - {entity_put, Key, Columns} - put wide-column entity to default CF
 %%   - {entity_delete, Key} - delete entity from default CF
+%%   - {local_put, Key, Value} - put to local CF (config/state)
+%%   - {local_delete, Key} - delete from local CF
 -spec write_batch(db_ref(), list(), map()) -> ok | {error, term()}.
 write_batch(#{ref := Ref, bitmap_cf := BitmapCF, posting_cf := PostingCF,
-              body_cf := BodyCF}, Operations, Opts) ->
+              body_cf := BodyCF, local_cf := LocalCF}, Operations, Opts) ->
     Sync = maps:get(sync, Opts, false),
     {ok, Batch} = rocksdb:batch(),
     try
@@ -203,7 +216,11 @@ write_batch(#{ref := Ref, bitmap_cf := BitmapCF, posting_cf := PostingCF,
                 %% Encode columns to fixed binary format (fast decode)
                 ok = rocksdb:batch_put(Batch, Key, encode_entity(Columns));
                ({entity_delete, Key}) ->
-                ok = rocksdb:batch_delete(Batch, Key)
+                ok = rocksdb:batch_delete(Batch, Key);
+               ({local_put, Key, Value}) ->
+                ok = rocksdb:batch_put(Batch, LocalCF, Key, Value);
+               ({local_delete, Key}) ->
+                ok = rocksdb:batch_delete(Batch, LocalCF, Key)
             end,
             Operations
         ),
@@ -745,6 +762,67 @@ body_delete(#{ref := Ref, body_cf := BodyCF}, Key) ->
     rocksdb:delete(Ref, BodyCF, Key, []).
 
 %%====================================================================
+%% Local Document Column Family Operations
+%%====================================================================
+%% Local documents are stored without revision trees.
+%% Used for configuration, replication state, and other non-replicated data.
+%% Key format: DbName + 0 + DocId (per-database) or "_system" + 0 + DocId (global)
+
+%% @doc Put a local document
+-spec local_put(db_ref(), binary(), binary()) -> ok | {error, term()}.
+local_put(#{ref := Ref, local_cf := LocalCF}, Key, Value) ->
+    rocksdb:put(Ref, LocalCF, Key, Value, []).
+
+%% @doc Get a local document
+-spec local_get(db_ref(), binary()) -> {ok, binary()} | not_found | {error, term()}.
+local_get(#{ref := Ref, local_cf := LocalCF}, Key) ->
+    rocksdb:get(Ref, LocalCF, Key, []).
+
+%% @doc Delete a local document
+-spec local_delete(db_ref(), binary()) -> ok | {error, term()}.
+local_delete(#{ref := Ref, local_cf := LocalCF}, Key) ->
+    rocksdb:delete(Ref, LocalCF, Key, []).
+
+%% @doc Fold over local documents with a prefix
+%% Useful for listing all local docs for a database or all system docs.
+-spec local_fold(db_ref(), binary(), fun((binary(), binary(), term()) -> term()), term()) -> term().
+local_fold(#{ref := Ref, local_cf := LocalCF}, Prefix, Fun, Acc0) ->
+    {ok, Itr} = rocksdb:iterator(Ref, LocalCF, []),
+    try
+        do_local_fold(Itr, Prefix, byte_size(Prefix), Fun, Acc0)
+    after
+        rocksdb:iterator_close(Itr)
+    end.
+
+do_local_fold(Itr, Prefix, PrefixLen, Fun, Acc) ->
+    case rocksdb:iterator_move(Itr, Prefix) of
+        {ok, Key, Value} ->
+            case Key of
+                <<Prefix:PrefixLen/binary, _/binary>> ->
+                    Acc1 = Fun(Key, Value, Acc),
+                    do_local_fold_next(Itr, Prefix, PrefixLen, Fun, Acc1);
+                _ ->
+                    Acc
+            end;
+        {error, invalid_iterator} ->
+            Acc
+    end.
+
+do_local_fold_next(Itr, Prefix, PrefixLen, Fun, Acc) ->
+    case rocksdb:iterator_move(Itr, next) of
+        {ok, Key, Value} ->
+            case Key of
+                <<Prefix:PrefixLen/binary, _/binary>> ->
+                    Acc1 = Fun(Key, Value, Acc),
+                    do_local_fold_next(Itr, Prefix, PrefixLen, Fun, Acc1);
+                _ ->
+                    Acc
+            end;
+        {error, invalid_iterator} ->
+            Acc
+    end.
+
+%%====================================================================
 %% Wide Column (Entity) Operations
 %%====================================================================
 
@@ -766,10 +844,16 @@ put_entity(#{ref := Ref}, Key, Columns, Opts) ->
 -define(COL_DELETED, <<"del">>).
 -define(COL_HLC, <<"hlc">>).
 -define(COL_REVTREE, <<"revtree">>).
+%% TTL/Tier columns (added in v2)
+-define(COL_CREATED_AT, <<"created_at">>).
+-define(COL_EXPIRES_AT, <<"expires_at">>).
+-define(COL_TIER, <<"tier">>).
 
 %% @doc Encode entity columns to fixed binary format
-%% Format: <<RevLen:16, Rev/binary, Deleted:8, HlcLen:16, Hlc/binary, TreeLen:32, Tree/binary>>
-%% This avoids the overhead of term_to_binary on every entity read/write.
+%% Format v2 (with TTL/tier extension):
+%%   <<RevLen:16, Rev/binary, Deleted:8, HlcLen:16, Hlc/binary, TreeLen:32, Tree/binary,
+%%     CreatedAtLen:16, CreatedAt/binary, ExpiresAt:64, Tier:8>>
+%% Backward compatible: old data without extension uses defaults.
 -spec encode_entity([{binary(), term()}]) -> binary().
 encode_entity(Columns) ->
     Rev = proplists:get_value(?COL_REV, Columns, <<>>),
@@ -777,6 +861,10 @@ encode_entity(Columns) ->
     Hlc = proplists:get_value(?COL_HLC, Columns, <<>>),
     %% Tree is already term_to_binary'd by barrel_db_server
     TreeBin = proplists:get_value(?COL_REVTREE, Columns, <<>>),
+    %% TTL/Tier fields (v2)
+    CreatedAt = proplists:get_value(?COL_CREATED_AT, Columns, <<>>),
+    ExpiresAt = proplists:get_value(?COL_EXPIRES_AT, Columns, 0),
+    Tier = proplists:get_value(?COL_TIER, Columns, 0),
 
     DelByte = case Del of
         true -> 1;
@@ -784,19 +872,44 @@ encode_entity(Columns) ->
         _ -> 0
     end,
 
+    TierByte = case Tier of
+        hot -> 0;
+        warm -> 1;
+        cold -> 2;
+        N when is_integer(N) -> N;
+        _ -> 0
+    end,
+
     <<(byte_size(Rev)):16, Rev/binary,
       DelByte:8,
       (byte_size(Hlc)):16, Hlc/binary,
-      (byte_size(TreeBin)):32, TreeBin/binary>>.
+      (byte_size(TreeBin)):32, TreeBin/binary,
+      (byte_size(CreatedAt)):16, CreatedAt/binary,
+      ExpiresAt:64,
+      TierByte:8>>.
 
 %% @doc Decode entity from fixed binary format
+%% Handles both v1 (without TTL/tier) and v2 (with TTL/tier) formats.
 -spec decode_entity(binary()) -> [{binary(), term()}].
 decode_entity(<<RevLen:16, Rev:RevLen/binary,
                 DelByte:8,
                 HlcLen:16, Hlc:HlcLen/binary,
-                TreeLen:32, TreeBin:TreeLen/binary>>) ->
+                TreeLen:32, TreeBin:TreeLen/binary,
+                Rest/binary>>) ->
     Del = case DelByte of 1 -> <<"true">>; 0 -> <<"false">> end,
-    [{?COL_REV, Rev}, {?COL_DELETED, Del}, {?COL_HLC, Hlc}, {?COL_REVTREE, TreeBin}].
+    BaseColumns = [{?COL_REV, Rev}, {?COL_DELETED, Del}, {?COL_HLC, Hlc}, {?COL_REVTREE, TreeBin}],
+    case Rest of
+        <<CreatedAtLen:16, CreatedAt:CreatedAtLen/binary, ExpiresAt:64, TierByte:8>> ->
+            %% V2 format with TTL/tier extension
+            Tier = case TierByte of 0 -> hot; 1 -> warm; 2 -> cold; _ -> hot end,
+            BaseColumns ++ [{?COL_CREATED_AT, CreatedAt}, {?COL_EXPIRES_AT, ExpiresAt}, {?COL_TIER, Tier}];
+        <<>> ->
+            %% V1 format (no extension) - use defaults
+            BaseColumns ++ [{?COL_CREATED_AT, <<>>}, {?COL_EXPIRES_AT, 0}, {?COL_TIER, hot}];
+        _ ->
+            %% Unknown extension, ignore and use defaults
+            BaseColumns ++ [{?COL_CREATED_AT, <<>>}, {?COL_EXPIRES_AT, 0}, {?COL_TIER, hot}]
+    end.
 
 %% @doc Get a wide-column entity from the default column family
 %% Returns {ok, [{Name, Value}]} or not_found
@@ -831,4 +944,43 @@ delete_entity(#{ref := Ref}, Key) ->
 -spec batch_put_entity(rocksdb:batch_handle(), binary(), [{binary(), binary()}]) -> ok.
 batch_put_entity(Batch, Key, Columns) ->
     rocksdb:batch_put(Batch, Key, encode_entity(Columns)).
+
+%%====================================================================
+%% Stats and Capacity Monitoring
+%%====================================================================
+
+%% @doc Get RocksDB statistics
+%% Returns all available statistics as a proplist.
+-spec get_stats(db_ref()) -> {ok, list()} | {error, term()}.
+get_stats(#{ref := Ref}) ->
+    rocksdb:stats(Ref).
+
+%% @doc Get a specific RocksDB property
+%% Common properties:
+%%   - <<"rocksdb.estimate-live-data-size">> - estimated size of live data
+%%   - <<"rocksdb.total-sst-files-size">> - total size of SST files
+%%   - <<"rocksdb.estimate-num-keys">> - estimated number of keys
+%%   - <<"rocksdb.cur-size-all-mem-tables">> - current size of all memtables
+-spec get_property(db_ref(), binary()) -> {ok, binary()} | {error, term()}.
+get_property(#{ref := Ref}, Property) when is_binary(Property) ->
+    rocksdb:get_property(Ref, Property).
+
+%% @doc Get estimated database size in bytes
+%% Uses RocksDB's estimate-live-data-size property as primary metric,
+%% falling back to total-sst-files-size if not available.
+-spec get_db_size(db_ref()) -> {ok, non_neg_integer()} | {error, term()}.
+get_db_size(DbRef) ->
+    %% Try estimate-live-data-size first (more accurate for active data)
+    case get_property(DbRef, <<"rocksdb.estimate-live-data-size">>) of
+        {ok, SizeBin} ->
+            {ok, binary_to_integer(SizeBin)};
+        {error, _} ->
+            %% Fall back to total SST files size
+            case get_property(DbRef, <<"rocksdb.total-sst-files-size">>) of
+                {ok, SstSizeBin} ->
+                    {ok, binary_to_integer(SstSizeBin)};
+                {error, _} = Err ->
+                    Err
+            end
+    end.
 

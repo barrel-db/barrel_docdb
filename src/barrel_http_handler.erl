@@ -292,11 +292,25 @@ handle_delete_doc(Req) ->
 
 handle_get_changes(Req0) ->
     DbName = cowboy_req:binding(db, Req0),
-    {Since, Opts} = parse_changes_opts(Req0),
+    {Since, Feed, FilterPattern, Opts} = parse_changes_opts(Req0),
+    Timeout = maps:get(timeout, Opts, 60000),
+
+    %% Create filter function if pattern provided
+    FilterFun = create_filter_fun(FilterPattern),
+
+    case Feed of
+        longpoll ->
+            handle_longpoll_changes(DbName, Since, FilterFun, Opts, Timeout, Req0);
+        normal ->
+            handle_normal_changes(DbName, Since, FilterFun, Opts, Req0)
+    end.
+
+%% Normal poll - return changes immediately
+handle_normal_changes(DbName, Since, FilterFun, Opts, Req0) ->
     case barrel_docdb:get_changes(DbName, Since, Opts) of
         {ok, Changes, LastHlc} ->
-            %% Format changes for JSON serialization
-            FormattedChanges = lists:map(fun format_change/1, Changes),
+            FilteredChanges = filter_changes(Changes, FilterFun),
+            FormattedChanges = lists:map(fun format_change/1, FilteredChanges),
             Response = #{
                 <<"results">> => FormattedChanges,
                 <<"last_seq">> => format_hlc(LastHlc)
@@ -306,6 +320,96 @@ handle_get_changes(Req0) ->
         {error, Reason} ->
             throw({error, 500, format_error(Reason)})
     end.
+
+%% Long poll - wait for changes or timeout
+handle_longpoll_changes(DbName, Since, FilterFun, Opts, Timeout, Req0) ->
+    StartTime = erlang:monotonic_time(millisecond),
+    longpoll_loop(DbName, Since, FilterFun, Opts, Timeout, StartTime, Req0).
+
+longpoll_loop(DbName, Since, FilterFun, Opts, Timeout, StartTime, Req0) ->
+    Elapsed = erlang:monotonic_time(millisecond) - StartTime,
+    Remaining = Timeout - Elapsed,
+
+    case Remaining =< 0 of
+        true ->
+            %% Timeout - return empty results
+            Response = #{
+                <<"results">> => [],
+                <<"last_seq">> => format_hlc(Since)
+            },
+            Body = encode_response(Response, Req0),
+            {200, response_headers(Req0), Body, Req0};
+
+        false ->
+            case barrel_docdb:get_changes(DbName, Since, Opts) of
+                {ok, [], _LastHlc} ->
+                    %% No changes yet - wait and retry
+                    timer:sleep(100),
+                    longpoll_loop(DbName, Since, FilterFun, Opts, Timeout, StartTime, Req0);
+
+                {ok, Changes, LastHlc} ->
+                    FilteredChanges = filter_changes(Changes, FilterFun),
+                    case FilteredChanges of
+                        [] ->
+                            %% Changes exist but filtered out - continue waiting
+                            timer:sleep(100),
+                            longpoll_loop(DbName, LastHlc, FilterFun, Opts, Timeout, StartTime, Req0);
+                        _ ->
+                            %% Have matching changes - return them
+                            FormattedChanges = lists:map(fun format_change/1, FilteredChanges),
+                            Response = #{
+                                <<"results">> => FormattedChanges,
+                                <<"last_seq">> => format_hlc(LastHlc)
+                            },
+                            Body = encode_response(Response, Req0),
+                            {200, response_headers(Req0), Body, Req0}
+                    end;
+
+                {error, Reason} ->
+                    throw({error, 500, format_error(Reason)})
+            end
+    end.
+
+%% Create filter function from MQTT-style pattern
+%% Supports:
+%%   + : matches one segment
+%%   # : matches zero or more segments (must be last)
+create_filter_fun(undefined) -> undefined;
+create_filter_fun(Pattern) when is_binary(Pattern) ->
+    case match_trie:validate({filter, Pattern}) of
+        true ->
+            %% Pre-compute pattern words for efficiency
+            PatternWords = pattern_to_words(Pattern),
+            fun(Change) ->
+                DocId = maps:get(<<"id">>, Change, maps:get(id, Change, <<>>)),
+                DocWords = binary:split(DocId, <<"/">>, [global]),
+                match_mqtt_pattern(PatternWords, DocWords)
+            end;
+        false ->
+            undefined
+    end.
+
+%% Convert pattern to words, converting + and # to atoms
+pattern_to_words(Pattern) ->
+    [pattern_word(W) || W <- binary:split(Pattern, <<"/">>, [global])].
+
+pattern_word(<<"+">>) -> '+';
+pattern_word(<<"#">>) -> '#';
+pattern_word(W) -> W.
+
+%% Match document path against MQTT pattern words
+match_mqtt_pattern([], []) -> true;
+match_mqtt_pattern(['#'], _) -> true;  %% # at end matches anything
+match_mqtt_pattern(['+' | PRest], [_ | DRest]) ->
+    match_mqtt_pattern(PRest, DRest);
+match_mqtt_pattern([P | PRest], [P | DRest]) ->
+    match_mqtt_pattern(PRest, DRest);
+match_mqtt_pattern(_, _) -> false.
+
+%% Filter changes using filter function
+filter_changes(Changes, undefined) -> Changes;
+filter_changes(Changes, FilterFun) ->
+    lists:filter(FilterFun, Changes).
 
 %% Format a change for JSON serialization
 format_change(Change) when is_map(Change) ->
@@ -944,6 +1048,14 @@ parse_changes_opts(Req) ->
         <<"first">> -> first;
         HlcBin -> parse_hlc(HlcBin)
     end,
+    %% Parse feed type (normal or longpoll)
+    Feed = case proplists:get_value(<<"feed">>, Qs) of
+        <<"longpoll">> -> longpoll;
+        _ -> normal
+    end,
+    %% Parse filter pattern (MQTT-style)
+    FilterPattern = proplists:get_value(<<"filter">>, Qs),
+    %% Parse other options
     Opts = lists:foldl(
         fun({<<"limit">>, LimitBin}, Acc) ->
                 Acc#{limit => binary_to_integer(LimitBin)};
@@ -951,13 +1063,15 @@ parse_changes_opts(Req) ->
                 Acc#{include_docs => true};
            ({<<"descending">>, <<"true">>}, Acc) ->
                 Acc#{descending => true};
+           ({<<"timeout">>, TimeoutBin}, Acc) ->
+                Acc#{timeout => binary_to_integer(TimeoutBin)};
            (_, Acc) ->
                 Acc
         end,
         #{},
         Qs
     ),
-    {Since, Opts}.
+    {Since, Feed, FilterPattern, Opts}.
 
 %%====================================================================
 %% HLC Formatting
