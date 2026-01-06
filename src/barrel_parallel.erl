@@ -127,7 +127,12 @@ pfiltermap_pool(Fun, Items, MaxWorkers) ->
 
 %% @private Execute work via the pool
 execute_pool(Type, Fun, Items, MaxWorkers) ->
-    gen_server:call(?SERVER, {execute, Type, Fun, Items, MaxWorkers}, infinity).
+    case gen_server:call(?SERVER, {execute, Type, Fun, Items, MaxWorkers}, infinity) of
+        {ok, Result} ->
+            Result;
+        {error, {Class, Reason, Stack}} ->
+            erlang:raise(Class, Reason, Stack)
+    end.
 
 %%%===================================================================
 %%% Internal - Spawn-based fallback
@@ -275,7 +280,13 @@ handle_call({execute, Type, Fun, Items, MaxWorkers}, _From, State) ->
     UseWorkers = min(MaxWorkers, length(Workers)),
     ActiveWorkers = lists:sublist(Workers, UseWorkers),
 
-    Result = execute_on_workers(Type, Fun, Items, ActiveWorkers),
+    %% Execute and catch any errors - return them as tuples to avoid crashing gen_server
+    Result = try
+        {ok, execute_on_workers(Type, Fun, Items, ActiveWorkers)}
+    catch
+        Class:Reason:Stack ->
+            {error, {Class, Reason, Stack}}
+    end,
     {reply, Result, State};
 
 handle_call(_Request, _From, State) ->

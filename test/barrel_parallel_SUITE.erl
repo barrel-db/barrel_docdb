@@ -58,7 +58,9 @@ all() ->
 
 groups() ->
     [
-        {pmap, [parallel], [
+        %% Note: Cannot run in parallel - tests share the barrel_parallel pool
+        %% and error-handling tests can interfere with other tests
+        {pmap, [sequence], [
             pmap_empty_list,
             pmap_single_item,
             pmap_small_list_sequential,
@@ -68,7 +70,7 @@ groups() ->
             pmap_handles_worker_error,
             pmap_handles_worker_crash
         ]},
-        {pfiltermap, [parallel], [
+        {pfiltermap, [sequence], [
             pfiltermap_empty_list,
             pfiltermap_filters_false,
             pfiltermap_keeps_true_values,
@@ -95,7 +97,8 @@ init_per_suite(Config) ->
     Config.
 
 end_per_suite(_Config) ->
-    catch barrel_parallel:stop(),
+    %% Don't stop barrel_parallel - it's managed by barrel_docdb_sup
+    %% and stopping it here can cause race conditions when the supervisor restarts it
     ok.
 
 %%====================================================================
