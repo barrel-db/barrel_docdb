@@ -209,6 +209,24 @@ handle_action(federation, <<"DELETE">>, Req) ->
         {error, not_found} ->
             throw({error, 404, <<"Federation not found">>})
     end;
+handle_action(federation, <<"PUT">>, Req) ->
+    Name = cowboy_req:binding(name, Req),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req),
+    Spec = decode_request_body(ReqBody, Req1),
+    %% Update query if provided
+    case maps:get(<<"query">>, Spec, undefined) of
+        undefined ->
+            throw({error, 400, <<"No query provided">>});
+        QuerySpec ->
+            Query = convert_query_spec(QuerySpec),
+            case barrel_federation:set_query(Name, Query) of
+                ok ->
+                    Body = encode_response(#{<<"ok">> => true}, Req1),
+                    {200, response_headers(Req1), Body, Req1};
+                {error, not_found} ->
+                    throw({error, 404, <<"Federation not found">>})
+            end
+    end;
 
 %% Federation: add/remove member
 handle_action(federation_member, <<"PUT">>, Req) ->
@@ -235,6 +253,20 @@ handle_action(federation_member, <<"DELETE">>, Req) ->
     end;
 
 %% Federation: query
+handle_action(federation_find, <<"GET">>, Req) ->
+    %% GET uses stored query (find/1)
+    Name = cowboy_req:binding(name, Req),
+    case barrel_federation:find(Name) of
+        {ok, Results, Meta} ->
+            FormattedMeta = format_federation_meta(Meta),
+            Response = #{<<"results">> => Results, <<"meta">> => FormattedMeta},
+            Body = encode_response(Response, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, {federation_not_found, _}} ->
+            throw({error, 404, <<"Federation not found">>});
+        {error, Reason} ->
+            throw({error, 400, format_error(Reason)})
+    end;
 handle_action(federation_find, <<"POST">>, Req) ->
     handle_federation_find(Req);
 
@@ -572,7 +604,12 @@ handle_create_federation(Req0) ->
     Spec = decode_request_body(ReqBody, Req1),
     Name = maps:get(<<"name">>, Spec),
     Members = maps:get(<<"members">>, Spec, []),
-    Options = maps:get(<<"options">>, Spec, #{}),
+    Options0 = maps:get(<<"options">>, Spec, #{}),
+    %% Convert query spec if present
+    Options = case maps:get(<<"query">>, Spec, undefined) of
+        undefined -> Options0;
+        QuerySpec -> Options0#{query => convert_query_spec(QuerySpec)}
+    end,
     case barrel_federation:create(Name, Members, Options) of
         ok ->
             Response = #{<<"ok">> => true, <<"name">> => Name},
