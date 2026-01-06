@@ -82,6 +82,15 @@ init(Opts) ->
             %% Bulk operations
             {"/db/:db/_bulk_docs", barrel_http_handler, #{action => bulk_docs}},
 
+            %% Query endpoint
+            {"/db/:db/_find", barrel_http_handler, #{action => find}},
+
+            %% Materialized views
+            {"/db/:db/_views", barrel_http_handler, #{action => views}},
+            {"/db/:db/_views/:view_id", barrel_http_handler, #{action => view}},
+            {"/db/:db/_views/:view_id/_query", barrel_http_handler, #{action => view_query}},
+            {"/db/:db/_views/:view_id/_refresh", barrel_http_handler, #{action => view_refresh}},
+
             %% Replication endpoints
             {"/db/:db/_revsdiff", barrel_http_handler, #{action => revsdiff}},
             {"/db/:db/_put_rev", barrel_http_handler, #{action => put_rev}},
@@ -89,6 +98,10 @@ init(Opts) ->
 
             %% Local documents (checkpoints)
             {"/db/:db/_local/:doc_id", barrel_http_handler, #{action => local_doc}},
+
+            %% Attachments (before doc catch-all)
+            {"/db/:db/:doc_id/_attachments", barrel_http_handler, #{action => attachments}},
+            {"/db/:db/:doc_id/_attachments/:att_name", barrel_http_handler, #{action => attachment}},
 
             %% Document operations (variable path - must be last)
             {"/db/:db/:doc_id", barrel_http_handler, #{action => doc}}

@@ -169,6 +169,26 @@ handle_action(changes, <<"POST">>, Req) ->
 handle_action(bulk_docs, <<"POST">>, Req) ->
     handle_bulk_docs(Req);
 
+%% Query
+handle_action(find, <<"POST">>, Req) ->
+    handle_find(Req);
+
+%% Materialized Views
+handle_action(views, <<"GET">>, Req) ->
+    handle_list_views(Req);
+handle_action(views, <<"POST">>, Req) ->
+    handle_create_view(Req);
+handle_action(view, <<"GET">>, Req) ->
+    handle_get_view(Req);
+handle_action(view, <<"DELETE">>, Req) ->
+    handle_delete_view(Req);
+handle_action(view_query, <<"GET">>, Req) ->
+    handle_query_view(Req);
+handle_action(view_query, <<"POST">>, Req) ->
+    handle_query_view(Req);
+handle_action(view_refresh, <<"POST">>, Req) ->
+    handle_refresh_view(Req);
+
 %% Replication: revsdiff
 handle_action(revsdiff, <<"POST">>, Req) ->
     handle_revsdiff(Req);
@@ -198,6 +218,16 @@ handle_action(key, <<"GET">>, Req) ->
     handle_get_key(Req);
 handle_action(key, <<"DELETE">>, Req) ->
     handle_delete_key(Req);
+
+%% Attachments
+handle_action(attachments, <<"GET">>, Req) ->
+    handle_list_attachments(Req);
+handle_action(attachment, <<"GET">>, Req) ->
+    handle_get_attachment(Req);
+handle_action(attachment, <<"PUT">>, Req) ->
+    handle_put_attachment(Req);
+handle_action(attachment, <<"DELETE">>, Req) ->
+    handle_delete_attachment(Req);
 
 %% Method not allowed
 handle_action(_Action, _Method, _Req) ->
@@ -311,6 +341,367 @@ handle_bulk_docs(Req0) ->
     {201, response_headers(Req1), Body, Req1}.
 
 %%====================================================================
+%% Query Handler
+%%====================================================================
+
+handle_find(Req0) ->
+    DbName = cowboy_req:binding(db, Req0),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    QuerySpec0 = decode_request_body(ReqBody, Req1),
+    %% Convert binary keys to atoms for internal API
+    QuerySpec = convert_query_spec(QuerySpec0),
+    case barrel_docdb:find(DbName, QuerySpec) of
+        {ok, Results, Meta} ->
+            %% Format metadata for JSON/CBOR
+            FormattedMeta = format_query_meta(Meta),
+            %% Convert documents based on response type
+            case response_content_type(Req1) of
+                ?CT_CBOR ->
+                    %% For CBOR, keep documents in native format, convert meta
+                    ConvertedResults = [doc_to_map(Doc) || Doc <- Results],
+                    Response = #{
+                        <<"results">> => ConvertedResults,
+                        <<"meta">> => FormattedMeta
+                    },
+                    Body = barrel_docdb_codec_cbor:encode_cbor(Response),
+                    {200, response_headers(Req1), Body, Req1};
+                ?CT_JSON ->
+                    %% For JSON, encode each document properly
+                    JsonDocsStr = iolist_to_binary([
+                        <<"[">>,
+                        lists:join(<<",">>, [doc_to_json(Doc) || Doc <- Results]),
+                        <<"]">>
+                    ]),
+                    JsonMetaStr = iolist_to_binary(json:encode(FormattedMeta)),
+                    Body = iolist_to_binary([
+                        <<"{\"results\":">>, JsonDocsStr,
+                        <<",\"meta\":">>, JsonMetaStr,
+                        <<"}">>
+                    ]),
+                    {200, response_headers(Req1), Body, Req1}
+            end;
+        {error, Reason} ->
+            throw({error, 400, format_error(Reason)})
+    end.
+
+%% Convert document to JSON, handling both maps and indexed binary format
+doc_to_json(Doc) when is_map(Doc) ->
+    iolist_to_binary(json:encode(Doc));
+doc_to_json(Doc) when is_binary(Doc) ->
+    barrel_doc:to_json(Doc).
+
+%% Convert document to map for CBOR encoding
+doc_to_map(Doc) when is_map(Doc) -> Doc;
+doc_to_map(Doc) when is_binary(Doc) ->
+    barrel_doc:to_map(Doc).
+
+%%====================================================================
+%% Materialized Views Handlers
+%%====================================================================
+
+handle_list_views(Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    case barrel_docdb:list_views(DbName) of
+        {ok, Views} ->
+            %% Convert view info to JSON-safe format
+            JsonViews = [format_view_info(V) || V <- Views],
+            Body = encode_response(JsonViews, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+handle_create_view(Req0) ->
+    DbName = cowboy_req:binding(db, Req0),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    ViewSpec = decode_request_body(ReqBody, Req1),
+    ViewId = maps:get(<<"id">>, ViewSpec),
+    %% Convert binary keys to internal format and include id
+    Config0 = convert_view_config(ViewSpec),
+    Config = Config0#{id => ViewId},
+    case barrel_docdb:register_view(DbName, ViewId, Config) of
+        ok ->
+            Response = #{<<"ok">> => true, <<"id">> => ViewId},
+            Body = encode_response(Response, Req1),
+            {201, response_headers(Req1), Body, Req1};
+        {error, Reason} ->
+            throw({error, 400, format_error(Reason)})
+    end.
+
+handle_get_view(Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    ViewId = cowboy_req:binding(view_id, Req),
+    case barrel_docdb:list_views(DbName) of
+        {ok, Views} ->
+            case lists:filter(fun(V) -> maps:get(id, V) =:= ViewId end, Views) of
+                [ViewInfo] ->
+                    Body = encode_response(format_view_info(ViewInfo), Req),
+                    {200, response_headers(Req), Body, Req};
+                [] ->
+                    throw({error, 404, <<"View not found">>})
+            end;
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+handle_delete_view(Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    ViewId = cowboy_req:binding(view_id, Req),
+    case barrel_docdb:unregister_view(DbName, ViewId) of
+        ok ->
+            Response = #{<<"ok">> => true},
+            Body = encode_response(Response, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"View not found">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+handle_query_view(Req0) ->
+    DbName = cowboy_req:binding(db, Req0),
+    ViewId = cowboy_req:binding(view_id, Req0),
+    Method = cowboy_req:method(Req0),
+    {Opts, Req1} = case Method of
+        <<"GET">> ->
+            Qs = cowboy_req:parse_qs(Req0),
+            {parse_view_query_opts(Qs), Req0};
+        <<"POST">> ->
+            {ok, ReqBody, R1} = cowboy_req:read_body(Req0),
+            BodyMap = decode_request_body(ReqBody, R1),
+            {convert_view_query_opts(BodyMap), R1}
+    end,
+    case barrel_docdb:query_view(DbName, ViewId, Opts) of
+        {ok, Results} ->
+            RespBody = encode_response(Results, Req1),
+            {200, response_headers(Req1), RespBody, Req1};
+        {error, not_found} ->
+            throw({error, 404, <<"View not found">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+handle_refresh_view(Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    ViewId = cowboy_req:binding(view_id, Req),
+    case barrel_docdb:refresh_view(DbName, ViewId) of
+        {ok, Hlc} ->
+            Response = #{<<"ok">> => true, <<"hlc">> => format_seq(Hlc)},
+            Body = encode_response(Response, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"View not found">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%% Format view info for JSON response
+format_view_info(Info) when is_map(Info) ->
+    maps:fold(
+        fun(K, V, Acc) when is_atom(K) ->
+                Acc#{atom_to_binary(K) => format_view_value(V)};
+           (K, V, Acc) ->
+                Acc#{K => format_view_value(V)}
+        end,
+        #{},
+        Info
+    ).
+
+format_view_value(V) when is_atom(V) -> atom_to_binary(V);
+format_view_value(V) when is_pid(V) -> iolist_to_binary(pid_to_list(V));
+format_view_value(V) when is_map(V) -> format_view_info(V);
+format_view_value(V) when is_list(V) -> [format_view_value(E) || E <- V];
+format_view_value(V) -> V.
+
+%% Convert view config from JSON to internal format
+%% Views expect either #{module => Mod} or #{query => QuerySpec}
+convert_view_config(Spec) ->
+    %% Build the query spec from where clause
+    QuerySpec = case maps:get(<<"where">>, Spec, undefined) of
+        undefined -> #{};
+        Where -> #{where => convert_where_clauses(Where)}
+    end,
+    %% Add key if present
+    QuerySpec2 = case maps:get(<<"key">>, Spec, undefined) of
+        undefined -> QuerySpec;
+        Key when is_list(Key) -> QuerySpec#{key => Key}
+    end,
+    %% Build config with query spec
+    BaseConfig = #{query => QuerySpec2},
+    %% Add optional refresh mode
+    Config = case maps:get(<<"refresh">>, Spec, undefined) of
+        <<"on_change">> -> BaseConfig#{refresh => on_change};
+        <<"manual">> -> BaseConfig#{refresh => manual};
+        _ -> BaseConfig
+    end,
+    Config.
+
+%% Parse view query options from query string
+parse_view_query_opts(Qs) ->
+    lists:foldl(
+        fun({<<"key">>, Key}, Acc) ->
+                Acc#{key => decode_view_key(Key)};
+           ({<<"start_key">>, Key}, Acc) ->
+                Acc#{start_key => decode_view_key(Key)};
+           ({<<"end_key">>, Key}, Acc) ->
+                Acc#{end_key => decode_view_key(Key)};
+           ({<<"limit">>, LimitBin}, Acc) ->
+                Acc#{limit => binary_to_integer(LimitBin)};
+           ({<<"include_docs">>, <<"true">>}, Acc) ->
+                Acc#{include_docs => true};
+           ({<<"descending">>, <<"true">>}, Acc) ->
+                Acc#{descending => true};
+           (_, Acc) ->
+                Acc
+        end,
+        #{},
+        Qs
+    ).
+
+%% Convert view query options from JSON body
+convert_view_query_opts(Body) ->
+    maps:fold(
+        fun(<<"key">>, V, Acc) ->
+                Acc#{key => V};
+           (<<"start_key">>, V, Acc) ->
+                Acc#{start_key => V};
+           (<<"end_key">>, V, Acc) ->
+                Acc#{end_key => V};
+           (<<"limit">>, V, Acc) when is_integer(V) ->
+                Acc#{limit => V};
+           (<<"include_docs">>, V, Acc) when is_boolean(V) ->
+                Acc#{include_docs => V};
+           (<<"descending">>, V, Acc) when is_boolean(V) ->
+                Acc#{descending => V};
+           (_, _, Acc) ->
+                Acc
+        end,
+        #{},
+        Body
+    ).
+
+%% Decode view key from query string (JSON encoded)
+decode_view_key(KeyBin) ->
+    try
+        json:decode(KeyBin)
+    catch
+        _:_ -> KeyBin
+    end.
+
+%% Format query result metadata for JSON encoding
+format_query_meta(Meta) ->
+    maps:fold(
+        fun(last_seq, V, Acc) -> Acc#{<<"last_seq">> => format_seq(V)};
+           (has_more, V, Acc) -> Acc#{<<"has_more">> => V};
+           (continuation, V, Acc) -> Acc#{<<"continuation">> => V};
+           (K, V, Acc) when is_atom(K) -> Acc#{atom_to_binary(K) => format_meta_value(V)};
+           (K, V, Acc) -> Acc#{K => format_meta_value(V)}
+        end,
+        #{},
+        Meta
+    ).
+
+%% Format sequence number for JSON - convert to base64 string
+%% The sequence is an opaque CBOR-encoded binary from barrel_hlc:encode/1
+format_seq(Seq) when is_binary(Seq) ->
+    %% Convert binary to base64 for safe JSON transport
+    base64:encode(Seq);
+format_seq({Epoch, Counter}) when is_integer(Epoch), is_integer(Counter) ->
+    iolist_to_binary(io_lib:format("~p:~p", [Epoch, Counter]));
+format_seq(Seq) when is_tuple(Seq) ->
+    %% Handle other tuple formats
+    iolist_to_binary(io_lib:format("~p", [Seq]));
+format_seq(Other) ->
+    Other.
+
+%% Format meta values that may contain non-JSON-serializable data
+format_meta_value(V) when is_tuple(V) ->
+    iolist_to_binary(io_lib:format("~p", [V]));
+format_meta_value(V) when is_atom(V) ->
+    atom_to_binary(V);
+format_meta_value(V) ->
+    V.
+
+%% Convert query spec binary keys to internal format
+convert_query_spec(Spec) when is_map(Spec) ->
+    BaseSpec = maps:fold(
+        fun(<<"where">>, V, Acc) ->
+                Acc#{where => convert_where_clauses(V)};
+           (<<"order_by">>, V, Acc) ->
+                Acc#{order_by => convert_order_by(V)};
+           (<<"limit">>, V, Acc) when is_integer(V) ->
+                Acc#{limit => V};
+           (<<"offset">>, V, Acc) when is_integer(V) ->
+                Acc#{offset => V};
+           (<<"include_docs">>, V, Acc) when is_boolean(V) ->
+                Acc#{include_docs => V};
+           (<<"continuation">>, V, Acc) when is_binary(V) ->
+                Acc#{continuation => V};
+           (<<"chunk_size">>, V, Acc) when is_integer(V) ->
+                Acc#{chunk_size => V};
+           (_, _, Acc) ->
+                Acc
+        end,
+        #{},
+        Spec
+    ),
+    %% Ensure where clause is present (required by query compiler)
+    %% If no where clause, use "exists id" condition to match all documents
+    case maps:is_key(where, BaseSpec) of
+        true -> BaseSpec;
+        false -> BaseSpec#{where => [{exists, [<<"id">>]}]}
+    end.
+
+convert_where_clauses(Clauses) when is_list(Clauses) ->
+    lists:map(fun convert_where_clause/1, Clauses);
+convert_where_clauses(_) ->
+    [].
+
+convert_where_clause(#{<<"path">> := Path, <<"op">> := <<"eq">>, <<"value">> := Value}) ->
+    %% Equality uses {path, Path, Value} format
+    {path, Path, Value};
+convert_where_clause(#{<<"path">> := Path, <<"op">> := Op, <<"value">> := Value}) ->
+    %% Comparison operators use {compare, Path, Op, Value} format
+    {compare, Path, convert_op(Op), Value};
+convert_where_clause(#{<<"path">> := Path, <<"value">> := Value}) ->
+    %% Default to equality
+    {path, Path, Value};
+convert_where_clause(#{<<"path">> := Path, <<"op">> := <<"exists">>}) ->
+    {exists, Path};
+convert_where_clause(#{<<"path">> := Path, <<"op">> := <<"missing">>}) ->
+    {missing, Path};
+convert_where_clause(#{<<"path">> := Path, <<"op">> := <<"prefix">>, <<"value">> := Value}) ->
+    {prefix, Path, Value};
+convert_where_clause(#{<<"path">> := Path, <<"op">> := <<"in">>, <<"value">> := Value}) when is_list(Value) ->
+    {in, Path, Value};
+convert_where_clause(#{<<"path">> := Path, <<"op">> := <<"contains">>, <<"value">> := Value}) ->
+    {contains, Path, Value};
+convert_where_clause(_) ->
+    {error, invalid_clause}.
+
+convert_op(<<"ne">>) -> '=/=';
+convert_op(<<"gt">>) -> '>';
+convert_op(<<"gte">>) -> '>=';
+convert_op(<<"lt">>) -> '<';
+convert_op(<<"lte">>) -> '=<';
+convert_op(Op) when is_binary(Op) -> binary_to_atom(Op);
+convert_op(Op) -> Op.
+
+convert_order_by(Orders) when is_list(Orders) ->
+    lists:map(fun convert_order_spec/1, Orders);
+convert_order_by(_) ->
+    [].
+
+convert_order_spec(#{<<"path">> := Path, <<"dir">> := <<"asc">>}) ->
+    {Path, asc};
+convert_order_spec(#{<<"path">> := Path, <<"dir">> := <<"desc">>}) ->
+    {Path, desc};
+convert_order_spec(#{<<"path">> := Path}) ->
+    {Path, asc};
+convert_order_spec(_) ->
+    {error, invalid_order}.
+
+%%====================================================================
 %% Replication Handlers
 %%====================================================================
 
@@ -399,6 +790,72 @@ handle_delete_local_doc(Req) ->
             {200, response_headers(Req), Body, Req};
         {error, not_found} ->
             throw({error, 404, <<"Local document not found">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%%====================================================================
+%% Attachment Handlers
+%%====================================================================
+
+handle_list_attachments(Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    DocId = cowboy_req:binding(doc_id, Req),
+    Attachments = barrel_docdb:list_attachments(DbName, DocId),
+    Body = encode_response(Attachments, Req),
+    {200, response_headers(Req), Body, Req}.
+
+handle_get_attachment(Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    DocId = cowboy_req:binding(doc_id, Req),
+    AttName = cowboy_req:binding(att_name, Req),
+    case barrel_docdb:get_attachment(DbName, DocId, AttName) of
+        {ok, Data} ->
+            %% Return raw binary with octet-stream content type
+            Headers = #{<<"content-type">> => <<"application/octet-stream">>},
+            {200, Headers, Data, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Attachment not found">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+handle_put_attachment(Req0) ->
+    DbName = cowboy_req:binding(db, Req0),
+    DocId = cowboy_req:binding(doc_id, Req0),
+    AttName = cowboy_req:binding(att_name, Req0),
+    {ok, Data, Req1} = cowboy_req:read_body(Req0),
+    case barrel_docdb:put_attachment(DbName, DocId, AttName, Data) of
+        {ok, Info} ->
+            %% Convert atom keys to binary for JSON encoding
+            Response = maps:fold(
+                fun(name, V, Acc) -> Acc#{<<"name">> => V};
+                   (length, V, Acc) -> Acc#{<<"size">> => V};
+                   (digest, V, Acc) -> Acc#{<<"digest">> => V};
+                   (content_type, V, Acc) -> Acc#{<<"content_type">> => V};
+                   (K, V, Acc) when is_atom(K) -> Acc#{atom_to_binary(K) => V};
+                   (K, V, Acc) -> Acc#{K => V}
+                end,
+                #{<<"ok">> => true},
+                Info
+            ),
+            Body = encode_response(Response, Req1),
+            {201, response_headers(Req1), Body, Req1};
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+handle_delete_attachment(Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    DocId = cowboy_req:binding(doc_id, Req),
+    AttName = cowboy_req:binding(att_name, Req),
+    case barrel_docdb:delete_attachment(DbName, DocId, AttName) of
+        ok ->
+            Response = #{<<"ok">> => true},
+            Body = encode_response(Response, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Attachment not found">>});
         {error, Reason} ->
             throw({error, 500, format_error(Reason)})
     end.

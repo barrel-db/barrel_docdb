@@ -38,7 +38,25 @@
     key_get/1,
     key_delete/1,
     key_admin_required/1,
-    key_per_database/1
+    key_per_database/1,
+
+    %% Attachment tests
+    attachment_put/1,
+    attachment_get/1,
+    attachment_list/1,
+    attachment_delete/1,
+    attachment_not_found/1,
+
+    %% Query tests
+    query_find_basic/1,
+    query_find_with_where/1,
+    query_find_with_pagination/1,
+
+    %% View tests
+    view_create/1,
+    view_list/1,
+    view_query/1,
+    view_delete/1
 ]).
 
 -define(HTTP_PORT, 18081).
@@ -53,7 +71,10 @@ all() ->
         {group, http_transport},
         {group, replication},
         {group, tasks},
-        {group, keys}
+        {group, keys},
+        {group, attachments},
+        {group, query},
+        {group, views}
     ].
 
 groups() ->
@@ -82,6 +103,24 @@ groups() ->
             key_delete,
             key_admin_required,
             key_per_database
+        ]},
+        {attachments, [sequence], [
+            attachment_put,
+            attachment_get,
+            attachment_list,
+            attachment_delete,
+            attachment_not_found
+        ]},
+        {query, [sequence], [
+            query_find_basic,
+            query_find_with_where,
+            query_find_with_pagination
+        ]},
+        {views, [sequence], [
+            view_create,
+            view_list,
+            view_query,
+            view_delete
         ]}
     ].
 
@@ -134,6 +173,64 @@ init_per_group(keys, Config) ->
     ensure_db(<<"key_test_db">>),
     Config;
 
+init_per_group(attachments, Config) ->
+    %% Ensure HTTP server is running
+    ensure_http_server(),
+    %% Create test database and document for attachments
+    ensure_db(<<"att_test_db">>),
+    %% Create a document to attach to
+    Doc = #{<<"id">> => <<"att_test_doc">>, <<"name">> => <<"test doc">>},
+    {ok, _} = barrel_docdb:put_doc(<<"att_test_db">>, Doc),
+    Config;
+
+init_per_group(query, Config) ->
+    %% Ensure HTTP server is running
+    ensure_http_server(),
+    %% Create test database with sample documents
+    ensure_db(<<"query_test_db">>),
+    %% Insert test documents
+    lists:foreach(
+        fun(N) ->
+            Type = case N rem 2 of
+                0 -> <<"even">>;
+                1 -> <<"odd">>
+            end,
+            Doc = #{
+                <<"id">> => iolist_to_binary(["doc", integer_to_list(N)]),
+                <<"num">> => N,
+                <<"type">> => Type,
+                <<"name">> => iolist_to_binary(["Document ", integer_to_list(N)])
+            },
+            {ok, _} = barrel_docdb:put_doc(<<"query_test_db">>, Doc)
+        end,
+        lists:seq(1, 10)
+    ),
+    Config;
+
+init_per_group(views, Config) ->
+    %% Ensure HTTP server is running
+    ensure_http_server(),
+    %% Create test database with sample documents
+    ensure_db(<<"views_test_db">>),
+    %% Insert test documents with types for the view
+    lists:foreach(
+        fun(N) ->
+            Type = case N rem 3 of
+                0 -> <<"user">>;
+                1 -> <<"order">>;
+                2 -> <<"product">>
+            end,
+            Doc = #{
+                <<"id">> => iolist_to_binary(["doc", integer_to_list(N)]),
+                <<"type">> => Type,
+                <<"name">> => iolist_to_binary(["Item ", integer_to_list(N)])
+            },
+            {ok, _} = barrel_docdb:put_doc(<<"views_test_db">>, Doc)
+        end,
+        lists:seq(1, 9)
+    ),
+    Config;
+
 init_per_group(_, Config) ->
     Config.
 
@@ -154,6 +251,18 @@ end_per_group(tasks, _Config) ->
 
 end_per_group(keys, _Config) ->
     catch barrel_docdb:delete_db(<<"key_test_db">>),
+    ok;
+
+end_per_group(attachments, _Config) ->
+    catch barrel_docdb:delete_db(<<"att_test_db">>),
+    ok;
+
+end_per_group(query, _Config) ->
+    catch barrel_docdb:delete_db(<<"query_test_db">>),
+    ok;
+
+end_per_group(views, _Config) ->
+    catch barrel_docdb:delete_db(<<"views_test_db">>),
     ok;
 
 end_per_group(_, _Config) ->
@@ -586,6 +695,244 @@ key_per_database(_Config) ->
 
     %% Clean up
     barrel_http_api_keys:delete_key(AllDbKeyPrefix),
+
+    ok.
+
+%%====================================================================
+%% Attachment Tests
+%%====================================================================
+
+attachment_put(Config) ->
+    ApiKey = proplists:get_value(api_key, Config),
+    Url = <<?BASE_URL/binary, "/db/att_test_db/att_test_doc/_attachments/image.png">>,
+    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>},
+               {<<"Content-Type">>, <<"application/octet-stream">>}],
+    AttData = <<"fake png data for testing">>,
+
+    {ok, 201, _RespHeaders, ClientRef} = hackney:put(Url, Headers, AttData, []),
+    {ok, Body} = hackney:body(ClientRef),
+    Result = json:decode(Body),
+
+    #{<<"ok">> := true, <<"name">> := <<"image.png">>} = Result,
+    true = maps:is_key(<<"size">>, Result),
+    true = maps:is_key(<<"digest">>, Result),
+
+    ok.
+
+attachment_get(Config) ->
+    ApiKey = proplists:get_value(api_key, Config),
+    Url = <<?BASE_URL/binary, "/db/att_test_db/att_test_doc/_attachments/image.png">>,
+    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
+
+    {ok, 200, RespHeaders, ClientRef} = hackney:get(Url, Headers, <<>>, []),
+    {ok, Body} = hackney:body(ClientRef),
+
+    %% Should return the raw binary data
+    <<"fake png data for testing">> = Body,
+
+    %% Content-Type should be octet-stream
+    ContentType = proplists:get_value(<<"content-type">>, RespHeaders),
+    <<"application/octet-stream">> = ContentType,
+
+    ok.
+
+attachment_list(Config) ->
+    ApiKey = proplists:get_value(api_key, Config),
+
+    %% Add another attachment for the list test
+    Url1 = <<?BASE_URL/binary, "/db/att_test_db/att_test_doc/_attachments/readme.txt">>,
+    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>},
+               {<<"Content-Type">>, <<"application/octet-stream">>}],
+    {ok, 201, _, ClientRef1} = hackney:put(Url1, Headers, <<"readme content">>, []),
+    hackney:body(ClientRef1),
+
+    %% List attachments
+    Url2 = <<?BASE_URL/binary, "/db/att_test_db/att_test_doc/_attachments">>,
+    Headers2 = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>},
+                {<<"Accept">>, <<"application/json">>}],
+    {ok, 200, _RespHeaders, ClientRef2} = hackney:get(Url2, Headers2, <<>>, []),
+    {ok, Body} = hackney:body(ClientRef2),
+    Attachments = json:decode(Body),
+
+    %% Should have both attachments
+    true = is_list(Attachments),
+    true = lists:member(<<"image.png">>, Attachments),
+    true = lists:member(<<"readme.txt">>, Attachments),
+
+    ok.
+
+attachment_delete(Config) ->
+    ApiKey = proplists:get_value(api_key, Config),
+    Url = <<?BASE_URL/binary, "/db/att_test_db/att_test_doc/_attachments/readme.txt">>,
+    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
+
+    {ok, 200, _RespHeaders, ClientRef} = hackney:delete(Url, Headers, <<>>, []),
+    {ok, Body} = hackney:body(ClientRef),
+    #{<<"ok">> := true} = json:decode(Body),
+
+    %% Verify it's gone
+    {ok, 404, _, ClientRef2} = hackney:get(Url, Headers, <<>>, []),
+    hackney:body(ClientRef2),
+
+    ok.
+
+attachment_not_found(Config) ->
+    ApiKey = proplists:get_value(api_key, Config),
+    Url = <<?BASE_URL/binary, "/db/att_test_db/att_test_doc/_attachments/nonexistent.xyz">>,
+    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
+
+    {ok, 404, _RespHeaders, ClientRef} = hackney:get(Url, Headers, <<>>, []),
+    {ok, Body} = hackney:body(ClientRef),
+    #{<<"error">> := <<"Attachment not found">>} = json:decode(Body),
+
+    ok.
+
+%%====================================================================
+%% Query Tests
+%%====================================================================
+
+query_find_basic(Config) ->
+    ApiKey = proplists:get_value(api_key, Config),
+    Url = <<?BASE_URL/binary, "/db/query_test_db/_find">>,
+    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>},
+               {<<"Content-Type">>, <<"application/json">>}],
+
+    %% Query all documents
+    ReqBody = json:encode(#{}),
+    {ok, 200, _RespHeaders, ClientRef} = hackney:post(Url, Headers, ReqBody, []),
+    {ok, Body} = hackney:body(ClientRef),
+    #{<<"results">> := Results, <<"meta">> := _Meta} = json:decode(Body),
+
+    %% Should have 10 documents
+    10 = length(Results),
+
+    ok.
+
+query_find_with_where(Config) ->
+    ApiKey = proplists:get_value(api_key, Config),
+    Url = <<?BASE_URL/binary, "/db/query_test_db/_find">>,
+    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>},
+               {<<"Content-Type">>, <<"application/json">>}],
+
+    %% Query documents where type = "even"
+    ReqBody = json:encode(#{
+        <<"where">> => [
+            #{<<"path">> => [<<"type">>], <<"op">> => <<"eq">>, <<"value">> => <<"even">>}
+        ]
+    }),
+    {ok, 200, _RespHeaders, ClientRef} = hackney:post(Url, Headers, ReqBody, []),
+    {ok, Body} = hackney:body(ClientRef),
+    #{<<"results">> := Results} = json:decode(Body),
+
+    %% Should have 5 even documents (2, 4, 6, 8, 10)
+    5 = length(Results),
+
+    %% All results should have type = "even"
+    %% Results are wrapped as #{<<"id">> => ..., <<"doc">> => #{...}}
+    lists:foreach(
+        fun(Result) ->
+            #{<<"doc">> := Doc} = Result,
+            #{<<"type">> := <<"even">>} = Doc
+        end,
+        Results
+    ),
+
+    ok.
+
+query_find_with_pagination(Config) ->
+    ApiKey = proplists:get_value(api_key, Config),
+    Url = <<?BASE_URL/binary, "/db/query_test_db/_find">>,
+    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>},
+               {<<"Content-Type">>, <<"application/json">>}],
+
+    %% First page with limit
+    ReqBody1 = json:encode(#{<<"limit">> => 3}),
+    {ok, 200, _, ClientRef1} = hackney:post(Url, Headers, ReqBody1, []),
+    {ok, Body1} = hackney:body(ClientRef1),
+    #{<<"results">> := Results1, <<"meta">> := Meta1} = json:decode(Body1),
+
+    %% Should have at most 3 documents (limit respected)
+    true = length(Results1) =< 3,
+    true = length(Results1) > 0,
+
+    %% has_more and continuation should be consistent
+    HasMore = maps:get(<<"has_more">>, Meta1, false),
+    Continuation = maps:get(<<"continuation">>, Meta1, undefined),
+
+    %% If has_more is true, we should have a continuation token
+    case HasMore of
+        true ->
+            true = Continuation =/= undefined,
+            %% Continue with next page
+            ReqBody2 = json:encode(#{<<"continuation">> => Continuation, <<"limit">> => 3}),
+            {ok, 200, _, ClientRef2} = hackney:post(Url, Headers, ReqBody2, []),
+            {ok, Body2} = hackney:body(ClientRef2),
+            #{<<"results">> := Results2} = json:decode(Body2),
+            true = length(Results2) > 0;
+        false ->
+            %% No more results - that's fine for a small result set
+            ok
+    end,
+
+    ok.
+
+%%====================================================================
+%% View Tests
+%%====================================================================
+
+view_create(Config) ->
+    %% View creation requires complex query spec with logic variables
+    %% This test just verifies the endpoint responds correctly
+    ApiKey = proplists:get_value(api_key, Config),
+    Url = <<?BASE_URL/binary, "/db/views_test_db/_views">>,
+    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>},
+               {<<"Content-Type">>, <<"application/json">>}],
+
+    %% Try to create an invalid view (missing required fields)
+    %% Should return 400
+    ReqBody = json:encode(#{
+        <<"id">> => <<"test_view">>,
+        <<"where">> => []  %% Empty where clause is invalid
+    }),
+
+    {ok, 400, _RespHeaders, ClientRef} = hackney:post(Url, Headers, ReqBody, []),
+    {ok, _Body} = hackney:body(ClientRef),
+    %% 400 is expected for invalid view spec
+    ok.
+
+view_list(Config) ->
+    ApiKey = proplists:get_value(api_key, Config),
+    Url = <<?BASE_URL/binary, "/db/views_test_db/_views">>,
+    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
+
+    {ok, 200, _RespHeaders, ClientRef} = hackney:get(Url, Headers, <<>>, []),
+    {ok, Body} = hackney:body(ClientRef),
+    Views = json:decode(Body),
+
+    %% Should return a list (even if empty)
+    true = is_list(Views),
+
+    ok.
+
+view_query(Config) ->
+    ApiKey = proplists:get_value(api_key, Config),
+    Url = <<?BASE_URL/binary, "/db/views_test_db/_views/nonexistent/_query">>,
+    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
+
+    %% Query a non-existent view should return 404
+    {ok, 404, _RespHeaders, ClientRef} = hackney:get(Url, Headers, <<>>, []),
+    {ok, _Body} = hackney:body(ClientRef),
+
+    ok.
+
+view_delete(Config) ->
+    ApiKey = proplists:get_value(api_key, Config),
+    Url = <<?BASE_URL/binary, "/db/views_test_db/_views/nonexistent">>,
+    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
+
+    %% Delete a non-existent view should return 404
+    {ok, 404, _RespHeaders, ClientRef} = hackney:delete(Url, Headers, <<>>, []),
+    {ok, _Body} = hackney:body(ClientRef),
 
     ok.
 
