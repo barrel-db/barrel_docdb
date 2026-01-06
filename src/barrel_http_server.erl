@@ -68,6 +68,10 @@ init(Opts) ->
             %% Health endpoint
             {"/health", barrel_http_handler, #{action => health}},
 
+            %% API key management (admin only)
+            {"/keys", barrel_http_handler, #{action => keys}},
+            {"/keys/:key_prefix", barrel_http_handler, #{action => key}},
+
             %% Database operations
             {"/db/:db", barrel_http_handler, #{action => db_info}},
 
@@ -78,8 +82,13 @@ init(Opts) ->
             %% Bulk operations
             {"/db/:db/_bulk_docs", barrel_http_handler, #{action => bulk_docs}},
 
-            %% Replication
-            {"/db/:db/_replicate", barrel_http_handler, #{action => replicate}},
+            %% Replication endpoints
+            {"/db/:db/_revsdiff", barrel_http_handler, #{action => revsdiff}},
+            {"/db/:db/_put_rev", barrel_http_handler, #{action => put_rev}},
+            {"/db/:db/_sync_hlc", barrel_http_handler, #{action => sync_hlc}},
+
+            %% Local documents (checkpoints)
+            {"/db/:db/_local/:doc_id", barrel_http_handler, #{action => local_doc}},
 
             %% Document operations (variable path - must be last)
             {"/db/:db/:doc_id", barrel_http_handler, #{action => doc}}

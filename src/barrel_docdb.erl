@@ -351,15 +351,85 @@ put_doc(Db, Doc) ->
 %%
 %% Same as `put_doc/2' but accepts additional options.
 %%
+%% == Options ==
+%% <ul>
+%% <li>`replicate => sync' - Wait for document to reach replicas before returning</li>
+%% <li>`wait_for => [Target]' - List of targets to wait for (requires replicate => sync)</li>
+%% </ul>
+%%
+%% == Example ==
+%% ```
+%% %% Sync write - wait for document to reach nodeC
+%% {ok, _} = barrel_docdb:put_doc(<<"mydb">>, Doc, #{
+%%     replicate => sync,
+%%     wait_for => [<<"http://nodeC:8080/db/mydb">>]
+%% }).
+%% '''
+%%
 %% @param Db Database name or pid
 %% @param Doc Document map to store
-%% @param Opts Options map (currently unused, reserved for future use)
+%% @param Opts Options map
 %% @returns `{ok, #{<<"id">> => DocId, <<"rev">> => Rev, <<"ok">> => true}}'
 -spec put_doc(binary() | pid(), map(), map()) -> {ok, map()} | {error, term()}.
 put_doc(Db, Doc, Opts) ->
-    with_db(Db, fun(Pid) ->
+    %% Write document locally first
+    Result = with_db(Db, fun(Pid) ->
         barrel_db_server:put_doc(Pid, Doc, Opts)
-    end).
+    end),
+    %% Handle sync replication if requested
+    case {Result, maps:get(replicate, Opts, async)} of
+        {{ok, WriteResult}, sync} ->
+            WaitFor = maps:get(wait_for, Opts, []),
+            DocId = maps:get(<<"id">>, WriteResult),
+            Rev = maps:get(<<"rev">>, WriteResult),
+            case wait_for_sync_replication(DocId, Rev, WaitFor) of
+                ok -> Result;
+                {error, Reason} -> {error, {sync_replication_failed, Reason}}
+            end;
+        _ ->
+            Result
+    end.
+
+%% @doc Wait for a document revision to reach all specified targets
+-spec wait_for_sync_replication(binary(), binary(), [binary() | map()]) ->
+    ok | {error, term()}.
+wait_for_sync_replication(_DocId, _Rev, []) ->
+    ok;
+wait_for_sync_replication(DocId, Rev, Targets) ->
+    wait_for_sync_replication(DocId, Rev, Targets, 10, 500).
+
+wait_for_sync_replication(_DocId, _Rev, _Targets, 0, _Delay) ->
+    {error, timeout};
+wait_for_sync_replication(DocId, Rev, Targets, Retries, Delay) ->
+    %% Check if doc with revision exists at all targets
+    Results = lists:map(
+        fun(Target) ->
+            Transport = get_transport_for_target(Target),
+            case Transport:get_doc(Target, DocId, #{}) of
+                {ok, _Doc, #{<<"rev">> := TargetRev}} when TargetRev =:= Rev -> ok;
+                {ok, _Doc, #{rev := TargetRev}} when TargetRev =:= Rev -> ok;
+                {ok, _, _} -> revision_mismatch;
+                {error, not_found} -> not_found;
+                {error, _} -> error
+            end
+        end,
+        Targets
+    ),
+    case lists:all(fun(R) -> R =:= ok end, Results) of
+        true ->
+            ok;
+        false ->
+            timer:sleep(Delay),
+            wait_for_sync_replication(DocId, Rev, Targets, Retries - 1, Delay)
+    end.
+
+%% @doc Get transport module for a target
+get_transport_for_target(Target) when is_binary(Target) ->
+    barrel_rep_transport_local;
+get_transport_for_target(#{url := _}) ->
+    barrel_rep_transport_http;
+get_transport_for_target(_) ->
+    barrel_rep_transport_local.
 
 %% @doc Put multiple documents in a single batch.
 %%

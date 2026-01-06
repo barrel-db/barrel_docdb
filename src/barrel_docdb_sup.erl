@@ -121,7 +121,27 @@ init([]) ->
         modules => [barrel_db_sup]
     },
 
-    %% Cache must start first, then HLC, Sub, QuerySub, PathDict, QueryCursor, Parallel, finally DbSup
-    ChildSpecs = [Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup],
+    %% Replication task manager for persistent replication tasks
+    RepTasks = #{
+        id => barrel_rep_tasks,
+        start => {barrel_rep_tasks, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [barrel_rep_tasks]
+    },
+
+    %% API keys manager for HTTP authentication
+    ApiKeys = #{
+        id => barrel_http_api_keys,
+        start => {barrel_http_api_keys, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [barrel_http_api_keys]
+    },
+
+    %% Cache must start first, then HLC, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, ApiKeys
+    ChildSpecs = [Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, ApiKeys],
 
     {ok, {SupFlags, ChildSpecs}}.

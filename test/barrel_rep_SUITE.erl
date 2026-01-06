@@ -21,7 +21,9 @@ all() ->
         {group, put_rev},
         {group, replication},
         {group, filtered_replication},
-        {group, hlc_replication}
+        {group, hlc_replication},
+        {group, direction},
+        {group, chain}
     ].
 
 groups() ->
@@ -55,6 +57,15 @@ groups() ->
         {hlc_replication, [sequence], [
             replicate_hlc_checkpoint,
             replicate_hlc_sync
+        ]},
+        {direction, [sequence], [
+            direction_push,
+            direction_pull,
+            direction_both
+        ]},
+        {chain, [sequence], [
+            chain_replication_wait_for,
+            sync_put_doc
         ]}
     ].
 
@@ -91,6 +102,14 @@ init_per_group(Group, Config) ->
         hlc_replication ->
             {ok, _} = barrel_docdb:create_db(<<"test_source">>, #{data_dir => DataDir ++ "_source"}),
             {ok, _} = barrel_docdb:create_db(<<"test_target">>, #{data_dir => DataDir ++ "_target"});
+        direction ->
+            {ok, _} = barrel_docdb:create_db(<<"test_source">>, #{data_dir => DataDir ++ "_source"}),
+            {ok, _} = barrel_docdb:create_db(<<"test_target">>, #{data_dir => DataDir ++ "_target"});
+        chain ->
+            %% Chain: A -> B -> C
+            {ok, _} = barrel_docdb:create_db(<<"chain_a">>, #{data_dir => DataDir ++ "_chain_a"}),
+            {ok, _} = barrel_docdb:create_db(<<"chain_b">>, #{data_dir => DataDir ++ "_chain_b"}),
+            {ok, _} = barrel_docdb:create_db(<<"chain_c">>, #{data_dir => DataDir ++ "_chain_c"});
         _ ->
             ok
     end,
@@ -112,6 +131,13 @@ end_per_group(Group, Config) ->
         hlc_replication ->
             barrel_docdb:delete_db(<<"test_source">>),
             barrel_docdb:delete_db(<<"test_target">>);
+        direction ->
+            barrel_docdb:delete_db(<<"test_source">>),
+            barrel_docdb:delete_db(<<"test_target">>);
+        chain ->
+            barrel_docdb:delete_db(<<"chain_a">>),
+            barrel_docdb:delete_db(<<"chain_b">>),
+            barrel_docdb:delete_db(<<"chain_c">>);
         _ ->
             ok
     end,
@@ -629,5 +655,226 @@ replicate_hlc_sync(_Config) ->
         DocId = iolist_to_binary([<<"sync_doc_">>, integer_to_binary(N)]),
         {ok, _} = barrel_docdb:get_doc(Target, DocId)
     end, lists:seq(1, 5)),
+
+    ok.
+
+%%====================================================================
+%% Direction Tests
+%%====================================================================
+
+direction_push(_Config) ->
+    Source = <<"test_source">>,
+    Target = <<"test_target">>,
+
+    %% Create document in source
+    DocId = <<"push_doc_1">>,
+    {ok, _} = barrel_docdb:put_doc(Source, #{<<"id">> => DocId, <<"value">> => <<"from_source">>}),
+
+    %% Start push replication task
+    {ok, TaskId} = barrel_rep_tasks:start_task(#{
+        source => Source,
+        target => Target,
+        direction => push,
+        mode => one_shot
+    }),
+
+    %% Wait for completion
+    timer:sleep(500),
+
+    %% Verify task completed
+    {ok, Task} = barrel_rep_tasks:get_task(TaskId),
+    ?assertEqual(completed, maps:get(status, Task)),
+
+    %% Verify document was replicated to target
+    {ok, TargetDoc} = barrel_docdb:get_doc(Target, DocId),
+    ?assertEqual(<<"from_source">>, maps:get(<<"value">>, TargetDoc)),
+
+    %% Clean up
+    barrel_rep_tasks:delete_task(TaskId),
+    ok.
+
+direction_pull(_Config) ->
+    Source = <<"test_source">>,
+    Target = <<"test_target">>,
+
+    %% Clear any existing docs first
+    catch barrel_docdb:delete_doc(Source, <<"pull_doc_1">>, #{}),
+    catch barrel_docdb:delete_doc(Target, <<"pull_doc_1">>, #{}),
+    timer:sleep(100),
+
+    %% Create document in TARGET (we will pull from target to source)
+    DocId = <<"pull_doc_1">>,
+    {ok, _} = barrel_docdb:put_doc(Target, #{<<"id">> => DocId, <<"value">> => <<"from_target">>}),
+
+    %% Verify source doesn't have it
+    ?assertEqual({error, not_found}, barrel_docdb:get_doc(Source, DocId)),
+
+    %% Start pull replication task (pulls from target to source)
+    {ok, TaskId} = barrel_rep_tasks:start_task(#{
+        source => Source,
+        target => Target,
+        direction => pull,
+        mode => one_shot
+    }),
+
+    %% Wait for completion
+    timer:sleep(500),
+
+    %% Verify task completed
+    {ok, Task} = barrel_rep_tasks:get_task(TaskId),
+    ?assertEqual(completed, maps:get(status, Task)),
+
+    %% Verify document was pulled to source
+    {ok, SourceDoc} = barrel_docdb:get_doc(Source, DocId),
+    ?assertEqual(<<"from_target">>, maps:get(<<"value">>, SourceDoc)),
+
+    %% Clean up
+    barrel_rep_tasks:delete_task(TaskId),
+    ok.
+
+direction_both(_Config) ->
+    Source = <<"test_source">>,
+    Target = <<"test_target">>,
+
+    %% Create different documents in each
+    SourceDocId = <<"both_source_doc">>,
+    TargetDocId = <<"both_target_doc">>,
+
+    {ok, _} = barrel_docdb:put_doc(Source, #{<<"id">> => SourceDocId, <<"origin">> => <<"source">>}),
+    {ok, _} = barrel_docdb:put_doc(Target, #{<<"id">> => TargetDocId, <<"origin">> => <<"target">>}),
+
+    %% Verify docs are only in their origin
+    ?assertEqual({error, not_found}, barrel_docdb:get_doc(Target, SourceDocId)),
+    ?assertEqual({error, not_found}, barrel_docdb:get_doc(Source, TargetDocId)),
+
+    %% Start bidirectional replication task
+    {ok, TaskId} = barrel_rep_tasks:start_task(#{
+        source => Source,
+        target => Target,
+        direction => both,
+        mode => one_shot
+    }),
+
+    %% Wait for completion
+    timer:sleep(1000),
+
+    %% Verify task completed
+    {ok, Task} = barrel_rep_tasks:get_task(TaskId),
+    ?assertEqual(completed, maps:get(status, Task)),
+
+    %% Verify source doc is now in target
+    {ok, TargetSourceDoc} = barrel_docdb:get_doc(Target, SourceDocId),
+    ?assertEqual(<<"source">>, maps:get(<<"origin">>, TargetSourceDoc)),
+
+    %% Verify target doc is now in source
+    {ok, SourceTargetDoc} = barrel_docdb:get_doc(Source, TargetDocId),
+    ?assertEqual(<<"target">>, maps:get(<<"origin">>, SourceTargetDoc)),
+
+    %% Clean up
+    barrel_rep_tasks:delete_task(TaskId),
+    ok.
+
+%%====================================================================
+%% Chain Replication Tests
+%%====================================================================
+
+chain_replication_wait_for(_Config) ->
+    %% Setup chain: A -> B -> C
+
+    %% Write document to A FIRST (before starting replication)
+    DocId = <<"chain_doc_1">>,
+    {ok, _} = barrel_docdb:put_doc(<<"chain_a">>, #{
+        <<"id">> => DocId,
+        <<"value">> => <<"from_chain_a">>
+    }),
+
+    %% Start B -> C replication (continuous to pick up changes as they arrive)
+    {ok, TaskBC} = barrel_rep_tasks:start_task(#{
+        source => <<"chain_b">>,
+        target => <<"chain_c">>,
+        direction => push,
+        mode => continuous
+    }),
+
+    %% Give it time to start
+    timer:sleep(200),
+
+    %% Start A -> B replication with wait_for => C
+    %% This means A won't complete until documents reach C
+    {ok, TaskAB} = barrel_rep_tasks:start_task(#{
+        source => <<"chain_a">>,
+        target => <<"chain_b">>,
+        direction => push,
+        mode => one_shot,
+        wait_for => [<<"chain_c">>]
+    }),
+
+    %% Wait for task A->B to complete
+    %% Since wait_for is set, it should only complete after doc reaches C
+    timer:sleep(6000),
+
+    %% Verify task completed
+    {ok, Task} = barrel_rep_tasks:get_task(TaskAB),
+    ?assertEqual(completed, maps:get(status, Task)),
+
+    %% Verify document is in C (the final destination)
+    {ok, DocC} = barrel_docdb:get_doc(<<"chain_c">>, DocId),
+    ?assertEqual(<<"from_chain_a">>, maps:get(<<"value">>, DocC)),
+
+    %% Verify document is also in B (the intermediate)
+    {ok, DocB} = barrel_docdb:get_doc(<<"chain_b">>, DocId),
+    ?assertEqual(<<"from_chain_a">>, maps:get(<<"value">>, DocB)),
+
+    %% Clean up
+    barrel_rep_tasks:pause_task(TaskBC),
+    barrel_rep_tasks:delete_task(TaskAB),
+    barrel_rep_tasks:delete_task(TaskBC),
+
+    ok.
+
+sync_put_doc(_Config) ->
+    %% Test sync put_doc with wait_for
+
+    %% Start continuous replication A -> B
+    {ok, TaskAB} = barrel_rep_tasks:start_task(#{
+        source => <<"chain_a">>,
+        target => <<"chain_b">>,
+        direction => push,
+        mode => continuous
+    }),
+
+    %% Give it time to start
+    timer:sleep(200),
+
+    %% Sync write to A with wait_for => B
+    %% This should block until the doc reaches B
+    DocId = <<"sync_doc_1">>,
+    StartTime = erlang:system_time(millisecond),
+
+    Result = barrel_docdb:put_doc(<<"chain_a">>, #{
+        <<"id">> => DocId,
+        <<"value">> => <<"sync_value">>
+    }, #{
+        replicate => sync,
+        wait_for => [<<"chain_b">>]
+    }),
+
+    EndTime = erlang:system_time(millisecond),
+
+    %% Verify write succeeded
+    ?assertMatch({ok, _}, Result),
+
+    %% Verify document is immediately available in B
+    %% (since sync write waited for it)
+    {ok, DocB} = barrel_docdb:get_doc(<<"chain_b">>, DocId),
+    ?assertEqual(<<"sync_value">>, maps:get(<<"value">>, DocB)),
+
+    %% Verify write took some time (indicates it waited)
+    WriteTime = EndTime - StartTime,
+    ct:pal("Sync write time: ~p ms", [WriteTime]),
+
+    %% Clean up
+    barrel_rep_tasks:pause_task(TaskAB),
+    barrel_rep_tasks:delete_task(TaskAB),
 
     ok.

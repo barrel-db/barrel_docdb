@@ -26,6 +26,8 @@ init(Req0, State) ->
     #{action := Action} = State,
     Method = cowboy_req:method(Req0),
     try
+        %% Authenticate request (unless it's a health check)
+        ok = maybe_authenticate(Action, Req0),
         {Status, Headers, Body, Req1} = handle_action(Action, Method, Req0),
         Req2 = cowboy_req:reply(Status, Headers, Body, Req1),
         {ok, Req2, State}
@@ -44,6 +46,90 @@ init(Req0, State) ->
     end.
 
 %%====================================================================
+%% Authentication
+%%====================================================================
+
+%% @doc Check authentication for request
+%% Health endpoint is always public.
+%% Other endpoints require valid bearer token when API keys are configured.
+maybe_authenticate(health, _Req) ->
+    %% Health check is always public
+    ok;
+maybe_authenticate(Action, Req) when Action =:= keys; Action =:= key ->
+    %% Key management requires admin authentication
+    authenticate_admin(Req);
+maybe_authenticate(Action, Req) ->
+    %% Check if any API keys are configured
+    case barrel_http_api_keys:has_any_keys() of
+        false ->
+            %% No keys configured - allow all requests
+            ok;
+        true ->
+            %% Keys exist - require authentication
+            %% Get database name for per-database auth (if applicable)
+            DbName = get_db_from_action(Action, Req),
+            authenticate(Req, DbName)
+    end.
+
+%% @doc Get database name from action and request
+get_db_from_action(health, _Req) -> undefined;
+get_db_from_action(_Action, Req) ->
+    cowboy_req:binding(db, Req, undefined).
+
+%% @doc Authenticate request via bearer token
+authenticate(Req, DbName) ->
+    case extract_bearer_token(Req) of
+        undefined ->
+            throw({error, 401, <<"Authorization required">>});
+        Token ->
+            Result = case DbName of
+                undefined ->
+                    %% No database context - global validation
+                    barrel_http_api_keys:validate_key(Token);
+                _ ->
+                    %% Database-specific validation
+                    barrel_http_api_keys:validate_key(Token, DbName)
+            end,
+            case Result of
+                {ok, _KeyInfo} ->
+                    ok;
+                {error, invalid_key} ->
+                    throw({error, 401, <<"Invalid API key">>});
+                {error, access_denied} ->
+                    throw({error, 403, <<"Access denied to this database">>})
+            end
+    end.
+
+%% @doc Authenticate request requiring admin privileges
+authenticate_admin(Req) ->
+    case extract_bearer_token(Req) of
+        undefined ->
+            throw({error, 401, <<"Authorization required">>});
+        Token ->
+            case barrel_http_api_keys:validate_key(Token) of
+                {ok, #{is_admin := true}} ->
+                    ok;
+                {ok, _} ->
+                    throw({error, 403, <<"Admin access required">>});
+                {error, invalid_key} ->
+                    throw({error, 401, <<"Invalid API key">>})
+            end
+    end.
+
+%% @doc Extract bearer token from Authorization header
+extract_bearer_token(Req) ->
+    case cowboy_req:header(<<"authorization">>, Req) of
+        undefined ->
+            undefined;
+        <<"Bearer ", Token/binary>> ->
+            Token;
+        <<"bearer ", Token/binary>> ->
+            Token;
+        _ ->
+            undefined
+    end.
+
+%%====================================================================
 %% Action Handlers
 %%====================================================================
 
@@ -57,7 +143,9 @@ handle_action(db_info, <<"GET">>, Req) ->
     DbName = cowboy_req:binding(db, Req),
     case barrel_docdb:db_info(DbName) of
         {ok, Info} ->
-            Body = encode_response(Info, Req),
+            %% Sanitize info for JSON/CBOR encoding (remove pid, format atom keys)
+            SafeInfo = sanitize_db_info(Info),
+            Body = encode_response(SafeInfo, Req),
             {200, response_headers(Req), Body, Req};
         {error, not_found} ->
             throw({error, 404, <<"Database not found">>})
@@ -80,6 +168,36 @@ handle_action(changes, <<"POST">>, Req) ->
 %% Bulk docs
 handle_action(bulk_docs, <<"POST">>, Req) ->
     handle_bulk_docs(Req);
+
+%% Replication: revsdiff
+handle_action(revsdiff, <<"POST">>, Req) ->
+    handle_revsdiff(Req);
+
+%% Replication: put_rev
+handle_action(put_rev, <<"POST">>, Req) ->
+    handle_put_rev(Req);
+
+%% Replication: sync_hlc
+handle_action(sync_hlc, <<"POST">>, Req) ->
+    handle_sync_hlc(Req);
+
+%% Local documents
+handle_action(local_doc, <<"GET">>, Req) ->
+    handle_get_local_doc(Req);
+handle_action(local_doc, <<"PUT">>, Req) ->
+    handle_put_local_doc(Req);
+handle_action(local_doc, <<"DELETE">>, Req) ->
+    handle_delete_local_doc(Req);
+
+%% API Key management (admin only)
+handle_action(keys, <<"GET">>, Req) ->
+    handle_list_keys(Req);
+handle_action(keys, <<"POST">>, Req) ->
+    handle_create_key(Req);
+handle_action(key, <<"GET">>, Req) ->
+    handle_get_key(Req);
+handle_action(key, <<"DELETE">>, Req) ->
+    handle_delete_key(Req);
 
 %% Method not allowed
 handle_action(_Action, _Method, _Req) ->
@@ -191,6 +309,99 @@ handle_bulk_docs(Req0) ->
     ),
     Body = encode_response(Results, Req1),
     {201, response_headers(Req1), Body, Req1}.
+
+%%====================================================================
+%% Replication Handlers
+%%====================================================================
+
+handle_revsdiff(Req0) ->
+    DbName = cowboy_req:binding(db, Req0),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    #{<<"id">> := DocId, <<"revs">> := RevIds} = decode_request_body(ReqBody, Req1),
+    case barrel_docdb:revsdiff(DbName, DocId, RevIds) of
+        {ok, Missing, Ancestors} ->
+            Response = #{
+                <<"missing">> => Missing,
+                <<"possible_ancestors">> => Ancestors
+            },
+            Body = encode_response(Response, Req1),
+            {200, response_headers(Req1), Body, Req1};
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+handle_put_rev(Req0) ->
+    DbName = cowboy_req:binding(db, Req0),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    #{<<"doc">> := Doc, <<"history">> := History} = Body0 = decode_request_body(ReqBody, Req1),
+    Deleted = maps:get(<<"deleted">>, Body0, false),
+    case barrel_docdb:put_rev(DbName, Doc, History, Deleted) of
+        {ok, DocId, RevId} ->
+            Response = #{<<"ok">> => true, <<"id">> => DocId, <<"rev">> => RevId},
+            RespBody = encode_response(Response, Req1),
+            {201, response_headers(Req1), RespBody, Req1};
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+handle_sync_hlc(Req0) ->
+    DbName = cowboy_req:binding(db, Req0),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    #{<<"hlc">> := HlcBin} = decode_request_body(ReqBody, Req1),
+    RemoteHlc = parse_hlc(HlcBin),
+    case barrel_docdb:sync_hlc(RemoteHlc) of
+        {ok, LocalHlc} ->
+            Response = #{<<"hlc">> => format_hlc(LocalHlc), <<"db">> => DbName},
+            Body = encode_response(Response, Req1),
+            {200, response_headers(Req1), Body, Req1};
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%%====================================================================
+%% Local Document Handlers
+%%====================================================================
+
+handle_get_local_doc(Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    DocId = cowboy_req:binding(doc_id, Req),
+    case barrel_docdb:get_local_doc(DbName, DocId) of
+        {ok, Doc} ->
+            Body = encode_response(Doc, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Local document not found">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+handle_put_local_doc(Req0) ->
+    DbName = cowboy_req:binding(db, Req0),
+    DocId = cowboy_req:binding(doc_id, Req0),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    Doc = decode_request_body(ReqBody, Req1),
+    case barrel_docdb:put_local_doc(DbName, DocId, Doc) of
+        ok ->
+            Response = #{<<"ok">> => true, <<"id">> => DocId},
+            Body = encode_response(Response, Req1),
+            {201, response_headers(Req1), Body, Req1};
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+handle_delete_local_doc(Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    DocId = cowboy_req:binding(doc_id, Req),
+    case barrel_docdb:delete_local_doc(DbName, DocId) of
+        ok ->
+            Response = #{<<"ok">> => true},
+            Body = encode_response(Response, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Local document not found">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
 
 %%====================================================================
 %% Content Negotiation
@@ -312,6 +523,68 @@ parse_hlc(HlcBin) when is_binary(HlcBin) ->
     end.
 
 %%====================================================================
+%% API Key Management Handlers
+%%====================================================================
+
+handle_list_keys(Req) ->
+    {ok, Keys} = barrel_http_api_keys:list_keys(),
+    Body = encode_response(Keys, Req),
+    {200, response_headers(Req), Body, Req}.
+
+handle_create_key(Req0) ->
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    Opts0 = decode_request_body(ReqBody, Req1),
+    %% Convert binary keys to atom keys for internal use
+    Opts = maps:fold(
+        fun(<<"name">>, V, Acc) -> Acc#{name => V};
+           (<<"permissions">>, V, Acc) -> Acc#{permissions => V};
+           (<<"databases">>, <<"all">>, Acc) -> Acc#{databases => all};
+           (<<"databases">>, V, Acc) when is_list(V) -> Acc#{databases => V};
+           (<<"is_admin">>, V, Acc) -> Acc#{is_admin => V};
+           (_, _, Acc) -> Acc
+        end,
+        #{},
+        Opts0
+    ),
+    case barrel_http_api_keys:create_key(Opts) of
+        {ok, Key, KeyInfo} ->
+            %% Return the full key only on creation
+            Response = KeyInfo#{<<"key">> => Key},
+            Body = encode_response(Response, Req1),
+            {201, response_headers(Req1), Body, Req1};
+        {error, Reason} ->
+            throw({error, 400, format_error(Reason)})
+    end.
+
+handle_get_key(Req) ->
+    KeyPrefix = cowboy_req:binding(key_prefix, Req),
+    {ok, Keys} = barrel_http_api_keys:list_keys(),
+    case lists:filter(
+        fun(#{key_prefix := P}) -> P =:= KeyPrefix end,
+        Keys
+    ) of
+        [KeyInfo] ->
+            Body = encode_response(KeyInfo, Req),
+            {200, response_headers(Req), Body, Req};
+        [] ->
+            throw({error, 404, <<"Key not found">>})
+    end.
+
+handle_delete_key(Req) ->
+    KeyPrefix = cowboy_req:binding(key_prefix, Req),
+    case barrel_http_api_keys:delete_key(KeyPrefix) of
+        ok ->
+            Body = encode_response(#{<<"ok">> => true}, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Key not found">>});
+        {error, cannot_delete_last_admin_key} ->
+            throw({error, 400, <<"Cannot delete the last admin key">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%%====================================================================
 %% Error Formatting
 %%====================================================================
 
@@ -321,3 +594,35 @@ format_error(Reason) when is_binary(Reason) ->
     Reason;
 format_error(Reason) ->
     iolist_to_binary(io_lib:format("~p", [Reason])).
+
+%%====================================================================
+%% Database Info Sanitization
+%%====================================================================
+
+%% @doc Sanitize database info for JSON/CBOR encoding
+%% Removes pids and converts atom keys to binary
+sanitize_db_info(Info) when is_map(Info) ->
+    maps:fold(
+        fun(pid, _V, Acc) ->
+                %% Skip pid - not serializable
+                Acc;
+           (K, V, Acc) when is_atom(K) ->
+                maps:put(atom_to_binary(K), sanitize_value(V), Acc);
+           (K, V, Acc) when is_binary(K) ->
+                maps:put(K, sanitize_value(V), Acc)
+        end,
+        #{},
+        Info
+    ).
+
+sanitize_value(V) when is_pid(V) ->
+    %% Convert pid to string for debugging
+    iolist_to_binary(pid_to_list(V));
+sanitize_value(V) when is_atom(V) ->
+    atom_to_binary(V);
+sanitize_value(V) when is_map(V) ->
+    sanitize_db_info(V);
+sanitize_value(V) when is_list(V) ->
+    lists:map(fun sanitize_value/1, V);
+sanitize_value(V) ->
+    V.
