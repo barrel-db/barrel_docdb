@@ -18,6 +18,7 @@ all() ->
     [
         {group, federation_crud},
         {group, federation_query},
+        {group, stored_query},
         {group, remote_federation}
     ].
 
@@ -36,9 +37,16 @@ groups() ->
             query_with_duplicates,
             query_with_different_revisions
         ]},
+        {stored_query, [sequence], [
+            create_federation_with_query,
+            find_with_stored_query,
+            find_merges_queries,
+            set_query_on_existing
+        ]},
         {remote_federation, [sequence], [
             remote_url_validation,
-            create_federation_with_remote
+            create_federation_with_remote,
+            create_federation_with_domain
         ]}
     ].
 
@@ -52,6 +60,17 @@ end_per_suite(_Config) ->
 
 init_per_group(federation_crud, Config) ->
     Config;
+init_per_group(stored_query, Config) ->
+    %% Create test database for stored query tests
+    DbName = <<"stored_query_db">>,
+    DataDir = "/tmp/barrel_stored_query_test",
+    os:cmd("rm -rf " ++ DataDir),
+    case barrel_docdb:open_db(DbName) of
+        {ok, _} -> barrel_docdb:delete_db(DbName);
+        _ -> ok
+    end,
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => DataDir}),
+    [{db_name, DbName}, {data_dir, DataDir} | Config];
 init_per_group(remote_federation, Config) ->
     %% Create a local database for mixed local/remote testing
     DbName = <<"remote_test_db">>,
@@ -109,6 +128,15 @@ end_per_group(federation_query, Config) ->
     catch barrel_federation:delete(<<"test_federation">>),
     catch barrel_federation:delete(<<"query_fed">>),
 
+    DataDir = proplists:get_value(data_dir, Config),
+    os:cmd("rm -rf " ++ DataDir),
+    ok;
+end_per_group(stored_query, Config) ->
+    DbName = proplists:get_value(db_name, Config),
+    barrel_docdb:delete_db(DbName),
+    catch barrel_federation:delete(<<"stored_query_fed">>),
+    catch barrel_federation:delete(<<"merge_query_fed">>),
+    catch barrel_federation:delete(<<"set_query_fed">>),
     DataDir = proplists:get_value(data_dir, Config),
     os:cmd("rm -rf " ++ DataDir),
     ok;
@@ -458,4 +486,135 @@ create_federation_with_remote(Config) ->
 
     %% Cleanup
     ok = barrel_federation:delete(FedName),
+    ok.
+
+create_federation_with_domain(Config) ->
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Create federation with a domain member
+    %% (DNS lookup will fail but we just want to verify the config is stored)
+    FedName = <<"domain_fed">>,
+    ok = barrel_federation:create(FedName, [
+        DbName,
+        <<"example.com">>  %% Domain - will trigger DNS discovery
+    ]),
+
+    %% Verify federation was created
+    {ok, Fed} = barrel_federation:get(FedName),
+    Members = maps:get(members, Fed),
+    ?assertEqual(2, length(Members)),
+    ?assert(lists:member(DbName, Members)),
+    ?assert(lists:member(<<"example.com">>, Members)),
+
+    ct:pal("Created federation with domain member: ~p", [Members]),
+
+    %% Cleanup
+    ok = barrel_federation:delete(FedName),
+    ok.
+
+%%====================================================================
+%% Stored Query Tests
+%%====================================================================
+
+create_federation_with_query(Config) ->
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Create some test documents
+    {ok, _} = barrel_docdb:put_doc(DbName, #{
+        <<"id">> => <<"user1">>,
+        <<"type">> => <<"user">>,
+        <<"active">> => true
+    }),
+    {ok, _} = barrel_docdb:put_doc(DbName, #{
+        <<"id">> => <<"user2">>,
+        <<"type">> => <<"user">>,
+        <<"active">> => false
+    }),
+    {ok, _} = barrel_docdb:put_doc(DbName, #{
+        <<"id">> => <<"order1">>,
+        <<"type">> => <<"order">>
+    }),
+
+    %% Create federation with stored query
+    FedName = <<"stored_query_fed">>,
+    StoredQuery = #{where => [{path, [<<"type">>], <<"user">>}]},
+    ok = barrel_federation:create(FedName, [DbName], #{query => StoredQuery}),
+
+    %% Verify query was stored
+    {ok, Fed} = barrel_federation:get(FedName),
+    ?assert(maps:is_key(query, Fed)),
+    ?assertEqual(StoredQuery, maps:get(query, Fed)),
+
+    ct:pal("Created federation with stored query: ~p", [maps:get(query, Fed)]),
+    ok.
+
+find_with_stored_query(_Config) ->
+    FedName = <<"stored_query_fed">>,
+
+    %% Use find/1 which applies the stored query
+    {ok, Results, Meta} = barrel_federation:find(FedName),
+
+    %% Should only return users (not orders) based on stored query
+    ct:pal("Results from find/1: ~p", [Results]),
+    ?assertEqual(2, length(Results)),
+
+    DocIds = [maps:get(<<"id">>, R) || R <- Results],
+    ?assert(lists:member(<<"user1">>, DocIds)),
+    ?assert(lists:member(<<"user2">>, DocIds)),
+    ?assertNot(lists:member(<<"order1">>, DocIds)),
+
+    ct:pal("find/1 correctly used stored query, meta: ~p", [Meta]),
+    ok.
+
+find_merges_queries(Config) ->
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Create federation with stored query for type=user
+    FedName = <<"merge_query_fed">>,
+    StoredQuery = #{where => [{path, [<<"type">>], <<"user">>}]},
+    ok = barrel_federation:create(FedName, [DbName], #{query => StoredQuery}),
+
+    %% Query with additional filter (active=true)
+    %% This should combine with stored query: type=user AND active=true
+    {ok, Results, _Meta} = barrel_federation:find(FedName, #{
+        where => [{path, [<<"active">>], true}]
+    }),
+
+    %% Should only return user1 (type=user AND active=true)
+    ct:pal("Results after merge: ~p", [Results]),
+    ?assertEqual(1, length(Results)),
+
+    [Result] = Results,
+    ?assertEqual(<<"user1">>, maps:get(<<"id">>, Result)),
+
+    ct:pal("Queries merged correctly"),
+    ok.
+
+set_query_on_existing(Config) ->
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Create federation without query
+    FedName = <<"set_query_fed">>,
+    ok = barrel_federation:create(FedName, [DbName]),
+
+    %% Verify no query stored
+    {ok, Fed1} = barrel_federation:get(FedName),
+    ?assertNot(maps:is_key(query, Fed1)),
+
+    %% Set query
+    NewQuery = #{where => [{path, [<<"type">>], <<"order">>}]},
+    ok = barrel_federation:set_query(FedName, NewQuery),
+
+    %% Verify query was set
+    {ok, Fed2} = barrel_federation:get(FedName),
+    ?assert(maps:is_key(query, Fed2)),
+    ?assertEqual(NewQuery, maps:get(query, Fed2)),
+
+    %% Use find/1 to verify query works
+    {ok, Results, _Meta} = barrel_federation:find(FedName),
+    ?assertEqual(1, length(Results)),
+    [OrderResult] = Results,
+    ?assertEqual(<<"order1">>, maps:get(<<"id">>, OrderResult)),
+
+    ct:pal("set_query/2 works correctly"),
     ok.

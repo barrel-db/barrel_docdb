@@ -49,6 +49,10 @@
     discover_from/1,
     discover_from_dns/1,
     refresh_peers/0,
+    %% DNS domain management
+    add_dns_domain/1,
+    remove_dns_domain/1,
+    list_dns_domains/0,
     %% Peer tagging
     tag_peer/2,
     untag_peer/2,
@@ -210,6 +214,22 @@ resolve_member(Ref) ->
 resolve_peers_with_db(DbName) when is_binary(DbName) ->
     gen_server:call(?SERVER, {resolve_peers_with_db, DbName}).
 
+%% @doc Add a DNS domain for periodic discovery
+%% The domain will be queried via SRV records periodically
+-spec add_dns_domain(binary()) -> ok.
+add_dns_domain(Domain) when is_binary(Domain) ->
+    gen_server:call(?SERVER, {add_dns_domain, Domain}).
+
+%% @doc Remove a DNS domain from periodic discovery
+-spec remove_dns_domain(binary()) -> ok.
+remove_dns_domain(Domain) when is_binary(Domain) ->
+    gen_server:call(?SERVER, {remove_dns_domain, Domain}).
+
+%% @doc List all configured DNS domains
+-spec list_dns_domains() -> {ok, [binary()]}.
+list_dns_domains() ->
+    gen_server:call(?SERVER, list_dns_domains).
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -305,6 +325,18 @@ handle_call({resolve_peers_with_db, DbName}, _From, State) ->
     Result = do_resolve_peers_with_db(DbName),
     {reply, Result, State};
 
+handle_call({add_dns_domain, Domain}, _From, State) ->
+    Result = do_add_dns_domain(Domain),
+    {reply, Result, State};
+
+handle_call({remove_dns_domain, Domain}, _From, State) ->
+    Result = do_remove_dns_domain(Domain),
+    {reply, Result, State};
+
+handle_call(list_dns_domains, _From, State) ->
+    Result = do_list_dns_domains(),
+    {reply, Result, State};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
@@ -317,6 +349,7 @@ handle_cast(_Msg, State) ->
 
 handle_info(refresh_peers, #state{refresh_interval = Interval} = State) ->
     do_refresh_peers(),
+    do_refresh_dns_domains(),
     TimerRef = erlang:send_after(Interval, self(), refresh_peers),
     {noreply, State#state{refresh_timer = TimerRef}};
 
@@ -715,3 +748,55 @@ do_resolve_peers_with_db(DbName) ->
     Peers = filter_peers(AllPeers, #{status => active, has_db => DbName}),
     Urls = [<<(maps:get(url, P))/binary, "/db/", DbName/binary>> || P <- Peers],
     {ok, Urls}.
+
+%%====================================================================
+%% DNS Domain Management
+%%====================================================================
+
+%% @private Add a DNS domain for periodic discovery
+do_add_dns_domain(Domain) ->
+    DocId = <<"_dns_domains">>,
+    Domains = case barrel_docdb:get_system_doc(DocId) of
+        {ok, #{<<"domains">> := Existing}} -> Existing;
+        {error, not_found} -> []
+    end,
+    case lists:member(Domain, Domains) of
+        true ->
+            ok;  % Already registered
+        false ->
+            NewDomains = [Domain | Domains],
+            barrel_docdb:put_system_doc(DocId, #{<<"domains">> => NewDomains}),
+            %% Trigger immediate discovery for new domain
+            spawn(fun() -> do_discover_from_dns(Domain) end),
+            ok
+    end.
+
+%% @private Remove a DNS domain from periodic discovery
+do_remove_dns_domain(Domain) ->
+    DocId = <<"_dns_domains">>,
+    case barrel_docdb:get_system_doc(DocId) of
+        {ok, #{<<"domains">> := Domains}} ->
+            NewDomains = lists:delete(Domain, Domains),
+            barrel_docdb:put_system_doc(DocId, #{<<"domains">> => NewDomains});
+        {error, not_found} ->
+            ok
+    end.
+
+%% @private List all configured DNS domains
+do_list_dns_domains() ->
+    DocId = <<"_dns_domains">>,
+    case barrel_docdb:get_system_doc(DocId) of
+        {ok, #{<<"domains">> := Domains}} -> {ok, Domains};
+        {error, not_found} -> {ok, []}
+    end.
+
+%% @private Refresh all configured DNS domains
+do_refresh_dns_domains() ->
+    case do_list_dns_domains() of
+        {ok, Domains} ->
+            lists:foreach(fun(Domain) ->
+                spawn(fun() -> do_discover_from_dns(Domain) end)
+            end, Domains);
+        _ ->
+            ok
+    end.

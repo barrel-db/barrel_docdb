@@ -20,7 +20,8 @@ all() ->
         {group, basic},
         {group, peer_management},
         {group, tagging},
-        {group, member_resolution}
+        {group, member_resolution},
+        {group, dns_domains}
     ].
 
 groups() ->
@@ -45,6 +46,11 @@ groups() ->
         {member_resolution, [], [
             resolve_direct_url,
             resolve_tag_reference
+        ]},
+        {dns_domains, [], [
+            add_dns_domain,
+            remove_dns_domain,
+            list_dns_domains
         ]}
     ].
 
@@ -234,3 +240,47 @@ resolve_tag_reference(_Config) ->
     %% Cleanup
     ok = barrel_discovery:remove_peer(Url1),
     ok = barrel_discovery:remove_peer(Url2).
+
+%%====================================================================
+%% Test Cases - DNS Domain Management
+%%====================================================================
+
+add_dns_domain(_Config) ->
+    Domain = <<"test-discovery.example.com">>,
+    %% Add a domain
+    ok = barrel_discovery:add_dns_domain(Domain),
+    %% Verify it's in the list
+    {ok, Domains} = barrel_discovery:list_dns_domains(),
+    ?assert(lists:member(Domain, Domains)),
+    %% Add same domain again (should be idempotent)
+    ok = barrel_discovery:add_dns_domain(Domain),
+    {ok, Domains2} = barrel_discovery:list_dns_domains(),
+    %% Should still be only one occurrence
+    ?assertEqual(1, length([D || D <- Domains2, D =:= Domain])),
+    %% Cleanup
+    ok = barrel_discovery:remove_dns_domain(Domain).
+
+remove_dns_domain(_Config) ->
+    Domain = <<"remove-test.example.com">>,
+    %% Add domain
+    ok = barrel_discovery:add_dns_domain(Domain),
+    {ok, Domains1} = barrel_discovery:list_dns_domains(),
+    ?assert(lists:member(Domain, Domains1)),
+    %% Remove domain
+    ok = barrel_discovery:remove_dns_domain(Domain),
+    {ok, Domains2} = barrel_discovery:list_dns_domains(),
+    ?assertNot(lists:member(Domain, Domains2)).
+
+list_dns_domains(_Config) ->
+    Domain1 = <<"list-test1.example.com">>,
+    Domain2 = <<"list-test2.example.com">>,
+    %% Add domains
+    ok = barrel_discovery:add_dns_domain(Domain1),
+    ok = barrel_discovery:add_dns_domain(Domain2),
+    %% List them
+    {ok, Domains} = barrel_discovery:list_dns_domains(),
+    ?assert(lists:member(Domain1, Domains)),
+    ?assert(lists:member(Domain2, Domains)),
+    %% Cleanup
+    ok = barrel_discovery:remove_dns_domain(Domain1),
+    ok = barrel_discovery:remove_dns_domain(Domain2).

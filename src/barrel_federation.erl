@@ -54,10 +54,12 @@
     delete/1,
     get/1,
     list/0,
+    find/1,
     find/2,
     find/3,
     add_member/2,
-    remove_member/2
+    remove_member/2,
+    set_query/2
 ]).
 
 %% Exported for testing
@@ -82,7 +84,8 @@
     name := federation_name(),
     members := [member()],
     created_at := integer(),
-    options := map()
+    options := map(),
+    query => query_spec()  % Optional default query
 }.
 
 -type query_spec() :: map().
@@ -104,23 +107,37 @@ create(Name, Members) ->
 %% @doc Create a new federation with custom options
 %% Options:
 %%   - description: optional description
+%%   - query: default query spec applied when find/2 is called
 -spec create(federation_name(), [member()], map()) -> ok | {error, term()}.
 create(Name, Members, Options) when is_binary(Name), is_list(Members) ->
     %% Validate members exist
     case validate_members(Members) of
         ok ->
+            %% Extract query from options if present
+            Query = maps:get(query, Options, undefined),
+            CleanOptions = maps:remove(query, Options),
+
             Federation = #{
                 name => Name,
                 members => Members,
                 created_at => erlang:system_time(millisecond),
-                options => Options
+                options => CleanOptions
             },
+
+            %% Add query if specified
+            FederationWithQuery = case Query of
+                undefined -> Federation;
+                _ -> Federation#{query => Query}
+            end,
+
             %% Store as system document
             DocId = federation_doc_id(Name),
-            case barrel_docdb:put_system_doc(DocId, Federation) of
+            case barrel_docdb:put_system_doc(DocId, FederationWithQuery) of
                 ok ->
                     %% Cache in persistent_term
-                    persistent_term:put({barrel_federation, Name}, Federation),
+                    persistent_term:put({barrel_federation, Name}, FederationWithQuery),
+                    %% Trigger discovery for remote members
+                    trigger_discovery(Members),
                     ok;
                 {error, _} = Err ->
                     Err
@@ -211,7 +228,23 @@ remove_member(Name, Member) ->
             {error, not_found}
     end.
 
+%% @doc Execute the stored query across all federation members
+%% Uses the default query stored in the federation config
+-spec find(federation_name()) ->
+    {ok, [map()], map()} | {error, term()}.
+find(FederationName) ->
+    case get(FederationName) of
+        {ok, #{query := StoredQuery}} ->
+            find(FederationName, StoredQuery, #{});
+        {ok, _} ->
+            %% No stored query - use empty query (all docs)
+            find(FederationName, #{}, #{});
+        {error, not_found} ->
+            {error, {federation_not_found, FederationName}}
+    end.
+
 %% @doc Execute a query across all federation members
+%% If federation has a stored query, merges with provided query
 -spec find(federation_name(), query_spec()) ->
     {ok, [map()], map()} | {error, term()}.
 find(FederationName, QuerySpec) ->
@@ -222,15 +255,19 @@ find(FederationName, QuerySpec) ->
     {ok, [map()], map()} | {error, term()}.
 find(FederationName, QuerySpec, Opts) ->
     case get(FederationName) of
-        {ok, #{members := Members}} ->
+        {ok, #{members := Members} = Federation} ->
             Timeout = maps:get(timeout, Opts, 30000),
             MergeStrategy = maps:get(merge_strategy, Opts, newest),
+
+            %% Merge stored query with provided query
+            StoredQuery = maps:get(query, Federation, #{}),
+            MergedQuery = merge_queries(StoredQuery, QuerySpec),
 
             %% Resolve member references (expand {peer, X}, {tag, Y}, etc.)
             ResolvedMembers = resolve_members(Members),
 
             %% Execute queries in parallel
-            Results = parallel_query(ResolvedMembers, QuerySpec, Timeout),
+            Results = parallel_query(ResolvedMembers, MergedQuery, Timeout),
 
             %% Merge results
             {MergedDocs, SourceCounts} = merge_results(Results, MergeStrategy),
@@ -247,6 +284,17 @@ find(FederationName, QuerySpec, Opts) ->
             {error, {federation_not_found, FederationName}}
     end.
 
+%% @doc Set or update the default query for a federation
+-spec set_query(federation_name(), query_spec()) -> ok | {error, term()}.
+set_query(Name, QuerySpec) ->
+    case get(Name) of
+        {ok, Federation} ->
+            UpdatedFederation = Federation#{query => QuerySpec},
+            update_federation(Name, UpdatedFederation);
+        {error, not_found} ->
+            {error, not_found}
+    end.
+
 %%====================================================================
 %% Internal functions
 %%====================================================================
@@ -259,18 +307,22 @@ federation_doc_id(Name) ->
 %% Members can be:
 %%   - Local database name: <<"mydb">>
 %%   - Remote HTTP URL: <<"http://host:port/db/mydb">>
+%%   - Domain for DNS discovery: <<"example.com">>
 %%   - Discovery reference: {peer, NodeId}, {tag, Tag}, etc.
 validate_members([]) ->
     ok;
 validate_members([Member | Rest]) when is_binary(Member) ->
-    case is_remote_member(Member) of
-        true ->
+    case classify_member(Member) of
+        {url, _} ->
             %% Remote URL - validate format only (can't check if it exists)
             case validate_remote_url(Member) of
                 ok -> validate_members(Rest);
                 {error, _} = Err -> Err
             end;
-        false ->
+        {domain, _} ->
+            %% Domain for DNS discovery - just validate format
+            validate_members(Rest);
+        local_db ->
             %% Local database name
             case barrel_docdb:db_pid(Member) of
                 {ok, _Pid} ->
@@ -301,8 +353,17 @@ resolve_members(Members) ->
     lists:flatmap(fun resolve_member/1, Members).
 
 resolve_member(Member) when is_binary(Member) ->
-    %% Direct URL or local db name - return as-is
-    [Member];
+    case classify_member(Member) of
+        {domain, Domain} ->
+            %% Domain - resolve via DNS SRV, fall back to http://domain:8080
+            case resolve_domain(Domain) of
+                [] -> [<<"http://", Domain/binary, ":8080">>];  % Default fallback
+                Urls -> Urls
+            end;
+        _ ->
+            %% Direct URL or local db name - return as-is
+            [Member]
+    end;
 resolve_member({peer, _} = Ref) ->
     resolve_via_discovery(Ref);
 resolve_member({peer, _, _} = Ref) ->
@@ -569,4 +630,91 @@ rev_generation(Rev) when is_binary(Rev) ->
             end;
         _ ->
             0
+    end.
+
+%% @private Merge two query specs
+%% Provided query takes precedence, but 'where' conditions are combined
+merge_queries(Stored, Provided) when map_size(Stored) =:= 0 ->
+    Provided;
+merge_queries(Stored, Provided) when map_size(Provided) =:= 0 ->
+    Stored;
+merge_queries(Stored, Provided) ->
+    %% Start with provided query
+    Merged = maps:merge(Stored, Provided),
+    %% Combine 'where' conditions if both have them
+    case {maps:get(where, Stored, undefined), maps:get(where, Provided, undefined)} of
+        {undefined, _} -> Merged;
+        {_, undefined} -> Merged;
+        {StoredWhere, ProvidedWhere} ->
+            %% Combine as AND - both conditions must match
+            CombinedWhere = StoredWhere ++ ProvidedWhere,
+            Merged#{where => CombinedWhere}
+    end.
+
+%% @private Trigger discovery for remote members
+%% Called when federation is created to discover peers
+trigger_discovery(Members) ->
+    spawn(fun() ->
+        lists:foreach(fun(Member) ->
+            discover_member(Member)
+        end, Members)
+    end).
+
+%% @private Discover a single member
+discover_member(Member) when is_binary(Member) ->
+    case classify_member(Member) of
+        {url, Url} ->
+            %% HTTP URL - discover via /.well-known/barrel
+            catch barrel_discovery:discover_from(Url);
+        {domain, Domain} ->
+            %% Domain only - register for periodic DNS discovery and trigger initial lookup
+            catch barrel_discovery:add_dns_domain(Domain);
+        local_db ->
+            %% Local database - no discovery needed
+            ok
+    end;
+discover_member(_) ->
+    %% Discovery references are resolved at query time
+    ok.
+
+%% @private Classify a member string
+classify_member(<<"http://", _/binary>> = Url) -> {url, Url};
+classify_member(<<"https://", _/binary>> = Url) -> {url, Url};
+classify_member(Member) ->
+    %% Check if it looks like a domain (has dots, no slashes)
+    case {binary:match(Member, <<".">>), binary:match(Member, <<"/">>)} of
+        {{_, _}, nomatch} ->
+            %% Has dots but no slashes - treat as domain
+            {domain, Member};
+        _ ->
+            %% Probably a local database name
+            local_db
+    end.
+
+%% @private Resolve domain via DNS SRV lookup
+%% Returns list of URLs from SRV records, or empty list if no records
+resolve_domain(Domain) ->
+    SrvName = "_barrel._tcp." ++ binary_to_list(Domain),
+    case inet_res:lookup(SrvName, in, srv) of
+        [] ->
+            [];
+        Records ->
+            %% SRV record format: {Priority, Weight, Port, Host}
+            %% Sort by priority (lower is better), then weight (higher is better)
+            Sorted = lists:sort(
+                fun({P1, W1, _, _}, {P2, W2, _, _}) ->
+                    if P1 < P2 -> true;
+                       P1 > P2 -> false;
+                       W1 > W2 -> true;
+                       true -> false
+                    end
+                end,
+                Records
+            ),
+            [iolist_to_binary([
+                <<"http://">>,
+                list_to_binary(Host),
+                <<":">>,
+                integer_to_binary(Port)
+            ]) || {_Priority, _Weight, Port, Host} <- Sorted]
     end.
