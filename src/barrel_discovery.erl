@@ -37,12 +37,25 @@
     stop/0,
     node_info/0,
     node_id/0,
+    %% Peer management
     add_peer/1,
+    add_peer/2,
     remove_peer/1,
     list_peers/0,
+    list_peers/1,
     get_peer/1,
+    get_peer_by_node_id/1,
+    %% Discovery
     discover_from/1,
-    refresh_peers/0
+    discover_from_dns/1,
+    refresh_peers/0,
+    %% Peer tagging
+    tag_peer/2,
+    untag_peer/2,
+    list_tags/0,
+    %% Federation helpers
+    resolve_member/1,
+    resolve_peers_with_db/1
 ]).
 
 %% gen_server callbacks
@@ -64,11 +77,20 @@
     version => binary(),
     databases => [binary()],
     federations => [binary()],
+    tags => [binary()],
     last_seen => integer(),
     status => active | unreachable
 }.
 
--export_type([peer_info/0]).
+%% Federation member reference types
+-type member_ref() :: binary()                      % Direct URL or local db name
+                    | {peer, binary()}              % {peer, NodeId} - any db on peer
+                    | {peer, binary(), binary()}    % {peer, NodeId, DbName}
+                    | {tag, binary()}               % All peers with tag
+                    | {tag, binary(), binary()}     % Peers with tag + specific db
+                    | {all_peers, binary()}.        % All peers with specific db
+
+-export_type([peer_info/0, member_ref/0]).
 
 %%====================================================================
 %% API
@@ -134,6 +156,60 @@ discover_from(SeedUrl) when is_binary(SeedUrl) ->
 refresh_peers() ->
     gen_server:cast(?SERVER, refresh_peers).
 
+%% @doc Add a peer with options
+%% Options:
+%%   - tags: List of tags to assign to this peer
+-spec add_peer(binary(), map()) -> ok | {error, term()}.
+add_peer(Url, Opts) when is_binary(Url), is_map(Opts) ->
+    gen_server:call(?SERVER, {add_peer, Url, Opts}).
+
+%% @doc List peers with optional filter
+%% Filter options:
+%%   - tag: Filter by tag
+%%   - status: Filter by status (active | unreachable)
+%%   - has_db: Filter peers that have a specific database
+-spec list_peers(map()) -> {ok, [peer_info()]}.
+list_peers(Filter) when is_map(Filter) ->
+    gen_server:call(?SERVER, {list_peers, Filter}).
+
+%% @doc Get peer by node ID instead of URL
+-spec get_peer_by_node_id(binary()) -> {ok, peer_info()} | {error, not_found}.
+get_peer_by_node_id(NodeId) when is_binary(NodeId) ->
+    gen_server:call(?SERVER, {get_peer_by_node_id, NodeId}).
+
+%% @doc Discover peers from DNS SRV records
+%% Looks up _barrel._tcp.Domain for SRV records
+%% Example: discover_from_dns(<<"example.com">>) looks up _barrel._tcp.example.com
+-spec discover_from_dns(binary()) -> ok | {error, term()}.
+discover_from_dns(Domain) when is_binary(Domain) ->
+    gen_server:call(?SERVER, {discover_from_dns, Domain}, 30000).
+
+%% @doc Add a tag to a peer
+-spec tag_peer(binary(), binary()) -> ok | {error, not_found}.
+tag_peer(Url, Tag) when is_binary(Url), is_binary(Tag) ->
+    gen_server:call(?SERVER, {tag_peer, Url, Tag}).
+
+%% @doc Remove a tag from a peer
+-spec untag_peer(binary(), binary()) -> ok | {error, not_found}.
+untag_peer(Url, Tag) when is_binary(Url), is_binary(Tag) ->
+    gen_server:call(?SERVER, {untag_peer, Url, Tag}).
+
+%% @doc List all tags in use
+-spec list_tags() -> {ok, [binary()]}.
+list_tags() ->
+    gen_server:call(?SERVER, list_tags).
+
+%% @doc Resolve a member reference to a list of URLs
+%% Used by federation to expand references like {peer, NodeId} or {tag, Tag}
+-spec resolve_member(member_ref()) -> {ok, [binary()]} | {error, term()}.
+resolve_member(Ref) ->
+    gen_server:call(?SERVER, {resolve_member, Ref}).
+
+%% @doc Get all peer URLs that have a specific database
+-spec resolve_peers_with_db(binary()) -> {ok, [binary()]}.
+resolve_peers_with_db(DbName) when is_binary(DbName) ->
+    gen_server:call(?SERVER, {resolve_peers_with_db, DbName}).
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -190,6 +266,43 @@ handle_call({get_peer, Url}, _From, State) ->
 
 handle_call({discover_from, SeedUrl}, _From, State) ->
     Result = do_discover_from(SeedUrl),
+    {reply, Result, State};
+
+handle_call({add_peer, Url, Opts}, _From, State) ->
+    Result = do_add_peer(Url, Opts),
+    {reply, Result, State};
+
+handle_call({list_peers, Filter}, _From, State) ->
+    {ok, AllPeers} = do_list_peers(),
+    FilteredPeers = filter_peers(AllPeers, Filter),
+    {reply, {ok, FilteredPeers}, State};
+
+handle_call({get_peer_by_node_id, NodeId}, _From, State) ->
+    Result = do_get_peer_by_node_id(NodeId),
+    {reply, Result, State};
+
+handle_call({discover_from_dns, Domain}, _From, State) ->
+    Result = do_discover_from_dns(Domain),
+    {reply, Result, State};
+
+handle_call({tag_peer, Url, Tag}, _From, State) ->
+    Result = do_tag_peer(Url, Tag),
+    {reply, Result, State};
+
+handle_call({untag_peer, Url, Tag}, _From, State) ->
+    Result = do_untag_peer(Url, Tag),
+    {reply, Result, State};
+
+handle_call(list_tags, _From, State) ->
+    Result = do_list_tags(),
+    {reply, Result, State};
+
+handle_call({resolve_member, Ref}, _From, State) ->
+    Result = do_resolve_member(Ref),
+    {reply, Result, State};
+
+handle_call({resolve_peers_with_db, DbName}, _From, State) ->
+    Result = do_resolve_peers_with_db(DbName),
     {reply, Result, State};
 
 handle_call(_Request, _From, State) ->
@@ -434,3 +547,171 @@ peer_doc_id(Url) ->
     HashHex = binary:encode_hex(Hash),
     ShortHash = binary:part(HashHex, 0, 16),
     <<"peer:", ShortHash/binary>>.
+
+%% @private Add peer with options (tags)
+do_add_peer(Url, Opts) ->
+    case barrel_federation:validate_remote_url(Url) of
+        ok ->
+            Tags = maps:get(tags, Opts, []),
+            PeerInfo = case fetch_peer_info(Url) of
+                {ok, Info} ->
+                    Info#{
+                        url => Url,
+                        tags => Tags,
+                        last_seen => erlang:system_time(millisecond),
+                        status => active
+                    };
+                {error, _} ->
+                    #{
+                        url => Url,
+                        tags => Tags,
+                        last_seen => erlang:system_time(millisecond),
+                        status => unreachable
+                    }
+            end,
+            DocId = peer_doc_id(Url),
+            barrel_docdb:put_system_doc(DocId, PeerInfo);
+        {error, _} = Err ->
+            Err
+    end.
+
+%% @private Filter peers by criteria
+filter_peers(Peers, Filter) ->
+    lists:filter(fun(Peer) -> matches_filter(Peer, Filter) end, Peers).
+
+matches_filter(Peer, Filter) ->
+    TagMatch = case maps:get(tag, Filter, undefined) of
+        undefined -> true;
+        Tag -> lists:member(Tag, maps:get(tags, Peer, []))
+    end,
+    StatusMatch = case maps:get(status, Filter, undefined) of
+        undefined -> true;
+        Status -> maps:get(status, Peer, active) =:= Status
+    end,
+    DbMatch = case maps:get(has_db, Filter, undefined) of
+        undefined -> true;
+        DbName -> lists:member(DbName, maps:get(databases, Peer, []))
+    end,
+    TagMatch andalso StatusMatch andalso DbMatch.
+
+%% @private Get peer by node ID
+do_get_peer_by_node_id(NodeId) ->
+    {ok, Peers} = do_list_peers(),
+    case lists:filter(
+        fun(P) -> maps:get(node_id, P, undefined) =:= NodeId end,
+        Peers
+    ) of
+        [Peer | _] -> {ok, Peer};
+        [] -> {error, not_found}
+    end.
+
+%% @private Discover peers from DNS SRV records
+do_discover_from_dns(Domain) ->
+    SrvName = "_barrel._tcp." ++ binary_to_list(Domain),
+    case inet_res:lookup(SrvName, in, srv) of
+        [] ->
+            {error, {no_srv_records, Domain}};
+        Records ->
+            %% SRV record format: {Priority, Weight, Port, Host}
+            lists:foreach(fun({_Priority, _Weight, Port, Host}) ->
+                Url = iolist_to_binary([
+                    <<"http://">>,
+                    list_to_binary(Host),
+                    <<":">>,
+                    integer_to_binary(Port)
+                ]),
+                do_add_peer(Url)
+            end, Records),
+            ok
+    end.
+
+%% @private Add tag to peer
+do_tag_peer(Url, Tag) ->
+    DocId = peer_doc_id(Url),
+    case barrel_docdb:get_system_doc(DocId) of
+        {ok, PeerInfo} ->
+            ExistingTags = maps:get(tags, PeerInfo, []),
+            NewTags = case lists:member(Tag, ExistingTags) of
+                true -> ExistingTags;
+                false -> [Tag | ExistingTags]
+            end,
+            barrel_docdb:put_system_doc(DocId, PeerInfo#{tags => NewTags});
+        {error, not_found} ->
+            {error, not_found}
+    end.
+
+%% @private Remove tag from peer
+do_untag_peer(Url, Tag) ->
+    DocId = peer_doc_id(Url),
+    case barrel_docdb:get_system_doc(DocId) of
+        {ok, PeerInfo} ->
+            ExistingTags = maps:get(tags, PeerInfo, []),
+            NewTags = lists:delete(Tag, ExistingTags),
+            barrel_docdb:put_system_doc(DocId, PeerInfo#{tags => NewTags});
+        {error, not_found} ->
+            {error, not_found}
+    end.
+
+%% @private List all tags
+do_list_tags() ->
+    {ok, Peers} = do_list_peers(),
+    AllTags = lists:foldl(
+        fun(Peer, Acc) ->
+            Tags = maps:get(tags, Peer, []),
+            lists:umerge(lists:sort(Tags), Acc)
+        end,
+        [],
+        Peers
+    ),
+    {ok, AllTags}.
+
+%% @private Resolve member reference to list of URLs
+%% Returns URLs for federation to query
+do_resolve_member(Ref) when is_binary(Ref) ->
+    %% Direct URL or local db name - return as-is
+    {ok, [Ref]};
+
+do_resolve_member({peer, NodeId}) ->
+    %% Find peer by node ID, return its URL
+    case do_get_peer_by_node_id(NodeId) of
+        {ok, #{url := Url}} -> {ok, [Url]};
+        {error, not_found} -> {error, {peer_not_found, NodeId}}
+    end;
+
+do_resolve_member({peer, NodeId, DbName}) ->
+    %% Peer + specific database
+    case do_get_peer_by_node_id(NodeId) of
+        {ok, #{url := Url}} ->
+            DbUrl = <<Url/binary, "/db/", DbName/binary>>,
+            {ok, [DbUrl]};
+        {error, not_found} ->
+            {error, {peer_not_found, NodeId}}
+    end;
+
+do_resolve_member({tag, Tag}) ->
+    %% All peers with this tag (regardless of status - federation handles failures)
+    {ok, AllPeers} = do_list_peers(),
+    Peers = filter_peers(AllPeers, #{tag => Tag}),
+    Urls = [maps:get(url, P) || P <- Peers],
+    {ok, Urls};
+
+do_resolve_member({tag, Tag, DbName}) ->
+    %% Peers with tag + specific database
+    {ok, AllPeers} = do_list_peers(),
+    Peers = filter_peers(AllPeers, #{tag => Tag, has_db => DbName}),
+    Urls = [<<(maps:get(url, P))/binary, "/db/", DbName/binary>> || P <- Peers],
+    {ok, Urls};
+
+do_resolve_member({all_peers, DbName}) ->
+    %% All peers that have this database
+    {ok, AllPeers} = do_list_peers(),
+    Peers = filter_peers(AllPeers, #{has_db => DbName}),
+    Urls = [<<(maps:get(url, P))/binary, "/db/", DbName/binary>> || P <- Peers],
+    {ok, Urls}.
+
+%% @private Get all peer URLs that have a specific database
+do_resolve_peers_with_db(DbName) ->
+    {ok, AllPeers} = do_list_peers(),
+    Peers = filter_peers(AllPeers, #{status => active, has_db => DbName}),
+    Urls = [<<(maps:get(url, P))/binary, "/db/", DbName/binary>> || P <- Peers],
+    {ok, Urls}.

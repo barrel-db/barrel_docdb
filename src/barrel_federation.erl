@@ -13,6 +13,14 @@
 %%%     <<"archive_users_db">>
 %%% ]).
 %%%
+%%% %% Create a federation using discovery references
+%%% ok = barrel_federation:create(<<"distributed_users">>, [
+%%%     <<"local_users">>,                          % Local database
+%%%     <<"http://node2:8080">>,                    % Remote node
+%%%     {tag, <<"region-us">>},                     % All peers tagged "region-us"
+%%%     {all_peers, <<"users_db">>}                 % All peers with "users_db"
+%%% ]).
+%%%
 %%% %% Query across all federation members
 %%% {ok, Results, Meta} = barrel_federation:find(<<"all_users">>, #{
 %%%     where => [{path, [<<"type">>], <<"user">>}]
@@ -21,6 +29,14 @@
 %%% %% Delete federation
 %%% ok = barrel_federation:delete(<<"all_users">>).
 %%% '''
+%%%
+%%% Member types supported:
+%%% - Binary: Local database name or remote URL
+%%% - {peer, NodeId}: Peer identified by node ID from discovery
+%%% - {peer, NodeId, DbName}: Specific database on a peer
+%%% - {tag, TagName}: All discovered peers with this tag
+%%% - {tag, TagName, DbName}: Peers with tag + specific database
+%%% - {all_peers, DbName}: All discovered peers that have this database
 %%%
 %%% Results are merged by document ID. When the same document exists
 %%% in multiple databases, the version with the highest revision wins.
@@ -55,7 +71,12 @@
 %%====================================================================
 
 -type federation_name() :: binary().
--type member() :: binary().  % Local database name (remote URLs future)
+-type member() :: binary()                      % Local database name or remote URL
+                | {peer, binary()}              % {peer, NodeId}
+                | {peer, binary(), binary()}    % {peer, NodeId, DbName}
+                | {tag, binary()}               % {tag, TagName}
+                | {tag, binary(), binary()}     % {tag, TagName, DbName}
+                | {all_peers, binary()}.        % {all_peers, DbName}
 
 -type federation() :: #{
     name := federation_name(),
@@ -205,15 +226,18 @@ find(FederationName, QuerySpec, Opts) ->
             Timeout = maps:get(timeout, Opts, 30000),
             MergeStrategy = maps:get(merge_strategy, Opts, newest),
 
+            %% Resolve member references (expand {peer, X}, {tag, Y}, etc.)
+            ResolvedMembers = resolve_members(Members),
+
             %% Execute queries in parallel
-            Results = parallel_query(Members, QuerySpec, Timeout),
+            Results = parallel_query(ResolvedMembers, QuerySpec, Timeout),
 
             %% Merge results
             {MergedDocs, SourceCounts} = merge_results(Results, MergeStrategy),
 
             Meta = #{
                 federation => FederationName,
-                members_queried => length(Members),
+                members_queried => length(ResolvedMembers),
                 source_counts => SourceCounts,
                 total_results => length(MergedDocs)
             },
@@ -235,6 +259,7 @@ federation_doc_id(Name) ->
 %% Members can be:
 %%   - Local database name: <<"mydb">>
 %%   - Remote HTTP URL: <<"http://host:port/db/mydb">>
+%%   - Discovery reference: {peer, NodeId}, {tag, Tag}, etc.
 validate_members([]) ->
     ok;
 validate_members([Member | Rest]) when is_binary(Member) ->
@@ -254,8 +279,46 @@ validate_members([Member | Rest]) when is_binary(Member) ->
                     {error, {member_not_found, Member}}
             end
     end;
+%% Discovery references are validated at query time (dynamic resolution)
+validate_members([{peer, NodeId} | Rest]) when is_binary(NodeId) ->
+    validate_members(Rest);
+validate_members([{peer, NodeId, DbName} | Rest])
+  when is_binary(NodeId), is_binary(DbName) ->
+    validate_members(Rest);
+validate_members([{tag, Tag} | Rest]) when is_binary(Tag) ->
+    validate_members(Rest);
+validate_members([{tag, Tag, DbName} | Rest])
+  when is_binary(Tag), is_binary(DbName) ->
+    validate_members(Rest);
+validate_members([{all_peers, DbName} | Rest]) when is_binary(DbName) ->
+    validate_members(Rest);
 validate_members([Invalid | _]) ->
     {error, {invalid_member, Invalid}}.
+
+%% @private Resolve all member references to concrete URLs/db names
+%% Called at query time to expand dynamic references
+resolve_members(Members) ->
+    lists:flatmap(fun resolve_member/1, Members).
+
+resolve_member(Member) when is_binary(Member) ->
+    %% Direct URL or local db name - return as-is
+    [Member];
+resolve_member({peer, _} = Ref) ->
+    resolve_via_discovery(Ref);
+resolve_member({peer, _, _} = Ref) ->
+    resolve_via_discovery(Ref);
+resolve_member({tag, _} = Ref) ->
+    resolve_via_discovery(Ref);
+resolve_member({tag, _, _} = Ref) ->
+    resolve_via_discovery(Ref);
+resolve_member({all_peers, _} = Ref) ->
+    resolve_via_discovery(Ref).
+
+resolve_via_discovery(Ref) ->
+    case barrel_discovery:resolve_member(Ref) of
+        {ok, Urls} -> Urls;
+        {error, _} -> []  % Skip failed resolutions
+    end.
 
 %% @private Check if member is a remote HTTP URL
 is_remote_member(<<"http://", _/binary>>) -> true;
