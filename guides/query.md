@@ -10,12 +10,12 @@ Use `find/2` to query documents by field values:
 
 ```erlang
 %% Find all users
-{ok, Users} = barrel_docdb:find(<<"mydb">>, #{
+{ok, Users, _} = barrel_docdb:find(<<"mydb">>, #{
     where => [{path, [<<"type">>], <<"user">>}]
 }).
 
 %% Find users in a specific organization
-{ok, OrgUsers} = barrel_docdb:find(<<"mydb">>, #{
+{ok, OrgUsers, _} = barrel_docdb:find(<<"mydb">>, #{
     where => [
         {path, [<<"type">>], <<"user">>},
         {path, [<<"org_id">>], <<"org123">>}
@@ -150,7 +150,7 @@ Combine conditions with `and`, `or`, `not`:
 ### Find Active Users Over 18
 
 ```erlang
-{ok, Results} = barrel_docdb:find(<<"mydb">>, #{
+{ok, Results, _} = barrel_docdb:find(<<"mydb">>, #{
     where => [
         {path, [<<"type">>], <<"user">>},
         {path, [<<"active">>], true},
@@ -163,28 +163,31 @@ Combine conditions with `and`, `or`, `not`:
 ### Find Orders by Status with Pagination
 
 ```erlang
-{ok, Page1} = barrel_docdb:find(<<"mydb">>, #{
+{ok, Page1, Meta1} = barrel_docdb:find(<<"mydb">>, #{
     where => [
         {path, [<<"type">>], <<"order">>},
         {in, [<<"status">>], [<<"pending">>, <<"processing">>]}
     ],
     order_by => [<<"created_at">>],
-    limit => 20,
-    offset => 0
+    limit => 20
 }),
 
-%% Next page
-{ok, Page2} = barrel_docdb:find(<<"mydb">>, #{
-    where => [...],
-    limit => 20,
-    offset => 20
-}).
+%% Next page using continuation token
+case maps:get(has_more, Meta1) of
+    true ->
+        Token = maps:get(continuation, Meta1),
+        {ok, Page2, _} = barrel_docdb:find(<<"mydb">>, #{
+            where => [...]
+        }, #{continuation => Token});
+    false ->
+        done
+end.
 ```
 
 ### Complex Filter with Nested Conditions
 
 ```erlang
-{ok, Results} = barrel_docdb:find(<<"mydb">>, #{
+{ok, Results, _} = barrel_docdb:find(<<"mydb">>, #{
     where => [
         {path, [<<"type">>], <<"product">>},
         {'or', [

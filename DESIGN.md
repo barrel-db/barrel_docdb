@@ -427,6 +427,60 @@ Key: <<"replication-checkpoint-{rep_id}">>
 Value: #{<<"history">> => [#{<<"source_last_hlc">> => ...}]}
 ```
 
+### 11. Query Parallelization
+
+Large queries (>100 documents) use parallel CBOR decode + condition matching via `barrel_parallel`:
+
+```
+                    Query Coordinator
+                           │
+        ┌──────────────────┼──────────────────┐
+        │                  │                  │
+     Worker 1          Worker 2           Worker N
+  (DocIds 1-100)    (DocIds 101-200)   (DocIds N*100+)
+        │                  │                  │
+   Decode CBOR        Decode CBOR        Decode CBOR
+   Match Conds        Match Conds        Match Conds
+        │                  │                  │
+        └──────────────────┼──────────────────┘
+                           │
+                    Merge Results
+                   (preserve order)
+```
+
+**Configuration:**
+- 4 workers (PostgreSQL-style conservative default)
+- Threshold: >100 documents triggers parallel execution
+- Worker pool managed by `barrel_parallel` gen_server
+
+**Tradeoffs:**
+
+| Workers | Throughput | Reason |
+|---------|------------|--------|
+| 4 | Best | Optimal for RocksDB |
+| 8 | ~50% slower | RocksDB contention, cache thrashing |
+| 2 | ~30% slower | Underutilizes CPU |
+
+### 12. Chunked Query Execution
+
+Queries return results in chunks with continuation tokens for memory-efficient iteration:
+
+```erlang
+%% First chunk (default 1000 results)
+{ok, Results, #{has_more := true, continuation := Token}} =
+    barrel_docdb:find(Db, Query).
+
+%% Next chunk
+{ok, More, #{has_more := false}} =
+    barrel_docdb:find(Db, Query, #{continuation => Token}).
+```
+
+**Cursor Management:**
+- Cursors stored in ETS with 60-second TTL
+- Each access extends TTL
+- Cursors hold RocksDB snapshots for consistent reads
+- Snapshots released when `has_more => false` or cursor expires
+
 ## Design Decisions
 
 ### Why RocksDB?

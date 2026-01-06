@@ -254,7 +254,7 @@ init([DbName]) ->
     {ok, SubRef} = barrel_docdb:subscribe_query(DbName, Query),
 
     %% Build initial cache
-    {ok, Users} = barrel_docdb:find(DbName, Query),
+    {ok, Users, _} = barrel_docdb:find(DbName, Query),
     Cache = maps:from_list([{maps:get(<<"id">>, U), U} || U <- Users]),
 
     {ok, #{sub => SubRef, cache => Cache}}.

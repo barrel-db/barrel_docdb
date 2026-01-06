@@ -51,8 +51,8 @@ application:ensure_all_started(barrel_docdb).
 %% Update the document (include _rev for optimistic concurrency)
 {ok, _} = barrel_docdb:put_doc(<<"mydb">>, Doc#{<<"name">> => <<"Bob">>}).
 
-%% Query documents
-{ok, Users} = barrel_docdb:find(<<"mydb">>, #{
+%% Query documents (returns results with continuation metadata)
+{ok, Users, _Meta} = barrel_docdb:find(<<"mydb">>, #{
     where => [{path, [<<"type">>], <<"user">>}]
 }).
 
