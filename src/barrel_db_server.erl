@@ -61,8 +61,15 @@
     att_ref :: barrel_att_store:att_ref() | undefined,
     view_sup :: pid() | undefined,
     views :: #{binary() => pid()},  %% ViewId => ViewPid
-    filter_pid :: pid() | undefined  %% Compaction filter handler for this database
+    filter_pid :: pid() | undefined,  %% Compaction filter handler for this database
+    compaction_timer :: reference() | undefined,  %% Timer for periodic compaction checks
+    compaction_interval :: pos_integer(),  %% Interval between checks in ms (default: 1 hour)
+    compaction_size_threshold :: pos_integer()  %% Size threshold in bytes to trigger compaction
 }).
+
+%% Default compaction settings
+-define(DEFAULT_COMPACTION_INTERVAL, 3600000).  %% 1 hour in ms
+-define(DEFAULT_COMPACTION_SIZE_THRESHOLD, 1073741824).  %% 1 GB in bytes
 
 %%====================================================================
 %% API functions
@@ -244,6 +251,16 @@ init([Name, Config]) ->
                     %% and by compaction filter handler for body deletion
                     persistent_term:put({barrel_db, Name}, self()),
                     persistent_term:put({barrel_store, Name}, StoreRef),
+
+                    %% Compaction settings from config (or defaults)
+                    CompactionInterval = maps:get(compaction_interval, Config,
+                                                  ?DEFAULT_COMPACTION_INTERVAL),
+                    CompactionThreshold = maps:get(compaction_size_threshold, Config,
+                                                   ?DEFAULT_COMPACTION_SIZE_THRESHOLD),
+
+                    %% Start periodic compaction check timer
+                    TimerRef = erlang:send_after(CompactionInterval, self(), compaction_check),
+
                     logger:info("Database ~s started at ~s", [Name, DbPath]),
                     {ok, #state{
                         name = Name,
@@ -253,7 +270,10 @@ init([Name, Config]) ->
                         att_ref = AttRef,
                         view_sup = ViewSup,
                         views = Views,
-                        filter_pid = FilterPid
+                        filter_pid = FilterPid,
+                        compaction_timer = TimerRef,
+                        compaction_interval = CompactionInterval,
+                        compaction_size_threshold = CompactionThreshold
                     }};
                 {error, AttReason} ->
                     %% Close document store if attachment store fails
@@ -442,6 +462,15 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 %% @doc Handle other messages
+handle_info(compaction_check, #state{store_ref = StoreRef,
+                                      compaction_interval = Interval,
+                                      compaction_size_threshold = Threshold} = State) ->
+    %% Check database size and trigger compaction if needed
+    NewState = do_check_compaction(StoreRef, Threshold, State),
+    %% Restart timer for next check
+    TimerRef = erlang:send_after(Interval, self(), compaction_check),
+    {noreply, NewState#state{compaction_timer = TimerRef}};
+
 handle_info({'EXIT', Pid, Reason}, #state{views = Views} = State) ->
     %% Check if it's a view process that exited
     case find_view_by_pid(Pid, Views) of
@@ -458,7 +487,13 @@ handle_info(_Info, State) ->
 
 %% @doc Clean up when terminating
 terminate(_Reason, #state{name = Name, store_ref = StoreRef, att_ref = AttRef,
-                          view_sup = ViewSup, filter_pid = FilterPid}) ->
+                          view_sup = ViewSup, filter_pid = FilterPid,
+                          compaction_timer = CompactionTimer}) ->
+    %% Cancel compaction timer
+    case CompactionTimer of
+        undefined -> ok;
+        _ -> erlang:cancel_timer(CompactionTimer)
+    end,
     %% Stop view supervisor (will stop all views)
     case ViewSup of
         undefined -> ok;
@@ -521,6 +556,31 @@ find_view_by_pid(Pid, Views) ->
     ) of
         {found, ViewId} -> {ok, ViewId};
         not_found -> not_found
+    end.
+
+%% @doc Check database size and trigger compaction if threshold exceeded
+%% Called periodically by the compaction_check timer.
+do_check_compaction(StoreRef, Threshold, State) ->
+    #state{name = Name} = State,
+    case barrel_store_rocksdb:get_db_size(StoreRef) of
+        {ok, Size} when Size >= Threshold ->
+            logger:info("Database ~s size ~p bytes exceeds threshold ~p, triggering compaction",
+                        [Name, Size, Threshold]),
+            case barrel_store_rocksdb:compact_default_cf(StoreRef) of
+                ok ->
+                    logger:info("Database ~s compaction completed", [Name]),
+                    State;
+                {error, Reason} ->
+                    logger:warning("Database ~s compaction failed: ~p", [Name, Reason]),
+                    State
+            end;
+        {ok, Size} ->
+            logger:debug("Database ~s size ~p bytes below threshold ~p, skipping compaction",
+                         [Name, Size, Threshold]),
+            State;
+        {error, Reason} ->
+            logger:warning("Failed to get database ~s size: ~p", [Name, Reason]),
+            State
     end.
 
 %%====================================================================

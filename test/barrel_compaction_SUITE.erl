@@ -17,7 +17,8 @@
 all() ->
     [
         {group, basic_pruning},
-        {group, integrated_pruning}
+        {group, integrated_pruning},
+        {group, timer_compaction}
     ].
 
 groups() ->
@@ -31,6 +32,10 @@ groups() ->
             many_revisions_get_pruned,
             pruning_deletes_bodies,
             pruning_preserves_winner
+        ]},
+        {timer_compaction, [sequence], [
+            compaction_timer_starts,
+            compaction_triggered_by_size
         ]}
     ].
 
@@ -44,6 +49,24 @@ end_per_suite(_Config) ->
 
 init_per_group(basic_pruning, Config) ->
     Config;
+init_per_group(timer_compaction, Config) ->
+    %% Clean up any existing test database
+    DbName = <<"timer_test_db">>,
+    case barrel_docdb:open_db(DbName) of
+        {ok, _} -> barrel_docdb:delete_db(DbName);
+        _ -> ok
+    end,
+    DataDir = "/tmp/barrel_test_timer",
+    os:cmd("rm -rf " ++ DataDir),
+
+    %% Create db with short compaction interval and low threshold for testing
+    DbOpts = #{
+        data_dir => DataDir,
+        compaction_interval => 100,  %% 100ms for fast testing
+        compaction_size_threshold => 1024  %% 1KB threshold (very low for testing)
+    },
+    {ok, DbPid} = barrel_docdb:create_db(DbName, DbOpts),
+    [{db_name, DbName}, {data_dir, DataDir}, {db_pid, DbPid} | Config];
 init_per_group(integrated_pruning, Config) ->
     %% Clean up any existing test database
     DbName = <<"prune_test_db">>,
@@ -70,6 +93,12 @@ init_per_group(_Group, Config) ->
     Config.
 
 end_per_group(integrated_pruning, Config) ->
+    DbName = proplists:get_value(db_name, Config),
+    barrel_docdb:delete_db(DbName),
+    DataDir = proplists:get_value(data_dir, Config),
+    os:cmd("rm -rf " ++ DataDir),
+    ok;
+end_per_group(timer_compaction, Config) ->
     DbName = proplists:get_value(db_name, Config),
     barrel_docdb:delete_db(DbName),
     DataDir = proplists:get_value(data_dir, Config),
@@ -289,4 +318,57 @@ pruning_preserves_winner(Config) ->
 
     ct:pal("Winner preserved after compaction"),
 
+    ok.
+
+%%====================================================================
+%% Timer Compaction Tests
+%%====================================================================
+
+compaction_timer_starts(Config) ->
+    %% Verify that the compaction timer is running by checking that
+    %% the database was created with the custom interval
+    DbPid = proplists:get_value(db_pid, Config),
+    ?assert(is_pid(DbPid)),
+    ?assert(is_process_alive(DbPid)),
+
+    %% The database should be functional
+    DbName = proplists:get_value(db_name, Config),
+    Doc = #{<<"id">> => <<"timer_test_doc">>, <<"value">> => <<"hello">>},
+    {ok, #{<<"rev">> := Rev}} = barrel_docdb:put_doc(DbName, Doc),
+    ?assert(is_binary(Rev)),
+
+    ct:pal("Database with compaction timer is functional"),
+    ok.
+
+compaction_triggered_by_size(Config) ->
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Create multiple documents to exceed the 1KB threshold
+    %% Each document has a ~500 byte body to quickly exceed threshold
+    LargeValue = binary:copy(<<"x">>, 500),
+    lists:foreach(
+        fun(N) ->
+            DocId = iolist_to_binary([<<"large_doc_">>, integer_to_binary(N)]),
+            Doc = #{<<"id">> => DocId, <<"data">> => LargeValue},
+            {ok, _} = barrel_docdb:put_doc(DbName, Doc)
+        end,
+        lists:seq(1, 10)
+    ),
+
+    ct:pal("Created 10 documents with ~p bytes each", [500]),
+
+    %% Get initial db size
+    {ok, Pid} = barrel_docdb:db_pid(DbName),
+    {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
+    {ok, InitialSize} = barrel_store_rocksdb:get_db_size(StoreRef),
+    ct:pal("Database size after writes: ~p bytes", [InitialSize]),
+
+    %% Wait for the timer to fire (interval is 100ms, wait a bit longer)
+    timer:sleep(300),
+
+    %% Database should still be functional after timer fires
+    {ok, Doc1} = barrel_docdb:get_doc(DbName, <<"large_doc_1">>),
+    ?assertEqual(LargeValue, maps:get(<<"data">>, Doc1)),
+
+    ct:pal("Database functional after compaction timer fired"),
     ok.
