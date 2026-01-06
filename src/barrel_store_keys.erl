@@ -54,6 +54,9 @@
 -export([value_posting_bucket_key/4, value_posting_bucket_prefix/3, value_posting_bucket_end/3]).
 -export([docid_bucket/1]).
 
+%% Key parsing (for compaction filter)
+-export([parse_key/1]).
+
 %% Value-first index keys (for iterable equality queries with early termination)
 -export([value_index_key/4, value_index_prefix/3, value_index_end/3]).
 
@@ -851,3 +854,36 @@ change_bucket_prefix(DbName) ->
 change_bucket_end(DbName) ->
     <<?PREFIX_CHANGE_BUCKET, (encode_name(DbName))/binary,
       16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF>>.
+
+%%====================================================================
+%% Key Parsing (for compaction filter)
+%%====================================================================
+
+%% @doc Parse a key to determine its type and extract components.
+%% Used by compaction filter to identify doc_entity keys.
+-spec parse_key(binary()) ->
+    {doc_entity, DbName :: binary(), DocId :: binary()} |
+    {doc_body_rev, DbName :: binary(), DocId :: binary(), Rev :: binary()} |
+    other.
+parse_key(<<?PREFIX_DOC_ENTITY, Rest/binary>>) ->
+    case decode_name(Rest) of
+        {ok, DbName, DocId} -> {doc_entity, DbName, DocId};
+        error -> other
+    end;
+parse_key(<<?PREFIX_DOC_BODY, Rest/binary>>) ->
+    case decode_name(Rest) of
+        {ok, DbName, DocIdAndRev} ->
+            case binary:split(DocIdAndRev, <<$:>>) of
+                [DocId, Rev] -> {doc_body_rev, DbName, DocId, Rev};
+                [DocId] -> {doc_body, DbName, DocId}
+            end;
+        error -> other
+    end;
+parse_key(_) ->
+    other.
+
+%% @private Decode length-prefixed name from binary
+decode_name(<<Len:16, Name:Len/binary, Rest/binary>>) ->
+    {ok, Name, Rest};
+decode_name(_) ->
+    error.

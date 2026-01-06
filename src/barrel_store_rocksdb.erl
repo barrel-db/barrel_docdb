@@ -40,10 +40,13 @@
 %% Wide column (entity) operations
 -export([put_entity/3, put_entity/4, get_entity/2, multi_get_entity/2, delete_entity/2]).
 -export([batch_put_entity/3]).
--export([decode_entity/1]).  %% Decode entity binary to column list
+-export([decode_entity/1, encode_entity/1]).  %% Decode/encode entity binary
 
 %% Stats and capacity monitoring
 -export([get_stats/1, get_db_size/1, get_property/2]).
+
+%% Compaction
+-export([compact_default_cf/1]).
 
 %%====================================================================
 %% Types
@@ -89,7 +92,7 @@ open(Path, Options) ->
 
     %% Column family descriptors with their options
     CFDescriptors = [
-        {"default", [{merge_operator, counter_merge_operator}]},
+        {"default", build_default_cf_options(Options)},
         {?BITMAP_CF_NAME, [{merge_operator, {bitset_merge_operator, BitmapSize}}]},
         {?POSTING_CF_NAME, [{merge_operator, posting_list_merge_operator}]},
         {?BODY_CF_NAME, build_body_cf_options(Options)},
@@ -719,6 +722,23 @@ fold_posting_loop_reverse({ok, Key, Value}, Iter, Fun, Acc) ->
 %% Body Column Family Operations (BlobDB enabled)
 %%====================================================================
 
+%% @doc Build column family options for default CF (document entities)
+%% Configures compaction filter for revision tree pruning if handler is provided.
+-spec build_default_cf_options(map()) -> list().
+build_default_cf_options(Options) ->
+    BaseOpts = [{merge_operator, counter_merge_operator}],
+    case maps:get(compaction_filter_handler, Options, undefined) of
+        undefined ->
+            BaseOpts;
+        Pid when is_pid(Pid) ->
+            CompactionFilter = #{
+                handler => Pid,
+                batch_size => maps:get(compaction_filter_batch_size, Options, 100),
+                timeout => maps:get(compaction_filter_timeout, Options, 5000)
+            },
+            [{compaction_filter, CompactionFilter} | BaseOpts]
+    end.
+
 %% @doc Build column family options for document bodies with BlobDB enabled
 %% Bodies are stored as blobs for values larger than min_blob_size (4KB default).
 %% This keeps the LSM tree lean and enables efficient garbage collection.
@@ -760,6 +780,17 @@ body_multi_get(#{ref := Ref, body_cf := BodyCF}, Keys) ->
 -spec body_delete(db_ref(), binary()) -> ok | {error, term()}.
 body_delete(#{ref := Ref, body_cf := BodyCF}, Key) ->
     rocksdb:delete(Ref, BodyCF, Key, []).
+
+%% @doc Trigger compaction on the default column family
+%% This runs the compaction filter which prunes old revisions.
+%% Flushes memtable first, then forces full compaction to ensure filter runs.
+-spec compact_default_cf(db_ref()) -> ok | {error, term()}.
+compact_default_cf(#{ref := Ref, default_cf := DefaultCF}) ->
+    %% Flush to ensure data is in SST files
+    ok = rocksdb:flush(Ref, DefaultCF, []),
+    %% Force compaction to bottommost level to ensure filter processes all data
+    rocksdb:compact_range(Ref, DefaultCF, undefined, undefined,
+                          [{bottommost_level_compaction, force}]).
 
 %%====================================================================
 %% Local Document Column Family Operations

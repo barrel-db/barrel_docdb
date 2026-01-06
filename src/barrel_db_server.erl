@@ -60,7 +60,8 @@
     store_ref :: barrel_store_rocksdb:db_ref() | undefined,
     att_ref :: barrel_att_store:att_ref() | undefined,
     view_sup :: pid() | undefined,
-    views :: #{binary() => pid()}  %% ViewId => ViewPid
+    views :: #{binary() => pid()},  %% ViewId => ViewPid
+    filter_pid :: pid() | undefined  %% Compaction filter handler for this database
 }).
 
 %%====================================================================
@@ -212,9 +213,19 @@ init([Name, Config]) ->
     DataDir = maps:get(data_dir, Config, "/tmp/barrel_data"),
     DbPath = filename:join([DataDir, binary_to_list(Name)]),
 
+    %% Start compaction filter handler BEFORE opening RocksDB
+    %% (handler pid is passed to CF options)
+    PruneDepth = maps:get(prune_depth, Config, 1000),
+    {ok, FilterPid} = barrel_compaction_filter:start_link(#{
+        db_name => Name,
+        prune_depth => PruneDepth
+    }),
+
     %% Open document store (RocksDB with column families including body CF with BlobDB)
     DocStorePath = filename:join(DbPath, "docs"),
-    StoreOpts = maps:get(store_opts, Config, #{}),
+    StoreOpts0 = maps:get(store_opts, Config, #{}),
+    %% Pass the filter handler to the store options
+    StoreOpts = StoreOpts0#{compaction_filter_handler => FilterPid},
     case barrel_store_rocksdb:open(DocStorePath, StoreOpts) of
         {ok, StoreRef} ->
             %% Open attachment store (separate RocksDB with BlobDB)
@@ -230,6 +241,7 @@ init([Name, Config]) ->
 
                     %% Register in persistent_term for lookup
                     %% barrel_store is used by barrel_doc_body_store for body CF access
+                    %% and by compaction filter handler for body deletion
                     persistent_term:put({barrel_db, Name}, self()),
                     persistent_term:put({barrel_store, Name}, StoreRef),
                     logger:info("Database ~s started at ~s", [Name, DbPath]),
@@ -240,14 +252,17 @@ init([Name, Config]) ->
                         store_ref = StoreRef,
                         att_ref = AttRef,
                         view_sup = ViewSup,
-                        views = Views
+                        views = Views,
+                        filter_pid = FilterPid
                     }};
                 {error, AttReason} ->
                     %% Close document store if attachment store fails
                     barrel_store_rocksdb:close(StoreRef),
+                    exit(FilterPid, shutdown),
                     {stop, {att_store_open_failed, AttReason}}
             end;
         {error, Reason} ->
+            exit(FilterPid, shutdown),
             {stop, {store_open_failed, Reason}}
     end.
 
@@ -443,11 +458,16 @@ handle_info(_Info, State) ->
 
 %% @doc Clean up when terminating
 terminate(_Reason, #state{name = Name, store_ref = StoreRef, att_ref = AttRef,
-                          view_sup = ViewSup}) ->
+                          view_sup = ViewSup, filter_pid = FilterPid}) ->
     %% Stop view supervisor (will stop all views)
     case ViewSup of
         undefined -> ok;
         _ -> catch exit(ViewSup, shutdown)
+    end,
+    %% Stop compaction filter handler
+    case FilterPid of
+        undefined -> ok;
+        _ -> catch exit(FilterPid, shutdown)
     end,
     %% Close attachment store
     case AttRef of
@@ -1422,7 +1442,7 @@ do_resolve_conflict(StoreRef, DbName, DocId, BaseRev, Resolution) ->
     end.
 
 %% Apply the resolution to the document
-do_apply_resolution(StoreRef, _DbName, DocId, DocEntityKey, Columns,
+do_apply_resolution(StoreRef, DbName, DocId, DocEntityKey, Columns,
                     RevTree, Winner, Conflicts, {choose, ChosenRev}) ->
     %% Verify chosen rev is either the winner or one of the conflicts
     AllLeaves = [Winner | Conflicts],
@@ -1442,14 +1462,20 @@ do_apply_resolution(StoreRef, _DbName, DocId, DocEntityKey, Columns,
                 RevTree,
                 RevsToDelete
             ),
+            %% Delete bodies of resolved conflicting revisions
+            DeleteOps = [
+                {body_delete, barrel_store_keys:doc_body_rev(DbName, DocId, Rev)}
+                || Rev <- RevsToDelete
+            ],
             %% If chosen rev is not the current winner, we need to create a new
             %% revision as child of chosen (to make it the deterministic winner)
             case ChosenRev =:= Winner of
                 true ->
-                    %% Just update the revtree
+                    %% Just update the revtree + delete loser bodies
                     UpdatedColumns = lists:keyreplace(?COL_REVTREE, 1, Columns,
                                                       {?COL_REVTREE, encode_revtree(NewRevTree0)}),
-                    case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, DocEntityKey, UpdatedColumns}]) of
+                    AllOps = [{entity_put, DocEntityKey, UpdatedColumns} | DeleteOps],
+                    case barrel_store_rocksdb:write_batch(StoreRef, AllOps) of
                         ok ->
                             {ok, #{id => DocId, rev => Winner, conflicts_resolved => length(RevsToDelete)}};
                         {error, _} = Err ->
@@ -1476,7 +1502,8 @@ do_apply_resolution(StoreRef, _DbName, DocId, DocEntityKey, Columns,
                                                       {?COL_REVTREE, encode_revtree(NewRevTree)}),
                     UpdatedColumns2 = lists:keyreplace(?COL_REV, 1, UpdatedColumns,
                                                        {?COL_REV, NewRev}),
-                    case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, DocEntityKey, UpdatedColumns2}]) of
+                    AllOps = [{entity_put, DocEntityKey, UpdatedColumns2} | DeleteOps],
+                    case barrel_store_rocksdb:write_batch(StoreRef, AllOps) of
                         ok ->
                             {ok, #{id => DocId, rev => NewRev, conflicts_resolved => length(RevsToDelete)}};
                         {error, _} = Err ->
@@ -1543,12 +1570,18 @@ do_apply_resolution(StoreRef, DbName, DocId, DocEntityKey, Columns,
     CborBin = barrel_docdb_codec_cbor:encode(DocWithoutMeta),
     BodyKey = barrel_store_keys:doc_body(DbName, DocId),
 
+    %% Delete bodies of resolved conflict revisions
+    DeleteOps = [
+        {body_delete, barrel_store_keys:doc_body_rev(DbName, DocId, Rev)}
+        || Rev <- Conflicts
+    ],
+
     %% Build batch operations
     EntityOp = {entity_put, DocEntityKey, NewColumns},
     BodyOp = {body_put, BodyKey, CborBin},
 
-    %% Write batch
-    case barrel_store_rocksdb:write_batch(StoreRef, [EntityOp, BodyOp]) of
+    %% Write batch (entity + new body + delete conflict bodies)
+    case barrel_store_rocksdb:write_batch(StoreRef, [EntityOp, BodyOp | DeleteOps]) of
         ok ->
             {ok, #{id => DocId, rev => NewRev, conflicts_resolved => length(Conflicts)}};
         {error, _} = Err ->
