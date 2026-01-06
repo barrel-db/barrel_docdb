@@ -142,7 +142,18 @@ init([]) ->
         modules => [barrel_http_api_keys]
     },
 
-    %% Cache must start first, then HLC, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, ApiKeys
-    ChildSpecs = [Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, ApiKeys],
+    %% Discovery service for peer-to-peer federation
+    %% Provides node info endpoint (/.well-known/barrel) and peer gossip
+    Discovery = #{
+        id => barrel_discovery,
+        start => {barrel_discovery, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [barrel_discovery]
+    },
+
+    %% Cache must start first, then HLC, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, ApiKeys, Discovery
+    ChildSpecs = [Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, ApiKeys, Discovery],
 
     {ok, {SupFlags, ChildSpecs}}.

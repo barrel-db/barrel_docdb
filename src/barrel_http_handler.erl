@@ -55,6 +55,9 @@ init(Req0, State) ->
 maybe_authenticate(health, _Req) ->
     %% Health check is always public
     ok;
+maybe_authenticate(node_info, _Req) ->
+    %% Node info is public (for discovery)
+    ok;
 maybe_authenticate(Action, Req) when Action =:= keys; Action =:= key ->
     %% Key management requires admin authentication
     authenticate_admin(Req);
@@ -137,6 +140,103 @@ extract_bearer_token(Req) ->
 handle_action(health, <<"GET">>, Req) ->
     Body = encode_response(#{<<"status">> => <<"ok">>}, Req),
     {200, response_headers(Req), Body, Req};
+
+%% Node info (discovery endpoint)
+handle_action(node_info, <<"GET">>, Req) ->
+    case barrel_discovery:node_info() of
+        {ok, Info} ->
+            Body = encode_response(Info, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end;
+
+%% Peer management: list all peers
+handle_action(peers, <<"GET">>, Req) ->
+    {ok, Peers} = barrel_discovery:list_peers(),
+    Body = encode_response(#{<<"peers">> => Peers}, Req),
+    {200, response_headers(Req), Body, Req};
+
+%% Peer management: add peer
+handle_action(peers, <<"POST">>, Req) ->
+    handle_add_peer(Req);
+
+%% Peer management: get/delete peer
+handle_action(peer, <<"GET">>, Req) ->
+    PeerUrlEncoded = cowboy_req:binding(peer_url, Req),
+    PeerUrl = uri_string:unquote(PeerUrlEncoded),
+    case barrel_discovery:get_peer(PeerUrl) of
+        {ok, PeerInfo} ->
+            Body = encode_response(PeerInfo, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Peer not found">>})
+    end;
+
+handle_action(peer, <<"DELETE">>, Req) ->
+    PeerUrlEncoded = cowboy_req:binding(peer_url, Req),
+    PeerUrl = uri_string:unquote(PeerUrlEncoded),
+    ok = barrel_discovery:remove_peer(PeerUrl),
+    Body = encode_response(#{<<"ok">> => true}, Req),
+    {200, response_headers(Req), Body, Req};
+
+%% Federation: list all
+handle_action(federations, <<"GET">>, Req) ->
+    {ok, Feds} = barrel_federation:list(),
+    Body = encode_response(#{<<"federations">> => Feds}, Req),
+    {200, response_headers(Req), Body, Req};
+
+%% Federation: create
+handle_action(federations, <<"POST">>, Req) ->
+    handle_create_federation(Req);
+
+%% Federation: get/delete
+handle_action(federation, <<"GET">>, Req) ->
+    Name = cowboy_req:binding(name, Req),
+    case barrel_federation:get(Name) of
+        {ok, Fed} ->
+            Body = encode_response(Fed, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Federation not found">>})
+    end;
+handle_action(federation, <<"DELETE">>, Req) ->
+    Name = cowboy_req:binding(name, Req),
+    case barrel_federation:delete(Name) of
+        ok ->
+            Body = encode_response(#{<<"ok">> => true}, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Federation not found">>})
+    end;
+
+%% Federation: add/remove member
+handle_action(federation_member, <<"PUT">>, Req) ->
+    Name = cowboy_req:binding(name, Req),
+    Member = cowboy_req:binding(member, Req),
+    case barrel_federation:add_member(Name, Member) of
+        ok ->
+            Body = encode_response(#{<<"ok">> => true}, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Federation not found">>});
+        {error, {member_not_found, _}} ->
+            throw({error, 400, <<"Member database not found">>})
+    end;
+handle_action(federation_member, <<"DELETE">>, Req) ->
+    Name = cowboy_req:binding(name, Req),
+    Member = cowboy_req:binding(member, Req),
+    case barrel_federation:remove_member(Name, Member) of
+        ok ->
+            Body = encode_response(#{<<"ok">> => true}, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Federation not found">>})
+    end;
+
+%% Federation: query
+handle_action(federation_find, <<"POST">>, Req) ->
+    handle_federation_find(Req);
 
 %% Database info
 handle_action(db_info, <<"GET">>, Req) ->
@@ -443,6 +543,93 @@ handle_bulk_docs(Req0) ->
     ),
     Body = encode_response(Results, Req1),
     {201, response_headers(Req1), Body, Req1}.
+
+%%====================================================================
+%% Peer Discovery Handlers
+%%====================================================================
+
+handle_add_peer(Req0) ->
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    Spec = decode_request_body(ReqBody, Req1),
+    Url = maps:get(<<"url">>, Spec),
+    case barrel_discovery:add_peer(Url) of
+        ok ->
+            Response = #{<<"ok">> => true, <<"url">> => Url},
+            Body = encode_response(Response, Req1),
+            {201, response_headers(Req1), Body, Req1};
+        {error, {invalid_remote_url, _}} ->
+            throw({error, 400, <<"Invalid peer URL">>});
+        {error, Reason} ->
+            throw({error, 400, format_error(Reason)})
+    end.
+
+%%====================================================================
+%% Federation Handlers
+%%====================================================================
+
+handle_create_federation(Req0) ->
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    Spec = decode_request_body(ReqBody, Req1),
+    Name = maps:get(<<"name">>, Spec),
+    Members = maps:get(<<"members">>, Spec, []),
+    Options = maps:get(<<"options">>, Spec, #{}),
+    case barrel_federation:create(Name, Members, Options) of
+        ok ->
+            Response = #{<<"ok">> => true, <<"name">> => Name},
+            Body = encode_response(Response, Req1),
+            {201, response_headers(Req1), Body, Req1};
+        {error, {member_not_found, Member}} ->
+            throw({error, 400, <<"Member not found: ", Member/binary>>});
+        {error, Reason} ->
+            throw({error, 400, format_error(Reason)})
+    end.
+
+handle_federation_find(Req0) ->
+    Name = cowboy_req:binding(name, Req0),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    QuerySpec0 = decode_request_body(ReqBody, Req1),
+    QuerySpec = convert_query_spec(QuerySpec0),
+    Opts = maps:get(<<"options">>, QuerySpec0, #{}),
+    case barrel_federation:find(Name, QuerySpec, Opts) of
+        {ok, Results, Meta} ->
+            FormattedMeta = format_federation_meta(Meta),
+            case response_content_type(Req1) of
+                ?CT_CBOR ->
+                    ConvertedResults = [doc_to_map(Doc) || Doc <- Results],
+                    Response = #{
+                        <<"results">> => ConvertedResults,
+                        <<"meta">> => FormattedMeta
+                    },
+                    Body = barrel_docdb_codec_cbor:encode_cbor(Response),
+                    {200, response_headers(Req1), Body, Req1};
+                ?CT_JSON ->
+                    JsonDocsStr = iolist_to_binary([
+                        <<"[">>,
+                        lists:join(<<",">>, [doc_to_json(Doc) || Doc <- Results]),
+                        <<"]">>
+                    ]),
+                    JsonMetaStr = iolist_to_binary(json:encode(FormattedMeta)),
+                    Body = iolist_to_binary([
+                        <<"{\"results\":">>, JsonDocsStr,
+                        <<",\"meta\":">>, JsonMetaStr,
+                        <<"}">>
+                    ]),
+                    {200, response_headers(Req1), Body, Req1}
+            end;
+        {error, {federation_not_found, _}} ->
+            throw({error, 404, <<"Federation not found">>});
+        {error, Reason} ->
+            throw({error, 400, format_error(Reason)})
+    end.
+
+%% Format federation query metadata for JSON/CBOR
+format_federation_meta(Meta) ->
+    #{
+        <<"federation">> => maps:get(federation, Meta),
+        <<"members_queried">> => maps:get(members_queried, Meta),
+        <<"source_counts">> => maps:get(source_counts, Meta),
+        <<"total_results">> => maps:get(total_results, Meta)
+    }.
 
 %%====================================================================
 %% Query Handler

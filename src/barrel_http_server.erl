@@ -68,9 +68,22 @@ init(Opts) ->
             %% Health endpoint
             {"/health", barrel_http_handler, #{action => health}},
 
+            %% Discovery endpoint (Mastodon-like node info)
+            {"/.well-known/barrel", barrel_http_handler, #{action => node_info}},
+
+            %% Peer management
+            {"/_peers", barrel_http_handler, #{action => peers}},
+            {"/_peers/:peer_url", barrel_http_handler, #{action => peer}},
+
             %% API key management (admin only)
             {"/keys", barrel_http_handler, #{action => keys}},
             {"/keys/:key_prefix", barrel_http_handler, #{action => key}},
+
+            %% Federation endpoints
+            {"/_federation", barrel_http_handler, #{action => federations}},
+            {"/_federation/:name", barrel_http_handler, #{action => federation}},
+            {"/_federation/:name/members/:member", barrel_http_handler, #{action => federation_member}},
+            {"/_federation/:name/_find", barrel_http_handler, #{action => federation_find}},
 
             %% Database operations
             {"/db/:db", barrel_http_handler, #{action => db_info}},

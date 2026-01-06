@@ -38,7 +38,8 @@
 -export([
     put_local_doc/3,
     get_local_doc/2,
-    delete_local_doc/2
+    delete_local_doc/2,
+    fold_local_docs/4
 ]).
 
 %% View API
@@ -183,6 +184,12 @@ get_local_doc(Pid, DocId) ->
 -spec delete_local_doc(pid(), binary()) -> ok | {error, not_found}.
 delete_local_doc(Pid, DocId) ->
     gen_server:call(Pid, {delete_local_doc, DocId}).
+
+%% @doc Fold over local documents with a given prefix
+-spec fold_local_docs(pid(), binary(), fun((binary(), map(), term()) -> term()), term()) ->
+    {ok, term()} | {error, term()}.
+fold_local_docs(Pid, Prefix, Fun, Acc) ->
+    gen_server:call(Pid, {fold_local_docs, Prefix, Fun, Acc}).
 
 %%====================================================================
 %% View API functions
@@ -369,6 +376,11 @@ handle_call({get_local_doc, DocId}, _From,
 handle_call({delete_local_doc, DocId}, _From,
             #state{name = DbName, store_ref = StoreRef} = State) ->
     Result = do_delete_local_doc(StoreRef, DbName, DocId),
+    {reply, Result, State};
+
+handle_call({fold_local_docs, Prefix, Fun, Acc}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_fold_local_docs(StoreRef, DbName, Prefix, Fun, Acc),
     {reply, Result, State};
 
 %% View operations
@@ -1349,6 +1361,26 @@ do_delete_local_doc(StoreRef, DbName, DocId) ->
         not_found ->
             {error, not_found}
     end.
+
+%% @doc Fold over local documents matching a prefix
+%% The prefix is applied to the DocId portion (after DbName).
+do_fold_local_docs(StoreRef, DbName, DocIdPrefix, Fun, Acc0) ->
+    %% Build full key prefix: DbName + 0 + DocIdPrefix
+    KeyPrefix = barrel_store_keys:local_doc_key(DbName, DocIdPrefix),
+    %% Fold over matching keys, decode values, extract DocId
+    DbNameLen = byte_size(DbName),
+    Result = barrel_store_rocksdb:local_fold(
+        StoreRef,
+        KeyPrefix,
+        fun(Key, Value, Acc) ->
+            %% Extract DocId from key (skip DbName + 0)
+            <<_:DbNameLen/binary, 0, DocId/binary>> = Key,
+            Doc = binary_to_term(Value),
+            Fun(DocId, Doc, Acc)
+        end,
+        Acc0
+    ),
+    {ok, Result}.
 
 %%====================================================================
 %% Subscription Notifications

@@ -134,6 +134,7 @@
     put_system_doc/2,
     get_system_doc/1,
     delete_system_doc/1,
+    fold_system_docs/3,
     ensure_system_db/0
 ]).
 
@@ -1324,6 +1325,32 @@ get_system_doc(DocId) ->
 delete_system_doc(DocId) ->
     ensure_system_db(),
     delete_local_doc(?SYSTEM_DB, DocId).
+
+%% @doc Fold over system documents with a given prefix.
+%%
+%% == Example ==
+%% ```
+%% {ok, Federations} = barrel_docdb:fold_system_docs(
+%%     <<"federation:">>,
+%%     fun(_DocId, Doc, Acc) -> [Doc | Acc] end,
+%%     []
+%% ).
+%% '''
+%%
+%% @param Prefix Document ID prefix to filter by
+%% @param Fun Callback function(DocId, Doc, Acc) -> NewAcc
+%% @param Acc0 Initial accumulator
+%% @returns `{ok, FinalAcc}'
+-spec fold_system_docs(binary(), fun((binary(), map(), term()) -> term()), term()) ->
+    {ok, term()}.
+fold_system_docs(Prefix, Fun, Acc0) ->
+    ensure_system_db(),
+    case db_pid(?SYSTEM_DB) of
+        {ok, Pid} ->
+            barrel_db_server:fold_local_docs(Pid, Prefix, Fun, Acc0);
+        {error, not_found} ->
+            {ok, Acc0}
+    end.
 
 %%====================================================================
 %% HLC (Hybrid Logical Clock)
