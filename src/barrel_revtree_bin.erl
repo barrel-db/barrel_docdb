@@ -355,9 +355,10 @@ decode_winner_leaves(Bin) ->
     HasChild0 = bitset_new(N),
     GenA0 = array:new([{default,0}]),
     RevA0 = array:new(),
+    DelA0 = array:new([{default,false}]),
 
-    {HasChild, GenA, RevA, _RestEnd} =
-        scan_nodes_for_winner_leaves(N, Rest, 0, HasChild0, GenA0, RevA0),
+    {HasChild, GenA, RevA, DelA, _RestEnd} =
+        scan_nodes_for_winner_leaves(N, Rest, 0, HasChild0, GenA0, RevA0, DelA0),
 
     Leaves = lists:foldl(
       fun(I, Acc) ->
@@ -369,15 +370,30 @@ decode_winner_leaves(Bin) ->
 
     Winner = pick_winner_from_arrays(HasChild, GenA, RevA, N),
 
-    Conflicts = [R || R <- Leaves, R =/= Winner],
+    %% Conflicts are non-deleted leaves excluding the winner
+    Conflicts = lists:foldl(
+      fun(I, Acc) ->
+          case bitset_get(HasChild, I) of
+              true -> Acc;
+              false ->
+                  R = array:get(I, RevA),
+                  Del = array:get(I, DelA),
+                  case {R =:= Winner, Del} of
+                      {true, _} -> Acc;      % winner, skip
+                      {_, true} -> Acc;      % deleted, skip
+                      _ -> [R | Acc]
+                  end
+          end
+      end, [], lists:seq(0, N-1)),
 
     #{winner => Winner, leaves => Leaves, conflicts => Conflicts}.
 
-scan_nodes_for_winner_leaves(0, Bin, _I, HasChild, GenA, RevA) ->
-    {HasChild, GenA, RevA, Bin};
-scan_nodes_for_winner_leaves(N, Bin, I, HasChild0, GenA0, RevA0) ->
+scan_nodes_for_winner_leaves(0, Bin, _I, HasChild, GenA, RevA, DelA) ->
+    {HasChild, GenA, RevA, DelA, Bin};
+scan_nodes_for_winner_leaves(N, Bin, I, HasChild0, GenA0, RevA0, DelA0) ->
     <<Flags:8, Rest0/binary>> = Bin,
     Root = (Flags band 1) =/= 0,
+    Deleted = (Flags band 2) =/= 0,
 
     {HasChild1, Rest1} =
         case Root of
@@ -394,8 +410,9 @@ scan_nodes_for_winner_leaves(N, Bin, I, HasChild0, GenA0, RevA0) ->
 
     GenA1 = array:set(I, Gen, GenA0),
     RevA1 = array:set(I, RevId, RevA0),
+    DelA1 = array:set(I, Deleted, DelA0),
 
-    scan_nodes_for_winner_leaves(N-1, Rest4, I+1, HasChild1, GenA1, RevA1).
+    scan_nodes_for_winner_leaves(N-1, Rest4, I+1, HasChild1, GenA1, RevA1, DelA1).
 
 pick_winner_from_arrays(HasChild, GenA, RevA, N) ->
     {BestId, _BestGen, _BestRev} =

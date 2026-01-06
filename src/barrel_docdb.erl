@@ -79,7 +79,9 @@
     get_docs/3,
     delete_doc/2,
     delete_doc/3,
-    fold_docs/3
+    fold_docs/3,
+    get_conflicts/2,
+    resolve_conflict/4
 ]).
 
 %% Attachments
@@ -641,6 +643,60 @@ delete_doc(Db, DocId, Opts) ->
 fold_docs(Db, Fun, Acc) ->
     with_db(Db, fun(Pid) ->
         barrel_db_server:fold_docs(Pid, Fun, Acc)
+    end).
+
+%% @doc Get list of conflicting revisions for a document.
+%%
+%% Returns the list of revision IDs that are in conflict with the current
+%% winning revision. An empty list means no conflicts.
+%%
+%% == Example ==
+%% ```
+%% {ok, Conflicts} = barrel_docdb:get_conflicts(<<"mydb">>, <<"doc1">>).
+%% %% Conflicts = [<<"2-abc">>, <<"2-def">>]
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param DocId Document ID
+%% @returns `{ok, [RevId]}' or `{error, not_found}'
+-spec get_conflicts(binary() | pid(), binary()) -> {ok, [binary()]} | {error, term()}.
+get_conflicts(Db, DocId) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:get_conflicts(Pid, DocId)
+    end).
+
+%% @doc Resolve a document conflict.
+%%
+%% Allows explicit resolution of conflicting revisions. Two resolution
+%% strategies are supported:
+%%
+%% == Choose Resolution ==
+%% Pick one of the existing revisions as the winner. All other branches
+%% are marked as deleted.
+%% ```
+%% {ok, Result} = barrel_docdb:resolve_conflict(<<"mydb">>, <<"doc1">>,
+%%     <<"2-winner">>, {choose, <<"2-abc">>}).
+%% '''
+%%
+%% == Merge Resolution ==
+%% Provide a new merged document that supersedes all conflicting branches.
+%% ```
+%% MergedDoc = #{<<"name">> => <<"Merged Name">>, <<"value">> => 42},
+%% {ok, Result} = barrel_docdb:resolve_conflict(<<"mydb">>, <<"doc1">>,
+%%     <<"2-winner">>, {merge, MergedDoc}).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param DocId Document ID
+%% @param BaseRev The current winning revision (for optimistic locking)
+%% @param Resolution Either `{choose, RevId}' or `{merge, Doc}'
+%% @returns `{ok, #{id, rev, conflicts_resolved}}' or `{error, Reason}'
+-spec resolve_conflict(binary() | pid(), binary(), binary(),
+                       {choose, binary()} | {merge, map()}) ->
+    {ok, map()} | {error, term()}.
+resolve_conflict(Db, DocId, BaseRev, Resolution) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:resolve_conflict(Pid, DocId, BaseRev, Resolution)
     end).
 
 %%====================================================================

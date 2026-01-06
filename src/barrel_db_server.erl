@@ -23,7 +23,9 @@
     get_doc/3,
     get_docs/3,
     delete_doc/3,
-    fold_docs/3
+    fold_docs/3,
+    resolve_conflict/4,
+    get_conflicts/2
 ]).
 
 %% Replication API
@@ -124,6 +126,21 @@ delete_doc(Pid, DocId, Opts) ->
 -spec fold_docs(pid(), fun(), term()) -> {ok, term()}.
 fold_docs(Pid, Fun, Acc) ->
     gen_server:call(Pid, {fold_docs, Fun, Acc}, infinity).
+
+%% @doc Get conflicts for a document
+%% Returns list of conflicting revision IDs (excluding the winner)
+-spec get_conflicts(pid(), binary()) -> {ok, [binary()]} | {error, term()}.
+get_conflicts(Pid, DocId) ->
+    gen_server:call(Pid, {get_conflicts, DocId}).
+
+%% @doc Resolve a conflict by choosing a winning revision or providing a merged doc
+%% Resolution can be:
+%%   - {choose, Rev} - keep this revision as winner, delete other branches
+%%   - {merge, Doc} - create new revision merging all conflicts
+-spec resolve_conflict(pid(), binary(), binary(), {choose, binary()} | {merge, map()}) ->
+    {ok, map()} | {error, term()}.
+resolve_conflict(Pid, DocId, BaseRev, Resolution) ->
+    gen_server:call(Pid, {resolve_conflict, DocId, BaseRev, Resolution}).
 
 %%====================================================================
 %% Replication API functions
@@ -279,6 +296,17 @@ handle_call({delete_doc, DocId, Opts}, _From,
 handle_call({fold_docs, Fun, Acc}, _From,
             #state{name = DbName, store_ref = StoreRef} = State) ->
     Result = do_fold_docs(StoreRef, DbName, Fun, Acc),
+    {reply, Result, State};
+
+%% Conflict operations
+handle_call({get_conflicts, DocId}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_get_conflicts(StoreRef, DbName, DocId),
+    {reply, Result, State};
+
+handle_call({resolve_conflict, DocId, BaseRev, Resolution}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_resolve_conflict(StoreRef, DbName, DocId, BaseRev, Resolution),
     {reply, Result, State};
 
 %% Replication operations
@@ -817,7 +845,20 @@ do_get_doc(StoreRef, DbName, DocId, Opts) ->
     DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
     case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
         {ok, Columns} ->
-            Rev = proplists:get_value(?COL_REV, Columns),
+            %% Get the deterministic winner from revtree (not just stored rev)
+            RevTreeBin = proplists:get_value(?COL_REVTREE, Columns),
+            Rev = case RevTreeBin of
+                undefined ->
+                    proplists:get_value(?COL_REV, Columns);
+                <<>> ->
+                    proplists:get_value(?COL_REV, Columns);
+                _ ->
+                    #{winner := Winner} = barrel_revtree_bin:decode_winner_leaves(RevTreeBin),
+                    case Winner of
+                        undefined -> proplists:get_value(?COL_REV, Columns);
+                        _ -> Winner
+                    end
+            end,
             Deleted = bin_to_deleted(proplists:get_value(?COL_DELETED, Columns, <<"false">>)),
             IncludeDeleted = maps:get(include_deleted, Opts, false),
 
@@ -840,7 +881,9 @@ do_get_doc(StoreRef, DbName, DocId, Opts) ->
                                 true -> Result#{<<"_deleted">> => true};
                                 false -> Result
                             end,
-                            {ok, Result2};
+                            %% Add conflicts if requested
+                            Result3 = maybe_add_conflicts(Result2, Columns, Opts),
+                            {ok, Result3};
                         not_found ->
                             {error, not_found}
                     end
@@ -1297,6 +1340,220 @@ decode_revtree(<<>>) -> #{};
 decode_revtree(Bin) ->
     RT = barrel_revtree_bin:decode(Bin),
     barrel_revtree_bin:to_map(RT).
+
+%% @doc Add conflicts to document if requested and conflicts exist
+maybe_add_conflicts(Doc, Columns, Opts) ->
+    case maps:get(conflicts, Opts, false) of
+        true ->
+            RevTreeBin = proplists:get_value(?COL_REVTREE, Columns),
+            case RevTreeBin of
+                undefined -> Doc;
+                <<>> -> Doc;
+                _ ->
+                    %% Use fast path to get conflicts directly from binary
+                    #{conflicts := Conflicts} = barrel_revtree_bin:decode_winner_leaves(RevTreeBin),
+                    case Conflicts of
+                        [] -> Doc;
+                        _ -> Doc#{<<"_conflicts">> => Conflicts}
+                    end
+            end;
+        false ->
+            Doc
+    end.
+
+%%====================================================================
+%% Conflict Operations
+%%====================================================================
+
+%% @doc Get list of conflicting revisions for a document
+do_get_conflicts(StoreRef, DbName, DocId) ->
+    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
+    case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
+        {ok, Columns} ->
+            RevTreeBin = proplists:get_value(?COL_REVTREE, Columns),
+            case RevTreeBin of
+                undefined -> {ok, []};
+                <<>> -> {ok, []};
+                _ ->
+                    #{conflicts := Conflicts} = barrel_revtree_bin:decode_winner_leaves(RevTreeBin),
+                    {ok, Conflicts}
+            end;
+        not_found ->
+            {error, not_found}
+    end.
+
+%% @doc Resolve a conflict
+%% Resolution types:
+%%   {choose, Rev} - Mark the chosen rev as winner, delete all other leaf branches
+%%   {merge, Doc} - Create a new revision that supersedes all conflicting branches
+do_resolve_conflict(StoreRef, DbName, DocId, BaseRev, Resolution) ->
+    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
+    case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
+        {ok, Columns} ->
+            CurrentRev = proplists:get_value(?COL_REV, Columns),
+            RevTreeBin = proplists:get_value(?COL_REVTREE, Columns),
+            case RevTreeBin of
+                undefined ->
+                    {error, no_conflicts};
+                <<>> ->
+                    {error, no_conflicts};
+                _ ->
+                    RevTree = decode_revtree(RevTreeBin),
+                    #{winner := Winner, conflicts := Conflicts} =
+                        barrel_revtree_bin:decode_winner_leaves(RevTreeBin),
+                    case Conflicts of
+                        [] ->
+                            {error, no_conflicts};
+                        _ ->
+                            %% Verify base rev matches current winner
+                            case BaseRev =:= Winner of
+                                false ->
+                                    {error, {conflict, CurrentRev}};
+                                true ->
+                                    do_apply_resolution(StoreRef, DbName, DocId,
+                                                       DocEntityKey, Columns,
+                                                       RevTree, Winner, Conflicts,
+                                                       Resolution)
+                            end
+                    end
+            end;
+        not_found ->
+            {error, not_found}
+    end.
+
+%% Apply the resolution to the document
+do_apply_resolution(StoreRef, _DbName, DocId, DocEntityKey, Columns,
+                    RevTree, Winner, Conflicts, {choose, ChosenRev}) ->
+    %% Verify chosen rev is either the winner or one of the conflicts
+    AllLeaves = [Winner | Conflicts],
+    case lists:member(ChosenRev, AllLeaves) of
+        false ->
+            {error, {invalid_rev, ChosenRev}};
+        true ->
+            %% Delete all other branches by marking them as deleted
+            RevsToDelete = [R || R <- AllLeaves, R =/= ChosenRev],
+            NewRevTree0 = lists:foldl(
+                fun(Rev, Tree) ->
+                    case maps:get(Rev, Tree, undefined) of
+                        undefined -> Tree;
+                        Info -> Tree#{Rev => Info#{deleted => true}}
+                    end
+                end,
+                RevTree,
+                RevsToDelete
+            ),
+            %% If chosen rev is not the current winner, we need to create a new
+            %% revision as child of chosen (to make it the deterministic winner)
+            case ChosenRev =:= Winner of
+                true ->
+                    %% Just update the revtree
+                    UpdatedColumns = lists:keyreplace(?COL_REVTREE, 1, Columns,
+                                                      {?COL_REVTREE, encode_revtree(NewRevTree0)}),
+                    case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, DocEntityKey, UpdatedColumns}]) of
+                        ok ->
+                            {ok, #{id => DocId, rev => Winner, conflicts_resolved => length(RevsToDelete)}};
+                        {error, _} = Err ->
+                            Err
+                    end;
+                false ->
+                    %% Create a new rev as child of chosen to make it the winner
+                    ChosenGen = case binary:split(ChosenRev, <<"-">>) of
+                        [GenBin, _] -> binary_to_integer(GenBin);
+                        _ -> 1
+                    end,
+                    NewGen = ChosenGen + 1,
+                    %% Generate a hash that will be higher than any competing branch
+                    Hash = crypto:hash(md5, term_to_binary({DocId, ChosenRev, erlang:system_time()})),
+                    HashHex = string:lowercase(binary:encode_hex(Hash)),
+                    NewRev = <<(integer_to_binary(NewGen))/binary, "-", HashHex/binary>>,
+
+                    %% Add new rev as child of chosen
+                    NewRevTree = NewRevTree0#{
+                        NewRev => #{id => NewRev, parent => ChosenRev, deleted => false}
+                    },
+
+                    UpdatedColumns = lists:keyreplace(?COL_REVTREE, 1, Columns,
+                                                      {?COL_REVTREE, encode_revtree(NewRevTree)}),
+                    UpdatedColumns2 = lists:keyreplace(?COL_REV, 1, UpdatedColumns,
+                                                       {?COL_REV, NewRev}),
+                    case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, DocEntityKey, UpdatedColumns2}]) of
+                        ok ->
+                            {ok, #{id => DocId, rev => NewRev, conflicts_resolved => length(RevsToDelete)}};
+                        {error, _} = Err ->
+                            Err
+                    end
+            end
+    end;
+
+do_apply_resolution(StoreRef, DbName, DocId, DocEntityKey, Columns,
+                    RevTree, Winner, Conflicts, {merge, MergedDoc}) ->
+    %% Create a new revision that has all conflicting branches as parents
+    %% This effectively merges all branches into one
+    AllLeaves = [Winner | Conflicts],
+
+    %% Generate new revision - use winner's generation + 1
+    WinnerGen = case binary:split(Winner, <<"-">>) of
+        [GenBin, _] -> binary_to_integer(GenBin);
+        _ -> 1
+    end,
+    NewGen = WinnerGen + 1,
+
+    %% Create new rev hash from merged content
+    DocWithoutMeta = maps:without([<<"id">>, <<"_id">>, <<"_rev">>, <<"_deleted">>], MergedDoc),
+    Hash = crypto:hash(md5, term_to_binary({DocWithoutMeta, AllLeaves})),
+    HashHex = string:lowercase(binary:encode_hex(Hash)),
+    NewRev = <<(integer_to_binary(NewGen))/binary, "-", HashHex/binary>>,
+
+    %% Build new revtree: add new rev as child of winner, mark all conflicts as deleted
+    NewRevTree0 = lists:foldl(
+        fun(Rev, Tree) ->
+            case maps:get(Rev, Tree, undefined) of
+                undefined -> Tree;
+                Info -> Tree#{Rev => Info#{deleted => true}}
+            end
+        end,
+        RevTree,
+        Conflicts
+    ),
+    %% Add the merged revision as child of winner
+    NewRevTree = NewRevTree0#{
+        NewRev => #{id => NewRev, parent => Winner, deleted => false}
+    },
+
+    %% Generate new HLC timestamp
+    NextHlc = barrel_hlc:new_hlc(),
+
+    %% Preserve existing tier metadata
+    CreatedAt = proplists:get_value(?COL_CREATED_AT, Columns, barrel_hlc:encode(NextHlc)),
+    ExistingTier = proplists:get_value(?COL_TIER, Columns, 0),
+    ExistingExpires = proplists:get_value(?COL_EXPIRES_AT, Columns, 0),
+
+    %% Update entity columns with new rev and revtree
+    NewColumns = [
+        {?COL_REV, NewRev},
+        {?COL_DELETED, <<"false">>},
+        {?COL_HLC, barrel_hlc:encode(NextHlc)},
+        {?COL_REVTREE, encode_revtree(NewRevTree)},
+        {?COL_CREATED_AT, CreatedAt},
+        {?COL_EXPIRES_AT, ExistingExpires},
+        {?COL_TIER, ExistingTier}
+    ],
+
+    %% Encode the merged document body
+    CborBin = barrel_docdb_codec_cbor:encode(DocWithoutMeta),
+    BodyKey = barrel_store_keys:doc_body(DbName, DocId),
+
+    %% Build batch operations
+    EntityOp = {entity_put, DocEntityKey, NewColumns},
+    BodyOp = {body_put, BodyKey, CborBin},
+
+    %% Write batch
+    case barrel_store_rocksdb:write_batch(StoreRef, [EntityOp, BodyOp]) of
+        ok ->
+            {ok, #{id => DocId, rev => NewRev, conflicts_resolved => length(Conflicts)}};
+        {error, _} = Err ->
+            Err
+    end.
 
 %%====================================================================
 %% Tier/TTL Operations
