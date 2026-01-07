@@ -70,6 +70,7 @@ nav:
   - HTTP API: api/http.md
   - Erlang API: api/erlang.md
   - Architecture: design.md
+  - Benchmarks: benchmarks.md
   - Development:
     - Contributing: development/contributing.md
 
@@ -107,3 +108,12 @@ extra:
     - icon: fontawesome/brands/gitlab
       link: https://gitlab.enki.io/barrel-db/barrel_docdb
   generator: false
+  # Enable browser translation
+  alternate:
+    - name: English
+      lang: en
+    - name: Translate
+      lang: x-default
+
+# Add translation meta tag
+hooks: []

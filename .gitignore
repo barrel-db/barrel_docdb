@@ -41,3 +41,4 @@ ct_run.*
 logs/
 log/
 *.trace
+site/
