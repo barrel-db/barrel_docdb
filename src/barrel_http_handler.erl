@@ -28,9 +28,17 @@ init(Req0, State) ->
     try
         %% Authenticate request (unless it's a health check)
         ok = maybe_authenticate(Action, Req0),
-        {Status, Headers, Body, Req1} = handle_action(Action, Method, Req0),
-        Req2 = cowboy_req:reply(Status, Headers, Body, Req1),
-        {ok, Req2, State}
+        case handle_action(Action, Method, Req0) of
+            {Status, Headers, Body, Req1} ->
+                %% Normal response
+                Req2 = cowboy_req:reply(Status, Headers, Body, Req1),
+                {ok, Req2, State};
+            {stream, Status, Headers, StreamFun, Req1} ->
+                %% Streaming response - StreamFun sends the body
+                Req2 = cowboy_req:stream_reply(Status, Headers, Req1),
+                StreamFun(Req2),
+                {ok, Req2, State}
+        end
     catch
         throw:{error, ErrStatus, Message} ->
             ErrorBody = encode_error(Message, Req0),
@@ -1137,41 +1145,143 @@ handle_get_attachment(Req) ->
     DbName = cowboy_req:binding(db, Req),
     DocId = cowboy_req:binding(doc_id, Req),
     AttName = cowboy_req:binding(att_name, Req),
-    case barrel_docdb:get_attachment(DbName, DocId, AttName) of
-        {ok, Data} ->
-            %% Return raw binary with octet-stream content type
-            Headers = #{<<"content-type">> => <<"application/octet-stream">>},
-            {200, Headers, Data, Req};
+    %% First get attachment info to decide streaming vs direct
+    case barrel_docdb:get_attachment_info(DbName, DocId, AttName) of
+        {ok, #{chunked := true, content_type := ContentType, length := Length} = _Info} ->
+            %% Large/chunked attachment - stream it
+            Headers = #{
+                <<"content-type">> => ContentType,
+                <<"content-length">> => integer_to_binary(Length)
+            },
+            StreamFun = fun(StreamReq) ->
+                stream_attachment(DbName, DocId, AttName, StreamReq)
+            end,
+            {stream, 200, Headers, StreamFun, Req};
+        {ok, #{content_type := ContentType}} ->
+            %% Small attachment - return directly
+            case barrel_docdb:get_attachment(DbName, DocId, AttName) of
+                {ok, Data} ->
+                    Headers = #{<<"content-type">> => ContentType},
+                    {200, Headers, Data, Req};
+                {error, Reason} ->
+                    throw({error, 500, format_error(Reason)})
+            end;
+        not_found ->
+            throw({error, 404, <<"Attachment not found">>});
         {error, not_found} ->
             throw({error, 404, <<"Attachment not found">>});
         {error, Reason} ->
             throw({error, 500, format_error(Reason)})
     end.
 
+%% @private Stream attachment chunks to HTTP response
+stream_attachment(DbName, DocId, AttName, Req) ->
+    case barrel_docdb:open_attachment_stream(DbName, DocId, AttName) of
+        {ok, Stream} ->
+            stream_attachment_loop(Stream, Req);
+        {error, Reason} ->
+            logger:error("Failed to open attachment stream: ~p", [Reason])
+    end.
+
+stream_attachment_loop(Stream, Req) ->
+    case barrel_docdb:read_attachment_chunk(Stream) of
+        {ok, Chunk, NewStream} ->
+            cowboy_req:stream_body(Chunk, nofin, Req),
+            stream_attachment_loop(NewStream, Req);
+        eof ->
+            cowboy_req:stream_body(<<>>, fin, Req),
+            barrel_docdb:close_attachment_stream(Stream)
+    end.
+
 handle_put_attachment(Req0) ->
     DbName = cowboy_req:binding(db, Req0),
     DocId = cowboy_req:binding(doc_id, Req0),
     AttName = cowboy_req:binding(att_name, Req0),
-    {ok, Data, Req1} = cowboy_req:read_body(Req0),
-    case barrel_docdb:put_attachment(DbName, DocId, AttName, Data) of
-        {ok, Info} ->
-            %% Convert atom keys to binary for JSON encoding
-            Response = maps:fold(
-                fun(name, V, Acc) -> Acc#{<<"name">> => V};
-                   (length, V, Acc) -> Acc#{<<"size">> => V};
-                   (digest, V, Acc) -> Acc#{<<"digest">> => V};
-                   (content_type, V, Acc) -> Acc#{<<"content_type">> => V};
-                   (K, V, Acc) when is_atom(K) -> Acc#{atom_to_binary(K) => V};
-                   (K, V, Acc) -> Acc#{K => V}
-                end,
-                #{<<"ok">> => true},
-                Info
-            ),
-            Body = encode_response(Response, Req1),
-            {201, response_headers(Req1), Body, Req1};
+    ContentType = cowboy_req:header(<<"content-type">>, Req0, <<"application/octet-stream">>),
+    ContentLength = cowboy_req:header(<<"content-length">>, Req0),
+
+    %% Use streaming upload for large files (> 64KB) or when content-length not provided
+    UseStreaming = case ContentLength of
+        undefined -> true;
+        Len -> binary_to_integer(Len) > 65536
+    end,
+
+    case UseStreaming of
+        true ->
+            %% Stream upload
+            handle_put_attachment_stream(DbName, DocId, AttName, ContentType, Req0);
+        false ->
+            %% Small file - read all at once
+            {ok, Data, Req1} = cowboy_req:read_body(Req0),
+            case barrel_docdb:put_attachment(DbName, DocId, AttName, Data) of
+                {ok, Info} ->
+                    Response = format_attachment_response(Info),
+                    Body = encode_response(Response, Req1),
+                    {201, response_headers(Req1), Body, Req1};
+                {error, Reason} ->
+                    throw({error, 500, format_error(Reason)})
+            end
+    end.
+
+%% @private Handle streaming upload of attachment
+handle_put_attachment_stream(DbName, DocId, AttName, ContentType, Req0) ->
+    case barrel_docdb:open_attachment_writer(DbName, DocId, AttName, ContentType) of
+        {ok, Writer} ->
+            case stream_upload_body(Req0, Writer) of
+                {ok, FinalWriter, Req1} ->
+                    case barrel_docdb:finish_attachment_writer(FinalWriter) of
+                        {ok, Info} ->
+                            Response = format_attachment_response(Info),
+                            Body = encode_response(Response, Req1),
+                            {201, response_headers(Req1), Body, Req1};
+                        {error, Reason} ->
+                            throw({error, 500, format_error(Reason)})
+                    end;
+                {error, Reason} ->
+                    throw({error, 500, format_error(Reason)})
+            end;
         {error, Reason} ->
             throw({error, 500, format_error(Reason)})
     end.
+
+%% @private Read body in chunks and write to attachment writer
+stream_upload_body(Req, Writer) ->
+    %% Read body in 64KB chunks
+    case cowboy_req:read_body(Req, #{length => 65536}) of
+        {ok, Data, Req1} ->
+            %% Last chunk
+            case barrel_docdb:write_attachment_chunk(Writer, Data) of
+                {ok, FinalWriter} ->
+                    {ok, FinalWriter, Req1};
+                {error, _} = Error ->
+                    Error
+            end;
+        {more, Data, Req1} ->
+            %% More data coming
+            case barrel_docdb:write_attachment_chunk(Writer, Data) of
+                {ok, NewWriter} ->
+                    stream_upload_body(Req1, NewWriter);
+                {error, _} = Error ->
+                    Error
+            end
+    end.
+
+%% @private Format attachment info for response
+format_attachment_response(Info) ->
+    maps:fold(
+        fun(name, V, Acc) -> Acc#{<<"name">> => V};
+           (length, V, Acc) -> Acc#{<<"size">> => V};
+           (digest, V, Acc) -> Acc#{<<"digest">> => V};
+           (content_type, V, Acc) -> Acc#{<<"content_type">> => V};
+           (chunked, V, Acc) -> Acc#{<<"chunked">> => V};
+           (chunk_count, V, Acc) -> Acc#{<<"chunk_count">> => V};
+           (chunk_size, V, Acc) -> Acc#{<<"chunk_size">> => V};
+           (K, V, Acc) when is_atom(K) -> Acc#{atom_to_binary(K) => V};
+           (K, V, Acc) -> Acc#{K => V}
+        end,
+        #{<<"ok">> => true},
+        Info
+    ).
 
 handle_delete_attachment(Req) ->
     DbName = cowboy_req:binding(db, Req),

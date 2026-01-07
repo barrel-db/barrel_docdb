@@ -89,7 +89,18 @@
     put_attachment/4,
     get_attachment/3,
     delete_attachment/3,
-    list_attachments/2
+    list_attachments/2,
+    get_attachment_info/3
+]).
+
+%% Attachment Streaming API
+-export([
+    open_attachment_stream/3,
+    read_attachment_chunk/1,
+    close_attachment_stream/1,
+    open_attachment_writer/4,
+    write_attachment_chunk/2,
+    finish_attachment_writer/1
 ]).
 
 %% Views
@@ -794,6 +805,124 @@ list_attachments(Db, DocId) ->
         DbName = maps:get(name, Info),
         barrel_att:list_attachments(AttRef, DbName, DocId)
     end).
+
+%% @doc Get attachment metadata without reading the data.
+%%
+%% Useful for checking attachment size, content type, etc. before downloading.
+%%
+%% @param Db Database name or pid
+%% @param DocId Document ID
+%% @param AttName Attachment name
+%% @returns `{ok, AttInfo}' or `{error, not_found}'
+-spec get_attachment_info(binary() | pid(), binary(), binary()) ->
+    {ok, map()} | {error, term()}.
+get_attachment_info(Db, DocId, AttName) ->
+    with_db(Db, fun(Pid) ->
+        {ok, AttRef} = barrel_db_server:get_att_ref(Pid),
+        {ok, Info} = barrel_db_server:info(Pid),
+        DbName = maps:get(name, Info),
+        barrel_att_store:get_info(AttRef, DbName, DocId, AttName)
+    end).
+
+%%====================================================================
+%% Attachment Streaming API
+%%====================================================================
+
+%% @doc Open a stream for reading an attachment in chunks.
+%%
+%% For large attachments, use streaming to avoid loading the entire
+%% attachment into memory at once.
+%%
+%% == Example ==
+%% ```
+%% {ok, Stream} = barrel_docdb:open_attachment_stream(<<"mydb">>, <<"doc1">>, <<"large.bin">>),
+%% stream_to_file(Stream, File).
+%%
+%% stream_to_file(Stream, File) ->
+%%     case barrel_docdb:read_attachment_chunk(Stream) of
+%%         {ok, Chunk, Stream2} ->
+%%             file:write(File, Chunk),
+%%             stream_to_file(Stream2, File);
+%%         eof ->
+%%             ok
+%%     end.
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param DocId Document ID
+%% @param AttName Attachment name
+%% @returns `{ok, Stream}' or `{error, not_found}'
+-spec open_attachment_stream(binary() | pid(), binary(), binary()) ->
+    {ok, map()} | {error, term()}.
+open_attachment_stream(Db, DocId, AttName) ->
+    with_db(Db, fun(Pid) ->
+        {ok, AttRef} = barrel_db_server:get_att_ref(Pid),
+        {ok, Info} = barrel_db_server:info(Pid),
+        DbName = maps:get(name, Info),
+        barrel_att_store:get_stream(AttRef, DbName, DocId, AttName)
+    end).
+
+%% @doc Read the next chunk from an attachment stream.
+%%
+%% @param Stream The stream returned by open_attachment_stream/3
+%% @returns `{ok, Chunk, NewStream}' or `eof'
+-spec read_attachment_chunk(map()) -> {ok, binary(), map()} | eof | {error, term()}.
+read_attachment_chunk(Stream) ->
+    barrel_att_store:read_chunk(Stream).
+
+%% @doc Close an attachment stream.
+%%
+%% @param Stream The stream to close
+%% @returns ok
+-spec close_attachment_stream(map()) -> ok.
+close_attachment_stream(Stream) ->
+    barrel_att_store:close_stream(Stream).
+
+%% @doc Open a stream for writing an attachment in chunks.
+%%
+%% For large attachments, use streaming to avoid loading the entire
+%% attachment into memory at once.
+%%
+%% == Example ==
+%% ```
+%% {ok, Writer} = barrel_docdb:open_attachment_writer(<<"mydb">>, <<"doc1">>,
+%%                                                    <<"large.bin">>, <<"application/octet-stream">>),
+%% {ok, Writer2} = barrel_docdb:write_attachment_chunk(Writer, Chunk1),
+%% {ok, Writer3} = barrel_docdb:write_attachment_chunk(Writer2, Chunk2),
+%% {ok, AttInfo} = barrel_docdb:finish_attachment_writer(Writer3).
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param DocId Document ID
+%% @param AttName Attachment name
+%% @param ContentType MIME content type
+%% @returns `{ok, Writer}'
+-spec open_attachment_writer(binary() | pid(), binary(), binary(), binary()) ->
+    {ok, map()} | {error, term()}.
+open_attachment_writer(Db, DocId, AttName, ContentType) ->
+    with_db(Db, fun(Pid) ->
+        {ok, AttRef} = barrel_db_server:get_att_ref(Pid),
+        {ok, Info} = barrel_db_server:info(Pid),
+        DbName = maps:get(name, Info),
+        barrel_att_store:put_stream(AttRef, DbName, DocId, AttName, ContentType)
+    end).
+
+%% @doc Write a chunk of data to an attachment writer.
+%%
+%% @param Writer The writer returned by open_attachment_writer/4
+%% @param Data Binary data to write
+%% @returns `{ok, NewWriter}'
+-spec write_attachment_chunk(map(), binary()) -> {ok, map()} | {error, term()}.
+write_attachment_chunk(Writer, Data) ->
+    barrel_att_store:write_chunk(Writer, Data).
+
+%% @doc Finish writing an attachment and store metadata.
+%%
+%% @param Writer The writer to finish
+%% @returns `{ok, AttInfo}'
+-spec finish_attachment_writer(map()) -> {ok, map()} | {error, term()}.
+finish_attachment_writer(Writer) ->
+    barrel_att_store:finish_stream(Writer).
 
 %%====================================================================
 %% Views

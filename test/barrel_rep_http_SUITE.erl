@@ -734,9 +734,9 @@ attachment_get(Config) ->
     %% Should return the raw binary data
     <<"fake png data for testing">> = Body,
 
-    %% Content-Type should be octet-stream
+    %% Content-Type should be determined by filename (image.png -> image/png)
     ContentType = proplists:get_value(<<"content-type">>, RespHeaders),
-    <<"application/octet-stream">> = ContentType,
+    <<"image/png">> = ContentType,
 
     ok.
 

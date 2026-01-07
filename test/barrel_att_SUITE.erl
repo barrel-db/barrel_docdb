@@ -34,12 +34,22 @@
     att_large_blob/1
 ]).
 
+%% Test cases - chunked/streaming
+-export([
+    chunked_small_attachment/1,
+    chunked_large_attachment/1,
+    chunked_get_info/1,
+    streaming_read/1,
+    streaming_write/1,
+    streaming_roundtrip/1
+]).
+
 %%====================================================================
 %% CT Callbacks
 %%====================================================================
 
 all() ->
-    [{group, att_store}, {group, att_api}].
+    [{group, att_store}, {group, att_api}, {group, chunked_streaming}].
 
 groups() ->
     [
@@ -58,6 +68,14 @@ groups() ->
             att_exists,
             att_validate_name,
             att_large_blob
+        ]},
+        {chunked_streaming, [sequence], [
+            chunked_small_attachment,
+            chunked_large_attachment,
+            chunked_get_info,
+            streaming_read,
+            streaming_write,
+            streaming_roundtrip
         ]}
     ].
 
@@ -359,3 +377,247 @@ att_large_blob(Config) ->
 
     ok = barrel_att_store:close(AttRef),
     ok.
+
+%%====================================================================
+%% Test Cases - Chunked/Streaming
+%%====================================================================
+
+chunked_small_attachment(Config) ->
+    %% Small attachments (< 64KB) should be stored as single values
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/chunked_small",
+
+    {ok, AttRef} = barrel_att_store:open(DbPath, #{
+        chunk_threshold => 65536,  %% 64KB threshold
+        chunk_size => 65536
+    }),
+
+    DbName = <<"testdb">>,
+    DocId = <<"doc1">>,
+    AttName = <<"small.txt">>,
+    SmallData = <<"This is a small attachment">>,
+
+    %% Put small attachment - should NOT be chunked
+    {ok, AttInfo} = barrel_att_store:put(AttRef, DbName, DocId, AttName, SmallData),
+    ?assertEqual(false, maps:get(chunked, AttInfo, false)),
+
+    %% Get should return same data
+    {ok, Retrieved} = barrel_att_store:get(AttRef, DbName, DocId, AttName),
+    ?assertEqual(SmallData, Retrieved),
+
+    ok = barrel_att_store:close(AttRef),
+    ok.
+
+chunked_large_attachment(Config) ->
+    %% Large attachments (>= 64KB) should be stored as chunks
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/chunked_large",
+
+    ChunkSize = 16384,  %% 16KB chunks for easier testing
+    {ok, AttRef} = barrel_att_store:open(DbPath, #{
+        chunk_threshold => ChunkSize,
+        chunk_size => ChunkSize
+    }),
+
+    DbName = <<"testdb">>,
+    DocId = <<"doc1">>,
+    AttName = <<"large.bin">>,
+
+    %% Create 100KB of data (should be ~7 chunks)
+    LargeData = crypto:strong_rand_bytes(100 * 1024),
+
+    %% Put large attachment - should be chunked
+    {ok, AttInfo} = barrel_att_store:put(AttRef, DbName, DocId, AttName, LargeData),
+    ?assertEqual(true, maps:get(chunked, AttInfo)),
+    ?assertEqual(ChunkSize, maps:get(chunk_size, AttInfo)),
+    ExpectedChunks = (100 * 1024 + ChunkSize - 1) div ChunkSize,
+    ?assertEqual(ExpectedChunks, maps:get(chunk_count, AttInfo)),
+
+    %% Get should reassemble all chunks
+    {ok, Retrieved} = barrel_att_store:get(AttRef, DbName, DocId, AttName),
+    ?assertEqual(LargeData, Retrieved),
+
+    %% Delete should remove all chunks
+    ok = barrel_att_store:delete(AttRef, DbName, DocId, AttName),
+    not_found = barrel_att_store:get(AttRef, DbName, DocId, AttName),
+
+    ok = barrel_att_store:close(AttRef),
+    ok.
+
+chunked_get_info(Config) ->
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/chunked_info",
+
+    ChunkSize = 8192,  %% 8KB
+    {ok, AttRef} = barrel_att_store:open(DbPath, #{
+        chunk_threshold => ChunkSize,
+        chunk_size => ChunkSize
+    }),
+
+    DbName = <<"testdb">>,
+    DocId = <<"doc1">>,
+
+    %% Store small (non-chunked)
+    SmallData = <<"hello">>,
+    {ok, _} = barrel_att_store:put(AttRef, DbName, DocId, <<"small.txt">>, SmallData),
+
+    %% Store large (chunked)
+    LargeData = crypto:strong_rand_bytes(50000),
+    {ok, _} = barrel_att_store:put(AttRef, DbName, DocId, <<"large.bin">>, LargeData),
+
+    %% Get info for small - should not be chunked
+    {ok, SmallInfo} = barrel_att_store:get_info(AttRef, DbName, DocId, <<"small.txt">>),
+    ?assertEqual(false, maps:get(chunked, SmallInfo)),
+    ?assertEqual(5, maps:get(length, SmallInfo)),
+
+    %% Get info for large - should be chunked
+    {ok, LargeInfo} = barrel_att_store:get_info(AttRef, DbName, DocId, <<"large.bin">>),
+    ?assertEqual(true, maps:get(chunked, LargeInfo)),
+    ?assertEqual(50000, maps:get(length, LargeInfo)),
+    ?assert(maps:get(chunk_count, LargeInfo) > 1),
+
+    %% Get info for non-existent
+    not_found = barrel_att_store:get_info(AttRef, DbName, DocId, <<"nope">>),
+
+    ok = barrel_att_store:close(AttRef),
+    ok.
+
+streaming_read(Config) ->
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/streaming_read",
+
+    ChunkSize = 8192,
+    {ok, AttRef} = barrel_att_store:open(DbPath, #{
+        chunk_threshold => ChunkSize,
+        chunk_size => ChunkSize
+    }),
+
+    DbName = <<"testdb">>,
+    DocId = <<"doc1">>,
+    AttName = <<"stream.bin">>,
+
+    %% Store large attachment
+    OriginalData = crypto:strong_rand_bytes(50000),
+    {ok, _} = barrel_att_store:put(AttRef, DbName, DocId, AttName, OriginalData),
+
+    %% Open stream
+    {ok, Stream} = barrel_att_store:get_stream(AttRef, DbName, DocId, AttName),
+    ?assert(is_map(Stream)),
+
+    %% Read all chunks
+    Chunks = read_all_chunks(Stream, []),
+    Reassembled = iolist_to_binary(Chunks),
+
+    ?assertEqual(OriginalData, Reassembled),
+
+    ok = barrel_att_store:close(AttRef),
+    ok.
+
+streaming_write(Config) ->
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/streaming_write",
+
+    ChunkSize = 8192,
+    {ok, AttRef} = barrel_att_store:open(DbPath, #{
+        chunk_threshold => ChunkSize,
+        chunk_size => ChunkSize
+    }),
+
+    DbName = <<"testdb">>,
+    DocId = <<"doc1">>,
+    AttName = <<"written.bin">>,
+
+    %% Create data to write in multiple chunks
+    Chunk1 = crypto:strong_rand_bytes(10000),
+    Chunk2 = crypto:strong_rand_bytes(15000),
+    Chunk3 = crypto:strong_rand_bytes(5000),
+    ExpectedData = <<Chunk1/binary, Chunk2/binary, Chunk3/binary>>,
+
+    %% Open write stream
+    {ok, Writer0} = barrel_att_store:put_stream(AttRef, DbName, DocId, AttName, <<"application/octet-stream">>),
+
+    %% Write chunks
+    {ok, Writer1} = barrel_att_store:write_chunk(Writer0, Chunk1),
+    {ok, Writer2} = barrel_att_store:write_chunk(Writer1, Chunk2),
+    {ok, Writer3} = barrel_att_store:write_chunk(Writer2, Chunk3),
+
+    %% Finish
+    {ok, AttInfo} = barrel_att_store:finish_stream(Writer3),
+    ?assertEqual(30000, maps:get(length, AttInfo)),
+    ?assertEqual(true, maps:get(chunked, AttInfo)),
+
+    %% Verify by reading back
+    {ok, Retrieved} = barrel_att_store:get(AttRef, DbName, DocId, AttName),
+    ?assertEqual(ExpectedData, Retrieved),
+
+    ok = barrel_att_store:close(AttRef),
+    ok.
+
+streaming_roundtrip(_Config) ->
+    %% Test using barrel_docdb streaming API (embedded use)
+    application:ensure_all_started(barrel_docdb),
+
+    DbName = <<"stream_roundtrip_db">>,
+    barrel_docdb:create_db(DbName),
+
+    DocId = <<"doc1">>,
+    AttName = <<"roundtrip.bin">>,
+    ContentType = <<"application/octet-stream">>,
+
+    %% Create test data
+    OriginalData = crypto:strong_rand_bytes(200000),  %% 200KB
+
+    %% Write using streaming API
+    {ok, Writer0} = barrel_docdb:open_attachment_writer(DbName, DocId, AttName, ContentType),
+
+    %% Write in 50KB chunks
+    ChunkSize = 50000,
+    Writer = write_in_chunks(Writer0, OriginalData, ChunkSize),
+
+    {ok, WriteInfo} = barrel_docdb:finish_attachment_writer(Writer),
+    ?assertEqual(200000, maps:get(length, WriteInfo)),
+
+    %% Read using streaming API
+    {ok, Stream} = barrel_docdb:open_attachment_stream(DbName, DocId, AttName),
+    ReadData = read_stream_data(Stream, []),
+    barrel_docdb:close_attachment_stream(Stream),
+
+    ?assertEqual(OriginalData, ReadData),
+
+    %% Also verify with non-streaming get
+    {ok, DirectData} = barrel_docdb:get_attachment(DbName, DocId, AttName),
+    ?assertEqual(OriginalData, DirectData),
+
+    %% Cleanup
+    barrel_docdb:delete_db(DbName),
+    ok.
+
+%%====================================================================
+%% Helper Functions
+%%====================================================================
+
+read_all_chunks(Stream, Acc) ->
+    case barrel_att_store:read_chunk(Stream) of
+        {ok, Chunk, NewStream} ->
+            read_all_chunks(NewStream, [Chunk | Acc]);
+        eof ->
+            lists:reverse(Acc)
+    end.
+
+write_in_chunks(Writer, <<>>, _ChunkSize) ->
+    Writer;
+write_in_chunks(Writer, Data, ChunkSize) when byte_size(Data) =< ChunkSize ->
+    {ok, NewWriter} = barrel_docdb:write_attachment_chunk(Writer, Data),
+    NewWriter;
+write_in_chunks(Writer, Data, ChunkSize) ->
+    <<Chunk:ChunkSize/binary, Rest/binary>> = Data,
+    {ok, NewWriter} = barrel_docdb:write_attachment_chunk(Writer, Chunk),
+    write_in_chunks(NewWriter, Rest, ChunkSize).
+
+read_stream_data(Stream, Acc) ->
+    case barrel_docdb:read_attachment_chunk(Stream) of
+        {ok, Chunk, NewStream} ->
+            read_stream_data(NewStream, [Chunk | Acc]);
+        eof ->
+            iolist_to_binary(lists:reverse(Acc))
+    end.
