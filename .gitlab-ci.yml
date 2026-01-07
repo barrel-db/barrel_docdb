@@ -1,0 +1,44 @@
+# GitLab CI/CD for Barrel DocDB
+# Builds Erlang tests and deploys MkDocs documentation
+
+stages:
+  - test
+  - pages
+
+variables:
+  # Cache rebar3 dependencies
+  REBAR_CACHE_DIR: "$CI_PROJECT_DIR/.cache/rebar3"
+
+# Erlang tests
+test:
+  stage: test
+  image: erlang:27
+  cache:
+    key: rebar3-$CI_COMMIT_REF_SLUG
+    paths:
+      - .cache/rebar3
+      - _build
+  before_script:
+    - rebar3 --version
+  script:
+    - rebar3 compile
+    - rebar3 ct --sname test
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_MERGE_REQUEST_ID
+
+# MkDocs documentation deployment to GitLab Pages
+pages:
+  stage: pages
+  image: python:3.12-slim
+  before_script:
+    - pip install -q mkdocs>=1.6 mkdocs-material>=9.5 pymdown-extensions>=10.0
+  script:
+    - mkdocs build
+    - mv site public
+  artifacts:
+    paths:
+      - public
+  rules:
+    # Deploy on main branch only
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
