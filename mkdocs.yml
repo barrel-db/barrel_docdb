@@ -59,19 +59,17 @@ nav:
   - Getting Started:
     - Quick Start: getting-started.md
     - Document Format: document-format.md
-  - Core Concepts:
+  - Guides:
     - Queries: queries.md
     - Changes Feed: changes.md
     - Replication: replication.md
-  - API Reference:
-    - HTTP API: api/http.md
-    - Erlang API: api/erlang.md
-  - Advanced:
-    - Architecture: design.md
     - Federation: federation.md
-    - Replication Policies: replication-policies.md
     - Tiered Storage: tiered-storage.md
+    - Replication Policies: replication-policies.md
     - Metrics: metrics.md
+  - HTTP API: api/http.md
+  - Erlang API: api/erlang.md
+  - Architecture: design.md
   - Development:
     - Contributing: development/contributing.md
 
