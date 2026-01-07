@@ -1,0 +1,425 @@
+# HTTP API Reference
+
+Barrel DocDB provides a RESTful HTTP API for all operations. The server listens on port 8080 by default.
+
+## Content Types
+
+The API supports both JSON and CBOR:
+
+- `application/json` (default)
+- `application/cbor`
+
+Set the `Content-Type` and `Accept` headers accordingly.
+
+## Endpoints Overview
+
+| Endpoint | Methods | Description |
+|----------|---------|-------------|
+| `/health` | GET | Health check |
+| `/metrics` | GET | Prometheus metrics |
+| `/db/:db` | GET, POST, DELETE | Database operations |
+| `/db/:db/:doc_id` | GET, PUT, DELETE | Document operations |
+| `/db/:db/_find` | POST | Query documents |
+| `/db/:db/_changes` | GET | Changes feed |
+| `/db/:db/_changes/stream` | GET | SSE changes stream |
+| `/db/:db/_bulk_docs` | POST | Bulk operations |
+| `/db/:db/:doc_id/_attachments/:name` | GET, PUT, DELETE | Attachments |
+| `/_federation` | GET, POST | Federation management |
+| `/_policies` | GET, POST | Replication policies |
+
+---
+
+## Health & Metrics
+
+### Health Check
+
+```bash
+GET /health
+```
+
+Returns server health status including database information.
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "databases": [
+    {"name": "mydb", "doc_count": 1234}
+  ]
+}
+```
+
+### Prometheus Metrics
+
+```bash
+GET /metrics
+```
+
+Returns metrics in Prometheus text format.
+
+---
+
+## Database Operations
+
+### Create Database
+
+```bash
+POST /db/:db
+```
+
+**Example:**
+```bash
+curl -X POST http://localhost:8080/db/mydb
+```
+
+**Response:** `201 Created`
+
+### Get Database Info
+
+```bash
+GET /db/:db
+```
+
+**Response:**
+```json
+{
+  "name": "mydb",
+  "doc_count": 1234,
+  "update_seq": "1-abc123"
+}
+```
+
+### Delete Database
+
+```bash
+DELETE /db/:db
+```
+
+**Response:** `200 OK`
+
+---
+
+## Document Operations
+
+### Create/Update Document
+
+```bash
+PUT /db/:db/:doc_id
+```
+
+**Headers:**
+- `Content-Type: application/json`
+- `If-Match: <rev>` (optional, for updates)
+
+**Example - Create:**
+```bash
+curl -X PUT http://localhost:8080/db/mydb/user1 \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Alice", "email": "alice@example.com"}'
+```
+
+**Example - Update:**
+```bash
+curl -X PUT http://localhost:8080/db/mydb/user1 \
+  -H "Content-Type: application/json" \
+  -H "If-Match: 1-abc123" \
+  -d '{"name": "Alice Smith", "email": "alice@example.com"}'
+```
+
+**Response:**
+```json
+{
+  "ok": true,
+  "id": "user1",
+  "rev": "1-abc123"
+}
+```
+
+### Get Document
+
+```bash
+GET /db/:db/:doc_id
+```
+
+**Query Parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `rev` | Specific revision |
+| `revs` | Include revision history |
+| `conflicts` | Include conflicting revisions |
+
+**Example:**
+```bash
+curl http://localhost:8080/db/mydb/user1
+```
+
+**Response:**
+```json
+{
+  "_id": "user1",
+  "_rev": "1-abc123",
+  "name": "Alice",
+  "email": "alice@example.com"
+}
+```
+
+### Delete Document
+
+```bash
+DELETE /db/:db/:doc_id
+```
+
+**Headers:**
+- `If-Match: <rev>` (required)
+
+**Example:**
+```bash
+curl -X DELETE http://localhost:8080/db/mydb/user1 \
+  -H "If-Match: 1-abc123"
+```
+
+---
+
+## Queries
+
+### Find Documents
+
+```bash
+POST /db/:db/_find
+```
+
+**Request Body:**
+```json
+{
+  "where": [
+    {"path": ["type"], "value": "user"},
+    {"path": ["age"], "op": ">=", "value": 18}
+  ],
+  "limit": 100,
+  "offset": 0
+}
+```
+
+**Operators:**
+
+| Operator | Description |
+|----------|-------------|
+| `=` (default) | Equals |
+| `>`, `>=`, `<`, `<=` | Comparisons |
+| `!=` | Not equals |
+| `in` | Value in list |
+| `contains` | Array contains value |
+| `prefix` | String prefix match |
+| `regex` | Regular expression |
+
+**Example:**
+```bash
+curl -X POST http://localhost:8080/db/mydb/_find \
+  -H "Content-Type: application/json" \
+  -d '{
+    "where": [{"path": ["status"], "value": "active"}],
+    "limit": 10
+  }'
+```
+
+**Response:**
+```json
+{
+  "docs": [
+    {"_id": "doc1", "_rev": "1-abc", "status": "active", ...},
+    {"_id": "doc2", "_rev": "1-def", "status": "active", ...}
+  ],
+  "meta": {
+    "total": 42,
+    "offset": 0,
+    "limit": 10
+  }
+}
+```
+
+---
+
+## Changes Feed
+
+### Poll Changes
+
+```bash
+GET /db/:db/_changes
+```
+
+**Query Parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `since` | Start from sequence (use `first` for beginning) |
+| `limit` | Maximum changes to return |
+| `feed` | `normal` or `longpoll` |
+| `timeout` | Long-poll timeout in ms |
+
+**Example:**
+```bash
+curl "http://localhost:8080/db/mydb/_changes?since=first&limit=100"
+```
+
+### SSE Stream
+
+```bash
+GET /db/:db/_changes/stream
+```
+
+Server-Sent Events stream for real-time updates.
+
+**Example:**
+```bash
+curl http://localhost:8080/db/mydb/_changes/stream
+```
+
+**Events:**
+```
+data: {"seq": "1-abc", "id": "doc1", "changes": [{"rev": "1-xyz"}]}
+
+data: {"seq": "2-def", "id": "doc2", "changes": [{"rev": "1-uvw"}]}
+```
+
+---
+
+## Bulk Operations
+
+### Bulk Docs
+
+```bash
+POST /db/:db/_bulk_docs
+```
+
+**Request Body:**
+```json
+{
+  "docs": [
+    {"_id": "doc1", "name": "Alice"},
+    {"_id": "doc2", "name": "Bob"},
+    {"_id": "doc3", "_rev": "1-abc", "_deleted": true}
+  ]
+}
+```
+
+**Response:**
+```json
+[
+  {"ok": true, "id": "doc1", "rev": "1-abc"},
+  {"ok": true, "id": "doc2", "rev": "1-def"},
+  {"ok": true, "id": "doc3", "rev": "2-ghi"}
+]
+```
+
+---
+
+## Attachments
+
+### Put Attachment
+
+```bash
+PUT /db/:db/:doc_id/_attachments/:name
+```
+
+**Headers:**
+- `Content-Type: <mime-type>`
+- `If-Match: <rev>` (for existing documents)
+
+**Example:**
+```bash
+curl -X PUT http://localhost:8080/db/mydb/doc1/_attachments/photo.jpg \
+  -H "Content-Type: image/jpeg" \
+  --data-binary @photo.jpg
+```
+
+### Get Attachment
+
+```bash
+GET /db/:db/:doc_id/_attachments/:name
+```
+
+**Example:**
+```bash
+curl http://localhost:8080/db/mydb/doc1/_attachments/photo.jpg > photo.jpg
+```
+
+### Delete Attachment
+
+```bash
+DELETE /db/:db/:doc_id/_attachments/:name
+```
+
+---
+
+## Federation
+
+### List Federations
+
+```bash
+GET /_federation
+```
+
+### Create Federation
+
+```bash
+POST /_federation
+```
+
+**Request Body:**
+```json
+{
+  "name": "all_users",
+  "members": ["local_db", "http://nodeB:8080/users"]
+}
+```
+
+### Query Federation
+
+```bash
+POST /_federation/:name/_find
+```
+
+Same query format as `/db/:db/_find`.
+
+---
+
+## Replication Policies
+
+### List Policies
+
+```bash
+GET /_policies
+```
+
+### Create Policy
+
+```bash
+POST /_policies
+```
+
+**Request Body:**
+```json
+{
+  "name": "my_chain",
+  "pattern": "chain",
+  "nodes": ["http://nodeA:8080", "http://nodeB:8080"],
+  "database": "mydb",
+  "mode": "continuous"
+}
+```
+
+**Patterns:** `chain`, `group`, `fanout`
+
+### Enable/Disable Policy
+
+```bash
+POST /_policies/:name/_enable
+POST /_policies/:name/_disable
+```
+
+### Get Policy Status
+
+```bash
+GET /_policies/:name/_status
+```

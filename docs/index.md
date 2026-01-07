@@ -1,8 +1,8 @@
 # Barrel DocDB
 
-**An embedded document database for Erlang with MVCC, declarative queries, real-time subscriptions, and P2P replication.**
+**A document database built in Erlang. Embed it in your app or run it standalone over HTTP.**
 
-Build distributed, offline-first applications with Barrel DocDB - a production-ready document database that handles conflicts, replication, and real-time updates out of the box.
+Sync anywhere. Query anything. Your data, wherever you need it.
 
 <div class="grid cards" markdown>
 
