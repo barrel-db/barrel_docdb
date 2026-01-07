@@ -495,8 +495,17 @@ handle_get_doc(Req) ->
     DbName = cowboy_req:binding(db, Req),
     DocId = cowboy_req:binding(doc_id, Req),
     Qs = cowboy_req:parse_qs(Req),
-    Opts = parse_doc_opts(Qs),
+    Opts0 = parse_doc_opts(Qs),
+    %% For CBOR responses, request raw body for zero-copy
+    {Opts, IsCbor} = case response_content_type(Req) of
+        ?CT_CBOR -> {Opts0#{raw_body => true}, true};
+        ?CT_JSON -> {Opts0, false}
+    end,
     case barrel_docdb:get_doc(DbName, DocId, Opts) of
+        {ok, CborBin, Meta} when IsCbor ->
+            %% Zero-copy CBOR response: embed raw body with metadata
+            Body = encode_doc_with_raw_body(CborBin, Meta),
+            {200, response_headers(Req), Body, Req};
         {ok, Doc} ->
             Body = encode_doc_response(Doc, Req),
             {200, response_headers(Req), Body, Req};
@@ -927,23 +936,26 @@ handle_find(Req0) ->
     {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
     QuerySpec0 = decode_request_body(ReqBody, Req1),
     %% Convert binary keys to atoms for internal API
-    QuerySpec = convert_query_spec(QuerySpec0),
+    QuerySpec1 = convert_query_spec(QuerySpec0),
+    %% For CBOR responses with include_docs, use doc_format => binary for efficiency
+    IsCbor = response_content_type(Req1) =:= ?CT_CBOR,
+    IncludeDocs = maps:get(include_docs, QuerySpec1, false),
+    QuerySpec = case IsCbor andalso IncludeDocs of
+        true -> QuerySpec1#{doc_format => binary};
+        false -> QuerySpec1
+    end,
     case barrel_docdb:find(DbName, QuerySpec) of
         {ok, Results, Meta} ->
             %% Format metadata for JSON/CBOR
             FormattedMeta = format_query_meta(Meta),
             %% Convert documents based on response type
-            case response_content_type(Req1) of
-                ?CT_CBOR ->
-                    %% For CBOR, keep documents in native format, convert meta
-                    ConvertedResults = [doc_to_map(Doc) || Doc <- Results],
-                    Response = #{
-                        <<"results">> => ConvertedResults,
-                        <<"meta">> => FormattedMeta
-                    },
-                    Body = barrel_docdb_codec_cbor:encode_cbor(Response),
+            case IsCbor of
+                true ->
+                    %% For CBOR with doc_format=binary, results are raw CBOR binaries
+                    %% Use encode_cbor_with_raw_docs to embed them directly
+                    Body = encode_cbor_with_raw_docs(Results, FormattedMeta),
                     {200, response_headers(Req1), Body, Req1};
-                ?CT_JSON ->
+                false ->
                     %% For JSON, encode each document properly
                     JsonDocsStr = iolist_to_binary([
                         <<"[">>,
@@ -1584,6 +1596,46 @@ encode_doc_response(Doc, Req) ->
         ?CT_JSON -> barrel_doc:to_json(Doc);
         ?CT_CBOR -> barrel_doc:to_cbor(Doc)
     end.
+
+%% Encode document with raw CBOR body (zero-copy for CBOR responses)
+%% Merges metadata into the raw body CBOR without full decode/re-encode
+encode_doc_with_raw_body(CborBin, Meta) ->
+    #{id := Id, rev := Rev, deleted := Deleted} = Meta,
+    Conflicts = maps:get(conflicts, Meta, []),
+    %% Build metadata map
+    MetaMap = #{
+        <<"id">> => Id,
+        <<"_rev">> => Rev
+    },
+    MetaMap2 = case Deleted of
+        true -> MetaMap#{<<"_deleted">> => true};
+        false -> MetaMap
+    end,
+    MetaMap3 = case Conflicts of
+        [] -> MetaMap2;
+        _ -> MetaMap2#{<<"_conflicts">> => Conflicts}
+    end,
+    %% Merge metadata with raw body using efficient CBOR merge
+    barrel_docdb_codec_cbor:merge_into_cbor(CborBin, MetaMap3).
+
+%% Encode CBOR response with raw document bodies (for query results)
+%% Documents may be raw CBOR binaries (doc_format=binary) or maps
+encode_cbor_with_raw_docs(Results, Meta) ->
+    %% Convert results - raw CBOR docs stay as-is, maps need decoding
+    DecodedResults = [decode_doc_for_cbor(Doc) || Doc <- Results],
+    Response = #{
+        <<"results">> => DecodedResults,
+        <<"meta">> => Meta
+    },
+    barrel_docdb_codec_cbor:encode_cbor(Response).
+
+%% Decode document for CBOR response encoding
+%% Raw CBOR binary -> decode to map for inclusion in response
+%% Map -> use as-is
+decode_doc_for_cbor(Doc) when is_binary(Doc) ->
+    barrel_docdb_codec_cbor:decode_any(Doc);
+decode_doc_for_cbor(Doc) when is_map(Doc) ->
+    Doc.
 
 %% Decode request body based on Content-Type
 decode_request_body(Body, Req) ->

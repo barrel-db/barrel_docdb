@@ -962,20 +962,33 @@ do_get_doc(StoreRef, DbName, DocId, Opts) ->
                     BodyKey = barrel_store_keys:doc_body(DbName, DocId),
                     case barrel_store_rocksdb:body_get(StoreRef, BodyKey) of
                         {ok, CborBin} ->
-                            %% Decode CBOR to get document body
-                            DocBody = barrel_docdb_codec_cbor:decode_any(CborBin),
-                            %% Add metadata
-                            Result = DocBody#{
-                                <<"id">> => DocId,
-                                <<"_rev">> => Rev
-                            },
-                            Result2 = case Deleted of
-                                true -> Result#{<<"_deleted">> => true};
-                                false -> Result
-                            end,
-                            %% Add conflicts if requested
-                            Result3 = maybe_add_conflicts(Result2, Columns, Opts),
-                            {ok, Result3};
+                            %% Check if raw body requested (for zero-copy CBOR responses)
+                            case maps:get(raw_body, Opts, false) of
+                                true ->
+                                    %% Return raw CBOR body with metadata for zero-copy
+                                    Meta = #{
+                                        id => DocId,
+                                        rev => Rev,
+                                        deleted => Deleted
+                                    },
+                                    Meta2 = maybe_add_conflicts_to_meta(Meta, Columns, Opts),
+                                    {ok, CborBin, Meta2};
+                                false ->
+                                    %% Decode CBOR to get document body
+                                    DocBody = barrel_docdb_codec_cbor:decode_any(CborBin),
+                                    %% Add metadata
+                                    Result = DocBody#{
+                                        <<"id">> => DocId,
+                                        <<"_rev">> => Rev
+                                    },
+                                    Result2 = case Deleted of
+                                        true -> Result#{<<"_deleted">> => true};
+                                        false -> Result
+                                    end,
+                                    %% Add conflicts if requested
+                                    Result3 = maybe_add_conflicts(Result2, Columns, Opts),
+                                    {ok, Result3}
+                            end;
                         not_found ->
                             {error, not_found}
                     end
@@ -1471,6 +1484,25 @@ maybe_add_conflicts(Doc, Columns, Opts) ->
             end;
         false ->
             Doc
+    end.
+
+%% @doc Add conflicts to metadata map (for raw_body responses)
+maybe_add_conflicts_to_meta(Meta, Columns, Opts) ->
+    case maps:get(conflicts, Opts, false) of
+        true ->
+            RevTreeBin = proplists:get_value(?COL_REVTREE, Columns),
+            case RevTreeBin of
+                undefined -> Meta;
+                <<>> -> Meta;
+                _ ->
+                    #{conflicts := Conflicts} = barrel_revtree_bin:decode_winner_leaves(RevTreeBin),
+                    case Conflicts of
+                        [] -> Meta;
+                        _ -> Meta#{conflicts => Conflicts}
+                    end
+            end;
+        false ->
+            Meta
     end.
 
 %%====================================================================

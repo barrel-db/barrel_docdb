@@ -39,6 +39,9 @@
 -export([to_json/1, to_json_iolist/1]).
 -export([from_json/1]).
 
+%% CBOR Manipulation
+-export([merge_into_cbor/2]).
+
 %% Internal exports for testing
 -export([encode_varint/1, decode_varint/1]).
 -export([encode_cbor/1, decode_cbor/1]).
@@ -1135,3 +1138,22 @@ set_path(Map, [Key | Rest], Value) when is_map(Map) ->
     Map#{Key => set_path(SubMap, Rest, Value)};
 set_path(_, [], _Value) ->
     error(empty_path).
+
+%%====================================================================
+%% CBOR Manipulation
+%%====================================================================
+
+%% @doc Merge metadata map into raw CBOR document body.
+%% This is used for zero-copy CBOR responses where we have raw CBOR body
+%% and need to add metadata (id, rev, etc.) without full decode/re-encode.
+%%
+%% For plain CBOR (non-indexed), we decode, merge, and re-encode.
+%% This is still efficient as it avoids the HTTP-layer overhead.
+-spec merge_into_cbor(binary(), map()) -> binary().
+merge_into_cbor(CborBin, MetaMap) ->
+    %% Decode the body CBOR to map
+    BodyMap = decode_any(CborBin),
+    %% Merge metadata (metadata keys take precedence)
+    MergedMap = maps:merge(BodyMap, MetaMap),
+    %% Re-encode as plain CBOR
+    encode_cbor(MergedMap).

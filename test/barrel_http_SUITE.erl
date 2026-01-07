@@ -19,6 +19,8 @@
     get_doc_not_found/1,
     put_and_get_doc_json/1,
     put_and_get_doc_cbor/1,
+    cbor_zero_copy_get_doc/1,
+    cbor_zero_copy_find/1,
     delete_doc/1,
     get_changes/1,
     get_changes_with_filter/1,
@@ -51,6 +53,8 @@ groups() ->
             get_doc_not_found,
             put_and_get_doc_json,
             put_and_get_doc_cbor,
+            cbor_zero_copy_get_doc,
+            cbor_zero_copy_find,
             delete_doc,
             get_changes,
             get_changes_with_filter,
@@ -211,6 +215,83 @@ put_and_get_doc_cbor(Config) ->
     ),
     {ok, GetBody} = hackney:body(GetRef),
     #{<<"name">> := <<"Bob">>, <<"age">> := 25} = barrel_docdb_codec_cbor:decode_cbor(GetBody),
+    ok.
+
+%% @doc Test zero-copy CBOR GET document (raw_body optimization)
+%% Verifies that CBOR response includes id and _rev from metadata
+cbor_zero_copy_get_doc(Config) ->
+    Auth = auth_header(Config),
+    DocId = <<"test_doc_zerocopy">>,
+    Doc = #{<<"title">> => <<"Zero Copy Test">>, <<"value">> => 42},
+    DocCbor = barrel_docdb_codec_cbor:encode_cbor(Doc),
+
+    %% PUT document with CBOR
+    {ok, 201, _PutHeaders, PutRef} = hackney:put(
+        ?BASE_URL ++ "/db/testdb/" ++ binary_to_list(DocId),
+        [Auth,
+         {<<"Content-Type">>, <<"application/cbor">>},
+         {<<"Accept">>, <<"application/cbor">>}],
+        DocCbor,
+        []
+    ),
+    {ok, PutBody} = hackney:body(PutRef),
+    #{<<"id">> := DocId, <<"rev">> := Rev} = barrel_docdb_codec_cbor:decode_cbor(PutBody),
+
+    %% GET document with CBOR - should use zero-copy path
+    {ok, 200, GetHeaders, GetRef} = hackney:get(
+        ?BASE_URL ++ "/db/testdb/" ++ binary_to_list(DocId),
+        [Auth, {<<"Accept">>, <<"application/cbor">>}],
+        <<>>,
+        []
+    ),
+    %% Verify Content-Type is CBOR
+    <<"application/cbor">> = proplists:get_value(<<"content-type">>, GetHeaders),
+
+    {ok, GetBody} = hackney:body(GetRef),
+    DecodedDoc = barrel_docdb_codec_cbor:decode_cbor(GetBody),
+
+    %% Verify document content and metadata
+    #{<<"title">> := <<"Zero Copy Test">>,
+      <<"value">> := 42,
+      <<"id">> := DocId,
+      <<"_rev">> := Rev} = DecodedDoc,
+    ok.
+
+%% @doc Test zero-copy CBOR for _find queries with include_docs
+%% Verifies that CBOR query response works with doc_format=binary
+%% Uses documents created in earlier tests (test_doc_cbor, test_doc_zerocopy)
+cbor_zero_copy_find(Config) ->
+    Auth = auth_header(Config),
+
+    %% Query all documents with include_docs using CBOR
+    %% Use "exists id" to match all documents
+    Query = #{
+        <<"where">> => [#{<<"path">> => [<<"id">>], <<"op">> => <<"exists">>}],
+        <<"include_docs">> => true,
+        <<"limit">> => 10
+    },
+    QueryCbor = barrel_docdb_codec_cbor:encode_cbor(Query),
+
+    {ok, 200, FindHeaders, FindRef} = hackney:post(
+        ?BASE_URL ++ "/db/testdb/_find",
+        [Auth,
+         {<<"Content-Type">>, <<"application/cbor">>},
+         {<<"Accept">>, <<"application/cbor">>}],
+        QueryCbor,
+        []
+    ),
+    %% Verify Content-Type is CBOR
+    <<"application/cbor">> = proplists:get_value(<<"content-type">>, FindHeaders),
+
+    {ok, FindBody} = hackney:body(FindRef),
+    #{<<"results">> := Results, <<"meta">> := _Meta} = barrel_docdb_codec_cbor:decode_cbor(FindBody),
+
+    %% Verify we got results (should have docs from earlier tests)
+    true = length(Results) >= 1,
+    %% Each result should be a map (decoded document)
+    lists:foreach(fun(Doc) ->
+        true = is_map(Doc)
+    end, Results),
     ok.
 
 %% @doc Test DELETE document
