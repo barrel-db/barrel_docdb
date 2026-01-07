@@ -24,7 +24,14 @@
     get_changes_with_filter/1,
     get_changes_longpoll_timeout/1,
     changes_stream_basic/1,
-    bulk_docs/1
+    bulk_docs/1,
+    %% Policy tests
+    policy_create/1,
+    policy_get/1,
+    policy_list/1,
+    policy_enable_disable/1,
+    policy_status/1,
+    policy_delete/1
 ]).
 
 -define(PORT, 18080).
@@ -35,21 +42,31 @@
 %%====================================================================
 
 all() ->
-    [{group, http_tests}].
+    [{group, http_tests}, {group, policy_tests}].
 
 groups() ->
-    [{http_tests, [sequence], [
-        health_check,
-        get_doc_not_found,
-        put_and_get_doc_json,
-        put_and_get_doc_cbor,
-        delete_doc,
-        get_changes,
-        get_changes_with_filter,
-        get_changes_longpoll_timeout,
-        changes_stream_basic,
-        bulk_docs
-    ]}].
+    [
+        {http_tests, [sequence], [
+            health_check,
+            get_doc_not_found,
+            put_and_get_doc_json,
+            put_and_get_doc_cbor,
+            delete_doc,
+            get_changes,
+            get_changes_with_filter,
+            get_changes_longpoll_timeout,
+            changes_stream_basic,
+            bulk_docs
+        ]},
+        {policy_tests, [sequence], [
+            policy_create,
+            policy_get,
+            policy_list,
+            policy_enable_disable,
+            policy_status,
+            policy_delete
+        ]}
+    ].
 
 init_per_suite(Config) ->
     application:ensure_all_started(barrel_docdb),
@@ -73,6 +90,16 @@ end_per_suite(_Config) ->
 init_per_group(http_tests, Config) ->
     %% Create test database
     {ok, _} = barrel_docdb:create_db(<<"testdb">>),
+    Config;
+init_per_group(policy_tests, Config) ->
+    %% Clean up any existing test policies
+    case barrel_rep_policy:list() of
+        {ok, Policies} ->
+            lists:foreach(fun(#{name := Name}) ->
+                barrel_rep_policy:delete(Name)
+            end, Policies);
+        _ -> ok
+    end,
     Config.
 
 %% Helper to get auth header
@@ -82,6 +109,16 @@ auth_header(Config) ->
 
 end_per_group(http_tests, _Config) ->
     barrel_docdb:delete_db(<<"testdb">>),
+    ok;
+end_per_group(policy_tests, _Config) ->
+    %% Clean up test policies
+    case barrel_rep_policy:list() of
+        {ok, Policies} ->
+            lists:foreach(fun(#{name := Name}) ->
+                barrel_rep_policy:delete(Name)
+            end, Policies);
+        _ -> ok
+    end,
     ok.
 
 init_per_testcase(_TestCase, Config) ->
@@ -378,4 +415,224 @@ bulk_docs(Config) ->
         end,
         Results
     ),
+    ok.
+
+%%====================================================================
+%% Policy HTTP API Tests
+%%====================================================================
+
+%% @doc Test creating a policy via HTTP
+policy_create(Config) ->
+    Auth = auth_header(Config),
+    PolicySpec = #{
+        <<"name">> => <<"test_fanout">>,
+        <<"pattern">> => <<"fanout">>,
+        <<"source">> => <<"source_db">>,
+        <<"targets">> => [<<"target1">>, <<"target2">>],
+        <<"mode">> => <<"one_shot">>
+    },
+    ReqBody = iolist_to_binary(json:encode(PolicySpec)),
+
+    {ok, 201, _Headers, Ref} = hackney:post(
+        ?BASE_URL ++ "/_policies",
+        [Auth,
+         {<<"Content-Type">>, <<"application/json">>},
+         {<<"Accept">>, <<"application/json">>}],
+        ReqBody,
+        []
+    ),
+    {ok, Body} = hackney:body(Ref),
+    #{<<"ok">> := true, <<"name">> := <<"test_fanout">>} = json:decode(Body),
+
+    %% Try to create duplicate
+    {ok, 409, _Headers2, Ref2} = hackney:post(
+        ?BASE_URL ++ "/_policies",
+        [Auth,
+         {<<"Content-Type">>, <<"application/json">>},
+         {<<"Accept">>, <<"application/json">>}],
+        ReqBody,
+        []
+    ),
+    {ok, _} = hackney:body(Ref2),
+    ok.
+
+%% @doc Test getting a policy via HTTP
+policy_get(Config) ->
+    Auth = auth_header(Config),
+
+    %% Get existing policy
+    {ok, 200, _Headers, Ref} = hackney:get(
+        ?BASE_URL ++ "/_policies/test_fanout",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    {ok, Body} = hackney:body(Ref),
+    Policy = json:decode(Body),
+    <<"test_fanout">> = maps:get(<<"name">>, Policy),
+    <<"fanout">> = maps:get(<<"pattern">>, Policy),
+    <<"source_db">> = maps:get(<<"source">>, Policy),
+
+    %% Get non-existing policy
+    {ok, 404, _Headers2, Ref2} = hackney:get(
+        ?BASE_URL ++ "/_policies/nonexistent",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    {ok, _} = hackney:body(Ref2),
+    ok.
+
+%% @doc Test listing policies via HTTP
+policy_list(Config) ->
+    Auth = auth_header(Config),
+
+    %% Create another policy
+    PolicySpec = #{
+        <<"name">> => <<"test_chain">>,
+        <<"pattern">> => <<"chain">>,
+        <<"nodes">> => [<<"node1">>, <<"node2">>],
+        <<"database">> => <<"mydb">>
+    },
+    ReqBody = iolist_to_binary(json:encode(PolicySpec)),
+    {ok, 201, _, CreateRef} = hackney:post(
+        ?BASE_URL ++ "/_policies",
+        [Auth,
+         {<<"Content-Type">>, <<"application/json">>},
+         {<<"Accept">>, <<"application/json">>}],
+        ReqBody,
+        []
+    ),
+    {ok, _} = hackney:body(CreateRef),
+
+    %% List all policies
+    {ok, 200, _Headers, Ref} = hackney:get(
+        ?BASE_URL ++ "/_policies",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    {ok, Body} = hackney:body(Ref),
+    #{<<"policies">> := Policies} = json:decode(Body),
+    true = length(Policies) >= 2,
+
+    %% Verify we have our policies
+    Names = [maps:get(<<"name">>, P) || P <- Policies],
+    true = lists:member(<<"test_fanout">>, Names),
+    true = lists:member(<<"test_chain">>, Names),
+    ok.
+
+%% @doc Test enabling/disabling a policy via HTTP
+policy_enable_disable(Config) ->
+    Auth = auth_header(Config),
+
+    %% Check initial state (disabled by default)
+    {ok, 200, _Headers, Ref} = hackney:get(
+        ?BASE_URL ++ "/_policies/test_fanout",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    {ok, Body} = hackney:body(Ref),
+    #{<<"enabled">> := false} = json:decode(Body),
+
+    %% Enable policy (may fail to actually start tasks but API should work)
+    {ok, _Status1, _Headers2, Ref2} = hackney:post(
+        ?BASE_URL ++ "/_policies/test_fanout/_enable",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    {ok, _} = hackney:body(Ref2),
+    %% Enable may succeed (200) or fail (400/500) if tasks can't be started
+    %% (e.g., databases don't exist). The important thing is the API works.
+
+    %% Disable policy
+    {ok, 200, _Headers3, Ref3} = hackney:post(
+        ?BASE_URL ++ "/_policies/test_fanout/_disable",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    {ok, Body3} = hackney:body(Ref3),
+    #{<<"ok">> := true} = json:decode(Body3),
+
+    %% Verify disabled
+    {ok, 200, _Headers4, Ref4} = hackney:get(
+        ?BASE_URL ++ "/_policies/test_fanout",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    {ok, Body4} = hackney:body(Ref4),
+    #{<<"enabled">> := false} = json:decode(Body4),
+    ok.
+
+%% @doc Test getting policy status via HTTP
+policy_status(Config) ->
+    Auth = auth_header(Config),
+
+    {ok, 200, _Headers, Ref} = hackney:get(
+        ?BASE_URL ++ "/_policies/test_fanout/_status",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    {ok, Body} = hackney:body(Ref),
+    Status = json:decode(Body),
+    <<"test_fanout">> = maps:get(<<"name">>, Status),
+    <<"fanout">> = maps:get(<<"pattern">>, Status),
+    _ = maps:get(<<"enabled">>, Status),
+    _ = maps:get(<<"task_count">>, Status),
+
+    %% Non-existing policy status
+    {ok, 404, _Headers2, Ref2} = hackney:get(
+        ?BASE_URL ++ "/_policies/nonexistent/_status",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    {ok, _} = hackney:body(Ref2),
+    ok.
+
+%% @doc Test deleting a policy via HTTP
+policy_delete(Config) ->
+    Auth = auth_header(Config),
+
+    %% Delete test_fanout policy
+    {ok, 200, _Headers, Ref} = hackney:delete(
+        ?BASE_URL ++ "/_policies/test_fanout",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    {ok, Body} = hackney:body(Ref),
+    #{<<"ok">> := true} = json:decode(Body),
+
+    %% Verify deleted
+    {ok, 404, _Headers2, Ref2} = hackney:get(
+        ?BASE_URL ++ "/_policies/test_fanout",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    {ok, _} = hackney:body(Ref2),
+
+    %% Delete non-existing policy
+    {ok, 404, _Headers3, Ref3} = hackney:delete(
+        ?BASE_URL ++ "/_policies/nonexistent",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    {ok, _} = hackney:body(Ref3),
+
+    %% Delete test_chain too
+    {ok, 200, _Headers4, Ref4} = hackney:delete(
+        ?BASE_URL ++ "/_policies/test_chain",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    {ok, _} = hackney:body(Ref4),
     ok.

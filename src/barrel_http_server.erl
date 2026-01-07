@@ -68,6 +68,9 @@ init(Opts) ->
             %% Health endpoint
             {"/health", barrel_http_handler, #{action => health}},
 
+            %% Prometheus metrics endpoint
+            {"/metrics", barrel_http_handler, #{action => metrics}},
+
             %% Discovery endpoint (Mastodon-like node info)
             {"/.well-known/barrel", barrel_http_handler, #{action => node_info}},
 
@@ -84,6 +87,13 @@ init(Opts) ->
             {"/_federation/:name", barrel_http_handler, #{action => federation}},
             {"/_federation/:name/members/:member", barrel_http_handler, #{action => federation_member}},
             {"/_federation/:name/_find", barrel_http_handler, #{action => federation_find}},
+
+            %% Replication policy endpoints
+            {"/_policies", barrel_http_handler, #{action => policies}},
+            {"/_policies/:name", barrel_http_handler, #{action => policy}},
+            {"/_policies/:name/_enable", barrel_http_handler, #{action => policy_enable}},
+            {"/_policies/:name/_disable", barrel_http_handler, #{action => policy_disable}},
+            {"/_policies/:name/_status", barrel_http_handler, #{action => policy_status}},
 
             %% Database operations
             {"/db/:db", barrel_http_handler, #{action => db_info}},

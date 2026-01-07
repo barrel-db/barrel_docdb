@@ -38,6 +38,17 @@ init([]) ->
         period => 60
     },
 
+    %% Prometheus metrics module
+    %% Must start first to set up metric declarations
+    Metrics = #{
+        id => barrel_metrics,
+        start => {barrel_metrics, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [barrel_metrics]
+    },
+
     %% Shared RocksDB block cache for all databases
     %% Must start before any database opens
     Cache = #{
@@ -132,6 +143,16 @@ init([]) ->
         modules => [barrel_rep_tasks]
     },
 
+    %% Replication policy manager for high-level replication patterns
+    RepPolicy = #{
+        id => barrel_rep_policy,
+        start => {barrel_rep_policy, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [barrel_rep_policy]
+    },
+
     %% API keys manager for HTTP authentication
     ApiKeys = #{
         id => barrel_http_api_keys,
@@ -153,7 +174,7 @@ init([]) ->
         modules => [barrel_discovery]
     },
 
-    %% Cache must start first, then HLC, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, ApiKeys, Discovery
-    ChildSpecs = [Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, ApiKeys, Discovery],
+    %% Metrics must start first, then Cache, HLC, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, RepPolicy, ApiKeys, Discovery
+    ChildSpecs = [Metrics, Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, RepPolicy, ApiKeys, Discovery],
 
     {ok, {SupFlags, ChildSpecs}}.

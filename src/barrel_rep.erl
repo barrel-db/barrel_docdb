@@ -224,6 +224,15 @@ replicate_one_shot(Config, Opts) ->
             %% Write final checkpoint
             ok = barrel_rep_checkpoint:write_checkpoint(FinalCheckpoint),
 
+            %% Record replication metrics
+            DocsWritten = maps:get(docs_written, Stats, 0),
+            DocWriteFailures = maps:get(doc_write_failures, Stats, 0),
+            barrel_metrics:inc_rep_docs(push, DocsWritten),
+            case DocWriteFailures > 0 of
+                true -> barrel_metrics:inc_rep_errors(RepId);
+                false -> ok
+            end,
+
             %% Build result
             Result = Stats#{
                 ok => true,
@@ -232,6 +241,8 @@ replicate_one_shot(Config, Opts) ->
             },
             {ok, Result};
         {error, _} = Error ->
+            %% Record error metric
+            barrel_metrics:inc_rep_errors(RepId),
             Error
     end.
 

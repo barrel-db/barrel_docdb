@@ -254,7 +254,8 @@ find(FederationName, QuerySpec) ->
 -spec find(federation_name(), query_spec(), query_opts()) ->
     {ok, [map()], map()} | {error, term()}.
 find(FederationName, QuerySpec, Opts) ->
-    case get(FederationName) of
+    Start = erlang:monotonic_time(millisecond),
+    Result = case get(FederationName) of
         {ok, #{members := Members} = Federation} ->
             Timeout = maps:get(timeout, Opts, 30000),
             MergeStrategy = maps:get(merge_strategy, Opts, newest),
@@ -282,7 +283,12 @@ find(FederationName, QuerySpec, Opts) ->
             {ok, MergedDocs, Meta};
         {error, not_found} ->
             {error, {federation_not_found, FederationName}}
-    end.
+    end,
+    %% Record federation metrics
+    Duration = erlang:monotonic_time(millisecond) - Start,
+    barrel_metrics:inc_federation_queries(FederationName),
+    barrel_metrics:observe_federation_latency(FederationName, Duration),
+    Result.
 
 %% @doc Set or update the default query for a federation
 -spec set_query(federation_name(), query_spec()) -> ok | {error, term()}.

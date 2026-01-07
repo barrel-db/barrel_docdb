@@ -63,6 +63,9 @@ init(Req0, State) ->
 maybe_authenticate(health, _Req) ->
     %% Health check is always public
     ok;
+maybe_authenticate(metrics, _Req) ->
+    %% Metrics endpoint is always public (for Prometheus scraping)
+    ok;
 maybe_authenticate(node_info, _Req) ->
     %% Node info is public (for discovery)
     ok;
@@ -144,10 +147,23 @@ extract_bearer_token(Req) ->
 %% Action Handlers
 %%====================================================================
 
-%% Health check
+%% Health check - returns detailed system status
 handle_action(health, <<"GET">>, Req) ->
-    Body = encode_response(#{<<"status">> => <<"ok">>}, Req),
-    {200, response_headers(Req), Body, Req};
+    %% Collect health information
+    Health = collect_health_info(),
+    Body = encode_response(Health, Req),
+    %% Return 503 if unhealthy, 200 otherwise
+    Status = case maps:get(<<"status">>, Health) of
+        <<"ok">> -> 200;
+        _ -> 503
+    end,
+    {Status, response_headers(Req), Body, Req};
+
+%% Prometheus metrics endpoint
+handle_action(metrics, <<"GET">>, Req) ->
+    MetricsText = barrel_metrics:export_text(),
+    Headers = #{<<"content-type">> => <<"text/plain; version=0.0.4; charset=utf-8">>},
+    {200, Headers, MetricsText, Req};
 
 %% Node info (discovery endpoint)
 handle_action(node_info, <<"GET">>, Req) ->
@@ -277,6 +293,104 @@ handle_action(federation_find, <<"GET">>, Req) ->
     end;
 handle_action(federation_find, <<"POST">>, Req) ->
     handle_federation_find(Req);
+
+%% Replication policies: list all
+handle_action(policies, <<"GET">>, Req) ->
+    {ok, Policies} = barrel_rep_policy:list(),
+    %% Convert policies to JSON-safe format
+    SafePolicies = [policy_to_json(P) || P <- Policies],
+    Body = encode_response(#{<<"policies">> => SafePolicies}, Req),
+    {200, response_headers(Req), Body, Req};
+
+%% Replication policies: create
+handle_action(policies, <<"POST">>, Req) ->
+    handle_create_policy(Req);
+
+%% Replication policies: get
+handle_action(policy, <<"GET">>, Req) ->
+    Name = cowboy_req:binding(name, Req),
+    case barrel_rep_policy:get(Name) of
+        {ok, Policy} ->
+            Body = encode_response(policy_to_json(Policy), Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Policy not found">>})
+    end;
+
+%% Replication policies: update
+handle_action(policy, <<"PUT">>, Req) ->
+    Name = cowboy_req:binding(name, Req),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req),
+    Spec = decode_request_body(ReqBody, Req1),
+    %% Delete and recreate with new config
+    case barrel_rep_policy:get(Name) of
+        {ok, OldPolicy} ->
+            WasEnabled = maps:get(enabled, OldPolicy, false),
+            ok = barrel_rep_policy:delete(Name),
+            Config = json_to_policy_config(Spec),
+            case barrel_rep_policy:create(Name, Config) of
+                ok ->
+                    %% Re-enable if it was enabled
+                    case WasEnabled of
+                        true -> barrel_rep_policy:enable(Name);
+                        false -> ok
+                    end,
+                    Body = encode_response(#{<<"ok">> => true}, Req1),
+                    {200, response_headers(Req1), Body, Req1};
+                {error, Reason} ->
+                    throw({error, 400, format_error(Reason)})
+            end;
+        {error, not_found} ->
+            throw({error, 404, <<"Policy not found">>})
+    end;
+
+%% Replication policies: delete
+handle_action(policy, <<"DELETE">>, Req) ->
+    Name = cowboy_req:binding(name, Req),
+    case barrel_rep_policy:delete(Name) of
+        ok ->
+            Body = encode_response(#{<<"ok">> => true}, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Policy not found">>})
+    end;
+
+%% Replication policies: enable
+handle_action(policy_enable, <<"POST">>, Req) ->
+    Name = cowboy_req:binding(name, Req),
+    case barrel_rep_policy:enable(Name) of
+        ok ->
+            Body = encode_response(#{<<"ok">> => true}, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Policy not found">>});
+        {error, Reason} ->
+            throw({error, 400, format_error(Reason)})
+    end;
+
+%% Replication policies: disable
+handle_action(policy_disable, <<"POST">>, Req) ->
+    Name = cowboy_req:binding(name, Req),
+    case barrel_rep_policy:disable(Name) of
+        ok ->
+            Body = encode_response(#{<<"ok">> => true}, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Policy not found">>});
+        {error, Reason} ->
+            throw({error, 400, format_error(Reason)})
+    end;
+
+%% Replication policies: get status
+handle_action(policy_status, <<"GET">>, Req) ->
+    Name = cowboy_req:binding(name, Req),
+    case barrel_rep_policy:status(Name) of
+        {ok, Status} ->
+            Body = encode_response(policy_status_to_json(Status), Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Policy not found">>})
+    end;
 
 %% Database info
 handle_action(db_info, <<"GET">>, Req) ->
@@ -675,6 +789,134 @@ format_federation_meta(Meta) ->
         <<"source_counts">> => maps:get(source_counts, Meta),
         <<"total_results">> => maps:get(total_results, Meta)
     }.
+
+%%====================================================================
+%% Replication Policy Handlers
+%%====================================================================
+
+handle_create_policy(Req0) ->
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    Spec = decode_request_body(ReqBody, Req1),
+    Name = maps:get(<<"name">>, Spec),
+    Config = json_to_policy_config(Spec),
+    case barrel_rep_policy:create(Name, Config) of
+        ok ->
+            Response = #{<<"ok">> => true, <<"name">> => Name},
+            Body = encode_response(Response, Req1),
+            {201, response_headers(Req1), Body, Req1};
+        {error, already_exists} ->
+            throw({error, 409, <<"Policy already exists">>});
+        {error, {invalid_config, Reason}} ->
+            throw({error, 400, format_error({invalid_config, Reason})});
+        {error, {unknown_pattern, Pattern}} ->
+            throw({error, 400, <<"Unknown pattern: ", (atom_to_binary(Pattern))/binary>>});
+        {error, Reason} ->
+            throw({error, 400, format_error(Reason)})
+    end.
+
+%% Convert JSON policy spec to Erlang config
+json_to_policy_config(Spec) ->
+    Config0 = #{},
+    Config1 = case maps:get(<<"pattern">>, Spec, undefined) of
+        undefined -> Config0;
+        PatternBin -> Config0#{pattern => binary_to_atom(PatternBin)}
+    end,
+    Config2 = case maps:get(<<"mode">>, Spec, undefined) of
+        undefined -> Config1;
+        ModeBin -> Config1#{mode => binary_to_atom(ModeBin)}
+    end,
+    Config3 = case maps:get(<<"enabled">>, Spec, undefined) of
+        undefined -> Config2;
+        Enabled -> Config2#{enabled => Enabled}
+    end,
+    %% Chain pattern options
+    Config4 = case maps:get(<<"nodes">>, Spec, undefined) of
+        undefined -> Config3;
+        Nodes -> Config3#{nodes => Nodes}
+    end,
+    Config5 = case maps:get(<<"database">>, Spec, undefined) of
+        undefined -> Config4;
+        Database -> Config4#{database => Database}
+    end,
+    %% Group pattern options
+    Config6 = case maps:get(<<"members">>, Spec, undefined) of
+        undefined -> Config5;
+        Members -> Config5#{members => Members}
+    end,
+    %% Fanout pattern options
+    Config7 = case maps:get(<<"source">>, Spec, undefined) of
+        undefined -> Config6;
+        Source -> Config6#{source => Source}
+    end,
+    Config8 = case maps:get(<<"targets">>, Spec, undefined) of
+        undefined -> Config7;
+        Targets -> Config7#{targets => Targets}
+    end,
+    %% Tiered pattern options
+    Config9 = case maps:get(<<"hot_db">>, Spec, undefined) of
+        undefined -> Config8;
+        HotDb -> Config8#{hot_db => HotDb}
+    end,
+    Config10 = case maps:get(<<"warm_db">>, Spec, undefined) of
+        undefined -> Config9;
+        WarmDb -> Config9#{warm_db => WarmDb}
+    end,
+    Config11 = case maps:get(<<"cold_db">>, Spec, undefined) of
+        undefined -> Config10;
+        ColdDb -> Config10#{cold_db => ColdDb}
+    end,
+    %% Filter
+    case maps:get(<<"filter">>, Spec, undefined) of
+        undefined -> Config11;
+        Filter -> Config11#{filter => Filter}
+    end.
+
+%% Convert Erlang policy to JSON-safe map
+policy_to_json(Policy) ->
+    maps:fold(
+        fun(pattern, V, Acc) -> Acc#{<<"pattern">> => atom_to_binary(V)};
+           (mode, V, Acc) -> Acc#{<<"mode">> => atom_to_binary(V)};
+           (enabled, V, Acc) -> Acc#{<<"enabled">> => V};
+           (name, V, Acc) -> Acc#{<<"name">> => V};
+           (nodes, V, Acc) -> Acc#{<<"nodes">> => V};
+           (database, V, Acc) -> Acc#{<<"database">> => V};
+           (members, V, Acc) -> Acc#{<<"members">> => V};
+           (source, V, Acc) -> Acc#{<<"source">> => V};
+           (targets, V, Acc) -> Acc#{<<"targets">> => V};
+           (hot_db, V, Acc) -> Acc#{<<"hot_db">> => V};
+           (warm_db, V, Acc) -> Acc#{<<"warm_db">> => V};
+           (cold_db, V, Acc) -> Acc#{<<"cold_db">> => V};
+           (filter, V, Acc) -> Acc#{<<"filter">> => V};
+           (_, _, Acc) -> Acc
+        end,
+        #{},
+        Policy
+    ).
+
+%% Convert policy status to JSON-safe map
+policy_status_to_json(Status) ->
+    #{
+        <<"name">> => maps:get(name, Status),
+        <<"pattern">> => atom_to_binary(maps:get(pattern, Status)),
+        <<"enabled">> => maps:get(enabled, Status),
+        <<"task_count">> => maps:get(task_count, Status),
+        <<"tasks">> => [task_to_json(T) || T <- maps:get(tasks, Status, [])]
+    }.
+
+%% Convert task info to JSON
+task_to_json(Task) when is_map(Task) ->
+    maps:fold(
+        fun(status, V, Acc) when is_atom(V) -> Acc#{<<"status">> => atom_to_binary(V)};
+           (task_id, V, Acc) -> Acc#{<<"task_id">> => V};
+           (pid, V, Acc) when is_pid(V) -> Acc#{<<"pid">> => list_to_binary(pid_to_list(V))};
+           (K, V, Acc) when is_atom(K) -> Acc#{atom_to_binary(K) => V};
+           (K, V, Acc) -> Acc#{K => V}
+        end,
+        #{},
+        Task
+    );
+task_to_json(_) ->
+    #{<<"status">> => <<"unknown">>}.
 
 %%====================================================================
 %% Query Handler
@@ -1531,3 +1773,150 @@ sanitize_value(V) when is_list(V) ->
     lists:map(fun sanitize_value/1, V);
 sanitize_value(V) ->
     V.
+
+%%====================================================================
+%% Health Check
+%%====================================================================
+
+%% @doc Collect comprehensive health information for the node
+collect_health_info() ->
+    %% Basic node info
+    NodeName = atom_to_binary(node()),
+    {ok, Version} = application:get_key(barrel_docdb, vsn),
+    VersionBin = iolist_to_binary(Version),
+
+    %% Memory info
+    MemInfo = erlang:memory(),
+    TotalMem = proplists:get_value(total, MemInfo),
+    ProcessMem = proplists:get_value(processes, MemInfo),
+    BinaryMem = proplists:get_value(binary, MemInfo),
+    EtsMem = proplists:get_value(ets, MemInfo),
+
+    %% Process info
+    ProcessCount = erlang:system_info(process_count),
+    ProcessLimit = erlang:system_info(process_limit),
+
+    %% Scheduler info
+    SchedulersOnline = erlang:system_info(schedulers_online),
+    SchedulerUsage = try
+        scheduler_wall_time_usage()
+    catch _:_ -> undefined
+    end,
+
+    %% Database health
+    {DbStatus, DbHealth} = collect_database_health(),
+
+    %% Peer status
+    PeerHealth = collect_peer_health(),
+
+    %% Overall status
+    Status = case DbStatus of
+        ok -> <<"ok">>;
+        degraded -> <<"degraded">>;
+        unhealthy -> <<"unhealthy">>
+    end,
+
+    #{
+        <<"status">> => Status,
+        <<"node">> => NodeName,
+        <<"version">> => VersionBin,
+        <<"uptime_seconds">> => uptime_seconds(),
+        <<"memory">> => #{
+            <<"total_bytes">> => TotalMem,
+            <<"process_bytes">> => ProcessMem,
+            <<"binary_bytes">> => BinaryMem,
+            <<"ets_bytes">> => EtsMem
+        },
+        <<"processes">> => #{
+            <<"count">> => ProcessCount,
+            <<"limit">> => ProcessLimit,
+            <<"utilization">> => ProcessCount / ProcessLimit
+        },
+        <<"schedulers">> => #{
+            <<"online">> => SchedulersOnline,
+            <<"utilization">> => SchedulerUsage
+        },
+        <<"databases">> => DbHealth,
+        <<"peers">> => PeerHealth
+    }.
+
+%% @private Get node uptime in seconds
+uptime_seconds() ->
+    {UpTime, _} = erlang:statistics(wall_clock),
+    UpTime div 1000.
+
+%% @private Calculate scheduler utilization
+scheduler_wall_time_usage() ->
+    case erlang:statistics(scheduler_wall_time) of
+        undefined ->
+            %% Enable scheduler wall time if not already
+            erlang:system_flag(scheduler_wall_time, true),
+            undefined;
+        SchedulerTimes ->
+            TotalActive = lists:sum([A || {_, A, _} <- SchedulerTimes]),
+            TotalTime = lists:sum([T || {_, _, T} <- SchedulerTimes]),
+            case TotalTime of
+                0 -> 0.0;
+                _ -> TotalActive / TotalTime
+            end
+    end.
+
+%% @private Collect health status for all databases
+collect_database_health() ->
+    DbNames = barrel_docdb:list_dbs(),
+    %% Filter out system databases from health reporting
+    UserDbNames = [N || N <- DbNames, not is_system_db(N)],
+    DbHealthList = lists:map(fun collect_single_db_health/1, UserDbNames),
+    %% Determine overall status
+    Statuses = [maps:get(<<"status">>, H) || H <- DbHealthList],
+    OverallStatus = case lists:member(<<"unhealthy">>, Statuses) of
+        true -> unhealthy;
+        false ->
+            case lists:member(<<"degraded">>, Statuses) of
+                true -> degraded;
+                false -> ok
+            end
+    end,
+    {OverallStatus, DbHealthList}.
+
+%% @private Check if database is a system database
+is_system_db(<<"_", _/binary>>) -> true;
+is_system_db(_) -> false.
+
+%% @private Collect health for a single database
+collect_single_db_health(DbName) ->
+    case barrel_docdb:db_info(DbName) of
+        {ok, Info} ->
+            DocCount = maps:get(doc_count, Info, 0),
+            #{
+                <<"name">> => DbName,
+                <<"status">> => <<"ok">>,
+                <<"doc_count">> => DocCount
+            };
+        {error, _} ->
+            #{
+                <<"name">> => DbName,
+                <<"status">> => <<"unhealthy">>,
+                <<"error">> => <<"unable_to_access">>
+            }
+    end.
+
+%% @private Collect peer health status
+collect_peer_health() ->
+    case barrel_discovery:list_peers() of
+        {ok, Peers} ->
+            TotalPeers = length(Peers),
+            ActivePeers = length([P || P <- Peers,
+                                       maps:get(status, P, unknown) =:= active]),
+            #{
+                <<"total">> => TotalPeers,
+                <<"active">> => ActivePeers,
+                <<"inactive">> => TotalPeers - ActivePeers
+            };
+        {error, _} ->
+            #{
+                <<"total">> => 0,
+                <<"active">> => 0,
+                <<"inactive">> => 0
+            }
+    end.

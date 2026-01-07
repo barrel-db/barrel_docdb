@@ -406,10 +406,16 @@ put_doc(Db, Doc) ->
 %% @returns `{ok, #{<<"id">> => DocId, <<"rev">> => Rev, <<"ok">> => true}}'
 -spec put_doc(binary() | pid(), map(), map()) -> {ok, map()} | {error, term()}.
 put_doc(Db, Doc, Opts) ->
+    DbName = db_name(Db),
+    Start = erlang:monotonic_time(millisecond),
     %% Write document locally first
     Result = with_db(Db, fun(Pid) ->
         barrel_db_server:put_doc(Pid, Doc, Opts)
     end),
+    %% Record metrics
+    Duration = erlang:monotonic_time(millisecond) - Start,
+    barrel_metrics:inc_doc_ops(DbName, put),
+    barrel_metrics:observe_doc_latency(DbName, put, Duration),
     %% Handle sync replication if requested
     case {Result, maps:get(replicate, Opts, async)} of
         {{ok, WriteResult}, sync} ->
@@ -550,9 +556,15 @@ get_doc(Db, DocId) ->
 %% @returns `{ok, Document}' or `{error, not_found}'
 -spec get_doc(binary() | pid(), binary(), map()) -> {ok, map()} | {error, term()}.
 get_doc(Db, DocId, Opts) ->
-    with_db(Db, fun(Pid) ->
+    DbName = db_name(Db),
+    Start = erlang:monotonic_time(millisecond),
+    Result = with_db(Db, fun(Pid) ->
         barrel_db_server:get_doc(Pid, DocId, Opts)
-    end).
+    end),
+    Duration = erlang:monotonic_time(millisecond) - Start,
+    barrel_metrics:inc_doc_ops(DbName, get),
+    barrel_metrics:observe_doc_latency(DbName, get, Duration),
+    Result.
 
 %% @doc Get multiple documents by ID (batch read).
 %%
@@ -621,9 +633,15 @@ delete_doc(Db, DocId) ->
 %% @returns `{ok, #{<<"id">> => DocId, <<"rev">> => NewRev, <<"ok">> => true}}'
 -spec delete_doc(binary() | pid(), binary(), map()) -> {ok, map()} | {error, term()}.
 delete_doc(Db, DocId, Opts) ->
-    with_db(Db, fun(Pid) ->
+    DbName = db_name(Db),
+    Start = erlang:monotonic_time(millisecond),
+    Result = with_db(Db, fun(Pid) ->
         barrel_db_server:delete_doc(Pid, DocId, Opts)
-    end).
+    end),
+    Duration = erlang:monotonic_time(millisecond) - Start,
+    barrel_metrics:inc_doc_ops(DbName, delete),
+    barrel_metrics:observe_doc_latency(DbName, delete, Duration),
+    Result.
 
 %% @doc Fold over all documents in the database.
 %%
@@ -1147,7 +1165,9 @@ find(Db, QuerySpec) ->
 %%          where Meta = #{has_more => boolean(), continuation => binary(), last_seq => seq()}
 -spec find(binary() | pid(), map(), map()) -> {ok, [map()], map()} | {error, term()}.
 find(Db, QuerySpec, Opts) ->
-    with_db(Db, fun(Pid) ->
+    MetricsDbName = db_name(Db),
+    Start = erlang:monotonic_time(millisecond),
+    Result = with_db(Db, fun(Pid) ->
         {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
         {ok, Info} = barrel_db_server:info(Pid),
         DbName = maps:get(name, Info),
@@ -1172,7 +1192,18 @@ find(Db, QuerySpec, Opts) ->
             {error, _} = Error ->
                 Error
         end
-    end).
+    end),
+    %% Record query metrics
+    Duration = erlang:monotonic_time(millisecond) - Start,
+    barrel_metrics:inc_query_ops(MetricsDbName),
+    barrel_metrics:observe_query_latency(MetricsDbName, Duration),
+    case Result of
+        {ok, Results, _Meta} ->
+            barrel_metrics:observe_query_results(MetricsDbName, length(Results));
+        _ ->
+            ok
+    end,
+    Result.
 
 %% @doc Explain a query execution plan.
 %%
@@ -1699,6 +1730,20 @@ unsubscribe_query(SubRef) ->
 %%====================================================================
 %% Internal Functions
 %%====================================================================
+
+%% @private Extract database name from pid or binary
+-spec db_name(binary() | pid()) -> binary().
+db_name(Name) when is_binary(Name) ->
+    Name;
+db_name(Pid) when is_pid(Pid) ->
+    %% For pid, we need to look up the name - use unknown for metrics if not found
+    case process_info(Pid, registered_name) of
+        {registered_name, _} ->
+            %% Try to find name from persistent_term
+            <<"unknown">>;
+        _ ->
+            <<"unknown">>
+    end.
 
 %% @private Get database pid by name
 -spec get_db(binary()) -> {ok, pid()} | {error, not_found}.
