@@ -768,18 +768,15 @@ make_index_ops(DbName, DocId, Paths) ->
     StatsOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), 1}
                 || {Path, _} <- Paths],
 
-    %% Set bitmap bits for each path (position varies by path depth)
-    BitmapOps = [{bitmap_set,
-                  barrel_store_keys:path_bitmap_key(DbName, Path),
-                  doc_to_position(DocId, Path)}
-                 || {Path, _} <- Paths],
+    %% NOTE: Bitmap operations removed - V2 posting lists have built-in roaring bitmaps
+    %% Use barrel_postings:bitmap_contains/2 for O(1) existence checks
 
     %% Store reverse index (doc_id -> paths) for later updates/deletes
     ReverseOp = {put,
                  barrel_store_keys:doc_paths_key(DbName, DocId),
                  term_to_binary(Paths)},
 
-    PostingOps ++ ValueIndexOps ++ BucketedPostingOps ++ StatsOps ++ BitmapOps ++ [ReverseOp].
+    PostingOps ++ ValueIndexOps ++ BucketedPostingOps ++ StatsOps ++ [ReverseOp].
 
 %% @private Create value-first index operations for equality queries
 %% Path format: [field1, field2, value] -> value_index_key(DbName, value, [field1, field2], DocId)
@@ -980,12 +977,7 @@ make_update_ops(DbName, DocId, Added, Removed, NewPaths) ->
     IncrOps = [{merge, barrel_store_keys:path_stats_key(DbName, Path), 1}
                || {Path, _} <- Added],
 
-    %% Update bitmap for added paths (position varies by path depth)
-    %% Note: We don't unset on remove because other docs may share the position
-    BitmapSetOps = [{bitmap_set,
-                     barrel_store_keys:path_bitmap_key(DbName, Path),
-                     doc_to_position(DocId, Path)}
-                    || {Path, _} <- Added],
+    %% NOTE: Bitmap operations removed - V2 posting lists have built-in roaring bitmaps
 
     %% Update reverse index with new paths
     ReverseOp = {put,
@@ -993,4 +985,4 @@ make_update_ops(DbName, DocId, Added, Removed, NewPaths) ->
                  term_to_binary(NewPaths)},
 
     RemoveOps ++ AddOps ++ ValueRemoveOps ++ ValueAddOps ++
-        DecrOps ++ IncrOps ++ BitmapSetOps ++ [ReverseOp].
+        DecrOps ++ IncrOps ++ [ReverseOp].

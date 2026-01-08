@@ -477,39 +477,37 @@ cardinality_remove(Config) ->
     ok.
 
 %%====================================================================
-%% Test Cases - Bitmap
+%% Test Cases - Bitmap (V2 Postings Built-in Bitmaps)
 %%====================================================================
 
 bitmap_basic(Config) ->
     StoreRef = proplists:get_value(store_ref, Config),
     DbName = proplists:get_value(db_name, Config),
 
-    %% Initially no bitmap
-    not_found = barrel_ars_index:get_path_bitmap(StoreRef, DbName, [<<"type">>, <<"bitmap_test">>]),
-
-    %% Index a doc - bitmap should be created
+    %% Index docs for bitmap testing
     Doc1 = #{<<"type">> => <<"bitmap_test">>},
-    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"bm1">>, Doc1),
-
-    %% Bitmap should now exist
-    {ok, Bitmap1} = barrel_ars_index:get_path_bitmap(StoreRef, DbName, [<<"type">>, <<"bitmap_test">>]),
-    ?assert(is_binary(Bitmap1)),
-
-    %% Index another doc with same path
     Doc2 = #{<<"type">> => <<"bitmap_test">>},
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"bm1">>, Doc1),
     ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"bm2">>, Doc2),
 
-    %% Bitmap should still exist (and be updated)
-    {ok, Bitmap2} = barrel_ars_index:get_path_bitmap(StoreRef, DbName, [<<"type">>, <<"bitmap_test">>]),
-    ?assert(is_binary(Bitmap2)),
+    %% Get postings resource - V2 posting lists have built-in roaring bitmaps
+    {ok, Postings} = barrel_ars_index:get_postings_resource(StoreRef, DbName, [<<"type">>, <<"bitmap_test">>]),
+
+    %% Test O(1) bitmap contains for fast existence checks
+    ?assertEqual(true, barrel_postings:bitmap_contains(Postings, <<"bm1">>)),
+    ?assertEqual(true, barrel_postings:bitmap_contains(Postings, <<"bm2">>)),
+
+    %% Note: bitmap_contains may have false positives for absent keys due to hash collisions
+    %% Use barrel_postings:contains/2 for exact checks
 
     ok.
 
 bitmap_size_by_depth(_Config) ->
-    %% Test that bitmap size is global (same for all paths)
-    %% This enables cross-path bitmap intersection
+    %% Test that V2 posting lists provide O(1) bitmap operations
+    %% The old global bitmap size is no longer used - V2 has per-posting roaring bitmaps
+    %% This test verifies the old API is still available for backwards compatibility
     Size = barrel_ars_index:bitmap_size(),
-    ?assertEqual(1048576, Size),  %% 1M bits global
+    ?assertEqual(1048576, Size),  %% Legacy value for backwards compatibility
 
     ok.
 
