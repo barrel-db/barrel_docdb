@@ -61,6 +61,15 @@
     doc_position/2
 ]).
 
+%% Native postings API (V2 posting lists)
+-export([
+    get_posting_list_binary/3,
+    get_postings_resource/3,
+    intersect_posting_lists/1,
+    posting_contains/2,
+    posting_bitmap_contains/2
+]).
+
 -include("barrel_docdb.hrl").
 
 -type store_ref() :: barrel_store_rocksdb:db_ref().
@@ -666,6 +675,55 @@ get_bucketed_posting_list(StoreRef, DbName, Value, FieldPath) ->
     AllDocIds = barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, FoldFun, []),
     %% Sort the collected DocIds
     lists:sort(AllDocIds).
+
+%%====================================================================
+%% Native Postings API (V2 Posting Lists)
+%%====================================================================
+
+%% @doc Get posting list binary for an exact path+value.
+%% Returns the raw binary from storage without decoding.
+%% Use with barrel_postings:open/1 for repeated lookups.
+-spec get_posting_list_binary(store_ref(), db_name(), [term()]) ->
+    {ok, binary()} | not_found | {error, term()}.
+get_posting_list_binary(StoreRef, DbName, FullPath) ->
+    Key = barrel_store_keys:path_posting_key(DbName, FullPath),
+    barrel_store_rocksdb:posting_get_binary(StoreRef, Key).
+
+%% @doc Get posting list as a postings resource for fast repeated lookups.
+%% Parse once, lookup many times with O(1) or O(log n) performance.
+%% Returns an opaque postings resource for use with barrel_postings functions.
+-spec get_postings_resource(store_ref(), db_name(), [term()]) ->
+    {ok, barrel_postings:postings()} | not_found | {error, term()}.
+get_postings_resource(StoreRef, DbName, FullPath) ->
+    case get_posting_list_binary(StoreRef, DbName, FullPath) of
+        {ok, Binary} ->
+            barrel_postings:open(Binary);
+        not_found ->
+            not_found;
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc Intersect multiple posting list binaries using native roaring bitmap.
+%% Keys in V2 posting lists are pre-sorted in lexicographic order.
+%% Returns {ok, Postings} with the intersection result.
+-spec intersect_posting_lists([binary()]) ->
+    {ok, barrel_postings:postings()} | {error, term()}.
+intersect_posting_lists(PostingBinaries) when is_list(PostingBinaries) ->
+    barrel_postings:intersect_all(PostingBinaries).
+
+%% @doc Check if a postings resource contains a DocId using exact lookup.
+%% O(log n) binary search on sorted keys.
+-spec posting_contains(barrel_postings:postings(), binary()) -> boolean().
+posting_contains(Postings, DocId) ->
+    barrel_postings:contains(Postings, DocId).
+
+%% @doc Check if a postings resource contains a DocId using bitmap lookup.
+%% O(1) hash-based lookup, may have rare false positives.
+%% Use posting_contains/2 for exact checks when false positives are unacceptable.
+-spec posting_bitmap_contains(barrel_postings:postings(), binary()) -> boolean().
+posting_bitmap_contains(Postings, DocId) ->
+    barrel_postings:bitmap_contains(Postings, DocId).
 
 %% @doc Fold over value-first index with early termination support.
 %% Iterates over individual keys (one per DocId) allowing bounded queries

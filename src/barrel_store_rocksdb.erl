@@ -27,7 +27,7 @@
 
 %% Posting list operations (using erlang_merge_operator)
 -export([posting_append/3, posting_remove/3]).
--export([posting_get/2, posting_multi_get/2]).
+-export([posting_get/2, posting_get_binary/2, posting_multi_get/2]).
 -export([fold_range_posting/5, fold_range_posting_reverse/5]).
 -export([fold_range_posting_prefix/5, fold_range_posting_prefix_with_snapshot/6]).
 
@@ -627,6 +627,12 @@ posting_get(#{ref := Ref, posting_cf := PostingCF}, Key) ->
         not_found -> not_found;
         {error, _} = Err -> Err
     end.
+
+%% @doc Get raw posting list binary from the posting column family.
+%% Returns the binary without decoding, for use with postings_open/1.
+-spec posting_get_binary(db_ref(), binary()) -> {ok, binary()} | not_found | {error, term()}.
+posting_get_binary(#{ref := Ref, posting_cf := PostingCF}, Key) ->
+    rocksdb:get(Ref, PostingCF, Key, []).
 
 %% @doc Get multiple posting lists from the posting column family (batch read)
 -spec posting_multi_get(db_ref(), [binary()]) -> [{ok, [binary()]} | not_found | {error, term()}].

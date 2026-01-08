@@ -37,7 +37,12 @@
     cardinality_update/1,
     cardinality_remove/1,
     bitmap_basic/1,
-    bitmap_size_by_depth/1
+    bitmap_size_by_depth/1,
+    %% Native postings API tests
+    native_get_posting_list_binary/1,
+    native_get_postings_resource/1,
+    native_intersect_posting_lists/1,
+    native_posting_contains/1
 ]).
 
 %%====================================================================
@@ -45,7 +50,7 @@
 %%====================================================================
 
 all() ->
-    [{group, index}, {group, update}, {group, remove}, {group, fold}, {group, cardinality}, {group, bitmap}].
+    [{group, index}, {group, update}, {group, remove}, {group, fold}, {group, cardinality}, {group, bitmap}, {group, native_postings}].
 
 groups() ->
     [
@@ -77,6 +82,12 @@ groups() ->
         {bitmap, [sequence], [
             bitmap_basic,
             bitmap_size_by_depth
+        ]},
+        {native_postings, [sequence], [
+            native_get_posting_list_binary,
+            native_get_postings_resource,
+            native_intersect_posting_lists,
+            native_posting_contains
         ]}
     ].
 
@@ -499,5 +510,100 @@ bitmap_size_by_depth(_Config) ->
     %% This enables cross-path bitmap intersection
     Size = barrel_ars_index:bitmap_size(),
     ?assertEqual(1048576, Size),  %% 1M bits global
+
+    ok.
+
+%%====================================================================
+%% Test Cases - Native Postings API
+%%====================================================================
+
+native_get_posting_list_binary(Config) ->
+    StoreRef = proplists:get_value(store_ref, Config),
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Index docs with same path value
+    Doc1 = #{<<"native_test">> => <<"value1">>},
+    Doc2 = #{<<"native_test">> => <<"value1">>},
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"native1">>, Doc1),
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"native2">>, Doc2),
+
+    %% Get raw binary
+    {ok, Binary} = barrel_ars_index:get_posting_list_binary(StoreRef, DbName, [<<"native_test">>, <<"value1">>]),
+    ?assert(is_binary(Binary)),
+    ?assert(byte_size(Binary) > 0),
+
+    %% Non-existent path
+    not_found = barrel_ars_index:get_posting_list_binary(StoreRef, DbName, [<<"nonexistent">>]),
+
+    ok.
+
+native_get_postings_resource(Config) ->
+    StoreRef = proplists:get_value(store_ref, Config),
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Index some docs
+    Doc1 = #{<<"resource_test">> => <<"res_value">>},
+    Doc2 = #{<<"resource_test">> => <<"res_value">>},
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"res1">>, Doc1),
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"res2">>, Doc2),
+
+    %% Get postings resource
+    {ok, Postings} = barrel_ars_index:get_postings_resource(StoreRef, DbName, [<<"resource_test">>, <<"res_value">>]),
+
+    %% Use barrel_postings functions on the resource
+    Count = barrel_postings:count(Postings),
+    ?assertEqual(2, Count),
+
+    Keys = barrel_postings:keys(Postings),
+    ?assertEqual([<<"res1">>, <<"res2">>], lists:sort(Keys)),
+
+    %% Non-existent path
+    not_found = barrel_ars_index:get_postings_resource(StoreRef, DbName, [<<"nonexistent">>]),
+
+    ok.
+
+native_intersect_posting_lists(Config) ->
+    StoreRef = proplists:get_value(store_ref, Config),
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Create overlapping docs
+    %% Doc A: type=inter, status=active
+    %% Doc B: type=inter, status=inactive
+    %% Doc C: type=inter, status=active
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"interA">>, #{<<"type">> => <<"inter">>, <<"status">> => <<"active">>}),
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"interB">>, #{<<"type">> => <<"inter">>, <<"status">> => <<"inactive">>}),
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"interC">>, #{<<"type">> => <<"inter">>, <<"status">> => <<"active">>}),
+
+    %% Get posting list binaries
+    {ok, TypeBin} = barrel_ars_index:get_posting_list_binary(StoreRef, DbName, [<<"type">>, <<"inter">>]),
+    {ok, StatusBin} = barrel_ars_index:get_posting_list_binary(StoreRef, DbName, [<<"status">>, <<"active">>]),
+
+    %% Intersect: type=inter AND status=active -> interA, interC
+    {ok, Result} = barrel_ars_index:intersect_posting_lists([TypeBin, StatusBin]),
+    Keys = barrel_postings:keys(Result),
+    ?assertEqual([<<"interA">>, <<"interC">>], lists:sort(Keys)),
+
+    ok.
+
+native_posting_contains(Config) ->
+    StoreRef = proplists:get_value(store_ref, Config),
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Index some docs
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"contains1">>, #{<<"contains_test">> => <<"val">>}),
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"contains2">>, #{<<"contains_test">> => <<"val">>}),
+
+    %% Get postings resource
+    {ok, Postings} = barrel_ars_index:get_postings_resource(StoreRef, DbName, [<<"contains_test">>, <<"val">>]),
+
+    %% Test exact contains
+    ?assertEqual(true, barrel_ars_index:posting_contains(Postings, <<"contains1">>)),
+    ?assertEqual(true, barrel_ars_index:posting_contains(Postings, <<"contains2">>)),
+    ?assertEqual(false, barrel_ars_index:posting_contains(Postings, <<"contains3">>)),
+
+    %% Test bitmap contains (O(1) but may have false positives)
+    ?assertEqual(true, barrel_ars_index:posting_bitmap_contains(Postings, <<"contains1">>)),
+    ?assertEqual(true, barrel_ars_index:posting_bitmap_contains(Postings, <<"contains2">>)),
+    %% Note: bitmap_contains may have false positives for absent keys
 
     ok.
