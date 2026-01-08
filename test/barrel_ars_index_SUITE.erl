@@ -36,13 +36,12 @@
     cardinality_basic/1,
     cardinality_update/1,
     cardinality_remove/1,
-    bitmap_basic/1,
-    bitmap_size_by_depth/1,
     %% Native postings API tests
     native_get_posting_list_binary/1,
     native_get_postings_resource/1,
     native_intersect_posting_lists/1,
-    native_posting_contains/1
+    native_posting_contains/1,
+    native_bitmap_contains/1
 ]).
 
 %%====================================================================
@@ -50,7 +49,7 @@
 %%====================================================================
 
 all() ->
-    [{group, index}, {group, update}, {group, remove}, {group, fold}, {group, cardinality}, {group, bitmap}, {group, native_postings}].
+    [{group, index}, {group, update}, {group, remove}, {group, fold}, {group, cardinality}, {group, native_postings}].
 
 groups() ->
     [
@@ -79,15 +78,12 @@ groups() ->
             cardinality_update,
             cardinality_remove
         ]},
-        {bitmap, [sequence], [
-            bitmap_basic,
-            bitmap_size_by_depth
-        ]},
         {native_postings, [sequence], [
             native_get_posting_list_binary,
             native_get_postings_resource,
             native_intersect_posting_lists,
-            native_posting_contains
+            native_posting_contains,
+            native_bitmap_contains
         ]}
     ].
 
@@ -477,41 +473,6 @@ cardinality_remove(Config) ->
     ok.
 
 %%====================================================================
-%% Test Cases - Bitmap (V2 Postings Built-in Bitmaps)
-%%====================================================================
-
-bitmap_basic(Config) ->
-    StoreRef = proplists:get_value(store_ref, Config),
-    DbName = proplists:get_value(db_name, Config),
-
-    %% Index docs for bitmap testing
-    Doc1 = #{<<"type">> => <<"bitmap_test">>},
-    Doc2 = #{<<"type">> => <<"bitmap_test">>},
-    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"bm1">>, Doc1),
-    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"bm2">>, Doc2),
-
-    %% Get postings resource - V2 posting lists have built-in roaring bitmaps
-    {ok, Postings} = barrel_ars_index:get_postings_resource(StoreRef, DbName, [<<"type">>, <<"bitmap_test">>]),
-
-    %% Test O(1) bitmap contains for fast existence checks
-    ?assertEqual(true, barrel_postings:bitmap_contains(Postings, <<"bm1">>)),
-    ?assertEqual(true, barrel_postings:bitmap_contains(Postings, <<"bm2">>)),
-
-    %% Note: bitmap_contains may have false positives for absent keys due to hash collisions
-    %% Use barrel_postings:contains/2 for exact checks
-
-    ok.
-
-bitmap_size_by_depth(_Config) ->
-    %% Test that V2 posting lists provide O(1) bitmap operations
-    %% The old global bitmap size is no longer used - V2 has per-posting roaring bitmaps
-    %% This test verifies the old API is still available for backwards compatibility
-    Size = barrel_ars_index:bitmap_size(),
-    ?assertEqual(1048576, Size),  %% Legacy value for backwards compatibility
-
-    ok.
-
-%%====================================================================
 %% Test Cases - Native Postings API
 %%====================================================================
 
@@ -603,5 +564,27 @@ native_posting_contains(Config) ->
     ?assertEqual(true, barrel_ars_index:posting_bitmap_contains(Postings, <<"contains1">>)),
     ?assertEqual(true, barrel_ars_index:posting_bitmap_contains(Postings, <<"contains2">>)),
     %% Note: bitmap_contains may have false positives for absent keys
+
+    ok.
+
+native_bitmap_contains(Config) ->
+    StoreRef = proplists:get_value(store_ref, Config),
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Index docs for bitmap testing
+    Doc1 = #{<<"type">> => <<"bitmap_test">>},
+    Doc2 = #{<<"type">> => <<"bitmap_test">>},
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"bm1">>, Doc1),
+    ok = barrel_ars_index:index_doc(StoreRef, DbName, <<"bm2">>, Doc2),
+
+    %% Get postings resource - V2 posting lists have built-in roaring bitmaps
+    {ok, Postings} = barrel_ars_index:get_postings_resource(StoreRef, DbName, [<<"type">>, <<"bitmap_test">>]),
+
+    %% Test O(1) bitmap contains for fast existence checks
+    ?assertEqual(true, barrel_postings:bitmap_contains(Postings, <<"bm1">>)),
+    ?assertEqual(true, barrel_postings:bitmap_contains(Postings, <<"bm2">>)),
+
+    %% Note: bitmap_contains may have false positives for absent keys due to hash collisions
+    %% Use barrel_postings:contains/2 for exact checks
 
     ok.

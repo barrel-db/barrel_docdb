@@ -53,15 +53,6 @@
     docid_has_value/5
 ]).
 
-%% Bitmap utilities
--export([
-    get_path_bitmap/3,
-    bitmap_size/0,
-    bitmap_intersect/1,
-    bitmap_test_position/2,
-    doc_position/2
-]).
-
 %% Native postings API (V2 posting lists)
 -export([
     get_posting_list_binary/3,
@@ -75,11 +66,6 @@
 
 -type store_ref() :: barrel_store_rocksdb:db_ref().
 -type read_profile() :: barrel_store_rocksdb:read_profile().
-
-%% Global bitmap size for all paths.
-%% Using a single size enables cross-path bitmap intersection.
-%% 1M bits = 128KB per bitmap, good balance of space vs false positive rate.
--define(BITMAP_SIZE, 1048576).
 
 %%====================================================================
 %% API
@@ -249,14 +235,6 @@ get_posting_cardinality(StoreRef, DbName, Path) ->
 docid_has_value(StoreRef, DbName, Path, Value, DocId) ->
     Key = barrel_store_keys:value_index_key(DbName, Value, Path, DocId),
     barrel_store_rocksdb:key_exists(StoreRef, Key).
-
-%% @doc Get the bitmap for a path+value.
-%% Returns the raw bitmap binary from the bitmap column family.
--spec get_path_bitmap(store_ref(), db_name(), [term()]) ->
-    {ok, binary()} | not_found | {error, term()}.
-get_path_bitmap(StoreRef, DbName, Path) ->
-    Key = barrel_store_keys:path_bitmap_key(DbName, Path),
-    barrel_store_rocksdb:bitmap_get(StoreRef, Key).
 
 %% @doc Fold over path index entries matching a path prefix.
 %% The callback receives {Path, DocId} for each match.
@@ -860,60 +838,6 @@ make_bucketed_posting_remove_ops(DbName, DocId, [{Path, _Type} | Rest]) ->
             Op = {posting_remove, Key, DocId},
             [Op | make_bucketed_posting_remove_ops(DbName, DocId, Rest)]
     end.
-
-%% @private Convert DocId to a bitmap position using deterministic hash.
-%% Uses a global bitmap size so positions are consistent across all paths,
-%% enabling cross-path bitmap intersection for multi-condition queries.
-doc_to_position(DocId, _Path) ->
-    erlang:phash2(DocId, ?BITMAP_SIZE).
-
-%% @doc Get the global bitmap size.
-%% All paths use the same size to enable cross-path intersection.
--spec bitmap_size() -> pos_integer().
-bitmap_size() ->
-    ?BITMAP_SIZE.
-
-%% @doc Get the bitmap position for a document ID.
-%% Path is ignored - all paths use the same position for a given DocId.
--spec doc_position(docid(), [term()]) -> non_neg_integer().
-doc_position(DocId, Path) ->
-    doc_to_position(DocId, Path).
-
-%% @doc Intersect multiple bitmaps (binary AND operation).
-%% Returns a bitmap with only bits set that are in ALL input bitmaps.
--spec bitmap_intersect([binary()]) -> binary().
-bitmap_intersect([]) -> <<>>;
-bitmap_intersect([Bitmap]) -> Bitmap;
-bitmap_intersect([First | Rest]) ->
-    lists:foldl(fun bitmap_and/2, First, Rest).
-
-%% @doc Test if a position is set in a bitmap.
-%% Note: bitset_merge_operator uses big-endian bit ordering within bytes
--spec bitmap_test_position(binary(), non_neg_integer()) -> boolean().
-bitmap_test_position(Bitmap, Position) when is_binary(Bitmap) ->
-    ByteIndex = Position div 8,
-    %% Big-endian bit ordering: bit 0 is MSB (leftmost), bit 7 is LSB
-    BitIndex = 7 - (Position rem 8),
-    case ByteIndex < byte_size(Bitmap) of
-        true ->
-            Byte = binary:at(Bitmap, ByteIndex),
-            (Byte band (1 bsl BitIndex)) =/= 0;
-        false ->
-            false
-    end.
-
-%% @private Binary AND of two bitmaps
-bitmap_and(A, B) ->
-    MinLen = min(byte_size(A), byte_size(B)),
-    bitmap_and_loop(A, B, MinLen, 0, <<>>).
-
-bitmap_and_loop(_A, _B, Len, Idx, Acc) when Idx >= Len ->
-    Acc;
-bitmap_and_loop(A, B, Len, Idx, Acc) ->
-    ByteA = binary:at(A, Idx),
-    ByteB = binary:at(B, Idx),
-    Result = ByteA band ByteB,
-    bitmap_and_loop(A, B, Len, Idx + 1, <<Acc/binary, Result>>).
 
 %% @private Decode a posting key to extract path (no docid - docids are in value)
 %% Key format: 0x14 + len:16 + dbname + encoded_path

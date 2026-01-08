@@ -2300,12 +2300,9 @@ execute_multi_index(StoreRef, DbName, Plan, Snapshot) ->
                     case order_by_cardinality(StoreRef, DbName, IndexConditions) of
                         [] ->
                             filter_and_project(StoreRef, DbName, [], Plan, Snapshot);
-                        OrderedConditions when length(OrderedConditions) =< 2 ->
-                            execute_with_bitmap_filter(StoreRef, DbName, OrderedConditions, Plan, Snapshot);
                         OrderedConditions ->
-                            [{path, Path1, Value1} | Rest] = OrderedConditions,
-                            FullPath1 = Path1 ++ [Value1],
-                            execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, Plan, Snapshot)
+                            %% Use V2 postings intersection for all equality conditions
+                            execute_with_postings(StoreRef, DbName, OrderedConditions, Plan, Snapshot)
                     end;
                 false ->
                     %% Mixed conditions (equality + compare/exists/prefix)
@@ -2337,70 +2334,17 @@ execute_multi_index(StoreRef, DbName, Plan, Snapshot) ->
             end
     end.
 
-%% @doc Execute multi-condition query using bitmap filtering
-%% Tries to use bitmaps for fast pre-filtering, falls back to sorted intersection
-execute_with_bitmap_filter(StoreRef, DbName, [First | Rest] = IndexConditions, Plan, Snapshot) ->
-    {path, Path1, Value1} = First,
-    FullPath1 = Path1 ++ [Value1],
-
+%% @doc Execute multi-condition query using V2 posting list intersection.
+%% Uses native postings_intersect_all for O(min(n,m)) intersection performance.
+execute_with_postings(StoreRef, DbName, IndexConditions, Plan, Snapshot) ->
     %% Remaining conditions not verified by index (e.g., OR, logic vars)
     #query_plan{conditions = AllConditions} = Plan,
     RemainingConds = AllConditions -- IndexConditions,
     FilterPlan = Plan#query_plan{conditions = RemainingConds},
 
-    %% Check if all conditions have same bitmap size (same path depth category)
-    AllSameSize = all_same_bitmap_size(IndexConditions),
-
-    case AllSameSize andalso length(IndexConditions) > 1 of
-        true ->
-            %% Try to get bitmaps for all conditions
-            FullPaths = [Path ++ [Value] || {path, Path, Value} <- IndexConditions],
-            BitmapKeys = [barrel_store_keys:path_bitmap_key(DbName, FP) || FP <- FullPaths],
-            BitmapResults = barrel_store_rocksdb:multi_get_bitmap(StoreRef, BitmapKeys),
-
-            %% Check if all bitmaps are available and non-empty
-            AllBitmaps = [B || {ok, B} <- BitmapResults, byte_size(B) > 0],
-            case length(AllBitmaps) =:= length(IndexConditions) of
-                true ->
-                    %% All bitmaps available - use bitmap intersection for filtering
-                    FilterBitmap = barrel_ars_index:bitmap_intersect(AllBitmaps),
-                    %% Collect DocIds from first condition, filtered by bitmap
-                    DocIds = collect_docids_with_bitmap_filter(StoreRef, DbName, FullPath1, FilterBitmap),
-                    filter_and_project(StoreRef, DbName, DocIds, FilterPlan, Snapshot);
-                false ->
-                    %% Fallback: some bitmaps missing
-                    execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, FilterPlan, Snapshot)
-            end;
-        false ->
-            %% Fallback: different bitmap sizes or single condition
-            execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, FilterPlan, Snapshot)
-    end.
-
-%% @doc Check if all conditions use the same bitmap size.
-%% With global bitmap size, this always returns true.
-all_same_bitmap_size(_Conditions) -> true.
-
-%% @doc Execute using sorted intersection (fallback)
-execute_sorted_intersection(StoreRef, DbName, FullPath1, Rest, FilterPlan, Snapshot) ->
-    InitialDocIds = collect_docids_for_path(StoreRef, DbName, FullPath1),
-    FinalDocIds = intersect_conditions(StoreRef, DbName, Rest, InitialDocIds),
-    filter_and_project(StoreRef, DbName, FinalDocIds, FilterPlan, Snapshot).
-
-%% @doc Collect DocIds from a path, filtering by bitmap
-collect_docids_with_bitmap_filter(StoreRef, DbName, FullPath, FilterBitmap) ->
-    %% Use short_range profile - bitmap-filtered scans are typically moderate size
-    barrel_ars_index:fold_path_reverse(
-        StoreRef, DbName, FullPath,
-        fun({_Path, DocId}, Acc) ->
-            Position = barrel_ars_index:doc_position(DocId, FullPath),
-            case barrel_ars_index:bitmap_test_position(FilterBitmap, Position) of
-                true -> {ok, [DocId | Acc]};
-                false -> {ok, Acc}  %% Skip - doesn't match filter
-            end
-        end,
-        [],
-        short_range
-    ).
+    %% Use V2 native posting list intersection
+    DocIds = intersect_docid_sets_v2(StoreRef, DbName, IndexConditions),
+    filter_and_project(StoreRef, DbName, DocIds, FilterPlan, Snapshot).
 
 %% @doc Order conditions by cardinality (smallest first) for optimal intersection.
 %% Returns empty list if any condition has 0 cardinality (short-circuit).
@@ -2433,34 +2377,6 @@ order_by_cardinality(StoreRef, DbName, Conditions) ->
             Sorted = lists:keysort(1, WithCardinality),
             [Cond || {_, Cond} <- Sorted]
     end.
-
-%% @doc Intersect doc IDs from multiple conditions with short-circuit
-intersect_conditions(_StoreRef, _DbName, _Conditions, []) ->
-    %% Short-circuit: empty accumulator means no matches possible
-    [];
-intersect_conditions(_StoreRef, _DbName, [], AccDocIds) ->
-    AccDocIds;
-intersect_conditions(StoreRef, DbName, [{path, Path, Value} | Rest], AccDocIds) ->
-    FullPath = Path ++ [Value],
-    CondDocIds = collect_docids_for_path(StoreRef, DbName, FullPath),
-    case CondDocIds of
-        [] ->
-            %% Short-circuit: this condition has no matches
-            [];
-        _ ->
-            Intersection = sorted_intersection(AccDocIds, CondDocIds),
-            intersect_conditions(StoreRef, DbName, Rest, Intersection)
-    end.
-
-%% @doc Merge-based intersection of two sorted lists - O(n+m)
-sorted_intersection([], _) -> [];
-sorted_intersection(_, []) -> [];
-sorted_intersection([H | T1], [H | T2]) ->
-    [H | sorted_intersection(T1, T2)];
-sorted_intersection([H1 | T1], [H2 | _] = L2) when H1 < H2 ->
-    sorted_intersection(T1, L2);
-sorted_intersection(L1, [_ | T2]) ->
-    sorted_intersection(L1, T2).
 
 %% @doc Execute full document scan (slowest, last resort, using wide column entity)
 execute_full_scan(StoreRef, DbName, Plan, Snapshot) ->

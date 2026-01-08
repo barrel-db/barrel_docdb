@@ -46,6 +46,28 @@
 - Periodic refresh via `/.well-known/barrel`
 - HTTP API: `GET/POST/DELETE /_discovery/peers`
 
+### V2 Posting Lists (erlang-rocksdb 2.5.0) ✅
+Upgraded to erlang-rocksdb 2.5.0 with native posting list features:
+- **Native intersection**: `postings_intersect_all/1` for O(min(n,m)) multi-way intersection
+- **Pre-sorted keys**: V2 format stores keys lexicographically (no Erlang sorting)
+- **Roaring bitmaps**: Built-in roaring64 bitmaps for O(1) existence checks
+- **Removed bitmap CF**: Separate bitmap column family no longer needed
+
+**Files changed:**
+- `src/barrel_postings.erl` (new) - Wrapper for V2 postings API
+- `src/barrel_ars_index.erl` - Native postings functions, removed bitmap ops
+- `src/barrel_query.erl` - Uses `intersect_docid_sets_v2` with native intersection
+- `src/barrel_store_rocksdb.erl` - Removed bitmap operations
+
+**Performance (5000 docs):**
+| Query Type | Before | After | Improvement |
+|------------|--------|-------|-------------|
+| 2-condition AND | 10 ops/s | 59 ops/s | 6x |
+| 3-condition AND | 4 ops/s | 43 ops/s | 11x |
+| multi_index_limit | 4 ops/s | 59 ops/s | 15x |
+
+See `guides/features.md` for full details.
+
 ### HTTP API Extensions ✅
 - Attachment HTTP API (CRUD + streaming for large files)
 - Query HTTP API (`POST /db/:db/_find`)
@@ -564,7 +586,10 @@ src/
 ├── barrel_tier.erl             % Tiered storage manager
 ├── barrel_federation.erl       % Cross-db query federation
 ├── barrel_conflict.erl         % Conflict detection/resolution
-└── barrel_compaction_filter.erl % RocksDB compaction callback
+├── barrel_compaction_filter.erl % RocksDB compaction callback
+├── barrel_postings.erl         % V2 posting list wrapper (rocksdb 2.5.0)
+├── barrel_ars_index.erl        % Path index operations
+└── barrel_query.erl            % Query compiler and executor
 ```
 
 ---

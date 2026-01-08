@@ -22,9 +22,6 @@
 -export([get_with_snapshot/3, multi_get_with_snapshot/3]).
 -export([fold_range_posting_with_snapshot/6]).
 
-%% Bitmap operations
--export([bitmap_set/3, bitmap_unset/3, bitmap_get/2, multi_get_bitmap/2]).
-
 %% Posting list operations (using erlang_merge_operator)
 -export([posting_append/3, posting_remove/3]).
 -export([posting_get/2, posting_get_binary/2, posting_multi_get/2]).
@@ -178,8 +175,6 @@ write_batch(DbRef, Operations) ->
 %%   - {put, Key, Value} - put to default CF
 %%   - {delete, Key} - delete from default CF
 %%   - {merge, Key, Delta} - merge counter in default CF
-%%   - {bitmap_set, Key, Position} - set bit in bitmap CF
-%%   - {bitmap_unset, Key, Position} - unset bit in bitmap CF
 %%   - {posting_append, Key, DocId} - append DocId to posting list
 %%   - {posting_remove, Key, DocId} - remove DocId from posting list
 %%   - {body_put, Key, Value} - put to body CF (BlobDB)
@@ -189,7 +184,7 @@ write_batch(DbRef, Operations) ->
 %%   - {local_put, Key, Value} - put to local CF (config/state)
 %%   - {local_delete, Key} - delete from local CF
 -spec write_batch(db_ref(), list(), map()) -> ok | {error, term()}.
-write_batch(#{ref := Ref, bitmap_cf := BitmapCF, posting_cf := PostingCF,
+write_batch(#{ref := Ref, posting_cf := PostingCF,
               body_cf := BodyCF, local_cf := LocalCF}, Operations, Opts) ->
     Sync = maps:get(sync, Opts, false),
     {ok, Batch} = rocksdb:batch(),
@@ -201,12 +196,6 @@ write_batch(#{ref := Ref, bitmap_cf := BitmapCF, posting_cf := PostingCF,
                 ok = rocksdb:batch_delete(Batch, Key);
                ({merge, Key, Delta}) when is_integer(Delta) ->
                 ok = rocksdb:batch_merge(Batch, Key, integer_to_binary(Delta));
-               ({bitmap_set, Key, Position}) when is_integer(Position) ->
-                ok = rocksdb:batch_merge(Batch, BitmapCF, Key,
-                                         <<"+", (integer_to_binary(Position))/binary>>);
-               ({bitmap_unset, Key, Position}) when is_integer(Position) ->
-                ok = rocksdb:batch_merge(Batch, BitmapCF, Key,
-                                         <<"-", (integer_to_binary(Position))/binary>>);
                ({posting_append, Key, DocId}) ->
                 ok = rocksdb:batch_merge(Batch, PostingCF, Key, {posting_add, DocId});
                ({posting_remove, Key, DocId}) ->
@@ -574,32 +563,6 @@ fold_loop_reverse({error, invalid_iterator}, _Itr, _Fun, Acc) ->
     Acc;
 fold_loop_reverse({error, _Reason}, _Itr, _Fun, Acc) ->
     Acc.
-
-%%====================================================================
-%% Bitmap Operations
-%%====================================================================
-
-%% @doc Set a bit in a bitmap using merge operator
-%% The bitset_merge_operator uses format: <<"+", Position/binary>>
--spec bitmap_set(db_ref(), binary(), non_neg_integer()) -> ok | {error, term()}.
-bitmap_set(#{ref := Ref, bitmap_cf := BitmapCF}, Key, Position) ->
-    rocksdb:merge(Ref, BitmapCF, Key, <<"+", (integer_to_binary(Position))/binary>>, []).
-
-%% @doc Unset a bit in a bitmap using merge operator
-%% The bitset_merge_operator uses format: <<"-", Position/binary>>
--spec bitmap_unset(db_ref(), binary(), non_neg_integer()) -> ok | {error, term()}.
-bitmap_unset(#{ref := Ref, bitmap_cf := BitmapCF}, Key, Position) ->
-    rocksdb:merge(Ref, BitmapCF, Key, <<"-", (integer_to_binary(Position))/binary>>, []).
-
-%% @doc Get a bitmap from the bitmap column family
--spec bitmap_get(db_ref(), binary()) -> {ok, binary()} | not_found | {error, term()}.
-bitmap_get(#{ref := Ref, bitmap_cf := BitmapCF}, Key) ->
-    rocksdb:get(Ref, BitmapCF, Key, []).
-
-%% @doc Get multiple bitmaps from the bitmap column family (batch read)
--spec multi_get_bitmap(db_ref(), [binary()]) -> [{ok, binary()} | not_found | {error, term()}].
-multi_get_bitmap(#{ref := Ref, bitmap_cf := BitmapCF}, Keys) ->
-    rocksdb:multi_get(Ref, BitmapCF, Keys, []).
 
 %%====================================================================
 %% Posting List Operations
