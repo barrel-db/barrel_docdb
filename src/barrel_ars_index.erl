@@ -634,27 +634,20 @@ get_posting_list(StoreRef, DbName, FullPath) ->
     end.
 
 %% @doc Get posting list for an exact path+value, returning SORTED DocIds.
-%% Unlike get_posting_list which decodes a merged blob, this iterates
-%% value_index keys which are naturally sorted. No separate sort needed.
+%% V2 posting lists store keys in lexicographic order, so no sorting needed.
+%% Uses postings_keys/1 which returns already-sorted keys from V2 format.
 %% FullPath format: [field1, field2, value] where value is the last element.
 -spec get_posting_list_sorted(store_ref(), db_name(), [term()]) -> [binary()].
 get_posting_list_sorted(StoreRef, DbName, FullPath) ->
-    %% Extract value (last element) and field path (rest)
-    case split_path_value(FullPath) of
-        {[], _Value} ->
-            %% Single element path - fall back to unsorted
-            lists:sort(get_posting_list(StoreRef, DbName, FullPath));
-        {FieldPath, Value} ->
-            %% Iterate value_index keys in sorted order
-            StartKey = barrel_store_keys:value_index_prefix(DbName, Value, FieldPath),
-            EndKey = barrel_store_keys:value_index_end(DbName, Value, FieldPath),
-            PrefixLen = byte_size(StartKey),
-            FoldFun = fun(Key, _Val, Acc) ->
-                <<_:PrefixLen/binary, DocId/binary>> = Key,
-                {ok, [DocId | Acc]}
-            end,
-            DocIds = barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, []),
-            lists:reverse(DocIds)
+    %% V2 posting lists have keys pre-sorted in lexicographic order
+    case get_posting_list_binary(StoreRef, DbName, FullPath) of
+        {ok, Binary} ->
+            {ok, Postings} = barrel_postings:open(Binary),
+            barrel_postings:keys(Postings);  %% Already sorted in V2!
+        not_found ->
+            [];
+        {error, _} ->
+            []
     end.
 
 %% @doc Get DocIds from bucketed posting lists in sorted order.
