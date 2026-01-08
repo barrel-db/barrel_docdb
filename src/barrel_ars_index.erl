@@ -44,7 +44,8 @@
 %% Utility for reading stored paths
 -export([
     get_doc_paths/3,
-    get_path_cardinality/3
+    get_path_cardinality/3,
+    get_posting_cardinality/3
 ]).
 
 %% Point lookup for condition verification
@@ -210,6 +211,7 @@ get_doc_paths(StoreRef, DbName, DocId) ->
 
 %% @doc Get the cardinality (document count) for a path+value.
 %% Returns 0 if the path has never been indexed.
+%% Uses counter stored in path_stats_key (O(1) lookup).
 -spec get_path_cardinality(store_ref(), db_name(), [term()]) ->
     {ok, non_neg_integer()} | {error, term()}.
 get_path_cardinality(StoreRef, DbName, Path) ->
@@ -218,6 +220,22 @@ get_path_cardinality(StoreRef, DbName, Path) ->
         {ok, CountBin} ->
             Count = binary_to_integer(CountBin),
             {ok, max(0, Count)};
+        not_found ->
+            {ok, 0};
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc Get exact cardinality from posting list using postings_count.
+%% This reads the posting list binary and counts keys directly.
+%% More accurate than counter (no drift), but requires reading posting list.
+-spec get_posting_cardinality(store_ref(), db_name(), [term()]) ->
+    {ok, non_neg_integer()} | not_found | {error, term()}.
+get_posting_cardinality(StoreRef, DbName, Path) ->
+    case get_posting_list_binary(StoreRef, DbName, Path) of
+        {ok, Binary} ->
+            {ok, Postings} = barrel_postings:open(Binary),
+            {ok, barrel_postings:count(Postings)};
         not_found ->
             {ok, 0};
         {error, _} = Error ->
