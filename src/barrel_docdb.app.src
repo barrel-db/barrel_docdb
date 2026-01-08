@@ -11,7 +11,9 @@
     ]},
     {env, [
         {data_dir, "data/barrel_docdb"},
-        {default_store, barrel_store_rocksdb}
+        {default_store, barrel_store_rocksdb},
+        %% Enable async I/O for body reads (experimental, for benchmarking)
+        {body_async_io, false}
     ]},
     {modules, []},
     {licenses, ["Apache-2.0"]},

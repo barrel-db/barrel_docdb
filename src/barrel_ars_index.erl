@@ -50,7 +50,9 @@
 
 %% Point lookup for condition verification
 -export([
-    docid_has_value/5
+    docid_has_value/5,
+    docid_get_value/4,
+    docid_satisfies_compare/6
 ]).
 
 %% Native postings API (V2 posting lists)
@@ -235,6 +237,45 @@ get_posting_cardinality(StoreRef, DbName, Path) ->
 docid_has_value(StoreRef, DbName, Path, Value, DocId) ->
     Key = barrel_store_keys:value_index_key(DbName, Value, Path, DocId),
     barrel_store_rocksdb:key_exists(StoreRef, Key).
+
+%% @doc Get the value at a specific path for a DocId.
+%% Uses the reverse index (doc_paths) which stores all paths for a document.
+%% Returns {ok, Value} if found, not_found if path doesn't exist.
+-spec docid_get_value(store_ref(), db_name(), docid(), [term()]) ->
+    {ok, term()} | not_found | {error, term()}.
+docid_get_value(StoreRef, DbName, DocId, Path) ->
+    case get_doc_paths(StoreRef, DbName, DocId) of
+        {ok, PathValues} ->
+            case lists:keyfind(Path, 1, PathValues) of
+                {Path, Value} -> {ok, Value};
+                false -> not_found
+            end;
+        not_found ->
+            not_found;
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc Check if a DocId's value at a path satisfies a comparison.
+%% Op is one of: '>' | '<' | '>=' | '=<' | '=/=' | '=='
+%% Returns true if the condition is satisfied, false otherwise.
+-spec docid_satisfies_compare(store_ref(), db_name(), docid(), [term()], atom(), term()) ->
+    boolean().
+docid_satisfies_compare(StoreRef, DbName, DocId, Path, Op, CompareValue) ->
+    case docid_get_value(StoreRef, DbName, DocId, Path) of
+        {ok, DocValue} ->
+            compare_values(DocValue, Op, CompareValue);
+        _ ->
+            false
+    end.
+
+%% @private Compare two values with the given operator
+compare_values(A, '>', B) -> A > B;
+compare_values(A, '<', B) -> A < B;
+compare_values(A, '>=', B) -> A >= B;
+compare_values(A, '=<', B) -> A =< B;
+compare_values(A, '=/=', B) -> A =/= B;
+compare_values(A, '==', B) -> A == B.
 
 %% @doc Fold over path index entries matching a path prefix.
 %% The callback receives {Path, DocId} for each match.

@@ -38,6 +38,9 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running range queries...~n"),
     Range = barrel_bench_metrics:summarize(bench_query(Db, range_query(), Iterations)),
 
+    io:format("  Running range with LIMIT 10 (streaming body fetch)...~n"),
+    RangeLimit = barrel_bench_metrics:summarize(bench_query(Db, range_limit_query(), Iterations)),
+
     io:format("  Running pure compare queries (age > 50)...~n"),
     PureCompare = barrel_bench_metrics:summarize(bench_query(Db, pure_compare_query(), Iterations)),
 
@@ -74,6 +77,15 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running pure ORDER BY + LIMIT (no filter)...~n"),
     PureTopK = barrel_bench_metrics:summarize(bench_query(Db, pure_order_limit_query(), Iterations)),
 
+    io:format("  Running FILTER + ORDER BY + LIMIT (lazy ORDER BY with equality)...~n"),
+    FilterOrderEq = barrel_bench_metrics:summarize(bench_query(Db, filter_order_eq_limit_query(), Iterations)),
+
+    io:format("  Running FILTER + ORDER BY + LIMIT (lazy ORDER BY with range)...~n"),
+    FilterOrderRange = barrel_bench_metrics:summarize(bench_query(Db, filter_order_range_limit_query(), Iterations)),
+
+    io:format("  Running FILTER + ORDER BY + LIMIT (lazy ORDER BY with 2 conditions)...~n"),
+    FilterOrder2Cond = barrel_bench_metrics:summarize(bench_query(Db, filter_order_2cond_limit_query(), Iterations)),
+
     io:format("  Running prefix queries...~n"),
     PrefixQ = barrel_bench_metrics:summarize(bench_query(Db, prefix_query(), Iterations)),
 
@@ -104,6 +116,7 @@ run(Db, NumDocs, Iterations) ->
         selective_eq => SelectiveEq,
         very_selective_eq => VerySelectiveEq,
         range => Range,
+        range_limit => RangeLimit,
         pure_compare => PureCompare,
         pure_compare_limit => PureCompareLimit,
         multi_condition => MultiCond,
@@ -116,6 +129,9 @@ run(Db, NumDocs, Iterations) ->
         nested_path => NestedPath,
         order_by_limit => TopK,
         pure_topk => PureTopK,
+        filter_order_eq => FilterOrderEq,
+        filter_order_range => FilterOrderRange,
+        filter_order_2cond => FilterOrder2Cond,
         prefix => PrefixQ,
         prefix_limit => PrefixLimit,
         exists => ExistsQ,
@@ -169,6 +185,16 @@ range_query() ->
         {path, [<<"type">>], <<"user">>},
         {compare, [<<"age">>], '>', 50}
     ]}.
+
+range_limit_query() ->
+    %% Range query WITH LIMIT and include_docs=true
+    %% This tests the streaming batch fetch optimization:
+    %% - Has ~2380 matching DocIds but only needs 10 results
+    %% - Streaming should only fetch ~30-50 bodies instead of 2380
+    #{where => [
+        {path, [<<"type">>], <<"user">>},
+        {compare, [<<"age">>], '>', 50}
+    ], limit => 10}.
 
 pure_compare_query() ->
     %% Pure compare query: find all docs where age > 50
@@ -248,6 +274,35 @@ pure_order_limit_query() ->
     %% Pure ORDER BY + LIMIT with no filter conditions
     %% This is where Top-K optimization provides the most benefit
     #{where => [],
+      order_by => {[<<"created_at">>], desc},
+      limit => 10}.
+
+filter_order_eq_limit_query() ->
+    %% FILTER + ORDER BY + LIMIT with equality filter (lazy ORDER BY)
+    %% Tests lazy index-based filtering: type=user, ~5000 matches
+    %% Iterates ORDER BY index, checks type via docid_has_value (O(1))
+    #{where => [{path, [<<"type">>], <<"user">>}],
+      order_by => {[<<"created_at">>], desc},
+      limit => 10}.
+
+filter_order_range_limit_query() ->
+    %% FILTER + ORDER BY + LIMIT with range filter (lazy ORDER BY)
+    %% Tests lazy index-based filtering: age > 50, ~2380 matches
+    %% Iterates ORDER BY index, checks age via docid_satisfies_compare
+    #{where => [{compare, [<<"age">>], '>', 50}],
+      order_by => {[<<"created_at">>], desc},
+      limit => 10}.
+
+filter_order_2cond_limit_query() ->
+    %% FILTER + ORDER BY + LIMIT with 2 conditions (lazy ORDER BY)
+    %% Tests lazy index-based filtering: type=user AND age > 50
+    %% This is the key optimization: O(limit) instead of O(matching_docs)
+    %% Before: collect 2380 DocIds, sort, apply limit
+    %% After: iterate ORDER BY index, lazy check both conditions, stop at limit
+    #{where => [
+        {path, [<<"type">>], <<"user">>},
+        {compare, [<<"age">>], '>', 50}
+    ],
       order_by => {[<<"created_at">>], desc},
       limit => 10}.
 

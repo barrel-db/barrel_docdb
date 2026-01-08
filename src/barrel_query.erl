@@ -154,6 +154,27 @@
 -define(MAX_UNBOUNDED_RESULTS, 1000).
 
 %%====================================================================
+%% Streaming Batch Fetch Constants
+%%====================================================================
+
+%% Minimum batch size for streaming (too small = overhead from many batches)
+-define(STREAM_MIN_BATCH, 50).
+%% Maximum batch size for streaming (too large = defeats the purpose)
+-define(STREAM_MAX_BATCH, 500).
+%% Initial assumed selectivity (50% of docs pass filter)
+-define(STREAM_INITIAL_SELECTIVITY, 0.5).
+%% Threshold ratio: use streaming when we have Nx more docs than needed
+-define(STREAM_THRESHOLD_RATIO, 3).
+
+%% Streaming statistics for adaptive batch sizing
+-record(stream_stats, {
+    fetched = 0 :: non_neg_integer(),      %% Total DocIds fetched
+    decoded = 0 :: non_neg_integer(),      %% Total docs decoded
+    matched = 0 :: non_neg_integer(),      %% Docs passing filter
+    selectivity = ?STREAM_INITIAL_SELECTIVITY :: float()  %% Estimated filter pass rate
+}).
+
+%%====================================================================
 %% API
 %%====================================================================
 
@@ -669,8 +690,17 @@ execute_multi_index_chunked(StoreRef, DbName, Conditions, Plan, ChunkSize, Start
         S -> S
     end,
 
-    %% Collect DocIds using native postings API intersection (V2)
-    IntersectedDocIds = intersect_docid_sets_v2(StoreRef, DbName, Conditions),
+    %% Collect DocIds - use lazy intersection when chunking with reasonable size
+    %% and starting from scratch (no continuation)
+    MaxToCollect = ChunkSize + Offset + 1,  %% ChunkSize + 1 for has_more detection + offset
+    IntersectedDocIds = case {StartKey, MaxToCollect < 1000, length(Conditions) > 1} of
+        {undefined, true, true} ->
+            %% Fresh query with small limit and multiple conditions - use lazy
+            intersect_lazy_with_limit(StoreRef, DbName, Conditions, MaxToCollect);
+        _ ->
+            %% Continuation or large limit - use full intersection
+            intersect_docid_sets_v2(StoreRef, DbName, Conditions)
+    end,
 
     %% Apply pagination using StartKey
     PaginatedDocIds = case StartKey of
@@ -962,17 +992,52 @@ execute_by_strategy(StoreRef, DbName, Plan, Snapshot) ->
 %% @doc Decide if indexed order should be used
 %% The Top-K optimization is most beneficial when:
 %% - No filter conditions (pure ORDER BY + LIMIT)
-%% - This avoids sorting all documents
-%% With filter conditions, the standard path with early limit + batch fetch is often faster
+%% - Conditions can be checked via index (lazy evaluation)
+%% This changes complexity from O(matching_docs) to O(limit)
 should_use_indexed_order(_OrderPath, []) ->
     %% No conditions - pure ORDER BY + LIMIT, definitely use indexed order
     %% This is the main use case: "get latest N" without filtering
     true;
-should_use_indexed_order(_OrderPath, _Conditions) ->
-    %% With filter conditions, the standard path is usually better because:
-    %% 1. It uses batch fetching (multi_get)
-    %% 2. The early limit optimization already helps
-    %% 3. Filter conditions typically reduce the result set significantly
+should_use_indexed_order(_OrderPath, Conditions) ->
+    %% With filter conditions, use indexed order if all conditions
+    %% can be checked via index lookups (lazy evaluation)
+    can_lazy_check_conditions(Conditions).
+
+%% @doc Check if all conditions can be lazily evaluated via index.
+%% Returns true if we can avoid body fetch for condition checking.
+can_lazy_check_conditions([]) ->
+    true;
+can_lazy_check_conditions([Condition | Rest]) ->
+    case can_lazy_check_condition(Condition) of
+        true -> can_lazy_check_conditions(Rest);
+        false -> false
+    end.
+
+%% @private Check if a single condition can be lazily evaluated via O(1) index lookup.
+%% Only allow conditions that use docid_has_value (point lookup), not doc_paths load.
+can_lazy_check_condition({path, _Path, Value}) when not is_atom(Value) ->
+    %% Equality check - uses docid_has_value (O(1) point lookup)
+    %% Logic variables need body fetch for binding
+    true;
+can_lazy_check_condition({path, _Path, Value}) ->
+    %% Logic variables like '?Var' need body fetch
+    not is_logic_var(Value);
+can_lazy_check_condition({compare, _Path, _Op, _Value}) ->
+    %% Range check - docid_satisfies_compare loads doc_paths which is expensive
+    %% Disable for now until we have a more efficient range index lookup
+    false;
+can_lazy_check_condition({exists, _Path}) ->
+    %% Existence check - requires doc_paths load, expensive
+    false;
+can_lazy_check_condition({prefix, _Path, _Prefix}) ->
+    %% Prefix check - requires doc_paths load, expensive
+    false;
+can_lazy_check_condition({'and', Conditions}) ->
+    can_lazy_check_conditions(Conditions);
+can_lazy_check_condition({'or', Conditions}) ->
+    can_lazy_check_conditions(Conditions);
+can_lazy_check_condition(_) ->
+    %% Other conditions (in, contains, regex, not, etc.) need body fetch
     false.
 
 %% @doc Check if a document matches a compiled query plan.
@@ -1639,6 +1704,9 @@ execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan, _Snapshot) ->
         asc -> fun barrel_ars_index:fold_path_values/6
     end,
 
+    %% Determine if we should use lazy checking (index-based filtering)
+    UseLazy = can_lazy_check_conditions(Conditions),
+
     %% Collect matching documents with early termination
     {_Count, Results} = FoldFun(
         StoreRef, DbName, OrderPath,
@@ -1647,13 +1715,22 @@ execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan, _Snapshot) ->
                 true ->
                     {stop, {Count, Acc}};
                 false ->
-                    %% Fetch and filter document
-                    case fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) of
-                        {ok, CborBin, Doc, BoundVars} ->
-                            Result = project_result(CborBin, Doc, DocId, Projections, BoundVars, IncludeDocs, DecoderFun),
-                            {ok, {Count + 1, [Result | Acc]}};
-                        skip ->
-                            {ok, {Count, Acc}}
+                    %% Filter and fetch document
+                    case UseLazy of
+                        true ->
+                            %% Lazy path: check conditions via index BEFORE body fetch
+                            lazy_fetch_and_match_doc(StoreRef, DbName, DocId, Conditions,
+                                                      Bindings, Projections, IncludeDocs, DecoderFun,
+                                                      Count, Acc);
+                        false ->
+                            %% Standard path: fetch body first, then check conditions
+                            case fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, Bindings, IncludeDocs) of
+                                {ok, CborBin, Doc, BoundVars} ->
+                                    Result = project_result(CborBin, Doc, DocId, Projections, BoundVars, IncludeDocs, DecoderFun),
+                                    {ok, {Count + 1, [Result | Acc]}};
+                                skip ->
+                                    {ok, {Count, Acc}}
+                            end
                     end
             end
         end,
@@ -1673,6 +1750,94 @@ execute_with_indexed_order(StoreRef, DbName, OrderPath, Dir, Plan, _Snapshot) ->
     LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
 
     {ok, FinalResults, LastSeq}.
+
+%% @doc Lazy fetch and match - check conditions via index BEFORE body fetch.
+%% This avoids fetching bodies for documents that don't match filters.
+%% Complexity: O(limit) instead of O(matching_docs)
+lazy_fetch_and_match_doc(StoreRef, DbName, DocId, Conditions, _Bindings, Projections,
+                          IncludeDocs, DecoderFun, Count, Acc) ->
+    case lazy_check_conditions(StoreRef, DbName, DocId, Conditions) of
+        true ->
+            %% Conditions passed via index lookup - now fetch body if needed
+            case IncludeDocs of
+                true ->
+                    case barrel_doc_body_store:get_current_body(DbName, DocId) of
+                        {ok, CborBin} ->
+                            Doc = barrel_docdb_codec_cbor:decode_any(CborBin),
+                            Result = project_result(CborBin, Doc, DocId, Projections, #{}, IncludeDocs, DecoderFun),
+                            {ok, {Count + 1, [Result | Acc]}};
+                        _ ->
+                            %% Doc deleted
+                            {ok, {Count, Acc}}
+                    end;
+                false ->
+                    %% No body needed - just return DocId
+                    Result = #{<<"_id">> => DocId},
+                    {ok, {Count + 1, [Result | Acc]}}
+            end;
+        false ->
+            %% Conditions failed - skip without body fetch
+            {ok, {Count, Acc}}
+    end.
+
+%% @doc Check conditions via index lookups (lazy evaluation).
+%% Returns true if all conditions pass, false otherwise.
+%% Uses index point lookups instead of body fetch.
+lazy_check_conditions(_StoreRef, _DbName, _DocId, []) ->
+    true;
+lazy_check_conditions(StoreRef, DbName, DocId, [Condition | Rest]) ->
+    case lazy_check_condition(StoreRef, DbName, DocId, Condition) of
+        true -> lazy_check_conditions(StoreRef, DbName, DocId, Rest);
+        false -> false
+    end.
+
+%% @private Check a single condition via index lookup
+lazy_check_condition(StoreRef, DbName, DocId, {path, Path, Value}) ->
+    %% O(1) point lookup in value index
+    barrel_ars_index:docid_has_value(StoreRef, DbName, Path, Value, DocId);
+
+lazy_check_condition(StoreRef, DbName, DocId, {compare, Path, Op, Value}) ->
+    %% Load doc_paths (once per DocId) and compare
+    barrel_ars_index:docid_satisfies_compare(StoreRef, DbName, DocId, Path, Op, Value);
+
+lazy_check_condition(StoreRef, DbName, DocId, {exists, Path}) ->
+    %% Check if path exists via doc_paths
+    case barrel_ars_index:docid_get_value(StoreRef, DbName, DocId, Path) of
+        {ok, _} -> true;
+        _ -> false
+    end;
+
+lazy_check_condition(StoreRef, DbName, DocId, {prefix, Path, Prefix}) ->
+    %% Get value and check prefix
+    case barrel_ars_index:docid_get_value(StoreRef, DbName, DocId, Path) of
+        {ok, Value} when is_binary(Value) ->
+            PrefixLen = byte_size(Prefix),
+            case Value of
+                <<Prefix:PrefixLen/binary, _/binary>> -> true;
+                _ -> false
+            end;
+        _ ->
+            false
+    end;
+
+lazy_check_condition(StoreRef, DbName, DocId, {'and', Conditions}) ->
+    lazy_check_conditions(StoreRef, DbName, DocId, Conditions);
+
+lazy_check_condition(StoreRef, DbName, DocId, {'or', Conditions}) ->
+    lazy_check_any(StoreRef, DbName, DocId, Conditions);
+
+lazy_check_condition(_StoreRef, _DbName, _DocId, _Condition) ->
+    %% Unsupported condition type - should not happen if can_lazy_check_condition is correct
+    false.
+
+%% @private Check if any condition passes (for OR)
+lazy_check_any(_StoreRef, _DbName, _DocId, []) ->
+    false;
+lazy_check_any(StoreRef, DbName, DocId, [Condition | Rest]) ->
+    case lazy_check_condition(StoreRef, DbName, DocId, Condition) of
+        true -> true;
+        false -> lazy_check_any(StoreRef, DbName, DocId, Rest)
+    end.
 
 %% @doc Fetch a document and check if it matches conditions (direct body fetch)
 %% Returns {ok, CborBin, Doc, BoundVars} or skip
@@ -2296,40 +2461,62 @@ execute_multi_index(StoreRef, DbName, Plan, Snapshot) ->
 
             case AllEquality of
                 true ->
-                    %% All equality - use bitmap/sorted intersection path
+                    %% All equality conditions
                     case order_by_cardinality(StoreRef, DbName, IndexConditions) of
                         [] ->
                             filter_and_project(StoreRef, DbName, [], Plan, Snapshot);
                         OrderedConditions ->
-                            %% Use V2 postings intersection for all equality conditions
-                            execute_with_postings(StoreRef, DbName, OrderedConditions, Plan, Snapshot)
+                            %% Check if LIMIT allows lazy iteration
+                            RemainingConds = Conditions -- IndexConditions,
+                            NeedsBody = IncludeDocs orelse needs_body_for_projection(Projections)
+                                        orelse RemainingConds =/= [],
+                            case {Limit, NeedsBody, length(OrderedConditions)} of
+                                {L, false, N} when is_integer(L), L > 0, N > 1 ->
+                                    %% Multiple equality conditions with LIMIT, no body fetch
+                                    %% Use lazy iteration for early termination
+                                    execute_multi_index_lazy(StoreRef, DbName, OrderedConditions, Plan, Snapshot);
+                                {L, true, N} when is_integer(L), L > 0, N > 1 ->
+                                    %% Multiple equality conditions with LIMIT, needs body
+                                    %% Use lazy intersection then stream body
+                                    DocIds = intersect_lazy_with_limit(StoreRef, DbName, OrderedConditions, (L + Offset) * 3),
+                                    FilterPlan = Plan#query_plan{conditions = RemainingConds},
+                                    filter_and_project(StoreRef, DbName, DocIds, FilterPlan, Snapshot);
+                                _ ->
+                                    %% Single condition or no LIMIT - use full intersection
+                                    execute_with_postings(StoreRef, DbName, OrderedConditions, Plan, Snapshot)
+                            end
                     end;
                 false ->
                     %% Mixed conditions (equality + compare/exists/prefix)
-                    %% Use native postings intersection (V2) for all condition types
-                    IntersectedDocIds = intersect_docid_sets_v2(StoreRef, DbName, IndexConditions),
-
                     %% Check if remaining conditions need body fetch
                     RemainingConds = Conditions -- IndexConditions,
                     NeedsBody = IncludeDocs orelse needs_body_for_projection(Projections)
                                 orelse RemainingConds =/= [],
 
-                    case NeedsBody of
-                        false ->
-                            %% Pure index query - no body fetch needed
-                            LimitedDocIds = case Limit of
-                                undefined -> IntersectedDocIds;
-                                L -> lists:sublist(IntersectedDocIds, L + Offset)
-                            end,
-                            Results0 = [#{<<"id">> => DocId} || DocId <- LimitedDocIds],
-                            Results = apply_offset_limit(Results0, Offset, Limit),
-                            LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
-                            {ok, Results, LastSeq};
-                        true ->
-                            %% Need body fetch for remaining conditions or include_docs
-                            %% Create a new plan with only remaining conditions (index already verified the rest)
+                    %% Optimize: for LIMIT queries with mixed conditions,
+                    %% use lazy iteration with O(1) equality checks
+                    case {Limit, NeedsBody} of
+                        {L, false} when is_integer(L), L > 0 ->
+                            %% Pure index query with LIMIT - use lazy intersection
+                            execute_multi_index_lazy(StoreRef, DbName, IndexConditions, Plan, Snapshot);
+                        {L, true} when is_integer(L), L > 0 ->
+                            %% Body fetch with LIMIT - use lazy intersection then stream body
+                            DocIds = intersect_lazy_with_limit(StoreRef, DbName, IndexConditions, (L + Offset) * 3),
                             FilterPlan = Plan#query_plan{conditions = RemainingConds},
-                            filter_and_project(StoreRef, DbName, IntersectedDocIds, FilterPlan, Snapshot)
+                            filter_and_project(StoreRef, DbName, DocIds, FilterPlan, Snapshot);
+                        _ ->
+                            %% No limit - use standard intersection
+                            IntersectedDocIds = intersect_docid_sets_v2(StoreRef, DbName, IndexConditions),
+                            case NeedsBody of
+                                false ->
+                                    Results0 = [#{<<"id">> => DocId} || DocId <- IntersectedDocIds],
+                                    Results = apply_offset_limit(Results0, Offset, Limit),
+                                    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+                                    {ok, Results, LastSeq};
+                                true ->
+                                    FilterPlan = Plan#query_plan{conditions = RemainingConds},
+                                    filter_and_project(StoreRef, DbName, IntersectedDocIds, FilterPlan, Snapshot)
+                            end
                     end
             end
     end.
@@ -2345,6 +2532,250 @@ execute_with_postings(StoreRef, DbName, IndexConditions, Plan, Snapshot) ->
     %% Use V2 native posting list intersection
     DocIds = intersect_docid_sets_v2(StoreRef, DbName, IndexConditions),
     filter_and_project(StoreRef, DbName, DocIds, FilterPlan, Snapshot).
+
+%% @doc Execute multi-index with lazy iteration for LIMIT queries.
+%% Iterates the smallest condition and verifies others with O(1) lookups.
+%% Complexity: O(limit / selectivity) instead of O(matching_docs)
+execute_multi_index_lazy(StoreRef, DbName, Conditions, Plan, Snapshot) ->
+    #query_plan{limit = Limit, offset = Offset} = Plan,
+    MaxCollect = Limit + Offset,
+
+    DocIds = intersect_lazy_with_limit(StoreRef, DbName, Conditions, MaxCollect),
+
+    Results0 = [#{<<"id">> => DocId} || DocId <- DocIds],
+    Results = apply_offset_limit(Results0, Offset, Limit),
+
+    _ = Snapshot,
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+    {ok, Results, LastSeq}.
+
+%% @doc Lazy intersection with limit - iterates one condition and verifies others.
+%% Strategy: ALWAYS prefer iterating non-equality conditions because:
+%% - Non-equality (compare/exists/prefix) iteration uses fast fold with early termination
+%% - Equality verification uses O(1) docid_has_value lookup
+%% - Non-equality verification requires expensive doc_paths load
+%%
+%% Among non-equality conditions, choose the smallest estimated cardinality.
+%% Among equality conditions (if no non-equality), choose smallest cardinality.
+intersect_lazy_with_limit(StoreRef, DbName, Conditions, MaxCollect) ->
+    %% Separate: equality (O(1) verify) vs non-equality (fast iterate, slow verify)
+    {EqConds, NonEqConds} = lists:partition(fun
+        ({path, _, _}) -> true;
+        (_) -> false
+    end, Conditions),
+
+    case NonEqConds of
+        [] when length(EqConds) > 1 ->
+            %% All equality with multiple conditions - use direct posting list intersection
+            %% Get smallest posting list and verify others (O(1) per check)
+            {IterCond, RestEq} = pick_smallest_equality(StoreRef, DbName, EqConds),
+            intersect_equality_direct(StoreRef, DbName, IterCond, RestEq, MaxCollect);
+        [] ->
+            %% Single equality - just get posting list with limit
+            [{path, Path, Value}] = EqConds,
+            collect_docids_for_path_limited(StoreRef, DbName, Path ++ [Value], MaxCollect);
+        [SingleNonEq] ->
+            %% One non-equality condition - iterate it, verify equalities
+            iterate_with_lazy_verify(StoreRef, DbName, SingleNonEq, EqConds, MaxCollect);
+        MultipleNonEq ->
+            %% Multiple non-equality conditions - pick smallest to iterate
+            %% Others go to verification (may need doc_paths, but rare)
+            {IterCond, RestNonEq} = pick_smallest_non_eq(StoreRef, DbName, MultipleNonEq),
+            VerifyConds = EqConds ++ RestNonEq,
+            iterate_with_lazy_verify(StoreRef, DbName, IterCond, VerifyConds, MaxCollect)
+    end.
+
+%% @private Pick the non-equality condition with smallest estimated cardinality
+pick_smallest_non_eq(StoreRef, DbName, NonEqConds) ->
+    WithCardinality = lists:map(fun(Cond) ->
+        Card = estimate_non_eq_cardinality(StoreRef, DbName, Cond),
+        {Card, Cond}
+    end, NonEqConds),
+
+    Sorted = lists:keysort(1, WithCardinality),
+    [{_, Smallest} | Rest] = Sorted,
+    {Smallest, [C || {_, C} <- Rest]}.
+
+%% @private Estimate cardinality for non-equality conditions
+estimate_non_eq_cardinality(StoreRef, DbName, {compare, Path, _Op, _Value}) ->
+    %% For compare, estimate based on total docs with this field
+    %% Assume ~50% match a typical range condition
+    case barrel_ars_index:get_posting_cardinality(StoreRef, DbName, Path) of
+        {ok, C} -> C div 2;
+        _ -> 500000  %% Default estimate if unknown
+    end;
+estimate_non_eq_cardinality(StoreRef, DbName, {exists, Path}) ->
+    case barrel_ars_index:get_posting_cardinality(StoreRef, DbName, Path) of
+        {ok, C} -> C;
+        _ -> 500000
+    end;
+estimate_non_eq_cardinality(StoreRef, DbName, {prefix, Path, _Prefix}) ->
+    %% Assume ~10% match a prefix
+    case barrel_ars_index:get_posting_cardinality(StoreRef, DbName, Path) of
+        {ok, C} -> C div 10;
+        _ -> 50000
+    end;
+estimate_non_eq_cardinality(_StoreRef, _DbName, _) ->
+    500000.
+
+%% @private Pick the equality condition with smallest cardinality to iterate
+pick_smallest_equality(StoreRef, DbName, EqConds) ->
+    WithCardinality = lists:map(fun({path, Path, Value} = Cond) ->
+        FullPath = Path ++ [Value],
+        Card = case barrel_ars_index:get_path_cardinality(StoreRef, DbName, FullPath) of
+            {ok, C} -> C;
+            _ -> 500000
+        end,
+        {Card, Cond}
+    end, EqConds),
+    Sorted = lists:keysort(1, WithCardinality),
+    [{_, Smallest} | Rest] = Sorted,
+    {Smallest, [C || {_, C} <- Rest]}.
+
+%% @private Direct equality intersection - get posting list and verify with early termination
+%% Much faster than fold_posting for equality-only queries since we can iterate
+%% the in-memory list directly without iterator overhead.
+intersect_equality_direct(StoreRef, DbName, {path, Path, Value}, RestEqConds, MaxCollect) ->
+    %% Get posting list for smallest condition
+    FullPath = Path ++ [Value],
+    DocIds = barrel_ars_index:get_posting_list_sorted(StoreRef, DbName, FullPath),
+    %% Iterate and verify others with early termination
+    intersect_equality_loop(StoreRef, DbName, DocIds, RestEqConds, MaxCollect, []).
+
+intersect_equality_loop(_StoreRef, _DbName, [], _RestConds, _MaxCollect, Acc) ->
+    lists:reverse(Acc);
+intersect_equality_loop(_StoreRef, _DbName, _DocIds, _RestConds, MaxCollect, Acc) when length(Acc) >= MaxCollect ->
+    lists:reverse(Acc);
+intersect_equality_loop(StoreRef, DbName, [DocId | Rest], RestConds, MaxCollect, Acc) ->
+    case verify_all_equalities(StoreRef, DbName, DocId, RestConds) of
+        true ->
+            intersect_equality_loop(StoreRef, DbName, Rest, RestConds, MaxCollect, [DocId | Acc]);
+        false ->
+            intersect_equality_loop(StoreRef, DbName, Rest, RestConds, MaxCollect, Acc)
+    end.
+
+%% @private Verify all equality conditions for a DocId (O(1) per condition)
+verify_all_equalities(_StoreRef, _DbName, _DocId, []) ->
+    true;
+verify_all_equalities(StoreRef, DbName, DocId, [{path, Path, Value} | Rest]) ->
+    case barrel_ars_index:docid_has_value(StoreRef, DbName, Path, Value, DocId) of
+        true -> verify_all_equalities(StoreRef, DbName, DocId, Rest);
+        false -> false
+    end.
+
+%% @private Iterate a condition and lazily verify others with early termination
+iterate_with_lazy_verify(StoreRef, DbName, IterCond, VerifyConds, MaxCollect) ->
+    %% Callback for path iteration (receives {Path, DocId})
+    PathFoldFun = fun({_Path, DocId}, {Count, Seen, Acc}) ->
+        process_docid_for_verify(StoreRef, DbName, DocId, VerifyConds, MaxCollect,
+                                  Count, Seen, Acc)
+    end,
+
+    %% Callback for posting iteration (receives Key, DocIds list, Acc)
+    PostingFoldFun = fun(_Key, DocIds, {Count, Seen, Acc}) ->
+        process_docids_for_verify(StoreRef, DbName, DocIds, VerifyConds, MaxCollect,
+                                   Count, Seen, Acc)
+    end,
+
+    {_, _, DocIds} = case IterCond of
+        {compare, Path, Op, Value} ->
+            barrel_ars_index:fold_path_values_compare(
+                StoreRef, DbName, Path, Op, Value, PathFoldFun, {0, #{}, []});
+        {exists, Path} ->
+            barrel_ars_index:fold_path(
+                StoreRef, DbName, Path, PathFoldFun, {0, #{}, []}, short_range);
+        {prefix, Path, Prefix} ->
+            barrel_ars_index:fold_prefix(
+                StoreRef, DbName, Path, Prefix, PathFoldFun, {0, #{}, []}, short_range);
+        {path, Path, Value} ->
+            %% Equality - iterate posting list (uses different callback signature)
+            FullPath = Path ++ [Value],
+            barrel_ars_index:fold_posting(
+                StoreRef, DbName, FullPath, PostingFoldFun, {0, #{}, []}, short_range)
+    end,
+    lists:reverse(DocIds).
+
+%% @private Process a single DocId for verification
+process_docid_for_verify(StoreRef, DbName, DocId, VerifyConds, MaxCollect, Count, Seen, Acc) ->
+    case maps:is_key(DocId, Seen) of
+        true ->
+            {ok, {Count, Seen, Acc}};
+        false ->
+            NewSeen = Seen#{DocId => true},
+            case lazy_verify_all(StoreRef, DbName, DocId, VerifyConds) of
+                true ->
+                    NewCount = Count + 1,
+                    NewAcc = [DocId | Acc],
+                    case NewCount >= MaxCollect of
+                        true -> {stop, {NewCount, NewSeen, NewAcc}};
+                        false -> {ok, {NewCount, NewSeen, NewAcc}}
+                    end;
+                false ->
+                    {ok, {Count, NewSeen, Acc}}
+            end
+    end.
+
+%% @private Process a list of DocIds from a posting list
+process_docids_for_verify(StoreRef, DbName, DocIds, VerifyConds, MaxCollect, Count, Seen, Acc) ->
+    process_docids_loop(StoreRef, DbName, DocIds, VerifyConds, MaxCollect, Count, Seen, Acc).
+
+process_docids_loop(_StoreRef, _DbName, [], _VerifyConds, _MaxCollect, Count, Seen, Acc) ->
+    {ok, {Count, Seen, Acc}};
+process_docids_loop(StoreRef, DbName, [DocId | Rest], VerifyConds, MaxCollect, Count, Seen, Acc) ->
+    case maps:is_key(DocId, Seen) of
+        true ->
+            process_docids_loop(StoreRef, DbName, Rest, VerifyConds, MaxCollect, Count, Seen, Acc);
+        false ->
+            NewSeen = Seen#{DocId => true},
+            case lazy_verify_all(StoreRef, DbName, DocId, VerifyConds) of
+                true ->
+                    NewCount = Count + 1,
+                    NewAcc = [DocId | Acc],
+                    case NewCount >= MaxCollect of
+                        true -> {stop, {NewCount, NewSeen, NewAcc}};
+                        false -> process_docids_loop(StoreRef, DbName, Rest, VerifyConds, MaxCollect,
+                                                      NewCount, NewSeen, NewAcc)
+                    end;
+                false ->
+                    process_docids_loop(StoreRef, DbName, Rest, VerifyConds, MaxCollect,
+                                         Count, NewSeen, Acc)
+            end
+    end.
+
+%% @private Verify all conditions for a DocId using O(1) index lookups
+lazy_verify_all(_StoreRef, _DbName, _DocId, []) ->
+    true;
+lazy_verify_all(StoreRef, DbName, DocId, [{path, Path, Value} | Rest]) ->
+    case barrel_ars_index:docid_has_value(StoreRef, DbName, Path, Value, DocId) of
+        true -> lazy_verify_all(StoreRef, DbName, DocId, Rest);
+        false -> false
+    end;
+lazy_verify_all(StoreRef, DbName, DocId, [{compare, Path, Op, Value} | Rest]) ->
+    %% For compare in verification, we need to check doc_paths (slower)
+    %% But this is rare - usually compare is the iterator
+    case barrel_ars_index:docid_satisfies_compare(StoreRef, DbName, DocId, Path, Op, Value) of
+        true -> lazy_verify_all(StoreRef, DbName, DocId, Rest);
+        false -> false
+    end;
+lazy_verify_all(StoreRef, DbName, DocId, [{exists, Path} | Rest]) ->
+    case barrel_ars_index:docid_get_value(StoreRef, DbName, DocId, Path) of
+        {ok, _} -> lazy_verify_all(StoreRef, DbName, DocId, Rest);
+        _ -> false
+    end;
+lazy_verify_all(StoreRef, DbName, DocId, [{prefix, Path, Prefix} | Rest]) ->
+    case barrel_ars_index:docid_get_value(StoreRef, DbName, DocId, Path) of
+        {ok, Val} when is_binary(Val) ->
+            PrefixLen = byte_size(Prefix),
+            case Val of
+                <<Prefix:PrefixLen/binary, _/binary>> ->
+                    lazy_verify_all(StoreRef, DbName, DocId, Rest);
+                _ -> false
+            end;
+        _ -> false
+    end;
+lazy_verify_all(_StoreRef, _DbName, _DocId, [_ | _]) ->
+    %% Unknown condition type - fail safe
+    false.
 
 %% @doc Order conditions by cardinality (smallest first) for optimal intersection.
 %% Returns empty list if any condition has 0 cardinality (short-circuit).
@@ -2453,8 +2884,47 @@ collect_docids_for_prefix(StoreRef, DbName, PathPrefix, MaxCount) when is_intege
     ),
     DocIds.
 
-%% @doc Filter results by remaining conditions and apply projections
+%% @doc Filter results by remaining conditions and apply projections.
+%% Automatically chooses between streaming or batch fetch based on:
+%% - Number of DocIds vs limit (streaming when we have 3x+ more than needed)
+%% - Presence of ORDER BY (no streaming with ORDER BY, need all results for sorting)
 filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot) ->
+    %% Remove duplicates
+    UniqueDocIds = lists:usort(DocIds),
+    DocCount = length(UniqueDocIds),
+
+    %% Choose strategy based on DocIds count vs limit
+    case should_use_streaming_fetch(DocCount, Plan) of
+        true ->
+            %% Streaming: fetch in batches with early termination
+            filter_and_project_streamed(StoreRef, DbName, UniqueDocIds, Plan, Snapshot);
+        false ->
+            %% Batch: fetch all at once (original behavior)
+            filter_and_project_batch(StoreRef, DbName, UniqueDocIds, Plan, Snapshot)
+    end.
+
+%% @doc Decide whether to use streaming fetch.
+%% Returns true when:
+%% 1. Query has a limit (unbounded queries need all results)
+%% 2. No ORDER BY (need all results for sorting)
+%% 3. DocIds count is 3x+ more than limit+offset
+should_use_streaming_fetch(DocCount, #query_plan{limit = Limit, offset = Offset, order = Order}) ->
+    case {Limit, Order} of
+        {undefined, _} ->
+            %% No limit - need all results
+            false;
+        {_, [_ | _]} ->
+            %% Has ORDER BY - need all candidates for sorting
+            false;
+        {L, []} when is_integer(L), DocCount > (L + Offset) * ?STREAM_THRESHOLD_RATIO ->
+            %% Has limit, no ORDER BY, many more docs than needed - use streaming
+            true;
+        _ ->
+            false
+    end.
+
+%% @doc Original batch fetch strategy - fetches all DocIds at once.
+filter_and_project_batch(StoreRef, DbName, UniqueDocIds, Plan, Snapshot) ->
     #query_plan{
         conditions = Conditions,
         bindings = Bindings,
@@ -2465,9 +2935,6 @@ filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot) ->
         include_docs = IncludeDocs,
         decoder_fun = DecoderFun
     } = Plan,
-
-    %% Remove duplicates
-    UniqueDocIds = lists:usort(DocIds),
 
     %% Batch fetch documents using multi_get with snapshot for consistency
     Results0 = batch_fetch_and_filter(StoreRef, DbName, UniqueDocIds,
@@ -2483,6 +2950,153 @@ filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot) ->
     LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
 
     {ok, Results2, LastSeq}.
+
+%% @doc Streaming batch fetch - fetches DocIds in small batches with early termination.
+%% Stops as soon as we have limit + offset valid results.
+%% Uses adaptive batch sizing based on observed filter selectivity.
+filter_and_project_streamed(StoreRef, DbName, DocIds, Plan, Snapshot) ->
+    #query_plan{
+        conditions = Conditions,
+        bindings = Bindings,
+        projections = Projections,
+        limit = Limit,
+        offset = Offset,
+        include_docs = IncludeDocs,
+        decoder_fun = DecoderFun
+    } = Plan,
+
+    %% Calculate target: how many valid results we need
+    Target = Limit + Offset,
+
+    %% Initial batch size with over-collect factor for filter conditions
+    InitialBatchSize = calculate_initial_batch_size(Target, Conditions),
+
+    %% Stream batches until we have enough
+    {Results, _Stats} = stream_batches(
+        DbName, DocIds,
+        Conditions, Bindings, Projections, IncludeDocs, DecoderFun, Snapshot,
+        Target, InitialBatchSize, [], #stream_stats{}
+    ),
+
+    %% Apply offset and limit (no ORDER BY in streaming path)
+    FinalResults = apply_offset_limit(Results, Offset, Limit),
+
+    %% Get last sequence
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    {ok, FinalResults, LastSeq}.
+
+%% @doc Stream batches with early termination.
+stream_batches(_DbName, [], _Conds, _Bindings, _Projs, _IncludeDocs, _DecoderFun,
+               _Snapshot, _Target, _BatchSize, Acc, Stats) ->
+    %% Exhausted all DocIds
+    {lists:reverse(Acc), Stats};
+stream_batches(_DbName, _DocIds, _Conds, _Bindings, _Projs, _IncludeDocs, _DecoderFun,
+               _Snapshot, Target, _BatchSize, Acc, Stats) when length(Acc) >= Target ->
+    %% Reached target - stop early (this is the key optimization!)
+    {lists:reverse(Acc), Stats};
+stream_batches(DbName, DocIds, Conds, Bindings, Projs, IncludeDocs, DecoderFun,
+               Snapshot, Target, BatchSize, Acc, Stats) ->
+    %% Take next batch
+    {Batch, Remaining} = safe_split(BatchSize, DocIds),
+
+    %% Select read profile based on batch size
+    Profile = select_body_read_profile(length(Batch)),
+
+    %% Fetch and filter this batch
+    {BatchResults, DecodedCount} = fetch_and_filter_batch_streaming(
+        DbName, Batch, Conds, Bindings, Projs, IncludeDocs, DecoderFun, Snapshot, Profile
+    ),
+
+    %% Update running stats
+    MatchedCount = length(BatchResults),
+    NewStats = update_stream_stats(Stats, length(Batch), DecodedCount, MatchedCount),
+
+    %% Calculate next batch size based on observed selectivity
+    Needed = Target - length(Acc) - MatchedCount,
+    NextBatchSize = calculate_next_batch_size(Needed, NewStats),
+
+    %% Continue with remaining DocIds
+    stream_batches(DbName, Remaining, Conds, Bindings, Projs, IncludeDocs, DecoderFun,
+                   Snapshot, Target, NextBatchSize, BatchResults ++ Acc, NewStats).
+
+%% @doc Fetch and filter a single batch for streaming.
+%% Returns {Results, DecodedCount}.
+fetch_and_filter_batch_streaming(DbName, DocIds, Conds, Bindings, Projs,
+                                  IncludeDocs, DecoderFun, Snapshot, Profile) ->
+    case DocIds of
+        [] ->
+            {[], 0};
+        _ ->
+            %% Use snapshot-aware fetch with read profile
+            DocBodyResults = case Snapshot of
+                undefined ->
+                    barrel_doc_body_store:multi_get_current_bodies(DbName, DocIds, Profile);
+                _ ->
+                    barrel_doc_body_store:multi_get_current_bodies_with_snapshot(
+                        DbName, DocIds, Snapshot, Profile)
+            end,
+
+            %% Process each doc
+            Pairs = lists:zip(DocIds, DocBodyResults),
+            FilterFun = fun({DocId, BodyResult}) ->
+                process_doc_body(DocId, BodyResult, Conds, Bindings, Projs, IncludeDocs, DecoderFun)
+            end,
+            Results = lists:filtermap(FilterFun, Pairs),
+
+            %% Count successful decodes (not not_found or errors)
+            DecodedCount = length([ok || {ok, _} <- DocBodyResults]),
+
+            {Results, DecodedCount}
+    end.
+
+%% @doc Calculate initial batch size based on target and conditions.
+calculate_initial_batch_size(Target, []) ->
+    %% No filter conditions - all docs will match
+    min(?STREAM_MAX_BATCH, max(?STREAM_MIN_BATCH, Target + 10));
+calculate_initial_batch_size(Target, _Conditions) ->
+    %% Has filter conditions - over-collect assuming 50% selectivity
+    EstimatedNeeded = round(Target / ?STREAM_INITIAL_SELECTIVITY),
+    min(?STREAM_MAX_BATCH, max(?STREAM_MIN_BATCH, EstimatedNeeded)).
+
+%% @doc Calculate next batch size based on observed selectivity.
+calculate_next_batch_size(Needed, _Stats) when Needed =< 0 ->
+    0;
+calculate_next_batch_size(Needed, #stream_stats{selectivity = Selectivity}) ->
+    %% Adjust for observed selectivity with 20% safety margin
+    SafeSelectivity = max(0.1, Selectivity),  %% Floor at 10%
+    EstimatedNeeded = round(Needed / SafeSelectivity * 1.2),
+    min(?STREAM_MAX_BATCH, max(?STREAM_MIN_BATCH, EstimatedNeeded)).
+
+%% @doc Update streaming stats after processing a batch.
+update_stream_stats(Stats, FetchedCount, DecodedCount, MatchedCount) ->
+    #stream_stats{fetched = F, decoded = D, matched = M} = Stats,
+    TotalDecoded = D + DecodedCount,
+    TotalMatched = M + MatchedCount,
+    NewSelectivity = case TotalDecoded > 0 of
+        true -> TotalMatched / TotalDecoded;
+        false -> ?STREAM_INITIAL_SELECTIVITY
+    end,
+    #stream_stats{
+        fetched = F + FetchedCount,
+        decoded = TotalDecoded,
+        matched = TotalMatched,
+        selectivity = NewSelectivity
+    }.
+
+%% @doc Select read profile based on batch size.
+select_body_read_profile(BatchSize) when BatchSize =< 50 ->
+    point;
+select_body_read_profile(BatchSize) when BatchSize =< 200 ->
+    short_range;
+select_body_read_profile(_) ->
+    long_scan.
+
+%% @doc Safe split that handles lists shorter than N.
+safe_split(N, List) when length(List) =< N ->
+    {List, []};
+safe_split(N, List) ->
+    lists:split(N, List).
 
 %% @doc Batch fetch documents using direct body fetch (no entity lookup needed).
 %% With current body stored without revision key, we can skip the entity fetch entirely

@@ -29,7 +29,8 @@
 -export([fold_range_posting_prefix/5, fold_range_posting_prefix_with_snapshot/6]).
 
 %% Body column family operations (BlobDB enabled)
--export([body_put/3, body_put/4, body_get/2, body_multi_get/2, body_delete/2]).
+-export([body_put/3, body_put/4, body_get/2, body_multi_get/2, body_multi_get/3, body_delete/2]).
+-export([body_multi_get_with_snapshot/3, body_multi_get_with_snapshot/4]).
 
 %% Local document column family operations (no revtree, config/state storage)
 -export([local_put/3, local_get/2, local_delete/2, local_fold/4]).
@@ -126,26 +127,15 @@ put(#{ref := Ref}, Key, Value, Opts) ->
 get(#{ref := Ref}, Key) ->
     rocksdb:get(Ref, Key, []).
 
-%% @doc Check if a key exists without loading the value.
-%% Uses iterator seek which is more efficient than get for existence checks.
-%% Compares only up to the length of the lookup key since values may be truncated.
+%% @doc Check if a key exists.
+%% Uses rocksdb:get which leverages BloomFilter for fast negative lookups.
+%% Much faster than iterator seek for single key checks.
 -spec key_exists(db_ref(), binary()) -> boolean().
 key_exists(#{ref := Ref}, Key) ->
-    KeyLen = byte_size(Key),
-    {ok, Itr} = rocksdb:iterator(Ref, []),
-    try
-        case rocksdb:iterator_move(Itr, Key) of
-            {ok, FoundKey, _Value} ->
-                %% Check if the found key starts with the lookup key (prefix match)
-                case FoundKey of
-                    <<Key:KeyLen/binary, _/binary>> -> true;
-                    Key -> true;
-                    _ -> false
-                end;
-            {error, invalid_iterator} -> false
-        end
-    after
-        rocksdb:iterator_close(Itr)
+    case rocksdb:get(Ref, Key, []) of
+        {ok, _Value} -> true;
+        not_found -> false;
+        {error, _} -> false
     end.
 
 %% @doc Get multiple values by keys (batch read)
@@ -741,9 +731,57 @@ body_get(#{ref := Ref, body_cf := BodyCF}, Key) ->
     rocksdb:get(Ref, BodyCF, Key, []).
 
 %% @doc Get multiple values from the body column family (batch read)
+%% Uses short_range profile by default.
 -spec body_multi_get(db_ref(), [binary()]) -> [{ok, binary()} | not_found | {error, term()}].
-body_multi_get(#{ref := Ref, body_cf := BodyCF}, Keys) ->
-    rocksdb:multi_get(Ref, BodyCF, Keys, []).
+body_multi_get(DbRef, Keys) ->
+    body_multi_get(DbRef, Keys, short_range).
+
+%% @doc Get multiple values from body CF with explicit read profile.
+%% BlobDB has different I/O characteristics than LSM - use appropriate profile:
+%% - point: Small batches (<50 keys), cache friendly
+%% - short_range: Medium batches (50-200 keys), auto readahead
+%% - long_scan: Large batches (>200 keys), avoid cache pollution, explicit readahead
+-spec body_multi_get(db_ref(), [binary()], read_profile()) ->
+    [{ok, binary()} | not_found | {error, term()}].
+body_multi_get(#{ref := Ref, body_cf := BodyCF}, Keys, Profile) ->
+    Opts = body_read_profile_opts(Profile),
+    rocksdb:multi_get(Ref, BodyCF, Keys, Opts).
+
+%% @doc Get multiple values from body CF with snapshot for consistent reads.
+%% Uses short_range profile by default.
+-spec body_multi_get_with_snapshot(db_ref(), [binary()], snapshot()) ->
+    [{ok, binary()} | not_found | {error, term()}].
+body_multi_get_with_snapshot(DbRef, Keys, Snapshot) ->
+    body_multi_get_with_snapshot(DbRef, Keys, Snapshot, short_range).
+
+%% @doc Get multiple values from body CF with snapshot and explicit read profile.
+-spec body_multi_get_with_snapshot(db_ref(), [binary()], snapshot(), read_profile()) ->
+    [{ok, binary()} | not_found | {error, term()}].
+body_multi_get_with_snapshot(#{ref := Ref, body_cf := BodyCF}, Keys, Snapshot, Profile) ->
+    BaseOpts = body_read_profile_opts(Profile),
+    Opts = [{snapshot, Snapshot} | BaseOpts],
+    rocksdb:multi_get(Ref, BodyCF, Keys, Opts).
+
+%% @doc Read profile options for body column family (BlobDB).
+%% BlobDB stores values in separate blob files, so prefetching is beneficial
+%% for sequential access patterns.
+-spec body_read_profile_opts(read_profile()) -> list().
+body_read_profile_opts(Profile) ->
+    BaseOpts = body_read_profile_opts_base(Profile),
+    case application:get_env(barrel_docdb, body_async_io, false) of
+        true -> [{async_io, true} | BaseOpts];
+        false -> BaseOpts
+    end.
+
+body_read_profile_opts_base(point) ->
+    %% Small batch: use cache for faster repeated access
+    [{fill_cache, true}];
+body_read_profile_opts_base(short_range) ->
+    %% Medium batch: use cache, let RocksDB auto-tune readahead
+    [{fill_cache, true}, {auto_readahead_size, true}];
+body_read_profile_opts_base(long_scan) ->
+    %% Large batch: avoid cache pollution, explicit 2MB prefetch
+    [{fill_cache, false}, {readahead_size, 2 * 1024 * 1024}].
 
 %% @doc Delete a value from the body column family
 -spec body_delete(db_ref(), binary()) -> ok | {error, term()}.
