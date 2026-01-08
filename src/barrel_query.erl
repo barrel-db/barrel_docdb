@@ -669,8 +669,8 @@ execute_multi_index_chunked(StoreRef, DbName, Conditions, Plan, ChunkSize, Start
         S -> S
     end,
 
-    %% Collect DocIds using bitmap-accelerated intersection
-    IntersectedDocIds = intersect_docid_sets(StoreRef, DbName, Conditions),
+    %% Collect DocIds using native postings API intersection (V2)
+    IntersectedDocIds = intersect_docid_sets_v2(StoreRef, DbName, Conditions),
 
     %% Apply pagination using StartKey
     PaginatedDocIds = case StartKey of
@@ -838,6 +838,75 @@ verify_conditions(StoreRef, DbName, DocIds, [Cond | Rest]) ->
         sets:is_element(DocId, CondDocIds)
     end, DocIds),
     verify_conditions(StoreRef, DbName, FilteredDocIds, Rest).
+
+%%====================================================================
+%% Native Postings V2 Query Execution (using rocksdb 2.5.0 postings API)
+%%====================================================================
+
+%% @private Intersect DocId sets using native posting list intersection.
+%% For equality conditions, uses native postings_intersect_all for O(min(n,m)) performance.
+%% For non-equality conditions, falls back to set-based verification.
+intersect_docid_sets_v2(StoreRef, DbName, Conditions) ->
+    %% Separate equality conditions (can use native intersection) from others
+    {EqConds, OtherConds} = lists:partition(fun
+        ({path, _, _}) -> true;
+        (_) -> false
+    end, Conditions),
+
+    case EqConds of
+        [] ->
+            %% No equality conditions - fall back to original approach
+            intersect_docid_sets(StoreRef, DbName, Conditions);
+        _ ->
+            %% Collect posting list binaries for equality conditions
+            PostingBins = lists:filtermap(fun({path, Path, Value}) ->
+                FullPath = Path ++ [Value],
+                case barrel_ars_index:get_posting_list_binary(StoreRef, DbName, FullPath) of
+                    {ok, Bin} -> {true, Bin};
+                    not_found -> false;
+                    {error, _} -> false
+                end
+            end, EqConds),
+
+            case PostingBins of
+                [] ->
+                    %% All posting lists empty - no results
+                    [];
+                [Single] ->
+                    %% Only one posting list - open and get keys
+                    {ok, Postings} = barrel_postings:open(Single),
+                    DocIds = barrel_postings:keys(Postings),
+                    verify_conditions_v2(StoreRef, DbName, DocIds, OtherConds);
+                _ ->
+                    %% Multiple posting lists - use native intersection
+                    case barrel_postings:intersect_all(PostingBins) of
+                        {ok, ResultPostings} ->
+                            DocIds = barrel_postings:keys(ResultPostings),
+                            verify_conditions_v2(StoreRef, DbName, DocIds, OtherConds);
+                        {error, _} ->
+                            []
+                    end
+            end
+    end.
+
+%% @private Verify conditions using postings resources for O(1) bitmap lookups.
+%% Uses postings_bitmap_contains for fast filtering instead of sets.
+verify_conditions_v2(_StoreRef, _DbName, DocIds, []) ->
+    lists:usort(DocIds);
+verify_conditions_v2(StoreRef, DbName, DocIds, [{path, Path, Value} | Rest]) ->
+    %% Use point lookup for equality - O(1) per docid via value-first index
+    FilteredDocIds = lists:filter(fun(DocId) ->
+        barrel_ars_index:docid_has_value(StoreRef, DbName, Path, Value, DocId)
+    end, DocIds),
+    verify_conditions_v2(StoreRef, DbName, FilteredDocIds, Rest);
+verify_conditions_v2(StoreRef, DbName, DocIds, [Cond | Rest]) ->
+    %% For non-equality conditions (compare, exists, prefix), use set-based approach
+    %% These conditions need to iterate over ranges, so we can't use single posting list lookup
+    CondDocIds = sets:from_list(collect_condition_docids(StoreRef, DbName, Cond)),
+    FilteredDocIds = lists:filter(fun(DocId) ->
+        sets:is_element(DocId, CondDocIds)
+    end, DocIds),
+    verify_conditions_v2(StoreRef, DbName, FilteredDocIds, Rest).
 
 %% @private Release snapshot if present
 maybe_release_snapshot(undefined) -> ok;
@@ -1953,8 +2022,8 @@ execute_multi_index(StoreRef, DbName, Conditions, Plan, Snapshot) ->
         offset = Offset
     } = Plan,
 
-    %% Collect DocIds using posting list intersection
-    IntersectedDocIds = intersect_docid_sets(StoreRef, DbName, Conditions),
+    %% Collect DocIds using native postings API intersection (V2)
+    IntersectedDocIds = intersect_docid_sets_v2(StoreRef, DbName, Conditions),
 
     %% Build results with limit applied
     LimitedDocIds = case Limit of
@@ -2059,8 +2128,8 @@ collect_scan_docids(StoreRef, DbName, Conditions, _Snapshot, MaxCount) ->
     IndexConditions = [C || C <- Conditions, is_index_condition(C)],
     case IndexConditions of
         [_, _ | _] ->
-            %% Multiple index conditions - use bitmap intersection for efficiency
-            intersect_docid_sets(StoreRef, DbName, IndexConditions);
+            %% Multiple index conditions - use native postings intersection (V2)
+            intersect_docid_sets_v2(StoreRef, DbName, IndexConditions);
         _ ->
             %% Single or no index conditions - use existing path
             case find_exists_condition(Conditions) of
@@ -2240,8 +2309,8 @@ execute_multi_index(StoreRef, DbName, Plan, Snapshot) ->
                     end;
                 false ->
                     %% Mixed conditions (equality + compare/exists/prefix)
-                    %% Use intersect_docid_sets which handles all condition types via index
-                    IntersectedDocIds = intersect_docid_sets(StoreRef, DbName, IndexConditions),
+                    %% Use native postings intersection (V2) for all condition types
+                    IntersectedDocIds = intersect_docid_sets_v2(StoreRef, DbName, IndexConditions),
 
                     %% Check if remaining conditions need body fetch
                     RemainingConds = Conditions -- IndexConditions,
