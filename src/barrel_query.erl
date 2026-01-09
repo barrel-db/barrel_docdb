@@ -2566,10 +2566,10 @@ intersect_lazy_with_limit(StoreRef, DbName, Conditions, MaxCollect) ->
 
     case NonEqConds of
         [] when length(EqConds) > 1 ->
-            %% All equality with multiple conditions - use direct posting list intersection
-            %% Get smallest posting list and verify others (O(1) per check)
+            %% All equality with multiple conditions - iterate smallest posting list
+            %% and verify others with O(1) lookups, using lazy iterator (not loading full list)
             {IterCond, RestEq} = pick_smallest_equality(StoreRef, DbName, EqConds),
-            intersect_equality_direct(StoreRef, DbName, IterCond, RestEq, MaxCollect);
+            iterate_with_lazy_verify(StoreRef, DbName, IterCond, RestEq, MaxCollect);
         [] ->
             %% Single equality - just get posting list with limit
             [{path, Path, Value}] = EqConds,
@@ -2632,37 +2632,6 @@ pick_smallest_equality(StoreRef, DbName, EqConds) ->
     [{_, Smallest} | Rest] = Sorted,
     {Smallest, [C || {_, C} <- Rest]}.
 
-%% @private Direct equality intersection - get posting list and verify with early termination
-%% Much faster than fold_posting for equality-only queries since we can iterate
-%% the in-memory list directly without iterator overhead.
-intersect_equality_direct(StoreRef, DbName, {path, Path, Value}, RestEqConds, MaxCollect) ->
-    %% Get posting list for smallest condition
-    FullPath = Path ++ [Value],
-    DocIds = barrel_ars_index:get_posting_list_sorted(StoreRef, DbName, FullPath),
-    %% Iterate and verify others with early termination
-    intersect_equality_loop(StoreRef, DbName, DocIds, RestEqConds, MaxCollect, []).
-
-intersect_equality_loop(_StoreRef, _DbName, [], _RestConds, _MaxCollect, Acc) ->
-    lists:reverse(Acc);
-intersect_equality_loop(_StoreRef, _DbName, _DocIds, _RestConds, MaxCollect, Acc) when length(Acc) >= MaxCollect ->
-    lists:reverse(Acc);
-intersect_equality_loop(StoreRef, DbName, [DocId | Rest], RestConds, MaxCollect, Acc) ->
-    case verify_all_equalities(StoreRef, DbName, DocId, RestConds) of
-        true ->
-            intersect_equality_loop(StoreRef, DbName, Rest, RestConds, MaxCollect, [DocId | Acc]);
-        false ->
-            intersect_equality_loop(StoreRef, DbName, Rest, RestConds, MaxCollect, Acc)
-    end.
-
-%% @private Verify all equality conditions for a DocId (O(1) per condition)
-verify_all_equalities(_StoreRef, _DbName, _DocId, []) ->
-    true;
-verify_all_equalities(StoreRef, DbName, DocId, [{path, Path, Value} | Rest]) ->
-    case barrel_ars_index:docid_has_value(StoreRef, DbName, Path, Value, DocId) of
-        true -> verify_all_equalities(StoreRef, DbName, DocId, Rest);
-        false -> false
-    end.
-
 %% @private Iterate a condition and lazily verify others with early termination
 iterate_with_lazy_verify(StoreRef, DbName, IterCond, VerifyConds, MaxCollect) ->
     %% Callback for path iteration (receives {Path, DocId})
@@ -2671,10 +2640,10 @@ iterate_with_lazy_verify(StoreRef, DbName, IterCond, VerifyConds, MaxCollect) ->
                                   Count, Seen, Acc)
     end,
 
-    %% Callback for posting iteration (receives Key, DocIds list, Acc)
-    PostingFoldFun = fun(_Key, DocIds, {Count, Seen, Acc}) ->
-        process_docids_for_verify(StoreRef, DbName, DocIds, VerifyConds, MaxCollect,
-                                   Count, Seen, Acc)
+    %% Callback for value_index iteration (receives DocId directly)
+    ValueIndexFoldFun = fun(DocId, {Count, Seen, Acc}) ->
+        process_docid_for_verify(StoreRef, DbName, DocId, VerifyConds, MaxCollect,
+                                  Count, Seen, Acc)
     end,
 
     {_, _, DocIds} = case IterCond of
@@ -2688,10 +2657,11 @@ iterate_with_lazy_verify(StoreRef, DbName, IterCond, VerifyConds, MaxCollect) ->
             barrel_ars_index:fold_prefix(
                 StoreRef, DbName, Path, Prefix, PathFoldFun, {0, #{}, []}, short_range);
         {path, Path, Value} ->
-            %% Equality - iterate posting list (uses different callback signature)
-            FullPath = Path ++ [Value],
-            barrel_ars_index:fold_posting(
-                StoreRef, DbName, FullPath, PostingFoldFun, {0, #{}, []}, short_range)
+            %% Equality - iterate value_index keys (individual DocId per key)
+            %% Much faster than fold_posting for LIMIT queries since we read
+            %% one key at a time instead of loading the entire posting list
+            barrel_ars_index:fold_value_index(
+                StoreRef, DbName, Value, Path, ValueIndexFoldFun, {0, #{}, []})
     end,
     lists:reverse(DocIds).
 
@@ -2712,33 +2682,6 @@ process_docid_for_verify(StoreRef, DbName, DocId, VerifyConds, MaxCollect, Count
                     end;
                 false ->
                     {ok, {Count, NewSeen, Acc}}
-            end
-    end.
-
-%% @private Process a list of DocIds from a posting list
-process_docids_for_verify(StoreRef, DbName, DocIds, VerifyConds, MaxCollect, Count, Seen, Acc) ->
-    process_docids_loop(StoreRef, DbName, DocIds, VerifyConds, MaxCollect, Count, Seen, Acc).
-
-process_docids_loop(_StoreRef, _DbName, [], _VerifyConds, _MaxCollect, Count, Seen, Acc) ->
-    {ok, {Count, Seen, Acc}};
-process_docids_loop(StoreRef, DbName, [DocId | Rest], VerifyConds, MaxCollect, Count, Seen, Acc) ->
-    case maps:is_key(DocId, Seen) of
-        true ->
-            process_docids_loop(StoreRef, DbName, Rest, VerifyConds, MaxCollect, Count, Seen, Acc);
-        false ->
-            NewSeen = Seen#{DocId => true},
-            case lazy_verify_all(StoreRef, DbName, DocId, VerifyConds) of
-                true ->
-                    NewCount = Count + 1,
-                    NewAcc = [DocId | Acc],
-                    case NewCount >= MaxCollect of
-                        true -> {stop, {NewCount, NewSeen, NewAcc}};
-                        false -> process_docids_loop(StoreRef, DbName, Rest, VerifyConds, MaxCollect,
-                                                      NewCount, NewSeen, NewAcc)
-                    end;
-                false ->
-                    process_docids_loop(StoreRef, DbName, Rest, VerifyConds, MaxCollect,
-                                         Count, NewSeen, Acc)
             end
     end.
 

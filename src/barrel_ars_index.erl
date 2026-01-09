@@ -31,7 +31,7 @@
     get_posting_list/3,
     get_posting_list_sorted/3,
     get_bucketed_posting_list/4,
-    fold_value_index/7
+    fold_value_index/6, fold_value_index/7
 ]).
 
 %% Operations-only variants (for batching with other ops)
@@ -763,8 +763,21 @@ posting_bitmap_contains(Postings, DocId) ->
 %%   {ok, NewAcc} - continue iteration
 %%   {stop, FinalAcc} - stop iteration early
 %%
-%% Example: fold_value_index(S, Db, <<"user">>, [<<"type">>], Fun, Acc, Snapshot)
+%% Example: fold_value_index(S, Db, <<"user">>, [<<"type">>], Fun, Acc)
 %%   finds all docs where type = "user"
+-spec fold_value_index(store_ref(), db_name(), term(), [term()], fun(), term()) -> term().
+fold_value_index(StoreRef, DbName, Value, FieldPath, Fun, Acc0) ->
+    StartKey = barrel_store_keys:value_index_prefix(DbName, Value, FieldPath),
+    EndKey = barrel_store_keys:value_index_end(DbName, Value, FieldPath),
+    PrefixLen = byte_size(StartKey),
+    FoldFun = fun(Key, _Value, Acc) ->
+        %% Extract DocId from key (everything after the prefix)
+        <<_:PrefixLen/binary, DocId/binary>> = Key,
+        Fun(DocId, Acc)
+    end,
+    barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, Acc0).
+
+%% @doc Fold over value-first index with snapshot for consistent reads.
 -spec fold_value_index(store_ref(), db_name(), term(), [term()], fun(), term(),
                        barrel_store_rocksdb:snapshot()) -> term().
 fold_value_index(StoreRef, DbName, Value, FieldPath, Fun, Acc0, Snapshot) ->
