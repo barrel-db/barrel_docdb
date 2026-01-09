@@ -23,6 +23,7 @@
     fold_path_values/5, fold_path_values/6,
     fold_path_values_reverse/5, fold_path_values_reverse/6,
     fold_path_values_compare/7,
+    fold_compare_docids/7,
     fold_prefix/6, fold_prefix/7,
     fold_posting/5, fold_posting/6,
     fold_prefix_posting/6,
@@ -557,7 +558,34 @@ fold_path_values_compare(StoreRef, DbName, Path, Op, Value, Fun, Acc0) ->
         {ok, NewAcc}
     end,
     try
-        barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, FoldFun, Acc0)
+        %% Use compare-optimized fold with bloom filter
+        barrel_store_rocksdb:fold_range_posting_compare(StoreRef, StartKey, EndKey, FoldFun, Acc0)
+    catch
+        throw:{stop, Result} -> Result
+    end.
+
+%% @doc Fold over DocIds matching a comparison operator (no path decoding).
+%% Optimized for pure range queries where only DocIds are needed.
+%% Callback receives (DocId, Acc) instead of ({Path, DocId}, Acc).
+-spec fold_compare_docids(store_ref(), db_name(), [term()],
+                          '>' | '<' | '>=' | '=<', term(), fun(), term()) -> term().
+fold_compare_docids(StoreRef, DbName, Path, Op, Value, Fun, Acc0) ->
+    {StartKey, EndKey} = compare_range_keys(DbName, Path, Op, Value),
+    FoldFun = fun(_Key, DocIds, Acc) ->
+        NewAcc = lists:foldl(
+            fun(DocId, InnerAcc) ->
+                case Fun(DocId, InnerAcc) of
+                    {ok, Updated} -> Updated;
+                    {stop, StopAcc} -> throw({stop, StopAcc})
+                end
+            end,
+            Acc,
+            DocIds
+        ),
+        {ok, NewAcc}
+    end,
+    try
+        barrel_store_rocksdb:fold_range_posting_compare(StoreRef, StartKey, EndKey, FoldFun, Acc0)
     catch
         throw:{stop, Result} -> Result
     end.

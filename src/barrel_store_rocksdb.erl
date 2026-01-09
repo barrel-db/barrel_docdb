@@ -27,6 +27,7 @@
 -export([posting_get/2, posting_get_binary/2, posting_multi_get/2]).
 -export([fold_range_posting/5, fold_range_posting_reverse/5]).
 -export([fold_range_posting_prefix/5, fold_range_posting_prefix_with_snapshot/6]).
+-export([fold_range_posting_compare/5]).
 
 %% Body column family operations (BlobDB enabled)
 -export([body_put/3, body_put/4, body_get/2, body_multi_get/2, body_multi_get/3, body_delete/2]).
@@ -92,7 +93,7 @@ open(Path, Options) ->
     CFDescriptors = [
         {"default", build_default_cf_options(Options)},
         {?BITMAP_CF_NAME, [{merge_operator, {bitset_merge_operator, BitmapSize}}]},
-        {?POSTING_CF_NAME, [{merge_operator, posting_list_merge_operator}]},
+        {?POSTING_CF_NAME, build_posting_cf_options()},
         {?BODY_CF_NAME, build_body_cf_options(Options)},
         {?LOCAL_CF_NAME, []}  %% Simple KV storage for local docs (no merge operator)
     ],
@@ -648,6 +649,23 @@ fold_range_posting_prefix_with_snapshot(#{ref := Ref, posting_cf := PostingCF}, 
         rocksdb:iterator_close(Iter)
     end.
 
+%% @doc Fold over posting list entries for compare/range queries with bloom filter.
+%% Uses total_order_seek=false to enable bloom filter optimization.
+%% Unlike prefix fold, does NOT use prefix_same_as_start since range queries
+%% may span multiple value prefixes (e.g., age > 50 spans 51, 52, 53...).
+-spec fold_range_posting_compare(db_ref(), binary(), binary(), fun(), term()) -> term().
+fold_range_posting_compare(#{ref := Ref, posting_cf := PostingCF}, StartKey, EndKey, Fun, Acc0) ->
+    Opts = [{iterate_lower_bound, StartKey},
+            {iterate_upper_bound, EndKey},
+            {total_order_seek, false},
+            {readahead_size, 1048576}],  %% 1MB readahead for sequential range scans
+    {ok, Iter} = rocksdb:iterator(Ref, PostingCF, Opts),
+    try
+        fold_posting_loop(rocksdb:iterator_move(Iter, first), Iter, Fun, Acc0)
+    after
+        rocksdb:iterator_close(Iter)
+    end.
+
 fold_posting_loop({error, invalid_iterator}, _Iter, _Fun, Acc) ->
     Acc;
 fold_posting_loop({ok, Key, Value}, Iter, Fun, Acc) ->
@@ -721,6 +739,26 @@ build_body_cf_options(Options) ->
             maps:get(blob_gc_age_cutoff, Options, 0.25)},
         {blob_garbage_collection_force_threshold,
             maps:get(blob_gc_force_threshold, Options, 0.5)}
+    ].
+
+%% @doc Build column family options for posting lists (path index)
+%% Configures bloom filter, prefix extractor, and block cache for efficient range scans.
+-spec build_posting_cf_options() -> list().
+build_posting_cf_options() ->
+    [
+        {merge_operator, posting_list_merge_operator},
+        %% Prefix extractor for bloom filter efficiency on path-based keys
+        %% Key format: 0x14 | db_name_len(16) | db_name | encoded_path
+        %% 32 bytes captures db prefix + field name for most queries
+        {prefix_extractor, {capped_prefix_transform, 32}},
+        %% Block-based table options with bloom filter
+        {block_based_table_options, [
+            {filter_policy, {bloom, 10}},
+            {cache_index_and_filter_blocks, true},
+            {pin_l0_filter_and_index_blocks_in_cache, true}
+        ]},
+        %% Optimize for range scans (not just point lookups)
+        {optimize_filters_for_hits, false}
     ].
 
 %% @doc Put a value in the body column family

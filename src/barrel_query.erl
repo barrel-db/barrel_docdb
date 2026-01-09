@@ -2207,7 +2207,7 @@ execute_pure_prefix(StoreRef, DbName, Path, Prefix, Plan, Snapshot) ->
     {ok, Results2, LastSeq}.
 
 %% @doc Execute pure compare query - iterates posting lists for range matches
-%% Uses fold_path_values_compare which scans values matching the operator
+%% Uses optimized fold_compare_docids which skips key decoding overhead
 execute_pure_compare(StoreRef, DbName, Path, Op, Value, Plan, Snapshot) ->
     #query_plan{
         limit = Limit,
@@ -2221,7 +2221,8 @@ execute_pure_compare(StoreRef, DbName, Path, Op, Value, Plan, Snapshot) ->
     end,
 
     %% Iterate posting lists for values matching the compare condition
-    FoldFun = fun({_FullPath, DocId}, {Seen, Count, Acc}) ->
+    %% Uses optimized fold that doesn't decode keys (we don't need paths)
+    FoldFun = fun(DocId, {Seen, Count, Acc}) ->
         case maps:is_key(DocId, Seen) of
             true ->
                 {ok, {Seen, Count, Acc}};
@@ -2238,11 +2239,9 @@ execute_pure_compare(StoreRef, DbName, Path, Op, Value, Plan, Snapshot) ->
         end
     end,
 
-    %% Use fold_path_values_compare with snapshot
-    %% For now, use non-snapshot version and handle snapshot separately
-    %% TODO: Add snapshot support to fold_path_values_compare
-    _ = Snapshot,  %% Snapshot not used yet for this path
-    {_, _, Results} = barrel_ars_index:fold_path_values_compare(
+    %% Use optimized fold without key decoding
+    _ = Snapshot,  %% TODO: Add snapshot support
+    {_, _, Results} = barrel_ars_index:fold_compare_docids(
         StoreRef, DbName, Path, Op, Value, FoldFun, {#{}, 0, []}
     ),
 
