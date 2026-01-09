@@ -289,57 +289,47 @@ get_changes_chunked(StoreRef, DbName, ContinuationOrSince, Opts) ->
     {ok, Changes, ContinuationInfo}.
 
 %% @private Get changes using path index for a single path pattern
-%% Falls back to full scan if path index is empty (backwards compatibility)
 get_changes_with_path_index(StoreRef, DbName, PathPattern, Since, Opts, QuerySpec) ->
-    %% Try path index first
+    %% Use path index directly - no fallback to full scan
     {ok, PathChanges, PathLastHlc} = get_changes_by_path(StoreRef, DbName, PathPattern, Since,
                                                           #{limit => maps:get(limit, Opts, infinity)}),
 
-    case PathChanges of
-        [] ->
-            %% Path index empty - fall back to full scan
-            %% This handles old data without path index or direct write_change calls
-            get_changes_full_scan(StoreRef, DbName, Since, Opts#{paths => [PathPattern]});
-        _ ->
-            %% Path index has entries - use them
-            Limit = maps:get(limit, Opts, infinity),
-            Style = maps:get(style, Opts, all_docs),
-            CompiledQuery = compile_query(QuerySpec),
+    Limit = maps:get(limit, Opts, infinity),
+    Style = maps:get(style, Opts, all_docs),
+    CompiledQuery = compile_query(QuerySpec),
 
-            %% Apply query filter and style if needed
-            FilteredChanges = lists:filtermap(
-                fun(Change) ->
-                    case maybe_match_query(CompiledQuery, Change) of
-                        true ->
-                            %% Apply style filter
-                            StyledChange = apply_style(Style, Change),
-                            {true, StyledChange};
-                        false ->
-                            false
-                    end
-                end,
-                PathChanges
-            ),
+    %% Apply query filter and style if needed
+    FilteredChanges = lists:filtermap(
+        fun(Change) ->
+            case maybe_match_query(CompiledQuery, Change) of
+                true ->
+                    %% Apply style filter
+                    StyledChange = apply_style(Style, Change),
+                    {true, StyledChange};
+                false ->
+                    false
+            end
+        end,
+        PathChanges
+    ),
 
-            %% Apply limit if query filter was used (might have reduced count)
-            LimitedChanges = case {CompiledQuery, Limit} of
-                {undefined, _} -> FilteredChanges;
-                {_, infinity} -> FilteredChanges;
-                {_, N} -> lists:sublist(FilteredChanges, N)
-            end,
+    %% Apply limit if query filter was used (might have reduced count)
+    LimitedChanges = case {CompiledQuery, Limit} of
+        {undefined, _} -> FilteredChanges;
+        {_, infinity} -> FilteredChanges;
+        {_, N} -> lists:sublist(FilteredChanges, N)
+    end,
 
-            Changes = case maps:get(descending, Opts, false) of
-                true -> lists:reverse(LimitedChanges);
-                false -> LimitedChanges
-            end,
+    Changes = case maps:get(descending, Opts, false) of
+        true -> lists:reverse(LimitedChanges);
+        false -> LimitedChanges
+    end,
 
-            {ok, Changes, PathLastHlc}
-    end.
+    {ok, Changes, PathLastHlc}.
 
 %% @private Get changes from multiple path patterns and merge by HLC
-%% Falls back to full scan if path indexes are empty (backwards compatibility)
 get_changes_with_multiple_paths(StoreRef, DbName, Paths, Since, Opts, QuerySpec) ->
-    %% Get changes from each path index
+    %% Get changes from each path index - no fallback to full scan
     AllChanges = lists:flatmap(
         fun(PathPattern) ->
             case get_changes_by_path(StoreRef, DbName, PathPattern, Since, #{}) of
@@ -350,58 +340,52 @@ get_changes_with_multiple_paths(StoreRef, DbName, Paths, Since, Opts, QuerySpec)
         Paths
     ),
 
-    case AllChanges of
-        [] ->
-            %% Path indexes empty - fall back to full scan
-            get_changes_full_scan(StoreRef, DbName, Since, Opts#{paths => Paths});
-        _ ->
-            Limit = maps:get(limit, Opts, infinity),
-            Style = maps:get(style, Opts, all_docs),
-            CompiledQuery = compile_query(QuerySpec),
+    Limit = maps:get(limit, Opts, infinity),
+    Style = maps:get(style, Opts, all_docs),
+    CompiledQuery = compile_query(QuerySpec),
 
-            %% Remove duplicates (same doc_id) keeping latest HLC
-            Deduped = dedupe_changes_by_id(AllChanges),
+    %% Remove duplicates (same doc_id) keeping latest HLC
+    Deduped = dedupe_changes_by_id(AllChanges),
 
-            %% Sort by HLC
-            Sorted = lists:sort(
-                fun(A, B) ->
-                    barrel_hlc:compare(maps:get(hlc, A), maps:get(hlc, B)) =/= gt
-                end,
-                Deduped
-            ),
+    %% Sort by HLC
+    Sorted = lists:sort(
+        fun(A, B) ->
+            barrel_hlc:compare(maps:get(hlc, A), maps:get(hlc, B)) =/= gt
+        end,
+        Deduped
+    ),
 
-            %% Apply query filter and limit
-            {FilteredChanges, _Count} = lists:foldl(
-                fun(Change, {Acc, Count}) ->
-                    case Limit =/= infinity andalso Count >= Limit of
+    %% Apply query filter and limit
+    {FilteredChanges, _Count} = lists:foldl(
+        fun(Change, {Acc, Count}) ->
+            case Limit =/= infinity andalso Count >= Limit of
+                true ->
+                    {Acc, Count};
+                false ->
+                    case maybe_match_query(CompiledQuery, Change) of
                         true ->
-                            {Acc, Count};
+                            StyledChange = apply_style(Style, Change),
+                            {[StyledChange | Acc], Count + 1};
                         false ->
-                            case maybe_match_query(CompiledQuery, Change) of
-                                true ->
-                                    StyledChange = apply_style(Style, Change),
-                                    {[StyledChange | Acc], Count + 1};
-                                false ->
-                                    {Acc, Count}
-                            end
+                            {Acc, Count}
                     end
-                end,
-                {[], 0},
-                Sorted
-            ),
+            end
+        end,
+        {[], 0},
+        Sorted
+    ),
 
-            Changes = case maps:get(descending, Opts, false) of
-                true -> FilteredChanges;
-                false -> lists:reverse(FilteredChanges)
-            end,
+    Changes = case maps:get(descending, Opts, false) of
+        true -> FilteredChanges;
+        false -> lists:reverse(FilteredChanges)
+    end,
 
-            LastHlc = case FilteredChanges of
-                [] -> case Since of first -> barrel_hlc:min(); _ -> Since end;
-                _ -> maps:get(hlc, hd(FilteredChanges))
-            end,
+    LastHlc = case FilteredChanges of
+        [] -> case Since of first -> barrel_hlc:min(); _ -> Since end;
+        _ -> maps:get(hlc, hd(FilteredChanges))
+    end,
 
-            {ok, Changes, LastHlc}
-    end.
+    {ok, Changes, LastHlc}.
 
 %% @private Full scan with filtering
 get_changes_full_scan(StoreRef, DbName, Since, Opts) ->
@@ -912,7 +896,8 @@ batch_fetch_doc_bodies(StoreRef, DbName, DocChangePairs) ->
 write_change(StoreRef, DbName, Hlc, DocInfo) ->
     ChangeOps = write_change_ops(DbName, Hlc, DocInfo),
     BucketOps = update_change_bucket_ops(StoreRef, DbName, Hlc),
-    barrel_store_rocksdb:write_batch(StoreRef, ChangeOps ++ BucketOps).
+    PathOps = write_path_index_ops(DbName, Hlc, DocInfo),
+    barrel_store_rocksdb:write_batch(StoreRef, ChangeOps ++ BucketOps ++ PathOps).
 
 %% @doc Return batch operation to write a change entry.
 %% Use this to combine with other operations in a single write_batch.
@@ -1005,11 +990,6 @@ decode_change_compact(<<DocIdLen:16, DocId:DocIdLen/binary,
                         Deleted:8, NumConflicts:16, _Rest/binary>>, Hlc) ->
     {DocId, Hlc, Rev, Deleted =:= 1, NumConflicts}.
 
-%% @doc Extract just DocId from encoded change binary (for cheap dedup).
-%% Avoids full decode when only DocId is needed.
--spec decode_docid(binary()) -> docid().
-decode_docid(<<DocIdLen:16, DocId:DocIdLen/binary, _Rest/binary>>) ->
-    DocId.
 
 %% @doc Decode change to full map format for API responses.
 %% Includes doc body if present in the change record.
@@ -1069,10 +1049,20 @@ write_path_index_ops(DbName, Hlc, DocInfo) ->
     %% Format: <<DocIdLen:16, DocId, RevLen:16, Rev, Deleted:8, NumConflicts:16, HasDoc:8>>
     Value = encode_change(#{id => DocId, rev => Rev, deleted => Deleted}),
 
-    %% Create index entry for each topic and all its prefixes
+    %% Index each topic and all its prefixes
     AllPrefixes = lists:usort(lists:flatmap(fun topic_prefixes/1, Topics)),
-    [{put, barrel_store_keys:path_hlc(DbName, Prefix, Hlc), Value}
-     || Prefix <- AllPrefixes].
+
+    %% Old path_hlc index: topic + hlc (for exact matches)
+    PathHlcOps = [{put, barrel_store_keys:path_hlc(DbName, Prefix, Hlc), Value}
+                  || Prefix <- AllPrefixes],
+
+    %% New prefix_hlc index: prefix/ + 0x00 + hlc + docid (for efficient wildcard queries)
+    %% Index ALL prefixes so that "type/#" matches docs with path "type/user/admin"
+    %% Key format ensures HLC-ordered results within each subscription prefix
+    PrefixHlcOps = [{put, barrel_store_keys:prefix_hlc_key(DbName, Prefix, Hlc, DocId), Value}
+                   || Prefix <- AllPrefixes],
+
+    PathHlcOps ++ PrefixHlcOps.
 
 %% @doc Generate operations to update path index (remove old entries + add new).
 %% Used when a document is updated to maintain a current path index without stale entries.
@@ -1094,8 +1084,18 @@ update_path_index_ops(DbName, NewHlc, NewDocInfo, OldHlc, OldDoc) ->
             OldPaths = barrel_ars:analyze(OldDoc),
             OldTopics = barrel_ars:paths_to_topics(OldPaths),
             OldPrefixes = lists:usort(lists:flatmap(fun topic_prefixes/1, OldTopics)),
-            [{delete, barrel_store_keys:path_hlc(DbName, P, OldHlc)}
-             || P <- OldPrefixes]
+
+            %% Delete from old path_hlc index
+            OldPathHlcDeletes = [{delete, barrel_store_keys:path_hlc(DbName, P, OldHlc)}
+                                || P <- OldPrefixes],
+
+            %% Delete from new prefix_hlc index (all prefixes)
+            %% DocId is the same for old and new (document identity)
+            #{id := DocId} = NewDocInfo,
+            OldPrefixHlcDeletes = [{delete, barrel_store_keys:prefix_hlc_key(DbName, P, OldHlc, DocId)}
+                                  || P <- OldPrefixes],
+
+            OldPathHlcDeletes ++ OldPrefixHlcDeletes
     end,
 
     DeleteOps ++ NewOps.
@@ -1173,60 +1173,43 @@ scan_path_hlc(StoreRef, DbName, Topic, Since, Limit) ->
 
     {ok, lists:reverse(Changes), LastHlc}.
 
-%% @private Scan path_hlc index with prefix (for # wildcard)
-%% This scans all topics that start with the prefix.
-%% Deduplicates by DocId since a document may have multiple topic prefixes indexed.
-%% Uses ETS for O(1) dedup instead of Erlang maps for better performance.
+%% @private Scan prefix_hlc index for wildcard queries (# pattern)
+%% Uses new prefix_hlc index where keys are: prefix/ | 0x00 | hlc | docid
+%% This enables direct seeking to (prefix, since_hlc) and HLC-ordered iteration.
+%% No deduplication needed - each entry is unique.
 scan_path_hlc_prefix(StoreRef, DbName, TopicPrefix, Since, Limit) ->
-    %% For prefix scan, we need to scan all keys with the topic prefix
-    %% and filter by HLC afterward
     SinceHlc = case Since of
         first -> barrel_hlc:min();
         Hlc -> Hlc
     end,
 
-    %% Use wildcard range keys (without null terminator) to capture all topics
-    %% that START with TopicPrefix, e.g. "users" matches "users", "users/123", etc.
-    StartKey = barrel_store_keys:path_hlc_wildcard_start(DbName, TopicPrefix),
-    EndKey = barrel_store_keys:path_hlc_wildcard_end(DbName, TopicPrefix),
+    %% Use new prefix_hlc index - keys sorted by prefix, then HLC
+    StartKey = barrel_store_keys:prefix_hlc_start(DbName, TopicPrefix, SinceHlc),
+    EndKey = barrel_store_keys:prefix_hlc_end(DbName, TopicPrefix),
 
-    %% Use ETS set for O(1) dedup (much faster than maps for large scans)
-    Seen = ets:new(wildcard_seen, [set, private]),
-    try
-        %% Track seen DocIds to deduplicate (a doc may have multiple topic prefixes)
-        FoldFun = fun(Key, Value, {CurrentHlc, Count, Acc}) ->
-            case Limit =/= infinity andalso Count >= Limit of
-                true ->
-                    {stop, {CurrentHlc, Count, Acc}};
-                false ->
-                    {_KeyTopic, ChangeHlc} = barrel_store_keys:decode_path_hlc_key(DbName, Key),
-                    %% Filter by HLC (exclusive of Since)
-                    case barrel_hlc:compare(ChangeHlc, SinceHlc) of
-                        lt -> {ok, {CurrentHlc, Count, Acc}};
-                        eq when Since =/= first -> {ok, {CurrentHlc, Count, Acc}};
-                        _ ->
-                            %% Extract DocId cheaply for dedup check
-                            DocId = decode_docid(Value),
-                            %% ETS insert_new returns true if new, false if exists
-                            case ets:insert_new(Seen, {DocId}) of
-                                false ->
-                                    %% Already seen this doc, skip
-                                    {ok, {ChangeHlc, Count, Acc}};
-                                true ->
-                                    %% Decode full change and add
-                                    Change = decode_path_hlc_value(Value, ChangeHlc),
-                                    {ok, {ChangeHlc, Count + 1, [Change | Acc]}}
-                            end
-                    end
-            end
-        end,
-        {LastHlc, _Count, Changes} = barrel_store_rocksdb:fold_range_limit(
-            StoreRef, StartKey, EndKey, FoldFun, {SinceHlc, 0, []}, Limit
-        ),
-        {ok, lists:reverse(Changes), LastHlc}
-    after
-        ets:delete(Seen)
-    end.
+    %% No dedup needed - each (prefix, hlc, docid) entry is unique
+    FoldFun = fun(Key, Value, {CurrentHlc, Count, Acc}) ->
+        case Limit =/= infinity andalso Count >= Limit of
+            true ->
+                {stop, {CurrentHlc, Count, Acc}};
+            false ->
+                {_Prefix, ChangeHlc, _DocId} = barrel_store_keys:decode_prefix_hlc_key(DbName, Key),
+                %% Filter by HLC (exclusive of Since)
+                case Since =/= first andalso barrel_hlc:equal(ChangeHlc, SinceHlc) of
+                    true ->
+                        %% Skip the exact Since HLC (exclusive)
+                        {ok, {CurrentHlc, Count, Acc}};
+                    false ->
+                        %% Decode full change and add
+                        Change = decode_path_hlc_value(Value, ChangeHlc),
+                        {ok, {ChangeHlc, Count + 1, [Change | Acc]}}
+                end
+        end
+    end,
+    {LastHlc, _Count, Changes} = barrel_store_rocksdb:fold_range_limit(
+        StoreRef, StartKey, EndKey, FoldFun, {SinceHlc, 0, []}, Limit
+    ),
+    {ok, lists:reverse(Changes), LastHlc}.
 
 %% @private Decode path_hlc index value to change map.
 %% Uses same compact binary format as change feed.

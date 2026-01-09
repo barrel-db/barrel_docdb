@@ -74,6 +74,11 @@
 -export([path_hlc_wildcard_start/2, path_hlc_wildcard_end/2]).  %% For # wildcard matching
 -export([encode_topic/1, decode_path_hlc_key/2]).
 
+%% Prefix-HLC keys (for efficient wildcard change queries)
+%% Keys sorted by prefix then HLC for direct seeking
+-export([prefix_hlc_key/4, prefix_hlc_start/3, prefix_hlc_end/2]).
+-export([decode_prefix_hlc_key/2]).
+
 %% Attachment keys
 -export([att_data/3, att_data_prefix/2]).
 
@@ -113,6 +118,7 @@
 -define(PREFIX_VALUE_INDEX, 16#16).   %% Value-first index: [value_prefix, path, DocId] → marker (for iteration)
 -define(PREFIX_CHANGE_BUCKET, 16#17). %% Change bucket: DbName + BucketTs → {min_hlc, max_hlc, count}
 -define(PREFIX_DOC_ENTITY, 16#18).    %% Wide-column doc entity: DbName + DocId → entity with columns
+-define(PREFIX_PREFIX_HLC, 16#1A).    %% Prefix-HLC index: prefix/ + hlc + docid → change info
 
 %% Value prefix max length for value-first index (128 bytes)
 -define(VALUE_PREFIX_MAX_LEN, 128).
@@ -299,6 +305,74 @@ split_on_null(<<0, Rest/binary>>, Acc) ->
     {Acc, Rest};
 split_on_null(<<B, Rest/binary>>, Acc) ->
     split_on_null(Rest, <<Acc/binary, B>>).
+
+%%====================================================================
+%% Prefix-HLC Keys (Efficient Wildcard Change Queries)
+%%====================================================================
+%% Key format: PREFIX | db_name | query_prefix | 0x00 | hlc | docid
+%% This format enables efficient wildcard queries:
+%% - query_prefix is the subscription prefix (e.g., "type" without trailing /)
+%% - 0x00 separator ensures exact prefix boundary
+%% - HLC comes AFTER prefix for time-ordered iteration within a prefix
+%% - DocId handles multiple docs at the same HLC
+%%
+%% For a document with path "type/user/admin", we write keys for each prefix:
+%% - type | 0x00 | hlc | docid
+%% - type/user | 0x00 | hlc | docid
+%% - type/user/admin | 0x00 | hlc | docid
+%%
+%% Query "type/#" scans: type | 0x00 | since_hlc → type | 0x00 | max_hlc
+%% This returns ONE entry per document in HLC order (no dedup needed)!
+
+%% @doc Create prefix-hlc key for indexing changes.
+%% QueryPrefix is the subscription prefix (e.g., "type/" for wildcard "type/#")
+%% Key format: PREFIX_PREFIX_HLC | db_name | query_prefix | 0x00 | hlc | docid
+-spec prefix_hlc_key(db_name(), binary(), barrel_hlc:timestamp(), docid()) -> binary().
+prefix_hlc_key(DbName, QueryPrefix, Hlc, DocId) ->
+    NormalizedPrefix = normalize_prefix(QueryPrefix),
+    <<?PREFIX_PREFIX_HLC, (encode_name(DbName))/binary,
+      NormalizedPrefix/binary, 0, (encode_hlc(Hlc))/binary, DocId/binary>>.
+
+%% @doc Start key for prefix-hlc range scan.
+%% Used for wildcard queries to seek to (Prefix, SinceHlc).
+-spec prefix_hlc_start(db_name(), binary(), barrel_hlc:timestamp()) -> binary().
+prefix_hlc_start(DbName, QueryPrefix, SinceHlc) ->
+    NormalizedPrefix = normalize_prefix(QueryPrefix),
+    <<?PREFIX_PREFIX_HLC, (encode_name(DbName))/binary,
+      NormalizedPrefix/binary, 0, (encode_hlc(SinceHlc))/binary>>.
+
+%% @doc End key for prefix-hlc range scan.
+%% Matches all entries with given prefix (any HLC, any DocId).
+-spec prefix_hlc_end(db_name(), binary()) -> binary().
+prefix_hlc_end(DbName, QueryPrefix) ->
+    NormalizedPrefix = normalize_prefix(QueryPrefix),
+    %% prefix | 0x00 | max_hlc | max_docid
+    <<?PREFIX_PREFIX_HLC, (encode_name(DbName))/binary,
+      NormalizedPrefix/binary, 0,
+      16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF,
+      16#FF, 16#FF, 16#FF, 16#FF, 16#FF>>.
+
+%% @doc Decode prefix-hlc key to extract QueryPrefix, HLC, and DocId.
+-spec decode_prefix_hlc_key(db_name(), binary()) -> {binary(), barrel_hlc:timestamp(), docid()}.
+decode_prefix_hlc_key(DbName, Key) ->
+    %% Skip prefix byte and db_name
+    NameLen = byte_size(DbName),
+    HeaderLen = 1 + 2 + NameLen, %% PREFIX + 16-bit length + name
+    <<_:HeaderLen/binary, Rest/binary>> = Key,
+    %% Find the 0x00 separator after query_prefix
+    {QueryPrefix, <<0, HlcAndDocId/binary>>} = split_on_null(Rest),
+    HlcSize = 12,
+    <<HlcBin:HlcSize/binary, DocId/binary>> = HlcAndDocId,
+    {QueryPrefix, decode_hlc(HlcBin), DocId}.
+
+%% @private Normalize prefix - remove trailing "/" if present
+%% The 0x00 separator acts as the boundary, no trailing / needed
+normalize_prefix(<<>>) -> <<>>;
+normalize_prefix(Prefix) ->
+    case binary:last(Prefix) of
+        $/ -> binary:part(Prefix, 0, byte_size(Prefix) - 1);
+        _ -> Prefix
+    end.
 
 %%====================================================================
 %% Local Document Keys (Legacy - Default CF)
