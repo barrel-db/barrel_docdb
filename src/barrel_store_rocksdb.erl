@@ -9,7 +9,7 @@
 
 %% barrel_store callbacks
 -export([open/2, close/1]).
--export([put/3, put/4, get/2, key_exists/2, multi_get/2, delete/2]).
+-export([put/3, put/4, get/2, key_exists/2, multi_key_exists/2, multi_get/2, delete/2]).
 -export([merge/3]).
 -export([write_batch/2, write_batch/3]).
 -export([fold/4, fold_range/5, fold_range/6, fold_range_reverse/5, fold_range_reverse/6]).
@@ -137,6 +137,14 @@ key_exists(#{ref := Ref}, Key) ->
         not_found -> false;
         {error, _} -> false
     end.
+
+%% @doc Check if multiple keys exist (batch existence check).
+%% Uses multi_get internally and converts to boolean results.
+%% Much faster than calling key_exists for each key individually.
+-spec multi_key_exists(db_ref(), [binary()]) -> [boolean()].
+multi_key_exists(#{ref := Ref}, Keys) ->
+    Results = rocksdb:multi_get(Ref, Keys, []),
+    [case R of {ok, _} -> true; _ -> false end || R <- Results].
 
 %% @doc Get multiple values by keys (batch read)
 -spec multi_get(db_ref(), [binary()]) -> [{ok, binary()} | not_found | {error, term()}].

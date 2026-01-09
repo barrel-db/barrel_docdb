@@ -77,6 +77,11 @@ Benchmarks run with 5000 documents:
 4. Pre-sorted keys eliminating `lists:sort/1` overhead
 5. Roaring bitmaps for O(1) existence verification
 
+**Additional optimizations (Jan 9)**:
+6. **Cardinality-based condition ordering** - starts with most selective condition
+7. **Batch key verification** - `multi_key_exists` replaces individual `key_exists` calls
+8. Mixed equality+range queries now choose optimal iteration order based on cardinality
+
 ### Storage Changes
 
 The V2 integration removed the separate bitmap column family:

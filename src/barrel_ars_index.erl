@@ -52,7 +52,8 @@
 -export([
     docid_has_value/5,
     docid_get_value/4,
-    docid_satisfies_compare/6
+    docid_satisfies_compare/6,
+    filter_docids_by_value/5
 ]).
 
 %% Native postings API (V2 posting lists)
@@ -276,6 +277,29 @@ compare_values(A, '>=', B) -> A >= B;
 compare_values(A, '=<', B) -> A =< B;
 compare_values(A, '=/=', B) -> A =/= B;
 compare_values(A, '==', B) -> A == B.
+
+%% @doc Filter a list of DocIds to only those that have a specific value at a path.
+%% Uses batch multi_get for efficiency instead of individual key lookups.
+%% Much faster than calling docid_has_value for each DocId individually.
+-spec filter_docids_by_value(store_ref(), db_name(), [term()], term(), [docid()]) -> [docid()].
+filter_docids_by_value(_StoreRef, _DbName, _Path, _Value, []) ->
+    [];
+filter_docids_by_value(StoreRef, DbName, Path, Value, DocIds) ->
+    %% Build keys for batch lookup
+    Keys = [barrel_store_keys:value_index_key(DbName, Value, Path, DocId)
+            || DocId <- DocIds],
+    %% Use batch key existence check
+    Results = barrel_store_rocksdb:multi_key_exists(StoreRef, Keys),
+    %% Filter to only DocIds that exist
+    filter_by_exists(DocIds, Results, []).
+
+%% @private Filter DocIds based on existence results
+filter_by_exists([], [], Acc) ->
+    lists:reverse(Acc);
+filter_by_exists([DocId | DocIds], [true | Results], Acc) ->
+    filter_by_exists(DocIds, Results, [DocId | Acc]);
+filter_by_exists([_DocId | DocIds], [false | Results], Acc) ->
+    filter_by_exists(DocIds, Results, Acc).
 
 %% @doc Fold over path index entries matching a path prefix.
 %% The callback receives {Path, DocId} for each match.

@@ -875,7 +875,7 @@ verify_conditions(StoreRef, DbName, DocIds, [Cond | Rest]) ->
 
 %% @private Intersect DocId sets using native posting list intersection.
 %% For equality conditions, uses native postings_intersect_all for O(min(n,m)) performance.
-%% For non-equality conditions, falls back to set-based verification.
+%% For non-equality conditions, uses cardinality-based selection for optimal iteration order.
 intersect_docid_sets_v2(StoreRef, DbName, Conditions) ->
     %% Separate equality conditions (can use native intersection) from others
     {EqConds, OtherConds} = lists:partition(fun
@@ -883,51 +883,122 @@ intersect_docid_sets_v2(StoreRef, DbName, Conditions) ->
         (_) -> false
     end, Conditions),
 
-    case EqConds of
-        [] ->
+    case {EqConds, OtherConds} of
+        {[], _} ->
             %% No equality conditions - fall back to original approach
             intersect_docid_sets(StoreRef, DbName, Conditions);
-        _ ->
-            %% Collect posting list binaries for equality conditions
-            PostingBins = lists:filtermap(fun({path, Path, Value}) ->
-                FullPath = Path ++ [Value],
-                case barrel_ars_index:get_posting_list_binary(StoreRef, DbName, FullPath) of
-                    {ok, Bin} -> {true, Bin};
-                    not_found -> false;
-                    {error, _} -> false
-                end
-            end, EqConds),
+        {_, []} ->
+            %% Only equality conditions - use native posting intersection
+            intersect_equality_conditions(StoreRef, DbName, EqConds);
+        {_, _} ->
+            %% Mixed conditions - choose best starting condition based on cardinality
+            intersect_mixed_conditions_v2(StoreRef, DbName, EqConds, OtherConds)
+    end.
 
-            case PostingBins of
-                [] ->
-                    %% All posting lists empty - no results
-                    [];
-                [Single] ->
-                    %% Only one posting list - open and get keys
-                    {ok, Postings} = barrel_postings:open(Single),
-                    DocIds = barrel_postings:keys(Postings),
-                    verify_conditions_v2(StoreRef, DbName, DocIds, OtherConds);
-                _ ->
-                    %% Multiple posting lists - use native intersection
-                    case barrel_postings:intersect_all(PostingBins) of
-                        {ok, ResultPostings} ->
-                            DocIds = barrel_postings:keys(ResultPostings),
-                            verify_conditions_v2(StoreRef, DbName, DocIds, OtherConds);
-                        {error, _} ->
-                            []
-                    end
+%% @private Intersect multiple equality conditions using native posting list API.
+intersect_equality_conditions(StoreRef, DbName, EqConds) ->
+    PostingBins = lists:filtermap(fun({path, Path, Value}) ->
+        FullPath = Path ++ [Value],
+        case barrel_ars_index:get_posting_list_binary(StoreRef, DbName, FullPath) of
+            {ok, Bin} -> {true, Bin};
+            not_found -> false;
+            {error, _} -> false
+        end
+    end, EqConds),
+
+    case PostingBins of
+        [] ->
+            [];
+        [Single] ->
+            {ok, Postings} = barrel_postings:open(Single),
+            barrel_postings:keys(Postings);
+        _ ->
+            case barrel_postings:intersect_all(PostingBins) of
+                {ok, ResultPostings} ->
+                    barrel_postings:keys(ResultPostings);
+                {error, _} ->
+                    []
             end
     end.
 
-%% @private Verify conditions using postings resources for O(1) bitmap lookups.
-%% Uses postings_bitmap_contains for fast filtering instead of sets.
+%% @private Intersect mixed equality + non-equality conditions.
+%% Uses cardinality estimation to choose the most selective starting condition.
+intersect_mixed_conditions_v2(StoreRef, DbName, EqConds, OtherConds) ->
+    %% Estimate cardinality for all conditions
+    AllConds = EqConds ++ OtherConds,
+    CondsWithCard = estimate_all_cardinalities(StoreRef, DbName, AllConds),
+
+    %% Sort by estimated cardinality (smallest first)
+    Sorted = lists:sort(CondsWithCard),
+    %% Debug: io:format("Sorted conditions: ~p~n", [Sorted]),
+    [{_BestCard, BestCond} | RestWithCard] = Sorted,
+    RestConds = [C || {_, C} <- RestWithCard],
+
+    %% Collect DocIds from the most selective condition
+    T0 = erlang:monotonic_time(microsecond),
+    DocIds = collect_condition_docids(StoreRef, DbName, BestCond),
+    T1 = erlang:monotonic_time(microsecond),
+    put(profile_index_iter, pdict_get(profile_index_iter, 0) + (T1 - T0)),
+
+    %% Verify remaining conditions
+    T2 = erlang:monotonic_time(microsecond),
+    Result = verify_conditions_v2(StoreRef, DbName, DocIds, RestConds),
+    T3 = erlang:monotonic_time(microsecond),
+    put(profile_verify_conds, pdict_get(profile_verify_conds, 0) + (T3 - T2)),
+
+    Result.
+
+%% @private Estimate cardinality for all conditions.
+estimate_all_cardinalities(StoreRef, DbName, Conditions) ->
+    lists:map(fun(Cond) ->
+        Card = estimate_condition_cardinality(StoreRef, DbName, Cond),
+        {Card, Cond}
+    end, Conditions).
+
+%% @private Estimate cardinality for a single condition.
+estimate_condition_cardinality(StoreRef, DbName, {path, Path, Value}) ->
+    FullPath = Path ++ [Value],
+    case barrel_ars_index:get_path_cardinality(StoreRef, DbName, FullPath) of
+        {ok, C} -> C;
+        _ -> 999999999
+    end;
+estimate_condition_cardinality(StoreRef, DbName, {compare, Path, Op, _Value}) ->
+    %% Estimate compare cardinality - assume 50% selectivity for range queries
+    case barrel_ars_index:get_path_cardinality(StoreRef, DbName, Path) of
+        {ok, TotalCard} ->
+            case Op of
+                '>' -> TotalCard div 2;
+                '<' -> TotalCard div 2;
+                '>=' -> (TotalCard div 2) + 1;
+                '=<' -> (TotalCard div 2) + 1;
+                _ -> TotalCard
+            end;
+        _ -> 999999998
+    end;
+estimate_condition_cardinality(StoreRef, DbName, {exists, Path}) ->
+    case barrel_ars_index:get_path_cardinality(StoreRef, DbName, Path) of
+        {ok, C} -> C;
+        _ -> 999999999
+    end;
+estimate_condition_cardinality(StoreRef, DbName, {prefix, Path, _Prefix}) ->
+    %% Estimate prefix matches ~10% of path values
+    case barrel_ars_index:get_path_cardinality(StoreRef, DbName, Path) of
+        {ok, TotalCard} -> TotalCard div 10;
+        _ -> 999999997
+    end;
+estimate_condition_cardinality(_, _, _) ->
+    999999999.
+
+%% @private Verify conditions using batch lookups for efficiency.
+%% Uses multi_key_exists for batch verification instead of individual lookups.
 verify_conditions_v2(_StoreRef, _DbName, DocIds, []) ->
     lists:usort(DocIds);
 verify_conditions_v2(StoreRef, DbName, DocIds, [{path, Path, Value} | Rest]) ->
-    %% Use point lookup for equality - O(1) per docid via value-first index
-    FilteredDocIds = lists:filter(fun(DocId) ->
-        barrel_ars_index:docid_has_value(StoreRef, DbName, Path, Value, DocId)
-    end, DocIds),
+    %% Use batch key existence check - much faster than individual lookups
+    %% First deduplicate to avoid redundant checks
+    UniqueDocIds = lists:usort(DocIds),
+    FilteredDocIds = barrel_ars_index:filter_docids_by_value(
+        StoreRef, DbName, Path, Value, UniqueDocIds),
     verify_conditions_v2(StoreRef, DbName, FilteredDocIds, Rest);
 verify_conditions_v2(StoreRef, DbName, DocIds, [Cond | Rest]) ->
     %% For non-equality conditions (compare, exists, prefix), use set-based approach
@@ -3416,6 +3487,7 @@ find_best_scan_path([_ | Rest]) ->
 get_profile() ->
     #{
         index_iter_us => pdict_get(profile_index_iter, 0),
+        verify_conds_us => pdict_get(profile_verify_conds, 0),
         docinfo_fetch_us => pdict_get(profile_docinfo_fetch, 0),
         docbody_fetch_us => pdict_get(profile_docbody_fetch, 0),
         deser_match_us => pdict_get(profile_deser_match, 0),
@@ -3425,6 +3497,7 @@ get_profile() ->
 %% @doc Reset profiling counters
 reset_profile() ->
     erase(profile_index_iter),
+    erase(profile_verify_conds),
     erase(profile_docinfo_fetch),
     erase(profile_docbody_fetch),
     erase(profile_deser_match),
@@ -3435,6 +3508,7 @@ reset_profile() ->
 dump_profile() ->
     Profile = get_profile(),
     Total = maps:get(index_iter_us, Profile) +
+            maps:get(verify_conds_us, Profile) +
             maps:get(docinfo_fetch_us, Profile) +
             maps:get(docbody_fetch_us, Profile) +
             maps:get(deser_match_us, Profile),
@@ -3442,6 +3516,9 @@ dump_profile() ->
     io:format("  Index iteration:     ~8.B us (~5.1f%)~n",
               [maps:get(index_iter_us, Profile),
                pct(maps:get(index_iter_us, Profile), Total)]),
+    io:format("  Verify conditions:   ~8.B us (~5.1f%)~n",
+              [maps:get(verify_conds_us, Profile),
+               pct(maps:get(verify_conds_us, Profile), Total)]),
     io:format("  Doc info fetch:      ~8.B us (~5.1f%)~n",
               [maps:get(docinfo_fetch_us, Profile),
                pct(maps:get(docinfo_fetch_us, Profile), Total)]),
