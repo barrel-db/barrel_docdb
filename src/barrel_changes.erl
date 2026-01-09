@@ -1176,6 +1176,7 @@ scan_path_hlc(StoreRef, DbName, Topic, Since, Limit) ->
 %% @private Scan path_hlc index with prefix (for # wildcard)
 %% This scans all topics that start with the prefix.
 %% Deduplicates by DocId since a document may have multiple topic prefixes indexed.
+%% Uses ETS for O(1) dedup instead of Erlang maps for better performance.
 scan_path_hlc_prefix(StoreRef, DbName, TopicPrefix, Since, Limit) ->
     %% For prefix scan, we need to scan all keys with the topic prefix
     %% and filter by HLC afterward
@@ -1189,38 +1190,43 @@ scan_path_hlc_prefix(StoreRef, DbName, TopicPrefix, Since, Limit) ->
     StartKey = barrel_store_keys:path_hlc_wildcard_start(DbName, TopicPrefix),
     EndKey = barrel_store_keys:path_hlc_wildcard_end(DbName, TopicPrefix),
 
-    %% Track seen DocIds to deduplicate (a doc may have multiple topic prefixes)
-    %% Use fold_range_limit to select read profile based on expected result size
-    FoldFun = fun(Key, Value, {CurrentHlc, Count, Seen, Acc}) ->
-        case Limit =/= infinity andalso Count >= Limit of
-            true ->
-                {stop, {CurrentHlc, Count, Seen, Acc}};
-            false ->
-                {_KeyTopic, ChangeHlc} = barrel_store_keys:decode_path_hlc_key(DbName, Key),
-                %% Filter by HLC (exclusive of Since)
-                case barrel_hlc:compare(ChangeHlc, SinceHlc) of
-                    lt -> {ok, {CurrentHlc, Count, Seen, Acc}};
-                    eq when Since =/= first -> {ok, {CurrentHlc, Count, Seen, Acc}};
-                    _ ->
-                        %% Extract DocId cheaply for dedup check
-                        DocId = decode_docid(Value),
-                        case maps:is_key(DocId, Seen) of
-                            true ->
-                                %% Already seen this doc, skip
-                                {ok, {ChangeHlc, Count, Seen, Acc}};
-                            false ->
-                                %% Decode full change and add
-                                Change = decode_path_hlc_value(Value, ChangeHlc),
-                                {ok, {ChangeHlc, Count + 1, Seen#{DocId => true}, [Change | Acc]}}
-                        end
-                end
-        end
-    end,
-    {LastHlc, _Count, _Seen, Changes} = barrel_store_rocksdb:fold_range_limit(
-        StoreRef, StartKey, EndKey, FoldFun, {SinceHlc, 0, #{}, []}, Limit
-    ),
-
-    {ok, lists:reverse(Changes), LastHlc}.
+    %% Use ETS set for O(1) dedup (much faster than maps for large scans)
+    Seen = ets:new(wildcard_seen, [set, private]),
+    try
+        %% Track seen DocIds to deduplicate (a doc may have multiple topic prefixes)
+        FoldFun = fun(Key, Value, {CurrentHlc, Count, Acc}) ->
+            case Limit =/= infinity andalso Count >= Limit of
+                true ->
+                    {stop, {CurrentHlc, Count, Acc}};
+                false ->
+                    {_KeyTopic, ChangeHlc} = barrel_store_keys:decode_path_hlc_key(DbName, Key),
+                    %% Filter by HLC (exclusive of Since)
+                    case barrel_hlc:compare(ChangeHlc, SinceHlc) of
+                        lt -> {ok, {CurrentHlc, Count, Acc}};
+                        eq when Since =/= first -> {ok, {CurrentHlc, Count, Acc}};
+                        _ ->
+                            %% Extract DocId cheaply for dedup check
+                            DocId = decode_docid(Value),
+                            %% ETS insert_new returns true if new, false if exists
+                            case ets:insert_new(Seen, {DocId}) of
+                                false ->
+                                    %% Already seen this doc, skip
+                                    {ok, {ChangeHlc, Count, Acc}};
+                                true ->
+                                    %% Decode full change and add
+                                    Change = decode_path_hlc_value(Value, ChangeHlc),
+                                    {ok, {ChangeHlc, Count + 1, [Change | Acc]}}
+                            end
+                    end
+            end
+        end,
+        {LastHlc, _Count, Changes} = barrel_store_rocksdb:fold_range_limit(
+            StoreRef, StartKey, EndKey, FoldFun, {SinceHlc, 0, []}, Limit
+        ),
+        {ok, lists:reverse(Changes), LastHlc}
+    after
+        ets:delete(Seen)
+    end.
 
 %% @private Decode path_hlc index value to change map.
 %% Uses same compact binary format as change feed.
