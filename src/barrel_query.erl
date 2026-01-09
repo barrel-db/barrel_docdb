@@ -175,6 +175,17 @@
 }).
 
 %%====================================================================
+%% Pipelined Execution Constants
+%%====================================================================
+
+%% Batch size for pipelined index iteration
+-define(PIPELINE_BATCH_SIZE, 200).
+%% Maximum in-flight body fetches (limits memory usage)
+-define(PIPELINE_MAX_INFLIGHT, 4).
+%% Minimum DocIds to use pipelining (below this, sequential is faster)
+-define(PIPELINE_MIN_DOCIDS, 500).
+
+%%====================================================================
 %% API
 %%====================================================================
 
@@ -690,15 +701,17 @@ execute_multi_index_chunked(StoreRef, DbName, Conditions, Plan, ChunkSize, Start
         S -> S
     end,
 
-    %% Collect DocIds - use lazy intersection when chunking with reasonable size
-    %% and starting from scratch (no continuation)
+    %% Collect DocIds - use lazy intersection when starting from scratch
+    %% and have multiple conditions (lazy is O(result_count) vs O(total_matching))
     MaxToCollect = ChunkSize + Offset + 1,  %% ChunkSize + 1 for has_more detection + offset
-    IntersectedDocIds = case {StartKey, MaxToCollect < 1000, length(Conditions) > 1} of
-        {undefined, true, true} ->
-            %% Fresh query with small limit and multiple conditions - use lazy
+    IntersectedDocIds = case {StartKey, length(Conditions) > 1} of
+        {undefined, true} ->
+            %% Fresh query with multiple conditions - use lazy intersection
+            %% This is much faster when result set is larger than chunk size
             intersect_lazy_with_limit(StoreRef, DbName, Conditions, MaxToCollect);
         _ ->
-            %% Continuation or large limit - use full intersection
+            %% Continuation - need full sorted list for proper cursor position
+            %% Or single condition - no benefit from lazy
             intersect_docid_sets_v2(StoreRef, DbName, Conditions)
     end,
 
@@ -935,18 +948,9 @@ intersect_mixed_conditions_v2(StoreRef, DbName, EqConds, OtherConds) ->
     RestConds = [C || {_, C} <- RestWithCard],
 
     %% Collect DocIds from the most selective condition
-    T0 = erlang:monotonic_time(microsecond),
     DocIds = collect_condition_docids(StoreRef, DbName, BestCond),
-    T1 = erlang:monotonic_time(microsecond),
-    put(profile_index_iter, pdict_get(profile_index_iter, 0) + (T1 - T0)),
-
     %% Verify remaining conditions
-    T2 = erlang:monotonic_time(microsecond),
-    Result = verify_conditions_v2(StoreRef, DbName, DocIds, RestConds),
-    T3 = erlang:monotonic_time(microsecond),
-    put(profile_verify_conds, pdict_get(profile_verify_conds, 0) + (T3 - T2)),
-
-    Result.
+    verify_conditions_v2(StoreRef, DbName, DocIds, RestConds).
 
 %% @private Estimate cardinality for all conditions.
 estimate_all_cardinalities(StoreRef, DbName, Conditions) ->
@@ -2899,22 +2903,31 @@ collect_docids_for_prefix(StoreRef, DbName, PathPrefix, MaxCount) when is_intege
     DocIds.
 
 %% @doc Filter results by remaining conditions and apply projections.
-%% Automatically chooses between streaming or batch fetch based on:
+%% Automatically chooses between streaming, pipelined, or batch fetch based on:
 %% - Number of DocIds vs limit (streaming when we have 3x+ more than needed)
 %% - Presence of ORDER BY (no streaming with ORDER BY, need all results for sorting)
+%% - Large unbounded queries use pipelined execution for better throughput
 filter_and_project(StoreRef, DbName, DocIds, Plan, Snapshot) ->
     %% Remove duplicates
     UniqueDocIds = lists:usort(DocIds),
     DocCount = length(UniqueDocIds),
 
-    %% Choose strategy based on DocIds count vs limit
-    case should_use_streaming_fetch(DocCount, Plan) of
+    %% Choose strategy: streaming > pipelined > batch
+    StreamingCheck = should_use_streaming_fetch(DocCount, Plan),
+    PipelineCheck = should_use_pipelining(DocCount, Plan),
+    case StreamingCheck of
         true ->
-            %% Streaming: fetch in batches with early termination
+            %% Streaming: fetch in batches with early termination (for limited queries)
             filter_and_project_streamed(StoreRef, DbName, UniqueDocIds, Plan, Snapshot);
         false ->
-            %% Batch: fetch all at once (original behavior)
-            filter_and_project_batch(StoreRef, DbName, UniqueDocIds, Plan, Snapshot)
+            case PipelineCheck of
+                true ->
+                    %% Pipelined: parallel body fetches for large unbounded queries
+                    filter_and_project_pipelined(StoreRef, DbName, UniqueDocIds, Plan, Snapshot);
+                false ->
+                    %% Batch: fetch all at once (original behavior)
+                    filter_and_project_batch(StoreRef, DbName, UniqueDocIds, Plan, Snapshot)
+            end
     end.
 
 %% @doc Decide whether to use streaming fetch.
@@ -3477,6 +3490,199 @@ find_best_scan_path([{'and', Nested} | Rest]) ->
     end;
 find_best_scan_path([_ | Rest]) ->
     find_best_scan_path(Rest).
+
+
+%%====================================================================
+%% Pipelined Execution
+%%====================================================================
+
+%% @doc Execute query with pipelined index iteration and body fetching.
+%% Overlaps index iteration with body fetching for better throughput.
+%%
+%% Architecture:
+%% - Main process iterates index in batches
+%% - For each batch, spawns async body fetch process
+%% - Continues iterating while body fetches are in progress
+%% - Collects results at the end
+%%
+%% Benefits:
+%% - Overlaps I/O: index iteration and body fetch happen concurrently
+%% - Better resource utilization: multiple RocksDB reads in flight
+%% - Reduced total latency for large result sets
+%% - Bounded concurrency: limits memory usage with concurrent queries
+filter_and_project_pipelined(StoreRef, DbName, DocIds, Plan, Snapshot) ->
+    #query_plan{
+        conditions = Conditions,
+        bindings = Bindings,
+        projections = Projections,
+        order = Order,
+        limit = Limit,
+        offset = Offset,
+        include_docs = IncludeDocs,
+        decoder_fun = DecoderFun
+    } = Plan,
+
+    %% Split DocIds into batches
+    UniqueDocIds = lists:usort(DocIds),
+    Batches = split_into_batches(UniqueDocIds, ?PIPELINE_BATCH_SIZE),
+    NumBatches = length(Batches),
+
+    %% Use bounded concurrency to limit memory with concurrent queries
+    %% Spawn initial batch of fetchers (up to MAX_INFLIGHT)
+    Parent = self(),
+    FetchCtx = #{
+        db_name => DbName,
+        conditions => Conditions,
+        bindings => Bindings,
+        projections => Projections,
+        include_docs => IncludeDocs,
+        decoder_fun => DecoderFun,
+        snapshot => Snapshot,
+        parent => Parent
+    },
+
+    %% Execute with bounded concurrency
+    Results0 = execute_bounded_pipeline(Batches, FetchCtx, NumBatches),
+
+    %% Results are already in order (collected in batch order)
+
+    %% Apply ordering if needed
+    Results1 = apply_order(Results0, Order),
+
+    %% Apply offset and limit
+    Results2 = apply_offset_limit(Results1, Offset, Limit),
+
+    %% Get last sequence
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    {ok, Results2, LastSeq}.
+
+%% @doc Execute pipeline with bounded concurrency.
+%% Only spawns up to MAX_INFLIGHT fetchers at a time.
+%% As each completes, spawns the next batch if available.
+execute_bounded_pipeline(Batches, FetchCtx, NumBatches) ->
+    %% Create indexed batch list
+    IndexedBatches = lists:zip(lists:seq(1, NumBatches), Batches),
+
+    %% Spawn initial fetchers (up to MAX_INFLIGHT)
+    {InitialBatches, RemainingBatches} = safe_split(?PIPELINE_MAX_INFLIGHT, IndexedBatches),
+    InitialRefs = spawn_fetchers(InitialBatches, FetchCtx),
+
+    %% Collect results with bounded spawning
+    collect_bounded_results(InitialRefs, RemainingBatches, FetchCtx, #{}, NumBatches).
+
+%% @doc Spawn fetchers for a list of indexed batches.
+spawn_fetchers(IndexedBatches, FetchCtx) ->
+    #{parent := Parent} = FetchCtx,
+    lists:map(fun({BatchNum, Batch}) ->
+        Ref = make_ref(),
+        spawn_link(fun() ->
+            Results = fetch_batch_for_pipeline_ctx(Batch, FetchCtx),
+            Parent ! {pipeline_result, Ref, BatchNum, Results}
+        end),
+        {Ref, BatchNum}
+    end, IndexedBatches).
+
+%% @doc Fetch using context map.
+fetch_batch_for_pipeline_ctx(DocIds, FetchCtx) ->
+    #{db_name := DbName, conditions := Conditions, bindings := Bindings,
+      projections := Projections, include_docs := IncludeDocs,
+      decoder_fun := DecoderFun, snapshot := Snapshot} = FetchCtx,
+    fetch_batch_for_pipeline(DbName, DocIds, Conditions, Bindings,
+                             Projections, IncludeDocs, DecoderFun, Snapshot).
+
+%% @doc Collect results with bounded concurrency.
+%% When a fetcher completes, spawn next batch if available.
+collect_bounded_results([], [], _FetchCtx, Results, NumBatches) ->
+    %% All done - flatten in order
+    lists:flatmap(fun(N) ->
+        maps:get(N, Results, [])
+    end, lists:seq(1, NumBatches));
+collect_bounded_results(InFlight, Remaining, FetchCtx, Results, NumBatches) ->
+    receive
+        {pipeline_result, Ref, BatchNum, BatchResults} ->
+            case lists:keytake(Ref, 1, InFlight) of
+                {value, _, RestInFlight} ->
+                    %% Add results
+                    NewResults = Results#{BatchNum => BatchResults},
+                    %% Spawn next batch if available
+                    case Remaining of
+                        [] ->
+                            collect_bounded_results(RestInFlight, [], FetchCtx, NewResults, NumBatches);
+                        [NextBatch | RestRemaining] ->
+                            NewRefs = spawn_fetchers([NextBatch], FetchCtx),
+                            collect_bounded_results(NewRefs ++ RestInFlight, RestRemaining, FetchCtx, NewResults, NumBatches)
+                    end;
+                false ->
+                    %% Unknown ref, ignore
+                    collect_bounded_results(InFlight, Remaining, FetchCtx, Results, NumBatches)
+            end
+    after 30000 ->
+        %% Timeout - return what we have
+        lists:flatmap(fun(N) ->
+            maps:get(N, Results, [])
+        end, lists:seq(1, NumBatches))
+    end.
+
+%% @doc Split list into batches of specified size.
+split_into_batches(List, BatchSize) ->
+    split_into_batches(List, BatchSize, []).
+
+split_into_batches([], _BatchSize, Acc) ->
+    lists:reverse(Acc);
+split_into_batches(List, BatchSize, Acc) ->
+    case length(List) =< BatchSize of
+        true ->
+            lists:reverse([List | Acc]);
+        false ->
+            {Batch, Rest} = lists:split(BatchSize, List),
+            split_into_batches(Rest, BatchSize, [Batch | Acc])
+    end.
+
+%% @doc Fetch and filter a batch for pipelined execution.
+fetch_batch_for_pipeline(DbName, DocIds, Conditions, Bindings,
+                         Projections, IncludeDocs, DecoderFun, Snapshot) ->
+    Profile = select_body_read_profile(length(DocIds)),
+
+    %% Fetch bodies
+    DocBodyResults = case Snapshot of
+        undefined ->
+            barrel_doc_body_store:multi_get_current_bodies(DbName, DocIds, Profile);
+        _ ->
+            barrel_doc_body_store:multi_get_current_bodies_with_snapshot(
+                DbName, DocIds, Snapshot, Profile)
+    end,
+
+    %% Process each doc
+    Pairs = lists:zip(DocIds, DocBodyResults),
+    lists:filtermap(fun({DocId, BodyResult}) ->
+        process_doc_body(DocId, BodyResult, Conditions, Bindings,
+                         Projections, IncludeDocs, DecoderFun)
+    end, Pairs).
+
+%% @doc Decide whether to use pipelined execution.
+%% Use pipelining when:
+%% - Many DocIds to process (>500)
+%% - Include docs is true (need body fetch)
+%% - No limit or large limit (for small limits, streaming is better)
+should_use_pipelining(DocCount, #query_plan{include_docs = IncludeDocs, limit = Limit}) ->
+    case IncludeDocs of
+        false ->
+            %% No body fetch needed, pipelining doesn't help
+            false;
+        true ->
+            case Limit of
+                undefined ->
+                    %% Unbounded query with many docs
+                    DocCount >= ?PIPELINE_MIN_DOCIDS;
+                L when is_integer(L), L > 100 ->
+                    %% Large limit with many docs
+                    DocCount >= ?PIPELINE_MIN_DOCIDS;
+                _ ->
+                    %% Small limit - streaming is better
+                    false
+            end
+    end.
 
 
 %%====================================================================

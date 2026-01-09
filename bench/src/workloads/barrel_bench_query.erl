@@ -110,6 +110,13 @@ run(Db, NumDocs, Iterations) ->
     io:format("  Running range with continuation (500 per page)...~n"),
     RangeContinuation500 = barrel_bench_metrics:summarize(bench_range_continuation(Db, 500)),
 
+    %% Pipelining tests - unbounded queries WITH include_docs=true
+    io:format("  Running range WITH include_docs (tests pipelining)...~n"),
+    RangeWithDocs = barrel_bench_metrics:summarize(bench_query(Db, range_with_docs_query(), Iterations)),
+
+    io:format("  Running multi_condition WITH include_docs (tests pipelining)...~n"),
+    MultiCondWithDocs = barrel_bench_metrics:summarize(bench_query(Db, multi_condition_with_docs_query(), Iterations)),
+
     #{
         simple_eq => SimpleEq,
         simple_eq_limit => SimpleEqLimit,
@@ -139,7 +146,9 @@ run(Db, NumDocs, Iterations) ->
         or_condition => OrCond,
         or_condition_limit => OrCondLimit,
         range_cont_100 => RangeContinuation,
-        range_cont_500 => RangeContinuation500
+        range_cont_500 => RangeContinuation500,
+        range_with_docs => RangeWithDocs,
+        multi_cond_docs => MultiCondWithDocs
     }.
 
 %%====================================================================
@@ -343,6 +352,23 @@ or_condition_limit_query() ->
         {path, [<<"type">>], <<"user">>},
         {path, [<<"status">>], <<"active">>}
     ]}], limit => 10, include_docs => false}.
+
+range_with_docs_query() ->
+    %% Range query WITH include_docs=true - tests pipelined body fetching
+    %% Returns ~2380 docs (48% of 5000) and fetches their bodies
+    %% Should trigger pipelined execution (parallel body fetch)
+    #{where => [
+        {path, [<<"type">>], <<"user">>},
+        {compare, [<<"age">>], '>', 50}
+    ], include_docs => true}.
+
+multi_condition_with_docs_query() ->
+    %% Multi-condition WITH include_docs=true - tests pipelined body fetching
+    %% Returns ~1666 docs (1/3 of 5000) and fetches their bodies
+    #{where => [
+        {path, [<<"type">>], <<"user">>},
+        {path, [<<"status">>], <<"active">>}
+    ], include_docs => true}.
 
 %%====================================================================
 %% Internal functions
