@@ -302,3 +302,46 @@ The improvement comes from:
 2. **No deduplication** - posting lists are already unique
 3. **Sorted iteration** - entries pre-sorted by HLC
 4. **Bounded bucket size** - 1-hour sharding limits posting list growth
+
+---
+
+## Document Size & Structure Performance
+
+### Document Types Benchmark
+
+Configuration: 1000 documents per type, 100 iterations
+
+| Type | Fields | Depth | Size | Insert (ops/s) | Read (ops/s) | Query EQ | Multi-Idx |
+|------|--------|-------|------|----------------|--------------|----------|-----------|
+| **small_flat** | 5 | 1 | ~200B | 10,245 | 54,083 | 429 | 223 |
+| **medium_flat** | 20 | 1 | ~1KB | 3,305 | 62,854 | 365 | 203 |
+| **large_flat** | 100 | 1 | ~5KB | 444 | 24,826 | 442 | 113 |
+| **small_nested** | 8 | 3 | ~300B | 7,199 | 58,207 | 342 | 206 |
+| **medium_nested** | 25 | 4 | ~2KB | 2,798 | 53,163 | 363 | 191 |
+| **large_nested** | 80 | 5 | ~8KB | 649 | 35,398 | 328 | 93 |
+
+**Key Observations:**
+- Read performance remains high even for large documents (24-62K ops/s)
+- Insert throughput scales inversely with document size (indexing overhead)
+- Query performance is relatively stable across sizes (index-driven)
+- Nesting depth has minimal impact compared to total field count
+
+### Maximum Document Size
+
+| Size | Write Time | Status |
+|------|------------|--------|
+| 1 KB | < 1ms | OK |
+| 10 KB | < 1ms | OK |
+| 100 KB | < 1ms | OK |
+| 1 MB | 2ms | OK |
+| 5 MB | 11ms | OK |
+| 10 MB | 22ms | OK |
+| 20 MB | 51ms | OK |
+| 50 MB | 178ms | OK |
+| 100 MB | 331ms | OK |
+
+**Practical Limits:**
+- No hard document size limit in barrel_docdb
+- RocksDB handles large values efficiently via BlobDB (values > 4KB stored in separate blob files)
+- Recommended: Keep documents under 16 MB for optimal performance
+- For large binary data, use attachments (`barrel_att`) which are stored separately
