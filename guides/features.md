@@ -61,19 +61,21 @@ barrel_docdb:find(Db, #{
 
 Benchmarks run with 5000 documents:
 
-| Operation | Before (Jan 6) | After (Jan 8) | Improvement |
+| Operation | Before (Jan 6) | After (Jan 9) | Improvement |
 |-----------|----------------|---------------|-------------|
-| `multi_index` (2-cond) | 10 ops/s, p50: 102ms | 59 ops/s, p50: 17ms | **6x faster** |
-| `three_cond` (3-cond) | 4 ops/s, p50: 270ms | 43 ops/s, p50: 23ms | **11x faster** |
-| `three_cond_limit` | 2 ops/s, p50: 303ms | 43 ops/s, p50: 23ms | **13x faster** |
-| `multi_index_limit` | 4 ops/s, p50: 302ms | 59 ops/s, p50: 17ms | **15x faster** |
-| `multi_index_range` | 6 ops/s, p50: 143ms | 52 ops/s, p50: 19ms | **8x faster** |
-| `multi_condition` | 21 ops/s, p50: 48ms | 33 ops/s, p50: 30ms | **1.6x faster** |
+| `simple_eq_limit` | ~500 ops/s | 23,607 ops/s, 0.04ms | **47x faster** |
+| `multi_index_limit` | 4 ops/s, p50: 302ms | 9,707 ops/s, 0.10ms | **2,400x faster** |
+| `three_cond_limit` | 2 ops/s, p50: 303ms | 7,648 ops/s, 0.13ms | **3,800x faster** |
+| `range_limit` | ~50 ops/s | 3,505 ops/s, 0.29ms | **70x faster** |
+| `multi_index` (no limit) | 10 ops/s, p50: 102ms | 212 ops/s, 4.73ms | **21x faster** |
+| `simple_eq` (no limit) | ~300 ops/s | 512 ops/s, 1.95ms | **1.7x faster** |
 
-**Note**: The dramatic improvements in multi-condition queries come from:
-1. Native C++ intersection replacing Erlang set operations
-2. Pre-sorted keys eliminating `lists:sort/1` overhead
-3. Roaring bitmaps for fast existence verification
+**Note**: The dramatic improvements in LIMIT queries come from:
+1. **Lazy intersection with early termination** - stops after collecting `limit` results
+2. **Value-index iteration** - individual keys per DocId enable true early termination
+3. Native C++ intersection replacing Erlang set operations
+4. Pre-sorted keys eliminating `lists:sort/1` overhead
+5. Roaring bitmaps for O(1) existence verification
 
 ### Storage Changes
 
@@ -191,48 +193,44 @@ Conflicts are resolved using revision tree CRDTs with deterministic winner selec
 
 ---
 
-## Latest Benchmark Results (2026-01-08)
+## Latest Benchmark Results (2026-01-09)
 
-Configuration: 5000 documents, 1000 iterations
+Configuration: 5000 documents, 100 iterations
 
 ### Query Performance
 
-#### Fast Operations (>1000 ops/sec)
+#### LIMIT Queries (Optimized with lazy iteration + early termination)
 
-| Operation | Ops/sec | P50 Latency | P99 Latency |
-|-----------|---------|-------------|-------------|
-| `prefix_limit` | 35,174 | 22µs | 69µs |
-| `prefix` | 33,409 | 22µs | 73µs |
-| `simple_eq_limit` | 16,502 | 38µs | 292µs |
-| `pure_compare_limit` | 6,021 | 159µs | 255µs |
-| `range_cont_100` | 4,798 | 209µs | 275µs |
-| `pure_topk` | 2,471 | 374µs | 732µs |
-| `range_cont_500` | 1,290 | 707µs | 1.5ms |
+| Operation | Ops/sec | Latency | Notes |
+|-----------|---------|---------|-------|
+| `simple_eq_limit` | **23,607** | 0.04ms | Single equality, limit=10 |
+| `multi_index_limit` | **9,707** | 0.10ms | 2 equalities, limit=10 |
+| `three_cond_limit` | **7,648** | 0.13ms | 2 equalities + 1 range, limit=10 |
+| `range_limit` | **3,505** | 0.29ms | 1 equality + 1 range, limit=10 |
 
-#### Moderate Operations (100-1000 ops/sec)
+#### Non-LIMIT Queries (Returns all matching docs)
 
-| Operation | Ops/sec | P50 Latency | P99 Latency |
-|-----------|---------|-------------|-------------|
-| `exists_limit` | 941 | 1.0ms | 1.2ms |
-| `pure_compare` | 802 | 1.2ms | 1.8ms |
-| `exists` | 769 | 1.3ms | 1.5ms |
-| `simple_eq` | 319 | 1.9ms | 24ms |
-| `selective_eq` | 281 | 2.7ms | 19.5ms |
-| `very_selective_eq` | 269 | 2.8ms | 20ms |
-| `nested_path` | 158 | 6.2ms | 8.2ms |
+| Operation | Ops/sec | Latency | Notes |
+|-----------|---------|---------|-------|
+| `simple_eq` | 512 | 1.95ms | Returns all 5000 docs |
+| `multi_index` | 212 | 4.73ms | Returns ~1666 docs |
+| `range` (include_docs) | 58 | 17.38ms | Returns ~2380 docs with bodies |
 
-#### Multi-Index Intersection (V2 Postings)
+### Key Optimizations
 
-| Operation | Ops/sec | P50 Latency | P99 Latency |
-|-----------|---------|-------------|-------------|
-| `multi_index` | 59 | 16.8ms | 18.9ms |
-| `multi_index_limit` | 59 | 17.0ms | 19.1ms |
-| `multi_index_range` | 52 | 19.1ms | 23.6ms |
-| `multi_index_range_limit` | 52 | 19.0ms | 28ms |
-| `three_cond` | 43 | 23.3ms | 30.5ms |
-| `three_cond_limit` | 43 | 22.9ms | 30ms |
-| `multi_condition` | 33 | 29.6ms | 39.3ms |
-| `range` | 31 | 32.6ms | 40ms |
+1. **Value-index iteration for equality conditions**
+   - Individual keys per DocId enable true early termination
+   - Previously: loaded entire posting list (e.g., 3333 DocIds)
+   - Now: stops after finding `limit` matches
+
+2. **Lazy intersection with early termination**
+   - Iterates smallest cardinality condition
+   - Verifies others with O(1) index lookups
+   - Stops immediately when `limit` reached
+
+3. **Streaming body fetch for include_docs**
+   - Fetches bodies in small batches
+   - Adaptive batch sizing based on selectivity
 
 ### CRUD Performance
 
@@ -250,5 +248,3 @@ Configuration: 5000 documents, 1000 iterations
 | `subscription` | 6,530 | 141µs | 289µs |
 | `incremental` | 1,373 | 397µs | 6.6ms |
 | `full_scan` | 14 | 74ms | 74ms |
-
-Raw results: `bench/results/2026-01-08_16-32-36.json`
