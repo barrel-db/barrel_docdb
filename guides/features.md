@@ -250,6 +250,55 @@ Configuration: 5000 documents, 100 iterations
 
 | Operation | Ops/sec | P50 Latency | P99 Latency |
 |-----------|---------|-------------|-------------|
-| `subscription` | 6,530 | 141µs | 289µs |
-| `incremental` | 1,373 | 397µs | 6.6ms |
-| `full_scan` | 14 | 74ms | 74ms |
+| `subscription` | 4,449 | 169µs | 422µs |
+| `incremental` | 2,567 | 346µs | 1.2ms |
+| `wildcard_path` | **96.7** | 1.9ms | 29ms |
+| `full_scan` | 13.3 | 75ms | 75ms |
+
+---
+
+## Sharded Prefix Posting Lists (Wildcard Path Changes)
+
+The `wildcard_path` changes query (e.g., `paths => [<<"users/#">>]`) uses **sharded prefix posting lists** for efficient HLC-ordered iteration.
+
+### Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **Time-Bucketed Sharding** | Entries sharded by 1-hour buckets to bound posting list size |
+| **Native Merge Operator** | Uses RocksDB `posting_list_merge_operator` for sorted inserts |
+| **Range Scan Discovery** | Only existing buckets are scanned (no empty bucket iteration) |
+| **Sorted HLC Entries** | Entries stored as `<< HLC:12, Change/binary >>` in sorted order |
+
+### Index Layout
+
+```
+prefix_changes CF (posting_cf):
+  Key: PREFIX_CHANGES (0x1B) | db | prefix | 0x00 | bucket (4 bytes BE)
+  Value: Posting list of << HLC:12, DocId, Rev, Deleted >>
+
+Example for doc with path type/user:
+  Bucket = wall_time div 3600  (1-hour granularity)
+  Key: 0x1B | "mydb" | "type/user" | 0x00 | bucket
+  Value: [<< hlc1, "doc1", "1-abc", 0 >>, << hlc2, "doc2", "2-def", 0 >>, ...]
+```
+
+### Query Execution
+
+1. Compute start bucket from `since` HLC
+2. Range scan `posting_cf` from `prefix + start_bucket` to `prefix + 0xFFFFFF`
+3. For each bucket, iterate sorted entries and filter by HLC
+4. Collect results until `limit` reached
+
+### Performance Improvement
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Ops/sec | 1.9 | 96.7 | **50x faster** |
+| P50 latency | 746ms | 1.9ms | **390x faster** |
+
+The improvement comes from:
+1. **No full scan** - directly seek to prefix + bucket
+2. **No deduplication** - posting lists are already unique
+3. **Sorted iteration** - entries pre-sorted by HLC
+4. **Bounded bucket size** - 1-hour sharding limits posting list growth

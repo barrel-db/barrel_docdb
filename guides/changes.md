@@ -59,6 +59,8 @@ Filter changes by path patterns or queries:
 }).
 ```
 
+**Wildcard Performance:** Path patterns with `#` wildcards (e.g., `<<"users/#">>`) use sharded posting list indexes for efficient HLC-ordered iteration. Changes are pre-indexed by path prefix and time bucket, enabling ~50x faster queries compared to full scan with deduplication.
+
 ## HLC (Hybrid Logical Clock)
 
 HLC provides distributed event ordering without synchronized clocks.
