@@ -1022,10 +1022,10 @@ decode_change(<<DocIdLen:16, DocId:DocIdLen/binary,
 %%====================================================================
 
 %% @doc Generate operations to index a change by all its paths.
-%% Creates entries under path_hlc/{db}/{topic}/{hlc} for each path and its prefixes.
-%% This enables efficient filtered queries by scanning specific path indexes.
+%% Creates entries under path_hlc/{db}/{topic}/{hlc} for exact matches,
+%% and prefix_changes/{db}/{prefix}/{bucket} posting lists for wildcard queries.
 -spec write_path_index_ops(db_name(), barrel_hlc:timestamp(), doc_info()) ->
-    [{put, binary(), binary()}].
+    [{put, binary(), binary()} | {posting_append, binary(), binary()}].
 write_path_index_ops(DbName, Hlc, DocInfo) ->
     #{id := DocId, rev := Rev, deleted := Deleted} = DocInfo,
 
@@ -1045,30 +1045,33 @@ write_path_index_ops(DbName, Hlc, DocInfo) ->
             end
     end,
 
-    %% Create index entry value using compact binary format (same as change feed)
+    %% Create index entry value using compact binary format
     %% Format: <<DocIdLen:16, DocId, RevLen:16, Rev, Deleted:8, NumConflicts:16, HasDoc:8>>
-    Value = encode_change(#{id => DocId, rev => Rev, deleted => Deleted}),
+    ChangeValue = encode_change(#{id => DocId, rev => Rev, deleted => Deleted}),
 
     %% Index each topic and all its prefixes
     AllPrefixes = lists:usort(lists:flatmap(fun topic_prefixes/1, Topics)),
 
     %% Old path_hlc index: topic + hlc (for exact matches)
-    PathHlcOps = [{put, barrel_store_keys:path_hlc(DbName, Prefix, Hlc), Value}
+    PathHlcOps = [{put, barrel_store_keys:path_hlc(DbName, Prefix, Hlc), ChangeValue}
                   || Prefix <- AllPrefixes],
 
-    %% New prefix_hlc index: prefix/ + 0x00 + hlc + docid (for efficient wildcard queries)
-    %% Index ALL prefixes so that "type/#" matches docs with path "type/user/admin"
-    %% Key format ensures HLC-ordered results within each subscription prefix
-    PrefixHlcOps = [{put, barrel_store_keys:prefix_hlc_key(DbName, Prefix, Hlc, DocId), Value}
-                   || Prefix <- AllPrefixes],
+    %% New prefix_changes posting list: sharded by time bucket
+    %% Entry format: << HLC:12/binary, Change/binary >> - sorted by HLC in posting list
+    HlcBin = barrel_hlc:encode(Hlc),
+    Bucket = barrel_store_keys:hlc_to_bucket(Hlc),
+    PrefixChangeOps = [{posting_append,
+                        barrel_store_keys:prefix_changes_key(DbName, Prefix, Bucket),
+                        <<HlcBin/binary, ChangeValue/binary>>}
+                       || Prefix <- AllPrefixes],
 
-    PathHlcOps ++ PrefixHlcOps.
+    PathHlcOps ++ PrefixChangeOps.
 
 %% @doc Generate operations to update path index (remove old entries + add new).
 %% Used when a document is updated to maintain a current path index without stale entries.
 -spec update_path_index_ops(db_name(), barrel_hlc:timestamp(), doc_info(),
                             barrel_hlc:timestamp() | undefined, map() | undefined) ->
-    [{put | delete, binary(), binary()}].
+    [tuple()].
 update_path_index_ops(DbName, NewHlc, NewDocInfo, OldHlc, OldDoc) ->
     %% Generate new path entries
     NewOps = write_path_index_ops(DbName, NewHlc, NewDocInfo),
@@ -1080,6 +1083,10 @@ update_path_index_ops(DbName, NewHlc, NewDocInfo, OldHlc, OldDoc) ->
         {_, undefined} ->
             [];
         {_, _} ->
+            #{id := DocId, rev := OldRev} = NewDocInfo,
+            OldDeleted = false, %% If we're updating, old wasn't deleted
+            OldChangeValue = encode_change(#{id => DocId, rev => OldRev, deleted => OldDeleted}),
+
             %% Extract old topics and delete their path_hlc entries
             OldPaths = barrel_ars:analyze(OldDoc),
             OldTopics = barrel_ars:paths_to_topics(OldPaths),
@@ -1089,13 +1096,15 @@ update_path_index_ops(DbName, NewHlc, NewDocInfo, OldHlc, OldDoc) ->
             OldPathHlcDeletes = [{delete, barrel_store_keys:path_hlc(DbName, P, OldHlc)}
                                 || P <- OldPrefixes],
 
-            %% Delete from new prefix_hlc index (all prefixes)
-            %% DocId is the same for old and new (document identity)
-            #{id := DocId} = NewDocInfo,
-            OldPrefixHlcDeletes = [{delete, barrel_store_keys:prefix_hlc_key(DbName, P, OldHlc, DocId)}
-                                  || P <- OldPrefixes],
+            %% Remove from prefix_changes posting list (tombstone marker)
+            OldHlcBin = barrel_hlc:encode(OldHlc),
+            OldBucket = barrel_store_keys:hlc_to_bucket(OldHlc),
+            OldPrefixRemoves = [{posting_remove,
+                                barrel_store_keys:prefix_changes_key(DbName, P, OldBucket),
+                                <<OldHlcBin/binary, OldChangeValue/binary>>}
+                               || P <- OldPrefixes],
 
-            OldPathHlcDeletes ++ OldPrefixHlcDeletes
+            OldPathHlcDeletes ++ OldPrefixRemoves
     end,
 
     DeleteOps ++ NewOps.
@@ -1173,43 +1182,69 @@ scan_path_hlc(StoreRef, DbName, Topic, Since, Limit) ->
 
     {ok, lists:reverse(Changes), LastHlc}.
 
-%% @private Scan prefix_hlc index for wildcard queries (# pattern)
-%% Uses new prefix_hlc index where keys are: prefix/ | 0x00 | hlc | docid
-%% This enables direct seeking to (prefix, since_hlc) and HLC-ordered iteration.
-%% No deduplication needed - each entry is unique.
+%% @private Scan prefix_changes posting lists for wildcard queries (# pattern)
+%% Uses sharded posting lists: one posting list per (prefix, time_bucket)
+%% Each entry in the posting list is << HLC:12, Change/binary >> sorted by HLC.
+%% Uses range scan on posting_cf to find actual bucket keys (avoids scanning empty buckets).
 scan_path_hlc_prefix(StoreRef, DbName, TopicPrefix, Since, Limit) ->
     SinceHlc = case Since of
         first -> barrel_hlc:min();
         Hlc -> Hlc
     end,
 
-    %% Use new prefix_hlc index - keys sorted by prefix, then HLC
-    StartKey = barrel_store_keys:prefix_hlc_start(DbName, TopicPrefix, SinceHlc),
-    EndKey = barrel_store_keys:prefix_hlc_end(DbName, TopicPrefix),
+    %% Calculate bucket range for key bounds
+    StartBucket = barrel_store_keys:hlc_to_bucket(SinceHlc),
+    %% Use max bucket (0xFFFFFFFF) as upper bound - range scan will stop at actual keys
+    MaxBucket = 16#FFFFFFFF,
 
-    %% No dedup needed - each (prefix, hlc, docid) entry is unique
-    FoldFun = fun(Key, Value, {CurrentHlc, Count, Acc}) ->
+    %% Range scan to find all bucket keys for this prefix
+    StartKey = barrel_store_keys:prefix_changes_start(DbName, TopicPrefix, StartBucket),
+    EndKey = barrel_store_keys:prefix_changes_end(DbName, TopicPrefix, MaxBucket),
+
+    %% Fold over bucket keys in posting_cf
+    %% fold_range_posting already decodes entries via rocksdb:posting_list_keys
+    FoldFun = fun(_BucketKey, Entries, {CurrentLastHlc, Count, Acc}) ->
         case Limit =/= infinity andalso Count >= Limit of
             true ->
-                {stop, {CurrentHlc, Count, Acc}};
+                {stop, {CurrentLastHlc, Count, Acc}};
             false ->
-                {_Prefix, ChangeHlc, _DocId} = barrel_store_keys:decode_prefix_hlc_key(DbName, Key),
-                %% Filter by HLC (exclusive of Since)
-                case Since =/= first andalso barrel_hlc:equal(ChangeHlc, SinceHlc) of
-                    true ->
-                        %% Skip the exact Since HLC (exclusive)
-                        {ok, {CurrentHlc, Count, Acc}};
-                    false ->
-                        %% Decode full change and add
-                        Change = decode_path_hlc_value(Value, ChangeHlc),
-                        {ok, {ChangeHlc, Count + 1, [Change | Acc]}}
-                end
+                %% Filter entries by HLC and decode
+                {NewLastHlc, NewAcc} = filter_posting_entries(
+                    Entries, SinceHlc, Since, CurrentLastHlc, Acc, Limit
+                ),
+                {ok, {NewLastHlc, length(NewAcc), NewAcc}}
         end
     end,
-    {LastHlc, _Count, Changes} = barrel_store_rocksdb:fold_range_limit(
-        StoreRef, StartKey, EndKey, FoldFun, {SinceHlc, 0, []}, Limit
+
+    {LastHlc, _Count, Changes} = barrel_store_rocksdb:fold_range_posting(
+        StoreRef, StartKey, EndKey, FoldFun, {SinceHlc, 0, []}
     ),
     {ok, lists:reverse(Changes), LastHlc}.
+
+%% @private Filter and decode posting entries
+filter_posting_entries([], _SinceHlc, _Since, LastHlc, Acc, _Limit) ->
+    {LastHlc, Acc};
+filter_posting_entries(_Entries, _SinceHlc, _Since, LastHlc, Acc, Limit)
+  when Limit =/= infinity, length(Acc) >= Limit ->
+    {LastHlc, Acc};
+filter_posting_entries([Entry | Rest], SinceHlc, Since, LastHlc, Acc, Limit) ->
+    %% Entry format: << HLC:12/binary, Change/binary >>
+    <<HlcBin:12/binary, ChangeValue/binary>> = Entry,
+    EntryHlc = barrel_hlc:decode(HlcBin),
+    %% Check if entry is after SinceHlc
+    case barrel_hlc:compare(EntryHlc, SinceHlc) of
+        gt ->
+            %% Entry is after since - include it
+            Change = decode_path_hlc_value(ChangeValue, EntryHlc),
+            filter_posting_entries(Rest, SinceHlc, Since, EntryHlc, [Change | Acc], Limit);
+        eq when Since =:= first ->
+            %% Equal to min HLC and since is first - include it
+            Change = decode_path_hlc_value(ChangeValue, EntryHlc),
+            filter_posting_entries(Rest, SinceHlc, Since, EntryHlc, [Change | Acc], Limit);
+        _ ->
+            %% Entry is at or before since - skip it
+            filter_posting_entries(Rest, SinceHlc, Since, LastHlc, Acc, Limit)
+    end.
 
 %% @private Decode path_hlc index value to change map.
 %% Uses same compact binary format as change feed.

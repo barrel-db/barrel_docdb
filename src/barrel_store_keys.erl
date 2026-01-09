@@ -74,10 +74,10 @@
 -export([path_hlc_wildcard_start/2, path_hlc_wildcard_end/2]).  %% For # wildcard matching
 -export([encode_topic/1, decode_path_hlc_key/2]).
 
-%% Prefix-HLC keys (for efficient wildcard change queries)
-%% Keys sorted by prefix then HLC for direct seeking
--export([prefix_hlc_key/4, prefix_hlc_start/3, prefix_hlc_end/2]).
--export([decode_prefix_hlc_key/2]).
+%% Prefix changes posting list keys (sharded by time bucket)
+%% Each bucket contains a sorted list of << HLC:12, Change/binary >>
+-export([prefix_changes_key/3, prefix_changes_start/3, prefix_changes_end/3]).
+-export([hlc_to_bucket/1]).
 
 %% Attachment keys
 -export([att_data/3, att_data_prefix/2]).
@@ -118,7 +118,7 @@
 -define(PREFIX_VALUE_INDEX, 16#16).   %% Value-first index: [value_prefix, path, DocId] → marker (for iteration)
 -define(PREFIX_CHANGE_BUCKET, 16#17). %% Change bucket: DbName + BucketTs → {min_hlc, max_hlc, count}
 -define(PREFIX_DOC_ENTITY, 16#18).    %% Wide-column doc entity: DbName + DocId → entity with columns
--define(PREFIX_PREFIX_HLC, 16#1A).    %% Prefix-HLC index: prefix/ + hlc + docid → change info
+-define(PREFIX_CHANGES, 16#1B).       %% Prefix changes posting: prefix + bucket → [HLC:12, change, ...]
 
 %% Value prefix max length for value-first index (128 bytes)
 -define(VALUE_PREFIX_MAX_LEN, 128).
@@ -307,63 +307,54 @@ split_on_null(<<B, Rest/binary>>, Acc) ->
     split_on_null(Rest, <<Acc/binary, B>>).
 
 %%====================================================================
-%% Prefix-HLC Keys (Efficient Wildcard Change Queries)
+%% Prefix Changes Posting Lists (Sharded by Time Bucket)
 %%====================================================================
-%% Key format: PREFIX | db_name | query_prefix | 0x00 | hlc | docid
-%% This format enables efficient wildcard queries:
-%% - query_prefix is the subscription prefix (e.g., "type" without trailing /)
-%% - 0x00 separator ensures exact prefix boundary
-%% - HLC comes AFTER prefix for time-ordered iteration within a prefix
-%% - DocId handles multiple docs at the same HLC
+%% Key format: PREFIX_CHANGES | db_name | prefix | 0x00 | time_bucket (4 bytes BE)
+%% Value: sorted list of << HLC:12/binary, ChangeLen:16, Change/binary, ... >>
 %%
-%% For a document with path "type/user/admin", we write keys for each prefix:
-%% - type | 0x00 | hlc | docid
-%% - type/user | 0x00 | hlc | docid
-%% - type/user/admin | 0x00 | hlc | docid
+%% Each bucket covers 1 hour of changes (3600 seconds).
+%% For a document with path "type/user/admin", we merge into buckets for each prefix:
+%% - type | 0x00 | bucket -> [hlc, change]
+%% - type/user | 0x00 | bucket -> [hlc, change]
+%% - type/user/admin | 0x00 | bucket -> [hlc, change]
 %%
-%% Query "type/#" scans: type | 0x00 | since_hlc → type | 0x00 | max_hlc
-%% This returns ONE entry per document in HLC order (no dedup needed)!
+%% For wildcard queries like "type/#":
+%%   1. Calculate start/end buckets from since_hlc
+%%   2. Read each bucket's posting list (prefix bloom filter helps!)
+%%   3. Filter entries by HLC within each bucket
 
-%% @doc Create prefix-hlc key for indexing changes.
-%% QueryPrefix is the subscription prefix (e.g., "type/" for wildcard "type/#")
-%% Key format: PREFIX_PREFIX_HLC | db_name | query_prefix | 0x00 | hlc | docid
--spec prefix_hlc_key(db_name(), binary(), barrel_hlc:timestamp(), docid()) -> binary().
-prefix_hlc_key(DbName, QueryPrefix, Hlc, DocId) ->
-    NormalizedPrefix = normalize_prefix(QueryPrefix),
-    <<?PREFIX_PREFIX_HLC, (encode_name(DbName))/binary,
-      NormalizedPrefix/binary, 0, (encode_hlc(Hlc))/binary, DocId/binary>>.
+%% Bucket granularity: 1 hour (3600 seconds)
+-define(PREFIX_CHANGES_BUCKET_GRANULARITY, 3600).
 
-%% @doc Start key for prefix-hlc range scan.
-%% Used for wildcard queries to seek to (Prefix, SinceHlc).
--spec prefix_hlc_start(db_name(), binary(), barrel_hlc:timestamp()) -> binary().
-prefix_hlc_start(DbName, QueryPrefix, SinceHlc) ->
-    NormalizedPrefix = normalize_prefix(QueryPrefix),
-    <<?PREFIX_PREFIX_HLC, (encode_name(DbName))/binary,
-      NormalizedPrefix/binary, 0, (encode_hlc(SinceHlc))/binary>>.
+%% @doc Convert HLC to time bucket number.
+-spec hlc_to_bucket(barrel_hlc:timestamp()) -> non_neg_integer().
+hlc_to_bucket(Hlc) ->
+    WallTime = barrel_hlc:wall_time(Hlc),
+    WallTime div ?PREFIX_CHANGES_BUCKET_GRANULARITY.
 
-%% @doc End key for prefix-hlc range scan.
-%% Matches all entries with given prefix (any HLC, any DocId).
--spec prefix_hlc_end(db_name(), binary()) -> binary().
-prefix_hlc_end(DbName, QueryPrefix) ->
-    NormalizedPrefix = normalize_prefix(QueryPrefix),
-    %% prefix | 0x00 | max_hlc | max_docid
-    <<?PREFIX_PREFIX_HLC, (encode_name(DbName))/binary,
-      NormalizedPrefix/binary, 0,
-      16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF,
-      16#FF, 16#FF, 16#FF, 16#FF, 16#FF>>.
+%% @doc Create prefix changes key for a specific bucket.
+%% Key format: PREFIX_CHANGES | db_name | prefix | 0x00 | bucket (4 bytes BE)
+-spec prefix_changes_key(db_name(), binary(), non_neg_integer()) -> binary().
+prefix_changes_key(DbName, Prefix, Bucket) ->
+    NormalizedPrefix = normalize_prefix(Prefix),
+    <<?PREFIX_CHANGES, (encode_name(DbName))/binary,
+      NormalizedPrefix/binary, 0, Bucket:32/big>>.
 
-%% @doc Decode prefix-hlc key to extract QueryPrefix, HLC, and DocId.
--spec decode_prefix_hlc_key(db_name(), binary()) -> {binary(), barrel_hlc:timestamp(), docid()}.
-decode_prefix_hlc_key(DbName, Key) ->
-    %% Skip prefix byte and db_name
-    NameLen = byte_size(DbName),
-    HeaderLen = 1 + 2 + NameLen, %% PREFIX + 16-bit length + name
-    <<_:HeaderLen/binary, Rest/binary>> = Key,
-    %% Find the 0x00 separator after query_prefix
-    {QueryPrefix, <<0, HlcAndDocId/binary>>} = split_on_null(Rest),
-    HlcSize = 12,
-    <<HlcBin:HlcSize/binary, DocId/binary>> = HlcAndDocId,
-    {QueryPrefix, decode_hlc(HlcBin), DocId}.
+%% @doc Start key for prefix changes range scan.
+%% Used to scan from a specific bucket onwards.
+-spec prefix_changes_start(db_name(), binary(), non_neg_integer()) -> binary().
+prefix_changes_start(DbName, Prefix, StartBucket) ->
+    prefix_changes_key(DbName, Prefix, StartBucket).
+
+%% @doc End key for prefix changes range scan.
+%% Creates an upper bound key that's lexicographically after all bucket keys for this prefix.
+-spec prefix_changes_end(db_name(), binary(), non_neg_integer()) -> binary().
+prefix_changes_end(DbName, Prefix, _EndBucket) ->
+    %% Use 0xFF after the prefix separator to create upper bound
+    %% This is greater than any valid bucket number
+    NormalizedPrefix = normalize_prefix(Prefix),
+    <<?PREFIX_CHANGES, (encode_name(DbName))/binary,
+      NormalizedPrefix/binary, 0, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF>>.
 
 %% @private Normalize prefix - remove trailing "/" if present
 %% The 0x00 separator acts as the boundary, no trailing / needed
