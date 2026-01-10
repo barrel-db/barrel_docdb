@@ -77,9 +77,10 @@ end_per_suite(_Config) ->
     ok.
 
 init_per_group(lifecycle, Config) ->
-    %% Ensure clean state
+    %% Ensure clean state - stop application to prevent supervisor restart
+    application:stop(barrel_docdb),
     catch gen_server:stop(barrel_cache),
-    timer:sleep(50),
+    timer:sleep(100),
     Config;
 init_per_group(block_opts, Config) ->
     %% Start full application to get supervised cache

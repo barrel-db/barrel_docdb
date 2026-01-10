@@ -129,7 +129,9 @@ node_info() ->
 node_id() ->
     gen_server:call(?SERVER, node_id).
 
-%% @doc Add a peer to the registry
+%% @doc Add a peer to the registry (async by default)
+%% Returns ok immediately; peer info is fetched in background.
+%% Use get_peer/1 to check the final status.
 -spec add_peer(binary()) -> ok | {error, term()}.
 add_peer(Url) when is_binary(Url) ->
     gen_server:call(?SERVER, {add_peer, Url}).
@@ -163,9 +165,15 @@ refresh_peers() ->
 %% @doc Add a peer with options
 %% Options:
 %%   - tags: List of tags to assign to this peer
--spec add_peer(binary(), map()) -> ok | {error, term()}.
+%%   - sync: If true, wait for peer info fetch (default: false)
+%%           Returns {ok, PeerInfo} or {ok, PeerInfo, {unreachable, Reason}}
+-spec add_peer(binary(), map()) -> ok | {ok, map()} | {ok, map(), {unreachable, term()}} | {error, term()}.
 add_peer(Url, Opts) when is_binary(Url), is_map(Opts) ->
-    gen_server:call(?SERVER, {add_peer, Url, Opts}).
+    Timeout = case maps:get(sync, Opts, false) of
+        true -> 30000;  %% 30s for sync mode (HTTP timeouts)
+        false -> 5000   %% default
+    end,
+    gen_server:call(?SERVER, {add_peer, Url, Opts}, Timeout).
 
 %% @doc List peers with optional filter
 %% Filter options:
@@ -426,30 +434,86 @@ is_system_db(_) -> false.
 
 %% @private Add a peer to registry
 do_add_peer(Url) ->
-    %% Validate URL
+    do_add_peer(Url, #{}).
+
+%% @private Add peer with options
+%% Options:
+%%   - tags: list of tags to assign
+%%   - sync: if true, wait for peer info fetch and return full result (default: false)
+do_add_peer(Url, Opts) ->
     case barrel_federation:validate_remote_url(Url) of
         ok ->
-            %% Try to fetch peer info
-            PeerInfo = case fetch_peer_info(Url) of
-                {ok, Info} ->
-                    Info#{
-                        url => Url,
-                        last_seen => erlang:system_time(millisecond),
-                        status => active
-                    };
-                {error, _} ->
-                    #{
-                        url => Url,
-                        last_seen => erlang:system_time(millisecond),
-                        status => unreachable
-                    }
-            end,
-            %% Store in system doc
-            DocId = peer_doc_id(Url),
-            barrel_docdb:put_system_doc(DocId, PeerInfo);
+            Tags = maps:get(tags, Opts, []),
+            Sync = maps:get(sync, Opts, false),
+            case Sync of
+                true ->
+                    %% Synchronous: fetch info and store with final status
+                    do_add_peer_sync(Url, Tags);
+                false ->
+                    %% Async: store immediately, fetch in background
+                    do_add_peer_async(Url, Tags)
+            end;
         {error, _} = Err ->
             Err
     end.
+
+%% @private Synchronous peer add - fetches info and returns result
+do_add_peer_sync(Url, Tags) ->
+    DocId = peer_doc_id(Url),
+    case fetch_peer_info(Url) of
+        {ok, Info} ->
+            PeerInfo = Info#{
+                url => Url,
+                tags => Tags,
+                last_seen => erlang:system_time(millisecond),
+                status => active
+            },
+            ok = barrel_docdb:put_system_doc(DocId, PeerInfo),
+            {ok, PeerInfo};
+        {error, Reason} ->
+            PeerInfo = #{
+                url => Url,
+                tags => Tags,
+                last_seen => erlang:system_time(millisecond),
+                status => unreachable
+            },
+            ok = barrel_docdb:put_system_doc(DocId, PeerInfo),
+            {ok, PeerInfo, {unreachable, Reason}}
+    end.
+
+%% @private Async peer add - stores immediately, fetches in background
+do_add_peer_async(Url, Tags) ->
+    DocId = peer_doc_id(Url),
+    InitialInfo = #{
+        url => Url,
+        tags => Tags,
+        last_seen => erlang:system_time(millisecond),
+        status => pending
+    },
+    ok = barrel_docdb:put_system_doc(DocId, InitialInfo),
+    spawn(fun() -> async_fetch_peer_info(Url, Tags) end),
+    ok.
+
+%% @private Background fetch peer info and update stored record
+async_fetch_peer_info(Url, Tags) ->
+    DocId = peer_doc_id(Url),
+    PeerInfo = case fetch_peer_info(Url) of
+        {ok, Info} ->
+            Info#{
+                url => Url,
+                tags => Tags,
+                last_seen => erlang:system_time(millisecond),
+                status => active
+            };
+        {error, _} ->
+            #{
+                url => Url,
+                tags => Tags,
+                last_seen => erlang:system_time(millisecond),
+                status => unreachable
+            }
+    end,
+    barrel_docdb:put_system_doc(DocId, PeerInfo).
 
 %% @private Remove a peer from registry
 do_remove_peer(Url) ->
@@ -580,33 +644,6 @@ peer_doc_id(Url) ->
     HashHex = binary:encode_hex(Hash),
     ShortHash = binary:part(HashHex, 0, 16),
     <<"peer:", ShortHash/binary>>.
-
-%% @private Add peer with options (tags)
-do_add_peer(Url, Opts) ->
-    case barrel_federation:validate_remote_url(Url) of
-        ok ->
-            Tags = maps:get(tags, Opts, []),
-            PeerInfo = case fetch_peer_info(Url) of
-                {ok, Info} ->
-                    Info#{
-                        url => Url,
-                        tags => Tags,
-                        last_seen => erlang:system_time(millisecond),
-                        status => active
-                    };
-                {error, _} ->
-                    #{
-                        url => Url,
-                        tags => Tags,
-                        last_seen => erlang:system_time(millisecond),
-                        status => unreachable
-                    }
-            end,
-            DocId = peer_doc_id(Url),
-            barrel_docdb:put_system_doc(DocId, PeerInfo);
-        {error, _} = Err ->
-            Err
-    end.
 
 %% @private Filter peers by criteria
 filter_peers(Peers, Filter) ->

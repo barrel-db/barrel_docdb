@@ -109,14 +109,22 @@ node_info_contains_required_fields(_Config) ->
 %%====================================================================
 
 add_peer_valid_url(_Config) ->
-    Url = <<"http://example.com:8080">>,
-    ok = barrel_discovery:add_peer(Url),
-    %% Verify peer was added (status may be unreachable since we can't connect)
-    {ok, PeerInfo} = barrel_discovery:get_peer(Url),
+    %% Use localhost with closed port - connection refused is instant
+    Url = <<"http://127.0.0.1:19999">>,
+    %% Test sync mode - should return immediately with unreachable status
+    {ok, PeerInfo, {unreachable, Reason}} = barrel_discovery:add_peer(Url, #{sync => true}),
     ?assertEqual(Url, maps:get(url, PeerInfo)),
-    ?assert(lists:member(maps:get(status, PeerInfo), [active, unreachable])),
-    %% Cleanup
-    ok = barrel_discovery:remove_peer(Url).
+    ?assertEqual(unreachable, maps:get(status, PeerInfo)),
+    %% Verify real connection was attempted (should be connection_error)
+    ?assertMatch({connection_error, _}, Reason),
+    %% Verify peer is persisted - stored data should match returned data
+    {ok, StoredPeer} = barrel_discovery:get_peer(Url),
+    ?assertEqual(Url, maps:get(url, StoredPeer)),
+    ?assertEqual(unreachable, maps:get(status, StoredPeer)),
+    ?assertEqual(maps:get(last_seen, PeerInfo), maps:get(last_seen, StoredPeer)),
+    %% Verify persistence survives - remove and verify it's gone
+    ok = barrel_discovery:remove_peer(Url),
+    ?assertEqual({error, not_found}, barrel_discovery:get_peer(Url)).
 
 add_peer_invalid_url(_Config) ->
     %% Missing host
@@ -127,8 +135,8 @@ add_peer_invalid_url(_Config) ->
                  barrel_discovery:add_peer(<<"example.com">>)).
 
 remove_peer(_Config) ->
-    Url = <<"http://test-peer.example.com:9000">>,
-    ok = barrel_discovery:add_peer(Url),
+    Url = <<"http://127.0.0.1:19901">>,
+    {ok, _, _} = barrel_discovery:add_peer(Url, #{sync => true}),
     %% Verify it exists
     {ok, _} = barrel_discovery:get_peer(Url),
     %% Remove it
@@ -137,11 +145,11 @@ remove_peer(_Config) ->
     ?assertEqual({error, not_found}, barrel_discovery:get_peer(Url)).
 
 list_peers(_Config) ->
-    %% Add two peers
-    Url1 = <<"http://peer1.example.com:8080">>,
-    Url2 = <<"http://peer2.example.com:8080">>,
-    ok = barrel_discovery:add_peer(Url1),
-    ok = barrel_discovery:add_peer(Url2),
+    %% Add two peers (use sync to ensure they're fully added)
+    Url1 = <<"http://127.0.0.1:19902">>,
+    Url2 = <<"http://127.0.0.1:19903">>,
+    {ok, _, _} = barrel_discovery:add_peer(Url1, #{sync => true}),
+    {ok, _, _} = barrel_discovery:add_peer(Url2, #{sync => true}),
     %% List peers
     {ok, Peers} = barrel_discovery:list_peers(),
     ?assert(is_list(Peers)),
@@ -154,9 +162,8 @@ list_peers(_Config) ->
     ok = barrel_discovery:remove_peer(Url2).
 
 add_peer_with_tags(_Config) ->
-    Url = <<"http://tagged-peer.example.com:8080">>,
-    ok = barrel_discovery:add_peer(Url, #{tags => [<<"region-us">>, <<"production">>]}),
-    {ok, PeerInfo} = barrel_discovery:get_peer(Url),
+    Url = <<"http://127.0.0.1:19904">>,
+    {ok, PeerInfo, _} = barrel_discovery:add_peer(Url, #{sync => true, tags => [<<"region-us">>, <<"production">>]}),
     Tags = maps:get(tags, PeerInfo, []),
     ?assert(lists:member(<<"region-us">>, Tags)),
     ?assert(lists:member(<<"production">>, Tags)),
@@ -164,10 +171,10 @@ add_peer_with_tags(_Config) ->
     ok = barrel_discovery:remove_peer(Url).
 
 list_peers_filtered(_Config) ->
-    Url1 = <<"http://filter-test1.example.com:8080">>,
-    Url2 = <<"http://filter-test2.example.com:8080">>,
-    ok = barrel_discovery:add_peer(Url1, #{tags => [<<"test-tag">>]}),
-    ok = barrel_discovery:add_peer(Url2),  % No tags
+    Url1 = <<"http://127.0.0.1:19905">>,
+    Url2 = <<"http://127.0.0.1:19906">>,
+    {ok, _, _} = barrel_discovery:add_peer(Url1, #{sync => true, tags => [<<"test-tag">>]}),
+    {ok, _, _} = barrel_discovery:add_peer(Url2, #{sync => true}),
     %% Filter by tag
     {ok, TaggedPeers} = barrel_discovery:list_peers(#{tag => <<"test-tag">>}),
     TaggedUrls = [maps:get(url, P) || P <- TaggedPeers],
@@ -182,8 +189,8 @@ list_peers_filtered(_Config) ->
 %%====================================================================
 
 tag_peer(_Config) ->
-    Url = <<"http://tag-test.example.com:8080">>,
-    ok = barrel_discovery:add_peer(Url),
+    Url = <<"http://127.0.0.1:19907">>,
+    {ok, _, _} = barrel_discovery:add_peer(Url, #{sync => true}),
     %% Add tag
     ok = barrel_discovery:tag_peer(Url, <<"new-tag">>),
     {ok, PeerInfo} = barrel_discovery:get_peer(Url),
@@ -192,8 +199,8 @@ tag_peer(_Config) ->
     ok = barrel_discovery:remove_peer(Url).
 
 untag_peer(_Config) ->
-    Url = <<"http://untag-test.example.com:8080">>,
-    ok = barrel_discovery:add_peer(Url, #{tags => [<<"tag-to-remove">>]}),
+    Url = <<"http://127.0.0.1:19908">>,
+    {ok, _, _} = barrel_discovery:add_peer(Url, #{sync => true, tags => [<<"tag-to-remove">>]}),
     %% Verify tag exists
     {ok, PeerInfo1} = barrel_discovery:get_peer(Url),
     ?assert(lists:member(<<"tag-to-remove">>, maps:get(tags, PeerInfo1, []))),
@@ -205,10 +212,10 @@ untag_peer(_Config) ->
     ok = barrel_discovery:remove_peer(Url).
 
 list_tags(_Config) ->
-    Url1 = <<"http://list-tags1.example.com:8080">>,
-    Url2 = <<"http://list-tags2.example.com:8080">>,
-    ok = barrel_discovery:add_peer(Url1, #{tags => [<<"alpha">>, <<"beta">>]}),
-    ok = barrel_discovery:add_peer(Url2, #{tags => [<<"beta">>, <<"gamma">>]}),
+    Url1 = <<"http://127.0.0.1:19909">>,
+    Url2 = <<"http://127.0.0.1:19910">>,
+    {ok, _, _} = barrel_discovery:add_peer(Url1, #{sync => true, tags => [<<"alpha">>, <<"beta">>]}),
+    {ok, _, _} = barrel_discovery:add_peer(Url2, #{sync => true, tags => [<<"beta">>, <<"gamma">>]}),
     {ok, Tags} = barrel_discovery:list_tags(),
     ?assert(lists:member(<<"alpha">>, Tags)),
     ?assert(lists:member(<<"beta">>, Tags)),
@@ -222,17 +229,17 @@ list_tags(_Config) ->
 %%====================================================================
 
 resolve_direct_url(_Config) ->
-    %% Direct URL should resolve to itself
-    Url = <<"http://direct.example.com:8080">>,
+    %% Direct URL should resolve to itself (no connection made)
+    Url = <<"http://127.0.0.1:19911">>,
     {ok, [ResolvedUrl]} = barrel_discovery:resolve_member(Url),
     ?assertEqual(Url, ResolvedUrl).
 
 resolve_tag_reference(_Config) ->
     %% Add peers with a tag
-    Url1 = <<"http://resolve-tag1.example.com:8080">>,
-    Url2 = <<"http://resolve-tag2.example.com:8080">>,
-    ok = barrel_discovery:add_peer(Url1, #{tags => [<<"resolve-test">>]}),
-    ok = barrel_discovery:add_peer(Url2, #{tags => [<<"resolve-test">>]}),
+    Url1 = <<"http://127.0.0.1:19912">>,
+    Url2 = <<"http://127.0.0.1:19913">>,
+    {ok, _, _} = barrel_discovery:add_peer(Url1, #{sync => true, tags => [<<"resolve-test">>]}),
+    {ok, _, _} = barrel_discovery:add_peer(Url2, #{sync => true, tags => [<<"resolve-test">>]}),
     %% Resolve tag reference
     {ok, ResolvedUrls} = barrel_discovery:resolve_member({tag, <<"resolve-test">>}),
     ?assert(lists:member(Url1, ResolvedUrls)),
