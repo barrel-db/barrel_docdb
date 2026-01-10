@@ -117,6 +117,7 @@ init(Opts) ->
             {"/db/:db/_views/:view_id/_refresh", barrel_http_handler, #{action => view_refresh}},
 
             %% Replication endpoints
+            {"/db/:db/_replicate", barrel_http_handler, #{action => replicate}},
             {"/db/:db/_revsdiff", barrel_http_handler, #{action => revsdiff}},
             {"/db/:db/_put_rev", barrel_http_handler, #{action => put_rev}},
             {"/db/:db/_sync_hlc", barrel_http_handler, #{action => sync_hlc}},
@@ -127,6 +128,14 @@ init(Opts) ->
             %% Attachments (before doc catch-all)
             {"/db/:db/:doc_id/_attachments", barrel_http_handler, #{action => attachments}},
             {"/db/:db/:doc_id/_attachments/:att_name", barrel_http_handler, #{action => attachment}},
+
+            %% Tier management endpoints
+            {"/db/:db/_tier/config", barrel_http_handler, #{action => tier_config}},
+            {"/db/:db/_tier/capacity", barrel_http_handler, #{action => tier_capacity}},
+            {"/db/:db/_tier/migrate", barrel_http_handler, #{action => tier_migrate}},
+            {"/db/:db/_tier/run_migration", barrel_http_handler, #{action => tier_run_migration}},
+            {"/db/:db/:doc_id/_tier/ttl", barrel_http_handler, #{action => doc_tier_ttl}},
+            {"/db/:db/:doc_id/_tier", barrel_http_handler, #{action => doc_tier}},
 
             %% Document operations (variable path - must be last)
             {"/db/:db/:doc_id", barrel_http_handler, #{action => doc}}

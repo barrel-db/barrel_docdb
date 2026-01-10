@@ -392,6 +392,127 @@ handle_action(policy_status, <<"GET">>, Req) ->
             throw({error, 404, <<"Policy not found">>})
     end;
 
+%% Tier management: configure
+handle_action(tier_config, <<"POST">>, Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req),
+    Config = json_to_tier_config(decode_request_body(ReqBody, Req1)),
+    case barrel_tier:configure(DbName, Config) of
+        ok ->
+            Body = encode_response(#{<<"ok">> => true}, Req1),
+            {200, response_headers(Req1), Body, Req1};
+        {error, {missing_config, Field, Msg}} ->
+            throw({error, 400, <<"Missing config: ", Field/binary, " - ", Msg/binary>>});
+        {error, Reason} ->
+            throw({error, 400, format_error(Reason)})
+    end;
+handle_action(tier_config, <<"GET">>, Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    Config = barrel_tier:get_config(DbName),
+    Body = encode_response(tier_config_to_json(Config), Req),
+    {200, response_headers(Req), Body, Req};
+
+%% Tier management: capacity info
+handle_action(tier_capacity, <<"GET">>, Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    case barrel_tier:get_capacity_info(DbName) of
+        {ok, Info} ->
+            Body = encode_response(Info, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end;
+
+%% Tier management: migrate specific document
+handle_action(tier_migrate, <<"POST">>, Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req),
+    Spec = decode_request_body(ReqBody, Req1),
+    DocId = maps:get(<<"doc_id">>, Spec),
+    ToTier = binary_to_atom(maps:get(<<"to_tier">>, Spec)),
+    case barrel_docdb:db_pid(DbName) of
+        {ok, Pid} ->
+            case barrel_tier:migrate_to_tier(Pid, ToTier, #{doc_id => DocId}, #{}) of
+                {ok, Stats} ->
+                    Body = encode_response(Stats#{<<"ok">> => true}, Req1),
+                    {200, response_headers(Req1), Body, Req1};
+                {error, Reason} ->
+                    throw({error, 400, format_error(Reason)})
+            end;
+        {error, not_found} ->
+            throw({error, 404, <<"Database not found">>})
+    end;
+
+%% Tier management: run full migration
+handle_action(tier_run_migration, <<"POST">>, Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    case barrel_tier:run_migration(DbName) of
+        {ok, Results} ->
+            Body = encode_response(Results#{<<"ok">> => true}, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end;
+
+%% Tier management: get document tier
+handle_action(doc_tier, <<"GET">>, Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    DocId = cowboy_req:binding(doc_id, Req),
+    case barrel_docdb:db_pid(DbName) of
+        {ok, Pid} ->
+            case barrel_tier:get_tier(Pid, DocId, #{}) of
+                {ok, Tier} ->
+                    Body = encode_response(#{<<"tier">> => Tier, <<"doc_id">> => DocId}, Req),
+                    {200, response_headers(Req), Body, Req};
+                {error, not_found} ->
+                    throw({error, 404, <<"Document not found">>});
+                {error, Reason} ->
+                    throw({error, 500, format_error(Reason)})
+            end;
+        {error, not_found} ->
+            throw({error, 404, <<"Database not found">>})
+    end;
+
+%% Tier management: set document TTL
+handle_action(doc_tier_ttl, <<"POST">>, Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    DocId = cowboy_req:binding(doc_id, Req),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req),
+    Spec = decode_request_body(ReqBody, Req1),
+    TTL = maps:get(<<"ttl">>, Spec),
+    case barrel_docdb:db_pid(DbName) of
+        {ok, Pid} ->
+            case barrel_tier:set_ttl(Pid, DocId, TTL, #{}) of
+                ok ->
+                    ExpiresAt = erlang:system_time(second) + TTL,
+                    Body = encode_response(#{<<"ok">> => true, <<"expires_at">> => ExpiresAt}, Req1),
+                    {200, response_headers(Req1), Body, Req1};
+                {error, not_found} ->
+                    throw({error, 404, <<"Document not found">>});
+                {error, Reason} ->
+                    throw({error, 400, format_error(Reason)})
+            end;
+        {error, not_found} ->
+            throw({error, 404, <<"Database not found">>})
+    end;
+handle_action(doc_tier_ttl, <<"GET">>, Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    DocId = cowboy_req:binding(doc_id, Req),
+    case barrel_docdb:db_pid(DbName) of
+        {ok, Pid} ->
+            case barrel_tier:get_ttl(Pid, DocId, #{}) of
+                {ok, TTLInfo} ->
+                    Body = encode_response(TTLInfo, Req),
+                    {200, response_headers(Req), Body, Req};
+                {error, not_found} ->
+                    throw({error, 404, <<"Document not found">>});
+                {error, Reason} ->
+                    throw({error, 500, format_error(Reason)})
+            end;
+        {error, not_found} ->
+            throw({error, 404, <<"Database not found">>})
+    end;
+
 %% Database info
 handle_action(db_info, <<"GET">>, Req) ->
     DbName = cowboy_req:binding(db, Req),
@@ -403,6 +524,28 @@ handle_action(db_info, <<"GET">>, Req) ->
             {200, response_headers(Req), Body, Req};
         {error, not_found} ->
             throw({error, 404, <<"Database not found">>})
+    end;
+handle_action(db_info, <<"PUT">>, Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    case barrel_docdb:create_db(DbName) of
+        {ok, _Pid} ->
+            Body = encode_response(#{ok => true, name => DbName}, Req),
+            {201, response_headers(Req), Body, Req};
+        {error, already_exists} ->
+            throw({error, 409, <<"Database already exists">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end;
+handle_action(db_info, <<"DELETE">>, Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    case barrel_docdb:delete_db(DbName) of
+        ok ->
+            Body = encode_response(#{ok => true}, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Database not found">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
     end;
 
 %% Document operations
@@ -442,6 +585,10 @@ handle_action(view_query, <<"POST">>, Req) ->
     handle_query_view(Req);
 handle_action(view_refresh, <<"POST">>, Req) ->
     handle_refresh_view(Req);
+
+%% Replication: trigger one-shot replication
+handle_action(replicate, <<"POST">>, Req) ->
+    handle_replicate(Req);
 
 %% Replication: revsdiff
 handle_action(revsdiff, <<"POST">>, Req) ->
@@ -875,9 +1022,14 @@ json_to_policy_config(Spec) ->
         ColdDb -> Config10#{cold_db => ColdDb}
     end,
     %% Filter
-    case maps:get(<<"filter">>, Spec, undefined) of
+    Config12 = case maps:get(<<"filter">>, Spec, undefined) of
         undefined -> Config11;
         Filter -> Config11#{filter => Filter}
+    end,
+    %% Auth config for inter-node communication
+    case maps:get(<<"auth">>, Spec, undefined) of
+        undefined -> Config12;
+        Auth when is_map(Auth) -> Config12#{auth => Auth}
     end.
 
 %% Convert Erlang policy to JSON-safe map
@@ -900,6 +1052,38 @@ policy_to_json(Policy) ->
         end,
         #{},
         Policy
+    ).
+
+%% Convert JSON tier config to Erlang map
+json_to_tier_config(Spec) ->
+    maps:fold(
+        fun(<<"enabled">>, V, Acc) -> Acc#{enabled => V};
+           (<<"auto_migrate">>, V, Acc) -> Acc#{auto_migrate => V};
+           (<<"hot_threshold">>, V, Acc) -> Acc#{hot_threshold => V};
+           (<<"warm_threshold">>, V, Acc) -> Acc#{warm_threshold => V};
+           (<<"capacity_limit">>, V, Acc) -> Acc#{capacity_limit => V};
+           (<<"warm_db">>, V, Acc) -> Acc#{warm_db => V};
+           (<<"cold_db">>, V, Acc) -> Acc#{cold_db => V};
+           (_, _, Acc) -> Acc
+        end,
+        #{},
+        Spec
+    ).
+
+%% Convert Erlang tier config to JSON-safe map
+tier_config_to_json(Config) ->
+    maps:fold(
+        fun(enabled, V, Acc) -> Acc#{<<"enabled">> => V};
+           (auto_migrate, V, Acc) -> Acc#{<<"auto_migrate">> => V};
+           (hot_threshold, V, Acc) -> Acc#{<<"hot_threshold">> => V};
+           (warm_threshold, V, Acc) -> Acc#{<<"warm_threshold">> => V};
+           (capacity_limit, V, Acc) -> Acc#{<<"capacity_limit">> => V};
+           (warm_db, V, Acc) -> Acc#{<<"warm_db">> => V};
+           (cold_db, V, Acc) -> Acc#{<<"cold_db">> => V};
+           (_, _, Acc) -> Acc
+        end,
+        #{},
+        Config
     ).
 
 %% Convert policy status to JSON-safe map
@@ -1294,6 +1478,96 @@ convert_order_spec(_) ->
 %%====================================================================
 %% Replication Handlers
 %%====================================================================
+
+%% @doc Handle one-shot replication request
+%% POST /db/:db/_replicate
+%% Body: {"target": "http://...", "filter": {...}, "target_auth": "..."}
+handle_replicate(Req0) ->
+    DbName = cowboy_req:binding(db, Req0),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    Spec = decode_request_body(ReqBody, Req1),
+    TargetUrl = maps:get(<<"target">>, Spec),
+    %% Build replication options
+    Opts0 = #{},
+    Opts1 = case maps:get(<<"filter">>, Spec, undefined) of
+        undefined -> Opts0;
+        #{<<"paths">> := Paths} ->
+            %% Convert filter paths to internal format
+            Opts0#{filter => #{paths => Paths}};
+        Filter when is_map(Filter) ->
+            Opts0#{filter => Filter}
+    end,
+    %% Determine if target is a URL (remote) or local db name
+    {FinalTarget, Opts} = case is_url(TargetUrl) of
+        true ->
+            %% For remote targets, build endpoint with auth
+            %% Use target_auth from body, or inherit current auth token
+            AuthToken = case maps:get(<<"target_auth">>, Spec, undefined) of
+                undefined ->
+                    %% Inherit current request's auth token
+                    extract_bearer_token(Req1);
+                Token ->
+                    Token
+            end,
+            TargetEndpoint = case AuthToken of
+                undefined -> #{url => TargetUrl};
+                _ -> #{url => TargetUrl, bearer_token => AuthToken}
+            end,
+            {TargetEndpoint, Opts1#{target_transport => barrel_rep_transport_http}};
+        false ->
+            {TargetUrl, Opts1}
+    end,
+    %% Execute one-shot replication
+    case barrel_rep:replicate(DbName, FinalTarget, Opts) of
+        {ok, Result} ->
+            %% Format result for JSON response
+            Response = format_rep_result(Result),
+            Body = encode_response(Response, Req1),
+            {200, response_headers(Req1), Body, Req1};
+        {error, {target_error, Reason}} ->
+            throw({error, 400, format_error({target_error, Reason})});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%% Check if a string is a URL
+is_url(<<"http://", _/binary>>) -> true;
+is_url(<<"https://", _/binary>>) -> true;
+is_url(_) -> false.
+
+%% Format replication result for JSON response
+format_rep_result(Result) when is_map(Result) ->
+    maps:fold(
+        fun(ok, V, Acc) -> Acc#{<<"ok">> => V};
+           (docs_written, V, Acc) -> Acc#{<<"docs_written">> => V};
+           (docs_read, V, Acc) -> Acc#{<<"docs_read">> => V};
+           (doc_read_failures, V, Acc) -> Acc#{<<"doc_read_failures">> => V};
+           (doc_write_failures, V, Acc) -> Acc#{<<"doc_write_failures">> => V};
+           (start_seq, first, Acc) -> Acc#{<<"start_seq">> => <<"first">>};
+           (start_seq, V, Acc) -> Acc#{<<"start_seq">> => format_seq_for_rep(V)};
+           (last_seq, first, Acc) -> Acc#{<<"last_seq">> => <<"first">>};
+           (last_seq, V, Acc) -> Acc#{<<"last_seq">> => format_seq_for_rep(V)};
+           (source, V, Acc) when is_binary(V) -> Acc#{<<"source">> => V};
+           (target, V, Acc) when is_binary(V) -> Acc#{<<"target">> => V};
+           (_, _, Acc) -> Acc  %% Skip unknown fields to avoid serialization issues
+        end,
+        #{},
+        Result
+    );
+format_rep_result(_) ->
+    #{<<"ok">> => true}.
+
+%% Format seq for replication result (convert tuples to strings)
+format_seq_for_rep({timestamp, Ts, Counter}) ->
+    iolist_to_binary(io_lib:format("~p:~p", [Ts, Counter]));
+format_seq_for_rep(Seq) when is_tuple(Seq) ->
+    iolist_to_binary(io_lib:format("~p", [Seq]));
+format_seq_for_rep(Seq) when is_binary(Seq) ->
+    Seq;
+format_seq_for_rep(Seq) when is_integer(Seq) ->
+    integer_to_binary(Seq);
+format_seq_for_rep(_) ->
+    <<"unknown">>.
 
 handle_revsdiff(Req0) ->
     DbName = cowboy_req:binding(db, Req0),
