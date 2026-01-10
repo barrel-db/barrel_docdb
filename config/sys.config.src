@@ -1,17 +1,17 @@
 [
     {barrel_docdb, [
-        {data_dir, "data/barrel_docdb"},
+        {data_dir, "${BARREL_DATA_DIR:-data/barrel_docdb}"},
         {default_store, barrel_store_rocksdb},
         %% HTTP server configuration
         {http_enabled, true},
-        {http_port, 8080},
-        {http_acceptors, 100}
+        {http_port, ${BARREL_HTTP_PORT:-8080}},
+        {http_acceptors, ${BARREL_HTTP_ACCEPTORS:-100}}
     ]},
     {kernel, [
-        {logger_level, info},
+        {logger_level, ${BARREL_LOG_LEVEL:-info}},
         {logger, [
             {handler, default, logger_std_h, #{
-                level => info,
+                level => ${BARREL_LOG_LEVEL:-info},
                 formatter => {logger_formatter, #{
                     template => [time, " [", level, "] ", pid, " ", msg, "\n"]
                 }}

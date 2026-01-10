@@ -174,7 +174,26 @@ init([]) ->
         modules => [barrel_discovery]
     },
 
-    %% Metrics must start first, then Cache, HLC, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, RepPolicy, ApiKeys, Discovery
-    ChildSpecs = [Metrics, Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, RepPolicy, ApiKeys, Discovery],
+    %% HTTP server for REST API (optional, controlled by http_enabled config)
+    HttpEnabled = application:get_env(barrel_docdb, http_enabled, false),
+    HttpPort = application:get_env(barrel_docdb, http_port, 8080),
+    HttpAcceptors = application:get_env(barrel_docdb, http_acceptors, 100),
+    HttpServer = #{
+        id => barrel_http_server,
+        start => {barrel_http_server, start_link, [#{port => HttpPort, num_acceptors => HttpAcceptors}]},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [barrel_http_server]
+    },
+
+    %% Base child specs (always started)
+    BaseSpecs = [Metrics, Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, RepPolicy, ApiKeys, Discovery],
+
+    %% Conditionally add HTTP server
+    ChildSpecs = case HttpEnabled of
+        true -> BaseSpecs ++ [HttpServer];
+        false -> BaseSpecs
+    end,
 
     {ok, {SupFlags, ChildSpecs}}.

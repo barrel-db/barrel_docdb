@@ -1,0 +1,131 @@
+# barrel_docdb 5-node cluster for integration testing
+
+services:
+  barrel1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: barrel1
+    hostname: barrel1
+    environment:
+      - BARREL_NODE_NAME=barrel@barrel1
+      - BARREL_HTTP_PORT=8080
+      - BARREL_DATA_DIR=/data
+      - BARREL_COOKIE=barrel_cluster
+      - BARREL_LOG_LEVEL=info
+      - BARREL_DOCDB_ADMIN_KEY=test_admin_key_for_docker_tests
+    ports:
+      - "8091:8080"
+    volumes:
+      - barrel1_data:/data
+    networks:
+      - barrel_net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  barrel2:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: barrel2
+    hostname: barrel2
+    environment:
+      - BARREL_NODE_NAME=barrel@barrel2
+      - BARREL_HTTP_PORT=8080
+      - BARREL_DATA_DIR=/data
+      - BARREL_COOKIE=barrel_cluster
+      - BARREL_LOG_LEVEL=info
+      - BARREL_DOCDB_ADMIN_KEY=test_admin_key_for_docker_tests
+    ports:
+      - "8092:8080"
+    volumes:
+      - barrel2_data:/data
+    networks:
+      - barrel_net
+    depends_on:
+      barrel1:
+        condition: service_healthy
+
+  barrel3:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: barrel3
+    hostname: barrel3
+    environment:
+      - BARREL_NODE_NAME=barrel@barrel3
+      - BARREL_HTTP_PORT=8080
+      - BARREL_DATA_DIR=/data
+      - BARREL_COOKIE=barrel_cluster
+      - BARREL_LOG_LEVEL=info
+      - BARREL_DOCDB_ADMIN_KEY=test_admin_key_for_docker_tests
+    ports:
+      - "8093:8080"
+    volumes:
+      - barrel3_data:/data
+    networks:
+      - barrel_net
+    depends_on:
+      barrel1:
+        condition: service_healthy
+
+  barrel4:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: barrel4
+    hostname: barrel4
+    environment:
+      - BARREL_NODE_NAME=barrel@barrel4
+      - BARREL_HTTP_PORT=8080
+      - BARREL_DATA_DIR=/data
+      - BARREL_COOKIE=barrel_cluster
+      - BARREL_LOG_LEVEL=info
+      - BARREL_DOCDB_ADMIN_KEY=test_admin_key_for_docker_tests
+    ports:
+      - "8094:8080"
+    volumes:
+      - barrel4_data:/data
+    networks:
+      - barrel_net
+    depends_on:
+      barrel1:
+        condition: service_healthy
+
+  barrel5:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: barrel5
+    hostname: barrel5
+    environment:
+      - BARREL_NODE_NAME=barrel@barrel5
+      - BARREL_HTTP_PORT=8080
+      - BARREL_DATA_DIR=/data
+      - BARREL_COOKIE=barrel_cluster
+      - BARREL_LOG_LEVEL=info
+      - BARREL_DOCDB_ADMIN_KEY=test_admin_key_for_docker_tests
+    ports:
+      - "8095:8080"
+    volumes:
+      - barrel5_data:/data
+    networks:
+      - barrel_net
+    depends_on:
+      barrel1:
+        condition: service_healthy
+
+volumes:
+  barrel1_data:
+  barrel2_data:
+  barrel3_data:
+  barrel4_data:
+  barrel5_data:
+
+networks:
+  barrel_net:
+    driver: bridge
