@@ -1869,29 +1869,132 @@ do_migrate_expired(StoreRef, DbName) ->
 %% Filter options:
 %%   - min_age: minimum age in milliseconds
 %%   - tier: only documents in this tier
+%%   - doc_id: specific document to migrate
+%%
+%% If warm_db/cold_db are configured in tier config, performs physical migration
+%% (copies document to target DB and deletes from source). Otherwise, just
+%% updates the tier metadata byte.
 do_migrate_to_tier(StoreRef, DbName, TargetTier, Filter) ->
+    %% Get tier config to check for physical migration
+    Config = barrel_tier:get_config(DbName),
+    TargetDbName = get_target_db_name(TargetTier, Config, DbName),
+
+    %% Check if we're doing physical migration (different target DB)
+    PhysicalMigration = (TargetDbName =/= DbName),
+
+    %% Check if specific doc_id is provided
+    case maps:get(doc_id, Filter, undefined) of
+        undefined ->
+            %% Bulk migration
+            do_migrate_to_tier_bulk(StoreRef, DbName, TargetTier, TargetDbName,
+                                    PhysicalMigration, Filter);
+        DocId ->
+            %% Single document migration
+            do_migrate_single_doc(StoreRef, DbName, DocId, TargetTier,
+                                  TargetDbName, PhysicalMigration)
+    end.
+
+%% @private Get target database name based on tier and config
+get_target_db_name(warm, Config, DefaultDb) ->
+    maps:get(warm_db, Config, DefaultDb);
+get_target_db_name(cold, Config, DefaultDb) ->
+    maps:get(cold_db, Config, DefaultDb);
+get_target_db_name(hot, _Config, DefaultDb) ->
+    %% Hot tier is always the original database
+    DefaultDb.
+
+%% @private Migrate a single document to target tier
+do_migrate_single_doc(StoreRef, DbName, DocId, TargetTier, TargetDbName, PhysicalMigration) ->
+    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
+    case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
+        {ok, Columns} ->
+            CurrentTier = proplists:get_value(?COL_TIER, Columns, hot),
+            case CurrentTier =:= TargetTier of
+                true ->
+                    %% Already in target tier
+                    {ok, #{migrated => 0, skipped => 1, errors => 0}};
+                false when PhysicalMigration ->
+                    %% Physical migration to different database
+                    case do_physical_migrate_doc(StoreRef, DbName, DocId, TargetDbName) of
+                        ok ->
+                            {ok, #{migrated => 1, skipped => 0, errors => 0}};
+                        {error, _Reason} ->
+                            {ok, #{migrated => 0, skipped => 0, errors => 1}}
+                    end;
+                false ->
+                    %% Metadata-only migration
+                    TargetTierByte = barrel_tier:tier_to_byte(TargetTier),
+                    UpdatedColumns = lists:keyreplace(?COL_TIER, 1, Columns,
+                                                      {?COL_TIER, TargetTierByte}),
+                    case barrel_store_rocksdb:write_batch(StoreRef,
+                            [{entity_put, DocEntityKey, UpdatedColumns}]) of
+                        ok ->
+                            {ok, #{migrated => 1, skipped => 0, errors => 0}};
+                        _ ->
+                            {ok, #{migrated => 0, skipped => 0, errors => 1}}
+                    end
+            end;
+        not_found ->
+            {error, not_found}
+    end.
+
+%% @private Physically migrate a document to a different database
+do_physical_migrate_doc(StoreRef, SourceDb, DocId, TargetDb) ->
+    %% Get full document from source
+    case do_get_doc(StoreRef, SourceDb, DocId, #{}) of
+        {ok, #{<<"_rev">> := Rev} = Doc} ->
+            %% Check if document is deleted
+            Deleted = maps:get(<<"_deleted">>, Doc, false),
+            %% Put document in target database
+            case barrel_docdb:db_pid(TargetDb) of
+                {ok, TargetPid} ->
+                    %% Use put_rev to preserve the revision
+                    %% The 4th arg is Deleted (boolean), not Opts
+                    History = [Rev],
+                    case gen_server:call(TargetPid, {put_rev, Doc, History, Deleted}, infinity) of
+                        {ok, _, _} ->
+                            %% Delete from source - mark as deleted
+                            DeleteOpts = #{rev => Rev},
+                            case do_delete_doc(StoreRef, SourceDb, DocId, DeleteOpts) of
+                                {ok, _, _} -> ok;
+                                %% Ignore delete errors, doc is already copied
+                                _ -> ok
+                            end;
+                        {error, Reason} ->
+                            {error, {target_put_failed, Reason}}
+                    end;
+                {error, not_found} ->
+                    {error, {target_db_not_found, TargetDb}}
+            end;
+        {error, Reason} ->
+            {error, {source_get_failed, Reason}}
+    end.
+
+%% @private Bulk migration of documents matching filter
+do_migrate_to_tier_bulk(StoreRef, DbName, TargetTier, TargetDbName,
+                        PhysicalMigration, Filter) ->
     Now = erlang:system_time(millisecond),
     MinAge = maps:get(min_age, Filter, 0),
     SourceTier = maps:get(tier, Filter, undefined),
-    %% Convert target tier to byte for storage
     TargetTierByte = barrel_tier:tier_to_byte(TargetTier),
 
     StartKey = barrel_store_keys:doc_entity(DbName, <<>>),
     EndKey = barrel_store_keys:doc_entity_end(DbName),
+
+    %% Calculate prefix size for DocId extraction:
+    %% 1 byte (prefix) + 2 bytes (length) + DbName bytes
+    PrefixSize = 1 + 2 + byte_size(DbName),
 
     Stats = #{migrated => 0, skipped => 0, errors => 0},
 
     FoldFun = fun(Key, Value, AccStats) ->
         case barrel_store_rocksdb:decode_entity(Value) of
             Columns when is_list(Columns) ->
-                %% decode_entity returns tier as atom (hot, warm, cold)
                 CurrentTier = proplists:get_value(?COL_TIER, Columns, hot),
                 CreatedAtBin = proplists:get_value(?COL_CREATED_AT, Columns, <<>>),
 
-                %% Check source tier filter (compare atoms)
                 TierMatch = (SourceTier =:= undefined) orelse (CurrentTier =:= SourceTier),
 
-                %% Check age filter (calculate document age in ms)
                 AgeMs = case CreatedAtBin of
                     <<>> -> 0;
                     _ ->
@@ -1901,10 +2004,21 @@ do_migrate_to_tier(StoreRef, DbName, TargetTier, Filter) ->
                 AgeMatch = AgeMs >= MinAge,
 
                 case TierMatch andalso AgeMatch andalso CurrentTier =/= TargetTier of
+                    true when PhysicalMigration ->
+                        %% Physical migration - extract DocId from key and migrate
+                        <<_Prefix:PrefixSize/binary, DocId/binary>> = Key,
+                        case do_physical_migrate_doc(StoreRef, DbName, DocId, TargetDbName) of
+                            ok ->
+                                {ok, AccStats#{migrated := maps:get(migrated, AccStats) + 1}};
+                            _ ->
+                                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
+                        end;
                     true ->
-                        %% Store as byte value
-                        UpdatedColumns = lists:keyreplace(?COL_TIER, 1, Columns, {?COL_TIER, TargetTierByte}),
-                        case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, Key, UpdatedColumns}]) of
+                        %% Metadata-only migration
+                        UpdatedColumns = lists:keyreplace(?COL_TIER, 1, Columns,
+                                                          {?COL_TIER, TargetTierByte}),
+                        case barrel_store_rocksdb:write_batch(StoreRef,
+                                [{entity_put, Key, UpdatedColumns}]) of
                             ok ->
                                 {ok, AccStats#{migrated := maps:get(migrated, AccStats) + 1}};
                             _ ->
