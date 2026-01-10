@@ -38,6 +38,14 @@ Sync anywhere. Query anything. Your data, wherever you need it.
 
     [:octicons-arrow-right-24: Replication](replication.md)
 
+-   :books: __Advanced Features__
+
+    ---
+
+    Practical curl examples for replication, federation, and tiered storage
+
+    [:octicons-arrow-right-24: Advanced Guide](advanced-features.md)
+
 </div>
 
 ## What is Barrel DocDB?

@@ -17,13 +17,20 @@ Set the `Content-Type` and `Accept` headers accordingly.
 |----------|---------|-------------|
 | `/health` | GET | Health check |
 | `/metrics` | GET | Prometheus metrics |
-| `/db/:db` | GET, POST, DELETE | Database operations |
+| `/db/:db` | GET, PUT, DELETE | Database operations |
 | `/db/:db/:doc_id` | GET, PUT, DELETE | Document operations |
 | `/db/:db/_find` | POST | Query documents |
 | `/db/:db/_changes` | GET | Changes feed |
 | `/db/:db/_changes/stream` | GET | SSE changes stream |
 | `/db/:db/_bulk_docs` | POST | Bulk operations |
+| `/db/:db/_replicate` | POST | Trigger replication |
 | `/db/:db/:doc_id/_attachments/:name` | GET, PUT, DELETE | Attachments |
+| `/db/:db/_tier/config` | GET, POST | Tiered storage config |
+| `/db/:db/_tier/capacity` | GET | Tier capacity info |
+| `/db/:db/_tier/migrate` | POST | Migrate document |
+| `/db/:db/_tier/run_migration` | POST | Run migration policy |
+| `/db/:db/:doc_id/_tier` | GET | Get document tier |
+| `/db/:db/:doc_id/_tier/ttl` | GET, POST | Document TTL |
 | `/_federation` | GET, POST | Federation management |
 | `/_policies` | GET, POST | Replication policies |
 
@@ -422,4 +429,123 @@ POST /_policies/:name/_disable
 
 ```bash
 GET /_policies/:name/_status
+```
+
+---
+
+## Tiered Storage
+
+### Configure Tiering
+
+```bash
+POST /db/:db/_tier/config
+```
+
+**Request Body:**
+```json
+{
+  "enabled": true,
+  "warm_db": "archive_db",
+  "cold_db": "cold_db",
+  "hot_threshold": 3600,
+  "warm_threshold": 86400
+}
+```
+
+### Get Tier Config
+
+```bash
+GET /db/:db/_tier/config
+```
+
+### Get Capacity Info
+
+```bash
+GET /db/:db/_tier/capacity
+```
+
+**Response:**
+```json
+{
+  "doc_count": 1000,
+  "size_bytes": 1048576,
+  "capacity_limit": 10737418240,
+  "exceeded": false
+}
+```
+
+### Migrate Document
+
+```bash
+POST /db/:db/_tier/migrate
+```
+
+**Request Body:**
+```json
+{
+  "doc_id": "doc1",
+  "to_tier": "warm"
+}
+```
+
+### Run Migration Policy
+
+```bash
+POST /db/:db/_tier/run_migration
+```
+
+### Get Document Tier
+
+```bash
+GET /db/:db/:doc_id/_tier
+```
+
+**Response:**
+```json
+{"tier": "hot", "doc_id": "doc1"}
+```
+
+### Set/Get Document TTL
+
+```bash
+POST /db/:db/:doc_id/_tier/ttl
+GET /db/:db/:doc_id/_tier/ttl
+```
+
+**Request Body (POST):**
+```json
+{"ttl": 3600}
+```
+
+**Response:**
+```json
+{"ok": true, "expires_at": 1736538000}
+```
+
+---
+
+## Replication
+
+### Trigger Replication
+
+```bash
+POST /db/:db/_replicate
+```
+
+**Request Body:**
+```json
+{
+  "target": "http://remote:8080/db/target",
+  "auth": {"bearer_token": "api_key"},
+  "filter": {"paths": ["type/user"]}
+}
+```
+
+**Response:**
+```json
+{
+  "ok": true,
+  "docs_read": 100,
+  "docs_written": 100
+}
 ```
