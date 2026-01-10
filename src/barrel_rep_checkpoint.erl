@@ -208,6 +208,22 @@ read_last_seq(Db, Transport, RepId) ->
                     decode_seq(maps:get(<<"source_last_seq">>, LastHistory))
             end;
         {error, not_found} ->
+            first;
+        {error, {http_error, Status, Msg}} ->
+            %% HTTP error (e.g., 401 Unauthorized) - log and return first
+            %% This allows replication to start fresh if there's an auth issue
+            %% The replication itself will fail properly if auth is truly missing
+            error_logger:warning_msg(
+                "Failed to read checkpoint from ~p: HTTP ~p ~s~n",
+                [Db, Status, Msg]
+            ),
+            first;
+        {error, {connection_error, Reason}} ->
+            %% Connection error - log and return first
+            error_logger:warning_msg(
+                "Failed to read checkpoint from ~p: connection error ~p~n",
+                [Db, Reason]
+            ),
             first
     end.
 

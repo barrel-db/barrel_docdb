@@ -7,7 +7,13 @@
         kernel,
         stdlib,
         crypto,
-        rocksdb
+        rocksdb,
+        hlc,
+        match_trie,
+        bitmap,
+        cowboy,
+        hackney,
+        prometheus
     ]},
     {env, [
         {data_dir, "data/barrel_docdb"},

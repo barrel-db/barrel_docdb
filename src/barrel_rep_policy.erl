@@ -83,7 +83,9 @@
     cold_db => binary(),              % Cold tier database
     %% Common options
     mode => continuous | one_shot,
-    filter => map()                   % Optional replication filter
+    filter => map(),                  % Optional replication filter
+    %% Authentication for remote nodes
+    auth => map()                     % Auth config: #{bearer_token => Token} or #{basic_auth => {User, Pass}}
 }.
 
 -export_type([policy/0, pattern/0]).
@@ -348,6 +350,7 @@ apply_chain_pattern(Policy) ->
     Database = maps:get(database, Policy),
     Mode = maps:get(mode, Policy, continuous),
     Filter = maps:get(filter, Policy, #{}),
+    Auth = maps:get(auth, Policy, #{}),
 
     %% Create pairs: [{A,B}, {B,C}]
     Pairs = chain_pairs(Nodes),
@@ -359,7 +362,8 @@ apply_chain_pattern(Policy) ->
                 source => make_db_url(Source, Database),
                 target => make_db_url(Target, Database),
                 mode => Mode,
-                filter => Filter
+                filter => Filter,
+                auth => Auth
             })
         end,
         Pairs
@@ -372,6 +376,7 @@ apply_group_pattern(Policy) ->
     Members = maps:get(members, Policy, []),
     Mode = maps:get(mode, Policy, continuous),
     Filter = maps:get(filter, Policy, #{}),
+    Auth = maps:get(auth, Policy, #{}),
 
     %% Create all pairs (bidirectional)
     Pairs = group_pairs(Members),
@@ -382,7 +387,8 @@ apply_group_pattern(Policy) ->
                 source => Source,
                 target => Target,
                 mode => Mode,
-                filter => Filter
+                filter => Filter,
+                auth => Auth
             })
         end,
         Pairs
@@ -396,6 +402,7 @@ apply_fanout_pattern(Policy) ->
     Targets = maps:get(targets, Policy, []),
     Mode = maps:get(mode, Policy, continuous),
     Filter = maps:get(filter, Policy, #{}),
+    Auth = maps:get(auth, Policy, #{}),
 
     Results = lists:map(
         fun(Target) ->
@@ -403,7 +410,8 @@ apply_fanout_pattern(Policy) ->
                 source => Source,
                 target => Target,
                 mode => Mode,
-                filter => Filter
+                filter => Filter,
+                auth => Auth
             })
         end,
         Targets
@@ -451,7 +459,7 @@ create_policy(Name, Config, State) ->
                 ok ->
                     Policy = Config#{
                         name => Name,
-                        enabled => maps:get(enabled, Config, false)
+                        enabled => to_boolean(maps:get(enabled, Config, false))
                     },
                     NewPolicies = maps:put(Name, Policy, State#state.policies),
                     {ok, Policy, State#state{policies = NewPolicies}};
@@ -527,14 +535,19 @@ start_replication_task(Config) ->
     #{source := Source, target := Target} = Config,
     Mode = maps:get(mode, Config, one_shot),
     Filter = maps:get(filter, Config, #{}),
+    Auth = maps:get(auth, Config, #{}),
+
+    %% Apply auth to remote URLs
+    SourceEndpoint = apply_auth_to_url(Source, Auth),
+    TargetEndpoint = apply_auth_to_url(Target, Auth),
 
     %% Determine transports based on URL format
     SourceTransport = url_to_transport(Source),
     TargetTransport = url_to_transport(Target),
 
     TaskConfig = #{
-        source => Source,
-        target => Target,
+        source => SourceEndpoint,
+        target => TargetEndpoint,
         mode => Mode,
         source_transport => SourceTransport,
         target_transport => TargetTransport,
@@ -549,7 +562,7 @@ start_replication_task(Config) ->
                 target_transport => TargetTransport,
                 filter => Filter
             },
-            case barrel_rep:replicate(Source, Target, Opts) of
+            case barrel_rep:replicate(SourceEndpoint, TargetEndpoint, Opts) of
                 {ok, _Result} -> {ok, undefined};  % No long-running task
                 Error -> Error
             end;
@@ -564,6 +577,36 @@ start_replication_task(Config) ->
                     Error
             end
     end.
+
+%% @private Apply auth config to a URL if it's remote
+apply_auth_to_url(Url, Auth) when is_binary(Url), map_size(Auth) > 0 ->
+    case is_remote_url(Url) of
+        true ->
+            %% Build endpoint map with auth
+            Endpoint = #{url => Url},
+            apply_auth_config(Endpoint, Auth);
+        false ->
+            Url
+    end;
+apply_auth_to_url(Url, _Auth) ->
+    Url.
+
+%% @private Check if URL is remote (has http(s):// scheme)
+is_remote_url(<<"http://", _/binary>>) -> true;
+is_remote_url(<<"https://", _/binary>>) -> true;
+is_remote_url(_) -> false.
+
+%% @private Apply auth config to endpoint map
+apply_auth_config(Endpoint, #{bearer_token := Token}) ->
+    Endpoint#{bearer_token => Token};
+apply_auth_config(Endpoint, #{<<"bearer_token">> := Token}) ->
+    Endpoint#{bearer_token => Token};
+apply_auth_config(Endpoint, #{basic_auth := {User, Pass}}) ->
+    Endpoint#{basic_auth => {User, Pass}};
+apply_auth_config(Endpoint, #{<<"basic_auth">> := #{<<"user">> := User, <<"pass">> := Pass}}) ->
+    Endpoint#{basic_auth => {User, Pass}};
+apply_auth_config(Endpoint, _) ->
+    Endpoint.
 
 %% @private Determine transport module from URL
 url_to_transport(Url) when is_binary(Url) ->
@@ -678,7 +721,7 @@ decode_policy(Doc) ->
         fun(<<"pattern">>, V, Acc) ->
             Acc#{pattern => binary_to_atom(V)};
            (<<"enabled">>, V, Acc) ->
-            Acc#{enabled => V};
+            Acc#{enabled => to_boolean(V)};
            (<<"mode">>, V, Acc) when is_binary(V) ->
             Acc#{mode => binary_to_atom(V)};
            (<<"name">>, V, Acc) ->
@@ -701,9 +744,20 @@ decode_policy(Doc) ->
             Acc#{cold_db => V};
            (<<"filter">>, V, Acc) ->
             Acc#{filter => V};
+           (<<"auth">>, V, Acc) when is_map(V) ->
+            Acc#{auth => V};
            (_, _, Acc) ->
             Acc
         end,
         #{},
         Doc
     ).
+
+%% @private Convert various representations to boolean
+to_boolean(true) -> true;
+to_boolean(false) -> false;
+to_boolean(<<"true">>) -> true;
+to_boolean(<<"false">>) -> false;
+to_boolean("true") -> true;
+to_boolean("false") -> false;
+to_boolean(_) -> false.
