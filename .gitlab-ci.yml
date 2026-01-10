@@ -19,8 +19,8 @@ test:
       - .cache/rebar3
       - _build
   before_script:
-    # Install cmake and build tools needed for hackney QUIC support (lsquic)
-    - apt-get update && apt-get install -y cmake build-essential libssl-dev
+    # Install build tools for native dependencies (rocksdb, hackney QUIC)
+    - apt-get update && apt-get install -y cmake build-essential libssl-dev liblz4-dev libsnappy-dev
     - rebar3 --version
   script:
     - rebar3 compile
