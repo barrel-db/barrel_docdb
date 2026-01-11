@@ -126,8 +126,23 @@ list() ->
     barrel_shard_map:list().
 
 %% @doc Get VDB info including shard statistics and replication status
+%% Will attempt to pull config from peers if not found locally
 -spec info(binary()) -> {ok, map()} | {error, not_found}.
 info(VdbName) when is_binary(VdbName) ->
+    %% Try local first, then pull from peers if not found
+    case barrel_shard_map:get_config(VdbName) of
+        {error, not_found} ->
+            %% Try to ensure config from peers
+            case ensure_vdb_config(VdbName) of
+                ok -> info_internal(VdbName);
+                {error, _} -> {error, not_found}
+            end;
+        {ok, _Config} ->
+            info_internal(VdbName)
+    end.
+
+%% @private Internal info function after config is ensured
+info_internal(VdbName) ->
     case barrel_shard_map:get_config(VdbName) of
         {ok, Config} ->
             {ok, ShardDbs} = barrel_shard_map:all_physical_dbs(VdbName),

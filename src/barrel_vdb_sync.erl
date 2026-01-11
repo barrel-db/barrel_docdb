@@ -369,7 +369,7 @@ do_ensure_config(VdbName) ->
 %% @private Pull config from a specific peer
 do_pull_config(VdbName, PeerUrl) ->
     Url = <<PeerUrl/binary, "/vdb/", VdbName/binary>>,
-    Headers = [{<<"Accept">>, <<"application/json">>}],
+    Headers = [{<<"Accept">>, <<"application/json">>} | auth_headers()],
     Options = [{recv_timeout, ?PULL_TIMEOUT}, {connect_timeout, 5000}],
 
     try
@@ -593,7 +593,7 @@ do_sync_all() ->
 do_sync_from_peer(PeerUrl) ->
     %% Get peer's VDB list
     Url = <<PeerUrl/binary, "/vdb">>,
-    Headers = [{<<"Accept">>, <<"application/json">>}],
+    Headers = [{<<"Accept">>, <<"application/json">>} | auth_headers()],
     Options = [{recv_timeout, ?PULL_TIMEOUT}, {connect_timeout, 5000}],
 
     try
@@ -622,4 +622,19 @@ do_sync_from_peer(PeerUrl) ->
     catch
         _:Error ->
             {error, {sync_failed, Error}}
+    end.
+
+%%====================================================================
+%% Internal Functions - Auth
+%%====================================================================
+
+%% @private Get auth headers for internal cluster communication
+%% Uses the BARREL_DOCDB_ADMIN_KEY environment variable if set
+auth_headers() ->
+    case os:getenv("BARREL_DOCDB_ADMIN_KEY") of
+        false -> [];
+        "" -> [];
+        Key when is_list(Key) ->
+            Token = list_to_binary(Key),
+            [{<<"Authorization">>, <<"Bearer ", Token/binary>>}]
     end.

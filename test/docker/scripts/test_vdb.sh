@@ -135,10 +135,17 @@ assert_eq "eu-west" "$west1_zone" "barrel-west1 is in eu-west zone"
 assert_eq "eu-west" "$west2_zone" "barrel-west2 is in eu-west zone"
 
 test_start "Setup: Register peers"
-# Register all nodes with each other through east1
+# Register peers on all nodes so they can communicate with each other
+# East1 knows about all others
 add_peer "$EAST1" "http://barrel-east2:8080" > /dev/null || true
 add_peer "$EAST1" "http://barrel-west1:8080" > /dev/null || true
 add_peer "$EAST1" "http://barrel-west2:8080" > /dev/null || true
+# East2 knows about east1
+add_peer "$EAST2" "http://barrel-east1:8080" > /dev/null || true
+# West1 knows about east1
+add_peer "$WEST1" "http://barrel-east1:8080" > /dev/null || true
+# West2 knows about east1
+add_peer "$WEST2" "http://barrel-east1:8080" > /dev/null || true
 
 # Wait for peer discovery to propagate
 sleep 3
@@ -195,7 +202,7 @@ test_start "Scatter-gather query"
 
 # Query all documents with type=test
 result=$(find_vdb_docs "$EAST1" "test_vdb" '{"where": [{"path": ["type"], "op": "==", "value": "test"}]}')
-count=$(echo "$result" | jq -r '.results | length')
+count=$(echo "$result" | jq -r '.docs | length')
 
 if [ "$count" -ge "20" ]; then
     echo -e "${GREEN}PASS${NC}: Scatter-gather returned all 20 documents"
@@ -206,7 +213,7 @@ fi
 
 # Query with filter
 result=$(find_vdb_docs "$EAST1" "test_vdb" '{"where": [{"path": ["value"], "op": ">", "value": 15}]}')
-count=$(echo "$result" | jq -r '.results | length')
+count=$(echo "$result" | jq -r '.docs | length')
 assert_eq "5" "$count" "Scatter-gather with filter returns 5 documents"
 
 # ============================================================================
@@ -215,27 +222,44 @@ assert_eq "5" "$count" "Scatter-gather with filter returns 5 documents"
 test_start "Scatter-gather with limit"
 
 result=$(find_vdb_docs "$EAST1" "test_vdb" '{"where": [{"path": ["type"], "op": "==", "value": "test"}], "limit": 5}')
-count=$(echo "$result" | jq -r '.results | length')
+count=$(echo "$result" | jq -r '.docs | length')
 assert_eq "5" "$count" "Scatter-gather respects limit"
 
 # ============================================================================
-# Test 5: Cross-zone document access
+# Test 5: On-demand VDB config sync
 # ============================================================================
-test_start "Cross-zone document access"
+test_start "On-demand VDB config sync"
 
-# Insert document via west1
-put_vdb_doc "$WEST1" "test_vdb" '{"_id": "west_doc", "value": 999, "origin": "eu-west"}' > /dev/null
+# Trigger on-demand config pull by accessing VDB info from west1
+# This tests that barrel_vdb_sync pulls config with auth from peers
+echo "  Triggering on-demand config pull on west1..."
+result=$(curl -sf "$WEST1/vdb/test_vdb" -H "$AUTH_HEADER" 2>&1)
 
-# Retrieve via east1
-result=$(get_vdb_doc "$EAST1" "test_vdb" "west_doc")
-assert_contains "$result" "eu-west" "Document from eu-west accessible from us-east"
+if [[ "$result" == *"shard_count"* ]]; then
+    echo -e "${GREEN}PASS${NC}: VDB config pulled on-demand to west1"
+else
+    echo -e "${RED}FAIL${NC}: Failed to pull VDB config to west1: $result"
+    exit 1
+fi
 
-# Insert via east2
-put_vdb_doc "$EAST2" "test_vdb" '{"_id": "east_doc", "value": 888, "origin": "us-east"}' > /dev/null
+# Verify VDB is now in the list
+vdbs=$(curl -sf "$WEST1/vdb" -H "$AUTH_HEADER" | jq -r '.vdbs[]' 2>/dev/null || echo "")
+assert_contains "$vdbs" "test_vdb" "VDB visible in west1 list after sync"
 
-# Retrieve via west2
-result=$(get_vdb_doc "$WEST2" "test_vdb" "east_doc")
-assert_contains "$result" "us-east" "Document from us-east accessible from eu-west"
+# Test west1 can now write to local shards
+put_vdb_doc "$WEST1" "test_vdb" '{"_id": "west_local_doc", "value": 777, "origin": "eu-west"}' > /dev/null
+
+# Verify doc is readable from west1 (local shard)
+result=$(get_vdb_doc "$WEST1" "test_vdb" "west_local_doc")
+assert_contains "$result" "eu-west" "Document written to west1 local shards"
+
+# Same for west2
+curl -sf "$WEST2/vdb/test_vdb" -H "$AUTH_HEADER" > /dev/null 2>&1
+put_vdb_doc "$WEST2" "test_vdb" '{"_id": "west2_local_doc", "value": 666, "origin": "eu-west2"}' > /dev/null
+result=$(get_vdb_doc "$WEST2" "test_vdb" "west2_local_doc")
+assert_contains "$result" "eu-west2" "Document written to west2 local shards"
+
+# Note: Cross-zone document access requires shard replication (tested separately)
 
 # ============================================================================
 # Test 6: VDB configuration sync across nodes
