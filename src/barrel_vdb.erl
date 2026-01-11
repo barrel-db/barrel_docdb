@@ -75,7 +75,10 @@ create(VdbName, Opts) when is_binary(VdbName), is_map(Opts) ->
         ok ->
             %% Create all physical shard databases
             case create_shard_dbs(VdbName) of
-                ok -> ok;
+                ok ->
+                    %% Register with VDB registry
+                    barrel_vdb_registry:register_vdb(VdbName),
+                    ok;
                 {error, _} = Err ->
                     %% Rollback shard map on failure
                     barrel_shard_map:delete(VdbName),
@@ -98,6 +101,8 @@ delete(VdbName) when is_binary(VdbName) ->
             lists:foreach(fun(DbName) ->
                 barrel_docdb:delete_db(DbName)
             end, ShardDbs),
+            %% Unregister from VDB registry
+            barrel_vdb_registry:unregister_vdb(VdbName),
             %% Delete shard map
             barrel_shard_map:delete(VdbName)
     end.
