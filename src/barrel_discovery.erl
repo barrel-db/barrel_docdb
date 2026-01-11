@@ -37,6 +37,10 @@
     stop/0,
     node_info/0,
     node_id/0,
+    %% Zone management
+    get_zone/0,
+    nodes_in_zone/1,
+    list_zones/0,
     %% Peer management
     add_peer/1,
     add_peer/2,
@@ -71,6 +75,7 @@
 
 -record(state, {
     node_id :: binary(),
+    zone :: binary() | undefined,
     refresh_timer :: reference() | undefined,
     refresh_interval :: pos_integer()
 }).
@@ -78,6 +83,7 @@
 -type peer_info() :: #{
     url := binary(),
     node_id => binary(),
+    zone => binary(),
     version => binary(),
     databases => [binary()],
     federations => [binary()],
@@ -128,6 +134,23 @@ node_info() ->
 -spec node_id() -> {ok, binary()}.
 node_id() ->
     gen_server:call(?SERVER, node_id).
+
+%% @doc Get this node's zone
+%% Returns undefined if no zone is configured
+-spec get_zone() -> {ok, binary() | undefined}.
+get_zone() ->
+    gen_server:call(?SERVER, get_zone).
+
+%% @doc Get all peer URLs in a specific zone
+%% Returns list of peer URLs that are in the given zone
+-spec nodes_in_zone(binary()) -> {ok, [binary()]}.
+nodes_in_zone(ZoneName) when is_binary(ZoneName) ->
+    gen_server:call(?SERVER, {nodes_in_zone, ZoneName}).
+
+%% @doc List all known zones from peers
+-spec list_zones() -> {ok, [binary()]}.
+list_zones() ->
+    gen_server:call(?SERVER, list_zones).
 
 %% @doc Add a peer to the registry (async by default)
 %% Returns ok immediately; peer info is fetched in background.
@@ -249,6 +272,18 @@ init(Opts) ->
         Id -> Id
     end,
 
+    %% Get zone from opts or application config
+    Zone = case maps:get(zone, Opts, undefined) of
+        undefined ->
+            case application:get_env(barrel_docdb, zone) of
+                {ok, Z} when is_binary(Z) -> Z;
+                {ok, Z} when is_list(Z) -> list_to_binary(Z);
+                _ -> undefined
+            end;
+        Z when is_binary(Z) -> Z;
+        Z when is_list(Z) -> list_to_binary(Z)
+    end,
+
     RefreshInterval = maps:get(refresh_interval, Opts, ?DEFAULT_REFRESH_INTERVAL),
 
     %% Start refresh timer
@@ -265,16 +300,32 @@ init(Opts) ->
 
     {ok, #state{
         node_id = NodeId,
+        zone = Zone,
         refresh_timer = TimerRef,
         refresh_interval = RefreshInterval
     }}.
 
-handle_call(node_info, _From, #state{node_id = NodeId} = State) ->
-    Info = build_node_info(NodeId),
+handle_call(node_info, _From, #state{node_id = NodeId, zone = Zone} = State) ->
+    Info = build_node_info(NodeId, Zone),
     {reply, {ok, Info}, State};
 
 handle_call(node_id, _From, #state{node_id = NodeId} = State) ->
     {reply, {ok, NodeId}, State};
+
+handle_call(get_zone, _From, #state{zone = Zone} = State) ->
+    {reply, {ok, Zone}, State};
+
+handle_call(nodes_in_zone, _From, State) ->
+    Result = do_nodes_in_zone(all),
+    {reply, Result, State};
+
+handle_call({nodes_in_zone, ZoneName}, _From, State) ->
+    Result = do_nodes_in_zone(ZoneName),
+    {reply, Result, State};
+
+handle_call(list_zones, _From, State) ->
+    Result = do_list_zones(),
+    {reply, Result, State};
 
 handle_call({add_peer, Url}, _From, State) ->
     Result = do_add_peer(Url),
@@ -399,7 +450,7 @@ generate_node_id() ->
     <<Hostname/binary, "-", Random/binary>>.
 
 %% @private Build node info map
-build_node_info(NodeId) ->
+build_node_info(NodeId, Zone) ->
     %% Get list of databases (filter out internal system dbs)
     AllDbs = barrel_docdb:list_dbs(),
     Databases = [Db || Db <- AllDbs, not is_system_db(Db)],
@@ -412,14 +463,19 @@ build_node_info(NodeId) ->
     {ok, Peers} = do_list_peers(),
     PeerUrls = [maps:get(url, P) || P <- Peers, maps:get(status, P, active) =:= active],
 
-    #{
+    BaseInfo = #{
         node_id => NodeId,
         version => barrel_version(),
         databases => Databases,
         federations => FederationNames,
         known_peers => PeerUrls,
         timestamp => erlang:system_time(millisecond)
-    }.
+    },
+    %% Add zone if configured
+    case Zone of
+        undefined -> BaseInfo;
+        _ -> BaseInfo#{zone => Zone}
+    end.
 
 %% @private Get barrel version
 barrel_version() ->
@@ -662,7 +718,43 @@ matches_filter(Peer, Filter) ->
         undefined -> true;
         DbName -> lists:member(DbName, maps:get(databases, Peer, []))
     end,
-    TagMatch andalso StatusMatch andalso DbMatch.
+    ZoneMatch = case maps:get(zone, Filter, undefined) of
+        undefined -> true;
+        ZoneName -> maps:get(zone, Peer, undefined) =:= ZoneName
+    end,
+    TagMatch andalso StatusMatch andalso DbMatch andalso ZoneMatch.
+
+%% @private Get peers in a specific zone
+do_nodes_in_zone(all) ->
+    %% Return all peers grouped by zone
+    {ok, Peers} = do_list_peers(),
+    ActivePeers = filter_peers(Peers, #{status => active}),
+    Urls = [maps:get(url, P) || P <- ActivePeers],
+    {ok, Urls};
+do_nodes_in_zone(ZoneName) ->
+    {ok, Peers} = do_list_peers(),
+    ZonePeers = filter_peers(Peers, #{zone => ZoneName, status => active}),
+    Urls = [maps:get(url, P) || P <- ZonePeers],
+    {ok, Urls}.
+
+%% @private List all known zones from peers
+do_list_zones() ->
+    {ok, Peers} = do_list_peers(),
+    Zones = lists:foldl(
+        fun(Peer, Acc) ->
+            case maps:get(zone, Peer, undefined) of
+                undefined -> Acc;
+                Zone ->
+                    case lists:member(Zone, Acc) of
+                        true -> Acc;
+                        false -> [Zone | Acc]
+                    end
+            end
+        end,
+        [],
+        Peers
+    ),
+    {ok, lists:sort(Zones)}.
 
 %% @private Get peer by node ID
 do_get_peer_by_node_id(NodeId) ->
