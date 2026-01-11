@@ -70,6 +70,7 @@
 %% @doc Create a new virtual database
 %% Creates the shard map and all underlying physical databases
 %% If replica_factor > 1 in placement config, sets up replication
+%% Broadcasts config to meta database for cross-node sync
 -spec create(binary(), map()) -> ok | {error, term()}.
 create(VdbName, Opts) when is_binary(VdbName), is_map(Opts) ->
     case barrel_shard_map:create(VdbName, Opts) of
@@ -81,6 +82,8 @@ create(VdbName, Opts) when is_binary(VdbName), is_map(Opts) ->
                     barrel_vdb_registry:register_vdb(VdbName),
                     %% Setup replication if replica_factor > 1
                     setup_replication_if_needed(VdbName, Opts),
+                    %% Broadcast config to meta database for cross-node sync
+                    broadcast_config_async(VdbName),
                     ok;
                 {error, _} = Err ->
                     %% Rollback shard map on failure
@@ -383,11 +386,27 @@ get_doc_id(Doc) ->
     end.
 
 %% @private Route a document to its shard database
+%% If VDB config not found locally, attempts to pull from peers
 route_to_shard(VdbName, DocId) ->
     case barrel_shard_map:shard_for_doc(VdbName, DocId) of
         {ok, ShardId} ->
             ShardDb = barrel_shard_map:physical_db_name(VdbName, ShardId),
             {ok, ShardDb};
+        {error, not_found} ->
+            %% VDB not found locally - try to pull config from peers
+            case ensure_vdb_config(VdbName) of
+                ok ->
+                    %% Config imported, retry routing
+                    case barrel_shard_map:shard_for_doc(VdbName, DocId) of
+                        {ok, ShardId} ->
+                            ShardDb = barrel_shard_map:physical_db_name(VdbName, ShardId),
+                            {ok, ShardDb};
+                        {error, _} = Err ->
+                            Err
+                    end;
+                {error, _} = Err ->
+                    Err
+            end;
         {error, _} = Err ->
             Err
     end.
@@ -610,5 +629,29 @@ setup_replication_if_needed(VdbName, Opts) ->
                 {error, Reason} ->
                     logger:warning("VDB ~s: replication setup failed: ~p",
                                   [VdbName, Reason])
+            end
+    end.
+
+%% @private Broadcast VDB config to meta database asynchronously
+broadcast_config_async(VdbName) ->
+    spawn(fun() ->
+        case barrel_vdb_sync:broadcast_config(VdbName) of
+            ok ->
+                logger:debug("VDB ~s: config broadcast to meta database", [VdbName]);
+            {error, Reason} ->
+                logger:warning("VDB ~s: failed to broadcast config: ~p", [VdbName, Reason])
+        end
+    end).
+
+%% @private Ensure VDB config exists locally, pull from peers if needed
+%% This is used for operations that might access VDBs created on other nodes
+ensure_vdb_config(VdbName) ->
+    case barrel_shard_map:exists(VdbName) of
+        true ->
+            ok;
+        false ->
+            case barrel_vdb_sync:ensure_config(VdbName) of
+                {ok, _Config} -> ok;
+                {error, _} = Err -> Err
             end
     end.

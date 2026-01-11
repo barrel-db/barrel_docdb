@@ -455,6 +455,12 @@ build_node_info(NodeId, Zone) ->
     AllDbs = barrel_docdb:list_dbs(),
     Databases = [Db || Db <- AllDbs, not is_system_db(Db)],
 
+    %% Get list of VDBs (virtual databases / sharded)
+    Vdbs = case barrel_shard_map:list() of
+        {ok, VdbList} -> VdbList;
+        _ -> []
+    end,
+
     %% Get list of federations
     {ok, Federations} = barrel_federation:list(),
     FederationNames = [maps:get(name, F) || F <- Federations],
@@ -467,6 +473,7 @@ build_node_info(NodeId, Zone) ->
         node_id => NodeId,
         version => barrel_version(),
         databases => Databases,
+        vdbs => Vdbs,
         federations => FederationNames,
         known_peers => PeerUrls,
         timestamp => erlang:system_time(millisecond)

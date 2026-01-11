@@ -51,4 +51,14 @@ init([]) ->
         modules => [barrel_vdb_registry]
     },
 
-    {ok, {SupFlags, [Registry]}}.
+    %% VDB Sync - synchronizes VDB config across nodes
+    Sync = #{
+        id => barrel_vdb_sync,
+        start => {barrel_vdb_sync, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [barrel_vdb_sync]
+    },
+
+    {ok, {SupFlags, [Registry, Sync]}}.
