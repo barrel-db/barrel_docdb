@@ -50,6 +50,9 @@ groups() ->
             find_all,
             find_with_selector,
             find_with_limit,
+            find_with_offset,
+            find_with_sort,
+            get_changes_basic,
             fold_docs
         ]}
     ].
@@ -277,6 +280,59 @@ find_with_limit(_Config) ->
     %% Find with limit
     {ok, Results} = barrel_vdb:find(VdbName, #{}, #{limit => 10}),
     ?assertEqual(10, length(Results)).
+
+find_with_offset(_Config) ->
+    VdbName = <<"test_find_off">>,
+    ?assertEqual(ok, barrel_vdb:create(VdbName, #{shard_count => 2})),
+    %% Insert docs with sequential IDs
+    lists:foreach(fun(I) ->
+        DocId = list_to_binary(io_lib:format("off~3..0B", [I])),
+        {ok, _} = barrel_vdb:put_doc(VdbName, #{<<"id">> => DocId, <<"n">> => I})
+    end, lists:seq(1, 30)),
+    %% Find with offset and limit (pagination)
+    {ok, Page1} = barrel_vdb:find(VdbName, #{}, #{limit => 10, offset => 0}),
+    ?assertEqual(10, length(Page1)),
+    {ok, Page2} = barrel_vdb:find(VdbName, #{}, #{limit => 10, offset => 10}),
+    ?assertEqual(10, length(Page2)),
+    {ok, Page3} = barrel_vdb:find(VdbName, #{}, #{limit => 10, offset => 20}),
+    ?assertEqual(10, length(Page3)),
+    %% Pages should not overlap (different doc IDs)
+    Page1Ids = [maps:get(<<"id">>, D) || D <- Page1],
+    Page2Ids = [maps:get(<<"id">>, D) || D <- Page2],
+    ?assertEqual([], Page1Ids -- (Page1Ids -- Page2Ids)).
+
+find_with_sort(_Config) ->
+    VdbName = <<"test_find_sort">>,
+    ?assertEqual(ok, barrel_vdb:create(VdbName, #{shard_count => 4})),
+    %% Insert docs with different values
+    lists:foreach(fun(I) ->
+        DocId = list_to_binary("sort" ++ integer_to_list(I)),
+        {ok, _} = barrel_vdb:put_doc(VdbName, #{<<"id">> => DocId, <<"val">> => I})
+    end, lists:seq(1, 20)),
+    %% Find with ascending sort
+    {ok, AscResults} = barrel_vdb:find(VdbName, #{}, #{sort => {<<"val">>, asc}}),
+    AscVals = [maps:get(<<"val">>, D) || D <- AscResults],
+    ?assertEqual(lists:sort(AscVals), AscVals),
+    %% Find with descending sort
+    {ok, DescResults} = barrel_vdb:find(VdbName, #{}, #{sort => {<<"val">>, desc}}),
+    DescVals = [maps:get(<<"val">>, D) || D <- DescResults],
+    ?assertEqual(lists:reverse(lists:sort(DescVals)), DescVals).
+
+get_changes_basic(_Config) ->
+    VdbName = <<"test_changes">>,
+    ?assertEqual(ok, barrel_vdb:create(VdbName, #{shard_count => 2})),
+    %% Insert some docs
+    lists:foreach(fun(I) ->
+        DocId = list_to_binary("chg" ++ integer_to_list(I)),
+        {ok, _} = barrel_vdb:put_doc(VdbName, #{<<"id">> => DocId})
+    end, lists:seq(1, 5)),
+    %% Get changes
+    {ok, Changes} = barrel_vdb:get_changes(VdbName, #{}),
+    ?assert(is_map(Changes)),
+    ?assert(maps:is_key(changes, Changes)),
+    ?assert(maps:is_key(last_seq, Changes)),
+    ChangesList = maps:get(changes, Changes),
+    ?assertEqual(5, length(ChangesList)).
 
 fold_docs(_Config) ->
     VdbName = <<"test_fold">>,

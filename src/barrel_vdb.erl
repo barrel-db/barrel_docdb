@@ -258,10 +258,12 @@ find(VdbName, Query, Opts) when is_binary(VdbName), is_map(Query) ->
         {ok, ShardDbs} ->
             %% Normalize query - ensure where clause exists
             NormalizedQuery = normalize_query(Query),
+            %% Remove pagination opts from shard query - we apply at VDB level after merge
+            ShardOpts = maps:without([limit, offset, <<"limit">>, <<"offset">>], Opts),
             %% Scatter: query all shards in parallel
             Results = barrel_parallel:pmap(
                 fun(ShardDb) ->
-                    case barrel_docdb:find(ShardDb, NormalizedQuery, Opts) of
+                    case barrel_docdb:find(ShardDb, NormalizedQuery, ShardOpts) of
                         {ok, Docs, _Meta} ->
                             %% Extract actual doc from result format
                             [extract_doc(D) || D <- Docs];
@@ -270,7 +272,7 @@ find(VdbName, Query, Opts) when is_binary(VdbName), is_map(Query) ->
                 end,
                 ShardDbs
             ),
-            %% Gather: merge results
+            %% Gather: merge results with VDB-level pagination
             MergedResults = merge_query_results(lists:flatten(Results), Query, Opts),
             {ok, MergedResults};
         {error, _} = Err ->
@@ -280,24 +282,28 @@ find(VdbName, Query, Opts) when is_binary(VdbName), is_map(Query) ->
 %% @doc Get changes across all shards
 -spec get_changes(binary(), map()) -> {ok, map()} | {error, term()}.
 get_changes(VdbName, Opts) ->
-    get_changes(VdbName, 0, Opts).
+    get_changes(VdbName, first, Opts).
 
--spec get_changes(binary(), non_neg_integer() | binary(), map()) -> {ok, map()} | {error, term()}.
+-spec get_changes(binary(), first | non_neg_integer() | binary(), map()) -> {ok, map()} | {error, term()}.
 get_changes(VdbName, Since, Opts) when is_binary(VdbName) ->
     case barrel_shard_map:all_physical_dbs(VdbName) of
         {ok, ShardDbs} ->
-            %% Get changes from all shards
+            %% Get changes from all shards in parallel
+            %% Note: We fetch more from each shard and merge/limit at VDB level
+            ShardOpts = maps:remove(limit, Opts),
             AllChanges = barrel_parallel:pmap(
                 fun(ShardDb) ->
-                    case barrel_changes:get_changes(ShardDb, Since, Opts) of
-                        {ok, Changes} -> Changes;
-                        {error, _} -> #{changes => [], last_seq => 0}
+                    case barrel_docdb:get_changes(ShardDb, Since, ShardOpts) of
+                        {ok, Changes, LastSeq} ->
+                            #{changes => Changes, last_seq => LastSeq};
+                        {error, _} ->
+                            #{changes => [], last_seq => 0}
                     end
                 end,
                 ShardDbs
             ),
-            %% Merge changes by timestamp (HLC)
-            MergedChanges = merge_changes(AllChanges),
+            %% Merge changes by HLC timestamp and apply VDB-level limit
+            MergedChanges = merge_changes(AllChanges, Opts),
             {ok, MergedChanges};
         {error, _} = Err ->
             Err
@@ -434,75 +440,137 @@ extract_doc(Result) when is_map(Result) ->
 
 %% @private Merge query results from multiple shards
 merge_query_results(Results, Query, Opts) ->
-    %% Apply limit if specified
-    Limit = maps:get(limit, Opts, maps:get(<<"limit">>, Query, undefined)),
-
-    %% Apply sort if specified
-    Sort = maps:get(sort, Opts, maps:get(<<"sort">>, Query, undefined)),
+    %% Apply sort if specified (must sort before offset/limit)
+    Sort = maps:get(sort, Opts, maps:get(<<"sort">>, Query,
+           maps:get(order_by, Opts, maps:get(<<"order_by">>, Query, undefined)))),
     Sorted = case Sort of
         undefined -> Results;
         SortSpec -> sort_results(Results, SortSpec)
     end,
 
-    %% Apply limit
-    case Limit of
-        undefined -> Sorted;
-        N when is_integer(N) -> lists:sublist(Sorted, N);
+    %% Apply offset if specified
+    Offset = maps:get(offset, Opts, maps:get(<<"offset">>, Query, 0)),
+    AfterOffset = case Offset of
+        0 -> Sorted;
+        N when is_integer(N), N > 0 -> safe_drop(N, Sorted);
         _ -> Sorted
+    end,
+
+    %% Apply limit if specified
+    Limit = maps:get(limit, Opts, maps:get(<<"limit">>, Query, undefined)),
+    case Limit of
+        undefined -> AfterOffset;
+        M when is_integer(M) -> lists:sublist(AfterOffset, M);
+        _ -> AfterOffset
     end.
 
+%% @private Safely drop N elements from list
+safe_drop(N, List) when N >= length(List) -> [];
+safe_drop(N, List) -> lists:nthtail(N, List).
+
 %% @private Sort results by sort specification
+%% Supports formats:
+%%   - [{#{<<"field">> => <<"asc">>}] - list of maps
+%%   - [{field, asc}] - list of tuples
+%%   - #{<<"field">> => <<"asc">>} - single map
+%%   - {field, asc} - single tuple
+%%   - <<"field">> or field - single field ascending
 sort_results(Results, SortSpec) when is_list(SortSpec), length(SortSpec) > 0 ->
-    %% Simple single-field sort for now
     [FirstSort | _] = SortSpec,
-    case maps:to_list(FirstSort) of
-        [{Field, Direction}] when is_binary(Field) ->
-            Comparator = case Direction of
-                <<"asc">> -> fun(A, B) ->
-                    maps:get(Field, A, null) =< maps:get(Field, B, null)
-                end;
-                <<"desc">> -> fun(A, B) ->
-                    maps:get(Field, A, null) >= maps:get(Field, B, null)
-                end;
-                _ -> fun(_, _) -> true end
-            end,
-            lists:sort(Comparator, Results);
-        _ ->
-            Results
-    end;
+    sort_by_spec(Results, FirstSort);
+sort_results(Results, SortSpec) when is_map(SortSpec) ->
+    sort_by_spec(Results, SortSpec);
+sort_results(Results, {Field, Direction}) ->
+    sort_by_field(Results, Field, Direction);
+sort_results(Results, Field) when is_binary(Field); is_atom(Field) ->
+    sort_by_field(Results, Field, asc);
 sort_results(Results, _) ->
     Results.
 
+%% @private Sort by a single sort spec (map or tuple)
+sort_by_spec(Results, Spec) when is_map(Spec) ->
+    case maps:to_list(Spec) of
+        [{Field, Direction}] -> sort_by_field(Results, Field, Direction);
+        _ -> Results
+    end;
+sort_by_spec(Results, {Field, Direction}) ->
+    sort_by_field(Results, Field, Direction);
+sort_by_spec(Results, Field) when is_binary(Field); is_atom(Field) ->
+    sort_by_field(Results, Field, asc);
+sort_by_spec(Results, _) ->
+    Results.
+
+%% @private Sort results by field and direction
+sort_by_field(Results, Field, Direction) ->
+    FieldBin = if is_atom(Field) -> atom_to_binary(Field, utf8); true -> Field end,
+    IsAsc = case Direction of
+        asc -> true;
+        <<"asc">> -> true;
+        desc -> false;
+        <<"desc">> -> false;
+        _ -> true
+    end,
+    Comparator = if
+        IsAsc -> fun(A, B) -> compare_values(maps:get(FieldBin, A, null), maps:get(FieldBin, B, null)) end;
+        true -> fun(A, B) -> compare_values(maps:get(FieldBin, B, null), maps:get(FieldBin, A, null)) end
+    end,
+    lists:sort(Comparator, Results).
+
+%% @private Compare two values for sorting (null-safe)
+compare_values(null, _) -> true;
+compare_values(_, null) -> false;
+compare_values(A, B) -> A =< B.
+
 %% @private Merge changes from multiple shards
-merge_changes(AllChanges) ->
+merge_changes(AllChanges, Opts) ->
     %% Collect all changes
     AllChangesList = lists:flatmap(
         fun(#{changes := Changes}) -> Changes;
+           (#{<<"changes">> := Changes}) -> Changes;
            (_) -> []
         end,
         AllChanges
     ),
 
-    %% Sort by sequence/timestamp
+    %% Sort by HLC timestamp (seq contains HLC timestamp for ordering)
+    %% HLC format allows direct comparison for causal ordering
     SortedChanges = lists:sort(
         fun(A, B) ->
-            SeqA = maps:get(seq, A, 0),
-            SeqB = maps:get(seq, B, 0),
+            %% Try seq first (HLC timestamp), then fall back to ts
+            SeqA = maps:get(seq, A, maps:get(<<"seq">>, A, maps:get(ts, A, 0))),
+            SeqB = maps:get(seq, B, maps:get(<<"seq">>, B, maps:get(ts, B, 0))),
             SeqA =< SeqB
         end,
         AllChangesList
     ),
 
+    %% Apply limit if specified
+    Limit = maps:get(limit, Opts, undefined),
+    LimitedChanges = case Limit of
+        undefined -> SortedChanges;
+        N when is_integer(N), N > 0 -> lists:sublist(SortedChanges, N);
+        _ -> SortedChanges
+    end,
+
     %% Calculate last_seq (max across shards)
     LastSeq = lists:foldl(
-        fun(#{last_seq := Seq}, Max) when Seq > Max -> Seq;
-           (_, Max) -> Max
+        fun(Change, Max) ->
+            Seq = case Change of
+                #{last_seq := S} -> S;
+                #{<<"last_seq">> := S} -> S;
+                _ -> 0
+            end,
+            if Seq > Max -> Seq; true -> Max end
         end,
         0,
         AllChanges
     ),
 
+    %% Calculate if there are more changes
+    HasMore = length(SortedChanges) > length(LimitedChanges),
+
     #{
-        changes => SortedChanges,
-        last_seq => LastSeq
+        changes => LimitedChanges,
+        last_seq => LastSeq,
+        has_more => HasMore
     }.
