@@ -99,6 +99,7 @@ init(Opts) ->
             {"/vdb", barrel_http_handler, #{action => vdb_list}},
             {"/vdb/:vdb", barrel_http_handler, #{action => vdb_info}},
             {"/vdb/:vdb/_shards", barrel_http_handler, #{action => vdb_shards}},
+            {"/vdb/:vdb/_replication", barrel_http_handler, #{action => vdb_replication}},
             {"/vdb/:vdb/_changes", barrel_http_handler, #{action => vdb_changes}},
             {"/vdb/:vdb/_bulk_docs", barrel_http_handler, #{action => vdb_bulk_docs}},
             {"/vdb/:vdb/_find", barrel_http_handler, #{action => vdb_find}},

@@ -69,6 +69,7 @@
 
 %% @doc Create a new virtual database
 %% Creates the shard map and all underlying physical databases
+%% If replica_factor > 1 in placement config, sets up replication
 -spec create(binary(), map()) -> ok | {error, term()}.
 create(VdbName, Opts) when is_binary(VdbName), is_map(Opts) ->
     case barrel_shard_map:create(VdbName, Opts) of
@@ -78,6 +79,8 @@ create(VdbName, Opts) when is_binary(VdbName), is_map(Opts) ->
                 ok ->
                     %% Register with VDB registry
                     barrel_vdb_registry:register_vdb(VdbName),
+                    %% Setup replication if replica_factor > 1
+                    setup_replication_if_needed(VdbName, Opts),
                     ok;
                 {error, _} = Err ->
                     %% Rollback shard map on failure
@@ -89,13 +92,15 @@ create(VdbName, Opts) when is_binary(VdbName), is_map(Opts) ->
     end.
 
 %% @doc Delete a virtual database
-%% Deletes the shard map and all underlying physical databases
+%% Deletes the shard map, replication policies, and all underlying physical databases
 -spec delete(binary()) -> ok | {error, term()}.
 delete(VdbName) when is_binary(VdbName) ->
     case barrel_shard_map:exists(VdbName) of
         false ->
             {error, not_found};
         true ->
+            %% Teardown replication first
+            barrel_vdb_replication:teardown_replication(VdbName),
             %% Delete all physical shard databases
             {ok, ShardDbs} = barrel_shard_map:all_physical_dbs(VdbName),
             lists:foreach(fun(DbName) ->
@@ -117,7 +122,7 @@ exists(VdbName) when is_binary(VdbName) ->
 list() ->
     barrel_shard_map:list().
 
-%% @doc Get VDB info including shard statistics
+%% @doc Get VDB info including shard statistics and replication status
 -spec info(binary()) -> {ok, map()} | {error, not_found}.
 info(VdbName) when is_binary(VdbName) ->
     case barrel_shard_map:get_config(VdbName) of
@@ -147,6 +152,12 @@ info(VdbName) when is_binary(VdbName) ->
             TotalDocs = lists:sum([maps:get(doc_count, S) || S <- ShardStats]),
             TotalSize = lists:sum([maps:get(disk_size, S) || S <- ShardStats]),
 
+            %% Get replication status
+            ReplicationStatus = case barrel_vdb_replication:get_status(VdbName) of
+                {ok, RepStatus} -> RepStatus;
+                {error, _} -> #{enabled => false}
+            end,
+
             Info = #{
                 name => VdbName,
                 shard_count => maps:get(shard_count, Config),
@@ -156,7 +167,8 @@ info(VdbName) when is_binary(VdbName) ->
                 total_docs => TotalDocs,
                 total_disk_size => TotalSize,
                 shards => ShardStats,
-                assignments => Assignments
+                assignments => Assignments,
+                replication => ReplicationStatus
             },
             {ok, Info};
         {error, not_found} ->
@@ -579,3 +591,24 @@ merge_changes(AllChanges, Opts) ->
         last_seq => LastSeq,
         has_more => HasMore
     }.
+
+%% @private Setup replication if placement config has replica_factor > 1
+setup_replication_if_needed(VdbName, Opts) ->
+    Placement = maps:get(placement, Opts, #{}),
+    ReplicaFactor = maps:get(replica_factor, Placement, 1),
+    case ReplicaFactor of
+        1 ->
+            %% No replication needed
+            ok;
+        _ ->
+            %% Setup replication - extract auth from opts if provided
+            RepOpts = maps:with([auth], Opts),
+            case barrel_vdb_replication:setup_replication(VdbName, RepOpts) of
+                ok ->
+                    logger:info("VDB ~s: replication setup complete with replica_factor=~p",
+                               [VdbName, ReplicaFactor]);
+                {error, Reason} ->
+                    logger:warning("VDB ~s: replication setup failed: ~p",
+                                  [VdbName, Reason])
+            end
+    end.

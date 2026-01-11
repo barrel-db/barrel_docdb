@@ -524,6 +524,8 @@ handle_action(vdb_info, <<"DELETE">>, Req) ->
     handle_vdb_delete(Req);
 handle_action(vdb_shards, <<"GET">>, Req) ->
     handle_vdb_shards(Req);
+handle_action(vdb_replication, <<"GET">>, Req) ->
+    handle_vdb_replication(Req);
 handle_action(vdb_changes, <<"GET">>, Req) ->
     handle_vdb_changes(Req);
 handle_action(vdb_changes, <<"POST">>, Req) ->
@@ -954,6 +956,19 @@ handle_vdb_shards(Req) ->
             throw({error, 404, <<"VDB not found">>})
     end.
 
+%% Get VDB replication status
+handle_vdb_replication(Req) ->
+    VdbName = cowboy_req:binding(vdb, Req),
+    case barrel_vdb_replication:get_status(VdbName) of
+        {ok, Status} ->
+            %% Convert atom keys to binary and sanitize values
+            SafeStatus = sanitize_replication_status(Status),
+            Body = encode_response(SafeStatus, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"VDB not found">>})
+    end.
+
 %% Get VDB changes (merged from all shards)
 handle_vdb_changes(Req0) ->
     VdbName = cowboy_req:binding(vdb, Req0),
@@ -1152,6 +1167,70 @@ sanitize_shard_range(Range) ->
         #{},
         Range
     ).
+
+%% Sanitize replication status for JSON encoding
+sanitize_replication_status(Status) ->
+    maps:fold(
+        fun(vdb_name, V, Acc) -> Acc#{<<"vdb_name">> => V};
+           (replica_factor, V, Acc) -> Acc#{<<"replica_factor">> => V};
+           (shard_count, V, Acc) -> Acc#{<<"shard_count">> => V};
+           (policies, V, Acc) when is_map(V) ->
+               %% Convert policy counts
+               SafePolicies = maps:fold(
+                   fun(K, Val, PAcc) when is_atom(K) ->
+                       PAcc#{atom_to_binary(K, utf8) => Val};
+                      (K, Val, PAcc) ->
+                       PAcc#{K => Val}
+                   end,
+                   #{},
+                   V
+               ),
+               Acc#{<<"policies">> => SafePolicies};
+           (shards, V, Acc) when is_map(V) ->
+               %% Convert shard statuses (keyed by shard id integer)
+               SafeShards = maps:fold(
+                   fun(ShardId, ShardStatus, SAcc) when is_integer(ShardId) ->
+                       SAcc#{integer_to_binary(ShardId) => sanitize_shard_replication_status(ShardStatus)};
+                      (ShardId, ShardStatus, SAcc) ->
+                       SAcc#{ShardId => sanitize_shard_replication_status(ShardStatus)}
+                   end,
+                   #{},
+                   V
+               ),
+               Acc#{<<"shards">> => SafeShards};
+           (K, V, Acc) when is_atom(K) ->
+               Acc#{atom_to_binary(K, utf8) => V};
+           (K, V, Acc) ->
+               Acc#{K => V}
+        end,
+        #{},
+        Status
+    ).
+
+%% Sanitize individual shard replication status
+sanitize_shard_replication_status(Status) when is_map(Status) ->
+    maps:fold(
+        fun(policy_found, V, Acc) -> Acc#{<<"policy_found">> => V};
+           (policy_name, V, Acc) -> Acc#{<<"policy_name">> => V};
+           (policy_enabled, V, Acc) -> Acc#{<<"policy_enabled">> => V};
+           (task_count, V, Acc) -> Acc#{<<"task_count">> => V};
+           (tasks, V, Acc) when is_list(V) ->
+               Acc#{<<"tasks">> => [sanitize_json_value(T) || T <- V]};
+           (primary, V, Acc) -> Acc#{<<"primary">> => V};
+           (replicas, V, Acc) -> Acc#{<<"replicas">> => V};
+           (shard_status, V, Acc) when is_atom(V) ->
+               Acc#{<<"shard_status">> => atom_to_binary(V, utf8)};
+           (shard_status, V, Acc) -> Acc#{<<"shard_status">> => V};
+           (K, V, Acc) when is_atom(K) ->
+               Acc#{atom_to_binary(K, utf8) => sanitize_json_value(V)};
+           (K, V, Acc) ->
+               Acc#{K => sanitize_json_value(V)}
+        end,
+        #{},
+        Status
+    );
+sanitize_shard_replication_status(Status) ->
+    Status.
 
 %% Convert changes opts from query string
 convert_changes_opts(Opts) ->
