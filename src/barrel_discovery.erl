@@ -273,15 +273,17 @@ init(Opts) ->
     end,
 
     %% Get zone from opts or application config
+    %% Treat empty strings as undefined
     Zone = case maps:get(zone, Opts, undefined) of
         undefined ->
             case application:get_env(barrel_docdb, zone) of
-                {ok, Z} when is_binary(Z) -> Z;
-                {ok, Z} when is_list(Z) -> list_to_binary(Z);
+                {ok, Z} when is_binary(Z), Z =/= <<>> -> Z;
+                {ok, Z} when is_list(Z), Z =/= "" -> list_to_binary(Z);
                 _ -> undefined
             end;
-        Z when is_binary(Z) -> Z;
-        Z when is_list(Z) -> list_to_binary(Z)
+        Z when is_binary(Z), Z =/= <<>> -> Z;
+        Z when is_list(Z), Z =/= "" -> list_to_binary(Z);
+        _ -> undefined
     end,
 
     RefreshInterval = maps:get(refresh_interval, Opts, ?DEFAULT_REFRESH_INTERVAL),

@@ -32,6 +32,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --no-build    Skip Docker build"
             echo "  --cleanup     Remove containers and volumes after tests"
             echo "  --test NAME   Run specific test (http_api, replication, federation, policies, tiered)"
+            echo ""
+            echo "Note: VDB multi-region tests use a separate cluster. Run them with:"
+            echo "  ./run_vdb_tests.sh"
             exit 0
             ;;
         *)

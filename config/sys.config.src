@@ -5,7 +5,9 @@
         %% HTTP server configuration
         {http_enabled, true},
         {http_port, ${BARREL_HTTP_PORT:-8080}},
-        {http_acceptors, ${BARREL_HTTP_ACCEPTORS:-100}}
+        {http_acceptors, ${BARREL_HTTP_ACCEPTORS:-100}},
+        %% Zone configuration for multi-datacenter deployments
+        {zone, "${BARREL_ZONE:-}"}
     ]},
     {kernel, [
         {logger_level, ${BARREL_LOG_LEVEL:-info}},
