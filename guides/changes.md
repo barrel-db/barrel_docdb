@@ -272,18 +272,20 @@ handle_info({barrel_query_change, _, #{id := Id}}, State = #{cache := Cache}) ->
 
 ## API Reference
 
+See the [Erlang API Reference](api/erlang.md) for complete function documentation.
+
 ### Changes Feed
-- [`barrel_docdb:get_changes/2,3`](barrel_docdb.html#get_changes-2) - Get changes since timestamp
+- `barrel_docdb:get_changes/2,3` - Get changes since timestamp
 
 ### HLC
-- [`barrel_docdb:get_hlc/0`](barrel_docdb.html#get_hlc-0) - Get current HLC
-- [`barrel_docdb:new_hlc/0`](barrel_docdb.html#new_hlc-0) - Generate new HLC
-- [`barrel_docdb:sync_hlc/1`](barrel_docdb.html#sync_hlc-1) - Sync with remote HLC
+- `barrel_docdb:get_hlc/0` - Get current HLC
+- `barrel_docdb:new_hlc/0` - Generate new HLC
+- `barrel_docdb:sync_hlc/1` - Sync with remote HLC
 
 ### Path Subscriptions
-- [`barrel_docdb:subscribe/2,3`](barrel_docdb.html#subscribe-2) - Subscribe to path pattern
-- [`barrel_docdb:unsubscribe/1`](barrel_docdb.html#unsubscribe-1) - Unsubscribe
+- `barrel_docdb:subscribe/2,3` - Subscribe to path pattern
+- `barrel_docdb:unsubscribe/1` - Unsubscribe
 
 ### Query Subscriptions
-- [`barrel_docdb:subscribe_query/2,3`](barrel_docdb.html#subscribe_query-2) - Subscribe to query
-- [`barrel_docdb:unsubscribe_query/1`](barrel_docdb.html#unsubscribe_query-1) - Unsubscribe
+- `barrel_docdb:subscribe_query/2,3` - Subscribe to query
+- `barrel_docdb:unsubscribe_query/1` - Unsubscribe

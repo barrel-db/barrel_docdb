@@ -346,9 +346,9 @@ end.
 
 ## API Reference
 
-See the complete API documentation:
+See the [Erlang API Reference](api/erlang.md) for complete function documentation.
 
-- [`barrel_rep`](barrel_rep.html) - Replication public API
-- [`barrel_rep_transport`](barrel_rep_transport.html) - Transport behaviour
-- [`barrel_docdb:put_rev/4`](barrel_docdb.html#put_rev-4) - Low-level document write
-- [`barrel_docdb:revsdiff/3`](barrel_docdb.html#revsdiff-3) - Revision comparison
+- `barrel_rep` - Replication public API
+- `barrel_rep_transport` - Transport behaviour
+- `barrel_docdb:put_rev/4` - Low-level document write
+- `barrel_docdb:revsdiff/3` - Revision comparison

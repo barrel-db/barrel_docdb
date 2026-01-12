@@ -331,6 +331,6 @@ Rev3 = maps:get(<<"rev">>, R3).
 
 ## See Also
 
-- [Getting Started](getting_started.md) - Basic usage guide
+- [Getting Started](getting-started.md) - Basic usage guide
 - [Replication](replication.md) - How revisions enable replication
-- [`barrel_doc`](barrel_doc.html) - Document utility functions
+- [Erlang API Reference](api/erlang.md) - Complete API documentation

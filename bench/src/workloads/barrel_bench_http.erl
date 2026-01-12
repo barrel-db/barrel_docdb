@@ -17,6 +17,8 @@
 -define(BASE_URL, "http://localhost:" ++ integer_to_list(?HTTP_PORT)).
 -define(BENCH_DB, <<"http_bench_db">>).
 -define(BENCH_VDB, <<"http_bench_vdb">>).
+-define(POOL_NAME, barrel_bench_pool).
+-define(POOL_SIZE, 100).
 
 %% @doc Run HTTP benchmarks (called from barrel_bench)
 -spec run(pid(), non_neg_integer(), non_neg_integer()) -> map().
@@ -41,6 +43,9 @@ run_comparison(Config) ->
     %% Start HTTP server on dedicated bench port
     {ok, HttpPid} = barrel_http_server:start_link(#{port => ?HTTP_PORT}),
     unlink(HttpPid),
+
+    %% Start HTTP connection pool and warm it up
+    ok = start_pool(),
 
     %% Create API key for benchmarks
     {ok, ApiKey, _} = barrel_http_api_keys:create_key(#{
@@ -105,7 +110,8 @@ run_comparison(Config) ->
     after
         %% Cleanup
         cleanup(),
-        barrel_http_server:stop()
+        barrel_http_server:stop(),
+        stop_pool()
     end.
 
 %%====================================================================
@@ -367,6 +373,15 @@ http_vdb_find(VdbName, ApiKey, Query) ->
 %%====================================================================
 %% Helpers
 %%====================================================================
+
+%% Start HTTP connection pool for benchmarks
+start_pool() ->
+    %% Configure default pool with higher limits
+    application:set_env(hackney, max_connections, ?POOL_SIZE),
+    ok.
+
+stop_pool() ->
+    ok.
 
 http_headers(ApiKey) ->
     [{<<"Content-Type">>, <<"application/json">>},

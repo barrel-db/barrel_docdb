@@ -330,6 +330,8 @@ ok = barrel_docdb:register_view(<<"mydb">>, <<"active_users">>, #{
 
 ## API Reference
 
-- [`barrel_docdb:find/2,3`](barrel_docdb.html#find-2) - Execute a query
-- [`barrel_docdb:explain/2`](barrel_docdb.html#explain-2) - Explain query plan
-- [`barrel_docdb:register_view/3`](barrel_docdb.html#register_view-3) - Create materialized view
+See the [Erlang API Reference](api/erlang.md) for complete function documentation.
+
+- `barrel_docdb:find/2,3` - Execute a query
+- `barrel_docdb:explain/2` - Explain query plan
+- `barrel_docdb:register_view/3` - Create materialized view

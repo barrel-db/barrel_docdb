@@ -209,7 +209,7 @@ ok = barrel_docdb:delete_db(<<"mydb">>).
 
 ## Next Steps
 
-- [Query Guide](query.md) - Declarative queries for finding documents
+- [Query Guide](queries.md) - Declarative queries for finding documents
 - [Changes & Subscriptions](changes.md) - Real-time change notifications
 - [Replication Guide](replication.md) - Sync databases with filtering
-- [API Reference](barrel_docdb.html) - Complete API documentation
+- [Erlang API Reference](api/erlang.md) - Complete API documentation
