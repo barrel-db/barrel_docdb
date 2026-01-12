@@ -185,6 +185,9 @@ build_dispatch() ->
             {"/vdb/:vdb/_changes", barrel_http_handler, #{action => vdb_changes}},
             {"/vdb/:vdb/_bulk_docs", barrel_http_handler, #{action => vdb_bulk_docs}},
             {"/vdb/:vdb/_find", barrel_http_handler, #{action => vdb_find}},
+            {"/vdb/:vdb/_import", barrel_http_handler, #{action => vdb_import}},
+            {"/vdb/:vdb/_shards/:shard/_split", barrel_http_handler, #{action => vdb_shard_split}},
+            {"/vdb/:vdb/_shards/:shard/_merge", barrel_http_handler, #{action => vdb_shard_merge}},
             {"/vdb/:vdb/:doc_id", barrel_http_handler, #{action => vdb_doc}},
 
             %% Database operations

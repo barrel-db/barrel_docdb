@@ -540,6 +540,12 @@ handle_action(vdb_doc, <<"PUT">>, Req) ->
     handle_vdb_put_doc(Req);
 handle_action(vdb_doc, <<"DELETE">>, Req) ->
     handle_vdb_delete_doc(Req);
+handle_action(vdb_import, <<"POST">>, Req) ->
+    handle_vdb_import(Req);
+handle_action(vdb_shard_split, <<"POST">>, Req) ->
+    handle_vdb_shard_split(Req);
+handle_action(vdb_shard_merge, <<"POST">>, Req) ->
+    handle_vdb_shard_merge(Req);
 
 %% Database info
 handle_action(db_info, <<"GET">>, Req) ->
@@ -1091,6 +1097,150 @@ handle_vdb_delete_doc(Req) ->
         {error, Reason} ->
             throw({error, 500, format_error(Reason)})
     end.
+
+%% Import documents from a regular database to VDB
+handle_vdb_import(Req0) ->
+    VdbName = cowboy_req:binding(vdb, Req0),
+    {ok, Body, Req} = cowboy_req:read_body(Req0),
+    case decode_request_body(Body, Req) of
+        {ok, Data} ->
+            SourceDb = maps:get(<<"source_db">>, Data, undefined),
+            case SourceDb of
+                undefined ->
+                    throw({error, 400, <<"source_db is required">>});
+                _ ->
+                    Opts = convert_import_opts(Data),
+                    case barrel_vdb_import:import(SourceDb, VdbName, Opts) of
+                        {ok, Stats} ->
+                            %% Convert atom keys to binary for JSON
+                            SafeStats = maps:fold(
+                                fun(K, V, Acc) -> Acc#{atom_to_binary(K) => V} end,
+                                #{},
+                                Stats
+                            ),
+                            RespBody = encode_response(SafeStats, Req),
+                            {200, response_headers(Req), RespBody, Req};
+                        {error, {source_not_found, _}} ->
+                            throw({error, 404, <<"Source database not found">>});
+                        {error, {vdb_not_found, _}} ->
+                            throw({error, 404, <<"VDB not found">>});
+                        {error, Reason} ->
+                            throw({error, 500, format_error(Reason)})
+                    end
+            end;
+        {error, _} ->
+            throw({error, 400, <<"Invalid JSON">>})
+    end.
+
+%% Split a shard into two shards
+handle_vdb_shard_split(Req0) ->
+    VdbName = cowboy_req:binding(vdb, Req0),
+    ShardBin = cowboy_req:binding(shard, Req0),
+    ShardId = binary_to_integer(ShardBin),
+    %% Parse optional body for batch_size
+    Opts = case cowboy_req:has_body(Req0) of
+        true ->
+            {ok, Body, _} = cowboy_req:read_body(Req0),
+            case decode_request_body(Body, Req0) of
+                {ok, Data} ->
+                    convert_rebalance_opts(Data);
+                {error, _} ->
+                    #{}
+            end;
+        false ->
+            #{}
+    end,
+    case barrel_shard_rebalance:split_shard(VdbName, ShardId, Opts) of
+        {ok, NewShardId} ->
+            Response = #{
+                <<"ok">> => true,
+                <<"new_shard_id">> => NewShardId,
+                <<"message">> => iolist_to_binary([
+                    <<"Shard ">>, integer_to_binary(ShardId),
+                    <<" split into shards ">>, integer_to_binary(ShardId),
+                    <<" and ">>, integer_to_binary(NewShardId)
+                ])
+            },
+            RespBody = encode_response(Response, Req0),
+            {200, response_headers(Req0), RespBody, Req0};
+        {error, {shard_not_found, _}} ->
+            throw({error, 404, <<"Shard not found">>});
+        {error, {shard_not_active, Status}} ->
+            throw({error, 409, iolist_to_binary([
+                <<"Shard is not active, status: ">>, atom_to_binary(Status)
+            ])});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%% Merge a shard with another shard
+handle_vdb_shard_merge(Req0) ->
+    VdbName = cowboy_req:binding(vdb, Req0),
+    ShardBin = cowboy_req:binding(shard, Req0),
+    ShardId = binary_to_integer(ShardBin),
+    {ok, Body, Req} = cowboy_req:read_body(Req0),
+    case decode_request_body(Body, Req) of
+        {ok, Data} ->
+            TargetShard = maps:get(<<"target_shard">>, Data, undefined),
+            case TargetShard of
+                undefined ->
+                    throw({error, 400, <<"target_shard is required">>});
+                _ ->
+                    TargetShardId = if
+                        is_integer(TargetShard) -> TargetShard;
+                        is_binary(TargetShard) -> binary_to_integer(TargetShard);
+                        true -> throw({error, 400, <<"target_shard must be an integer">>})
+                    end,
+                    Opts = convert_rebalance_opts(Data),
+                    case barrel_shard_rebalance:merge_shards(VdbName, ShardId, TargetShardId, Opts) of
+                        ok ->
+                            Response = #{
+                                <<"ok">> => true,
+                                <<"message">> => iolist_to_binary([
+                                    <<"Shard ">>, integer_to_binary(ShardId),
+                                    <<" merged into shard ">>, integer_to_binary(TargetShardId)
+                                ])
+                            },
+                            RespBody = encode_response(Response, Req),
+                            {200, response_headers(Req), RespBody, Req};
+                        {error, shards_not_adjacent} ->
+                            throw({error, 409, <<"Shards are not adjacent in hash space">>});
+                        {error, {shard_not_active, ShId, Status}} ->
+                            throw({error, 409, iolist_to_binary([
+                                <<"Shard ">>, integer_to_binary(ShId),
+                                <<" is not active, status: ">>, atom_to_binary(Status)
+                            ])});
+                        {error, Reason} ->
+                            throw({error, 500, format_error(Reason)})
+                    end
+            end;
+        {error, _} ->
+            throw({error, 400, <<"Invalid JSON">>})
+    end.
+
+%% Convert import options from binary keys to atoms
+convert_import_opts(Data) ->
+    maps:fold(
+        fun(<<"batch_size">>, V, Acc) when is_integer(V) -> Acc#{batch_size => V};
+           (<<"filter">>, V, Acc) when is_map(V) -> Acc#{filter => V};
+           (<<"on_conflict">>, <<"skip">>, Acc) -> Acc#{on_conflict => skip};
+           (<<"on_conflict">>, <<"overwrite">>, Acc) -> Acc#{on_conflict => overwrite};
+           (<<"on_conflict">>, <<"merge">>, Acc) -> Acc#{on_conflict => merge};
+           (_, _, Acc) -> Acc
+        end,
+        #{},
+        Data
+    ).
+
+%% Convert rebalance options from binary keys to atoms
+convert_rebalance_opts(Data) ->
+    maps:fold(
+        fun(<<"batch_size">>, V, Acc) when is_integer(V) -> Acc#{batch_size => V};
+           (_, _, Acc) -> Acc
+        end,
+        #{},
+        Data
+    ).
 
 %% Convert VDB creation options from binary to atom keys
 convert_vdb_opts(Opts) ->

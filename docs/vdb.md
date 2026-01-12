@@ -137,6 +137,9 @@ Queries use scatter-gather to search all shards and merge results:
 | `DELETE` | `/vdb/:vdb` | Delete a VDB |
 | `GET` | `/vdb/:vdb/_shards` | Get shard assignments |
 | `GET` | `/vdb/:vdb/_replication` | Get replication status |
+| `POST` | `/vdb/:vdb/_import` | Import from regular database |
+| `POST` | `/vdb/:vdb/_shards/:shard/_split` | Split a shard |
+| `POST` | `/vdb/:vdb/_shards/:shard/_merge` | Merge two shards |
 
 ### Document Operations
 
@@ -326,6 +329,82 @@ Response:
 
 ---
 
+## Data Import
+
+Import documents from a regular database into a VDB. Documents are automatically distributed across shards based on their IDs.
+
+### Import All Documents
+
+=== "HTTP API"
+
+    ```bash
+    curl -X POST "http://localhost:8080/vdb/users/_import" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $API_KEY" \
+      -d '{"source_db": "legacy_users"}'
+    ```
+
+=== "Erlang API"
+
+    ```erlang
+    {ok, Stats} = barrel_vdb_import:import(<<"legacy_users">>, <<"users">>, #{}).
+    ```
+
+Response:
+
+```json
+{
+  "docs_read": 10000,
+  "docs_written": 9950,
+  "docs_skipped": 50,
+  "errors": 0,
+  "started_at": 1736712345000,
+  "finished_at": 1736712400000,
+  "status": "completed"
+}
+```
+
+### Import with Filter
+
+Import only specific documents:
+
+=== "HTTP API"
+
+    ```bash
+    curl -X POST "http://localhost:8080/vdb/users/_import" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $API_KEY" \
+      -d '{
+        "source_db": "legacy_data",
+        "filter": {
+          "where": [{"path": ["type"], "value": "user"}]
+        },
+        "batch_size": 500,
+        "on_conflict": "skip"
+      }'
+    ```
+
+=== "Erlang API"
+
+    ```erlang
+    {ok, Stats} = barrel_vdb_import:import(<<"legacy_data">>, <<"users">>, #{
+        filter => #{where => [{path, [<<"type">>], <<"user">>}]},
+        batch_size => 500,
+        on_conflict => skip
+    }).
+    ```
+
+### Import Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `source_db` | string | (required) | Source database name |
+| `filter` | object | - | Filter documents (same format as `_find`) |
+| `batch_size` | integer | 100 | Documents per batch |
+| `on_conflict` | string | `skip` | Conflict handling: `skip`, `overwrite`, `merge` |
+
+---
+
 ## Replication Status
 
 Check replication status for a VDB:
@@ -432,33 +511,92 @@ When shards become unbalanced, you can split or merge them.
 
 ### Split a Shard
 
-Split a large shard into two:
+Split a large shard into two. The original shard keeps the lower half of its hash range, and a new shard is created for the upper half.
 
-```erlang
-%% Split shard 0 into two shards
-{ok, NewShardId} = barrel_shard_rebalance:split_shard(<<"users">>, 0).
+=== "HTTP API"
 
-%% Split with progress callback
-ProgressFun = fun(#{phase := Phase, migrated := N, total := T}) ->
-    io:format("~p: ~p/~p~n", [Phase, N, T])
-end,
-{ok, NewShardId} = barrel_shard_rebalance:split_shard(<<"users">>, 0, #{
-    progress_callback => ProgressFun,
-    batch_size => 100
-}).
-```
+    ```bash
+    # Split shard 0 into two shards
+    curl -X POST "http://localhost:8080/vdb/users/_shards/0/_split" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $API_KEY"
+
+    # With batch size option
+    curl -X POST "http://localhost:8080/vdb/users/_shards/0/_split" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $API_KEY" \
+      -d '{"batch_size": 500}'
+    ```
+
+    Response:
+    ```json
+    {
+      "ok": true,
+      "new_shard_id": 4,
+      "message": "Shard 0 split into shards 0 and 4"
+    }
+    ```
+
+=== "Erlang API"
+
+    ```erlang
+    %% Split shard 0 into two shards
+    {ok, NewShardId} = barrel_shard_rebalance:split_shard(<<"users">>, 0).
+
+    %% Split with progress callback
+    ProgressFun = fun(#{phase := Phase, migrated := N, total := T}) ->
+        io:format("~p: ~p/~p~n", [Phase, N, T])
+    end,
+    {ok, NewShardId} = barrel_shard_rebalance:split_shard(<<"users">>, 0, #{
+        progress_callback => ProgressFun,
+        batch_size => 100
+    }).
+    ```
 
 ### Merge Shards
 
-Merge two adjacent shards:
+Merge two adjacent shards. Only shards that are adjacent in hash space can be merged.
 
-```erlang
-%% Check if shards can be merged
-{ok, true} = barrel_shard_rebalance:can_merge(<<"users">>, 0, 1).
+=== "HTTP API"
 
-%% Merge shards 0 and 1
-ok = barrel_shard_rebalance:merge_shards(<<"users">>, 0, 1).
-```
+    ```bash
+    # Merge shard 2 into shard 3
+    curl -X POST "http://localhost:8080/vdb/users/_shards/2/_merge" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $API_KEY" \
+      -d '{"target_shard": 3}'
+
+    # With batch size option
+    curl -X POST "http://localhost:8080/vdb/users/_shards/2/_merge" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $API_KEY" \
+      -d '{"target_shard": 3, "batch_size": 500}'
+    ```
+
+    Response:
+    ```json
+    {
+      "ok": true,
+      "message": "Shard 2 merged into shard 3"
+    }
+    ```
+
+    Error (shards not adjacent):
+    ```json
+    {
+      "error": "Shards are not adjacent in hash space"
+    }
+    ```
+
+=== "Erlang API"
+
+    ```erlang
+    %% Check if shards can be merged
+    {ok, true} = barrel_shard_rebalance:can_merge(<<"users">>, 0, 1).
+
+    %% Merge shards 0 and 1
+    ok = barrel_shard_rebalance:merge_shards(<<"users">>, 0, 1).
+    ```
 
 ### Estimate Migration
 

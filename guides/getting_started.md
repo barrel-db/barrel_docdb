@@ -14,7 +14,7 @@ Add barrel_docdb to your `rebar.config` dependencies:
 
 ```erlang
 {deps, [
-    {barrel_docdb, "0.1.0"}
+    {barrel_docdb, "0.2.0"}
 ]}.
 ```
 

@@ -132,6 +132,13 @@ Set the `Content-Type` and `Accept` headers accordingly.
 | `/db/:db/_tier/run_migration` | POST | Run migration policy |
 | `/db/:db/:doc_id/_tier` | GET | Get document tier |
 | `/db/:db/:doc_id/_tier/ttl` | GET, POST | Document TTL |
+| `/vdb` | GET, POST | List/create VDBs |
+| `/vdb/:vdb` | GET, DELETE | VDB info/delete |
+| `/vdb/:vdb/_shards` | GET | List VDB shards |
+| `/vdb/:vdb/_import` | POST | Import from database |
+| `/vdb/:vdb/_shards/:shard/_split` | POST | Split a shard |
+| `/vdb/:vdb/_shards/:shard/_merge` | POST | Merge shards |
+| `/vdb/:vdb/:doc_id` | GET, PUT, DELETE | VDB document operations |
 | `/_federation` | GET, POST | Federation management |
 | `/_policies` | GET, POST | Replication policies |
 
@@ -650,3 +657,228 @@ POST /db/:db/_replicate
   "docs_written": 100
 }
 ```
+
+---
+
+## VDB (Virtual Database / Sharded Database)
+
+Virtual Databases provide automatic horizontal sharding for large datasets. Documents are distributed across shards based on consistent hashing of the document ID.
+
+### List VDBs
+
+```bash
+GET /vdb
+```
+
+**Response:**
+```json
+{
+  "vdbs": ["users", "orders", "products"]
+}
+```
+
+### Create VDB
+
+```bash
+POST /vdb
+```
+
+**Request Body:**
+```json
+{
+  "name": "users",
+  "shard_count": 8,
+  "hash_function": "phash2",
+  "placement": {
+    "zones": ["us-east", "us-west"]
+  }
+}
+```
+
+**Response:** `201 Created`
+```json
+{
+  "ok": true,
+  "name": "users",
+  "shard_count": 8
+}
+```
+
+### Get VDB Info
+
+```bash
+GET /vdb/:vdb
+```
+
+**Response:**
+```json
+{
+  "name": "users",
+  "shard_count": 8,
+  "doc_count": 1234567,
+  "hash_function": "phash2"
+}
+```
+
+### Delete VDB
+
+```bash
+DELETE /vdb/:vdb
+```
+
+**Response:** `200 OK`
+
+### List VDB Shards
+
+```bash
+GET /vdb/:vdb/_shards
+```
+
+**Response:**
+```json
+{
+  "shards": [
+    {"shard_id": 0, "status": "active", "primary": "node1@host1"},
+    {"shard_id": 1, "status": "active", "primary": "node2@host2"}
+  ],
+  "ranges": [
+    {"shard_id": 0, "start_hash": 0, "end_hash": 2147483647},
+    {"shard_id": 1, "start_hash": 2147483648, "end_hash": 4294967295}
+  ]
+}
+```
+
+### Import from Database
+
+Import documents from a regular database into a VDB. Documents are automatically distributed across shards.
+
+```bash
+POST /vdb/:vdb/_import
+```
+
+**Request Body:**
+```json
+{
+  "source_db": "legacy_users",
+  "filter": {
+    "where": [{"path": ["type"], "value": "user"}]
+  },
+  "batch_size": 100,
+  "on_conflict": "skip"
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `source_db` | string | required | Source database name |
+| `filter` | object | - | Optional filter (same format as `_find`) |
+| `batch_size` | integer | 100 | Documents per batch |
+| `on_conflict` | string | `skip` | Conflict handling: `skip`, `overwrite`, `merge` |
+
+**Response:**
+```json
+{
+  "docs_read": 1000,
+  "docs_written": 950,
+  "docs_skipped": 50,
+  "errors": 0,
+  "started_at": 1736712345000,
+  "finished_at": 1736712355000,
+  "status": "completed"
+}
+```
+
+### Split Shard
+
+Split a shard into two shards when it grows too large. The original shard keeps the lower half of its hash range, and a new shard is created for the upper half.
+
+```bash
+POST /vdb/:vdb/_shards/:shard/_split
+```
+
+**Request Body (optional):**
+```json
+{
+  "batch_size": 100
+}
+```
+
+**Response:**
+```json
+{
+  "ok": true,
+  "new_shard_id": 8,
+  "message": "Shard 2 split into shards 2 and 8"
+}
+```
+
+### Merge Shards
+
+Merge two adjacent shards when they become underutilized. The source shard is merged into the target shard.
+
+```bash
+POST /vdb/:vdb/_shards/:shard/_merge
+```
+
+**Request Body:**
+```json
+{
+  "target_shard": 3,
+  "batch_size": 100
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `target_shard` | integer | required | Shard to merge into |
+| `batch_size` | integer | 100 | Documents per batch during migration |
+
+**Response:**
+```json
+{
+  "ok": true,
+  "message": "Shard 2 merged into shard 3"
+}
+```
+
+**Error - Shards not adjacent:**
+```json
+{
+  "error": "Shards are not adjacent in hash space"
+}
+```
+
+### VDB Document Operations
+
+VDB document operations work the same as regular database operations, but the VDB automatically routes to the correct shard.
+
+**Create/Update Document:**
+```bash
+PUT /vdb/:vdb/:doc_id
+```
+
+**Get Document:**
+```bash
+GET /vdb/:vdb/:doc_id
+```
+
+**Delete Document:**
+```bash
+DELETE /vdb/:vdb/:doc_id
+```
+
+### VDB Bulk Operations
+
+```bash
+POST /vdb/:vdb/_bulk_docs
+```
+
+Same format as regular database bulk operations. Documents are automatically routed to the correct shards.
+
+### VDB Queries
+
+```bash
+POST /vdb/:vdb/_find
+```
+
+Queries are executed across all shards in parallel and results are merged.
