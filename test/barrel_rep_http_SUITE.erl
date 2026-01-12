@@ -128,8 +128,10 @@ init_per_suite(Config) ->
     application:ensure_all_started(barrel_docdb),
     application:ensure_all_started(cowboy),
     application:ensure_all_started(hackney),
-    %% Start HTTP server at suite level - ensures it's available for all groups
-    ensure_http_server(),
+    %% Start HTTP server at suite level
+    %% Unlink so it survives process changes between init/end_per_suite
+    {ok, HttpPid} = barrel_http_server:start_link(#{port => ?HTTP_PORT}),
+    unlink(HttpPid),
     %% Create a test API key for authentication
     {ok, ApiKey, _} = barrel_http_api_keys:create_key(#{
         name => <<"test-suite-key">>,
@@ -139,8 +141,7 @@ init_per_suite(Config) ->
     [{api_key, ApiKey} | Config].
 
 end_per_suite(_Config) ->
-    %% Stop HTTP server at suite level
-    catch barrel_http_server:stop(),
+    barrel_http_server:stop(),
     ok.
 
 init_per_group(http_transport, Config) ->
@@ -945,49 +946,10 @@ view_delete(Config) ->
 %%====================================================================
 
 ensure_http_server() ->
-    %% First, check if gen_server process exists and is alive
+    %% Server is started in init_per_suite, just verify it's running
     case whereis(barrel_http_server) of
-        undefined ->
-            %% No server running - stop any lingering listener and start fresh
-            catch cowboy:stop_listener(barrel_http_listener),
-            timer:sleep(100),  %% Allow cleanup
-            {ok, _} = barrel_http_server:start_link(#{port => ?HTTP_PORT}),
-            ok;
-        Pid when is_pid(Pid) ->
-            case is_process_alive(Pid) of
-                true ->
-                    %% Server is running - verify the listener is on our port
-                    case ranch:info() of
-                        Info when is_list(Info) ->
-                            case lists:keyfind(barrel_http_listener, 1, Info) of
-                                {barrel_http_listener, Status} ->
-                                    Port = proplists:get_value(port, Status, 0),
-                                    if Port =:= ?HTTP_PORT ->
-                                           ok;
-                                       true ->
-                                           %% Wrong port - restart
-                                           catch barrel_http_server:stop(),
-                                           timer:sleep(100),
-                                           {ok, _} = barrel_http_server:start_link(#{port => ?HTTP_PORT}),
-                                           ok
-                                    end;
-                                false ->
-                                    %% Listener not found but process alive - restart
-                                    catch barrel_http_server:stop(),
-                                    timer:sleep(100),
-                                    {ok, _} = barrel_http_server:start_link(#{port => ?HTTP_PORT}),
-                                    ok
-                            end;
-                        _ ->
-                            ok
-                    end;
-                false ->
-                    %% Process dead - clean up and restart
-                    catch cowboy:stop_listener(barrel_http_listener),
-                    timer:sleep(100),
-                    {ok, _} = barrel_http_server:start_link(#{port => ?HTTP_PORT}),
-                    ok
-            end
+        Pid when is_pid(Pid) -> ok;
+        undefined -> error(http_server_not_running)
     end.
 
 ensure_db(Name) ->

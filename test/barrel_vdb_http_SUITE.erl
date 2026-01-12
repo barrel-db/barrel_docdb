@@ -53,11 +53,10 @@ groups() ->
 init_per_suite(Config) ->
     application:ensure_all_started(barrel_docdb),
     application:ensure_all_started(hackney),
-    %% Stop any existing HTTP server and start fresh
-    catch barrel_http_server:stop(),
-    timer:sleep(100),  %% Give time for cleanup
     %% Start HTTP server on test port
-    {ok, _} = barrel_http_server:start_link(#{port => ?PORT}),
+    %% Unlink so it survives process changes between init/end_per_suite
+    {ok, HttpPid} = barrel_http_server:start_link(#{port => ?PORT}),
+    unlink(HttpPid),
     %% Create API key for tests
     {ok, ApiKey, _} = barrel_http_api_keys:create_key(#{
         name => <<"vdb-http-suite-key">>,
@@ -67,8 +66,7 @@ init_per_suite(Config) ->
     [{api_key, ApiKey} | Config].
 
 end_per_suite(_Config) ->
-    catch barrel_http_server:stop(),
-    application:stop(barrel_docdb),
+    barrel_http_server:stop(),
     ok.
 
 init_per_group(_Group, Config) ->
