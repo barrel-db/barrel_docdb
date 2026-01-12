@@ -148,13 +148,14 @@ info_internal(VdbName) ->
             {ok, ShardDbs} = barrel_shard_map:all_physical_dbs(VdbName),
             {ok, Assignments} = barrel_shard_map:get_all_assignments(VdbName),
 
-            %% Get doc counts per shard (use find to get actual count since db_info doc_count is unreliable)
+            %% Get doc counts per shard (use fold_docs which excludes deleted docs)
             ShardStats = lists:map(fun(DbName) ->
                 case barrel_docdb:db_info(DbName) of
                     {ok, DbInfo} ->
-                        %% Get actual doc count via query
-                        DocCount = case barrel_docdb:find(DbName, #{where => []}, #{include_docs => false}) of
-                            {ok, Docs, _Meta} -> length(Docs);
+                        %% Get actual doc count via fold_docs (excludes deleted docs)
+                        DocCount = case barrel_docdb:fold_docs(DbName,
+                                fun(_Doc, Acc) -> {ok, Acc + 1} end, 0) of
+                            {ok, Count} -> Count;
                             {error, _} -> 0
                         end,
                         #{

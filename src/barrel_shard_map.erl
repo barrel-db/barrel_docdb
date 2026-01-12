@@ -218,11 +218,13 @@ physical_db_name(LogicalDb, ShardId) when is_binary(LogicalDb), is_integer(Shard
     <<LogicalDb/binary, "_s", (integer_to_binary(ShardId))/binary>>.
 
 %% @doc Get all physical database names for a VDB
+%% Uses actual shard IDs from ranges (may be non-contiguous after merge)
 -spec all_physical_dbs(binary()) -> {ok, [binary()]} | {error, not_found}.
 all_physical_dbs(LogicalDb) when is_binary(LogicalDb) ->
-    case get_config(LogicalDb) of
-        {ok, #{shard_count := Count}} ->
-            Dbs = [physical_db_name(LogicalDb, I) || I <- lists:seq(0, Count - 1)],
+    case get_ranges(LogicalDb) of
+        {ok, Ranges} ->
+            ShardIds = [maps:get(shard_id, R) || R <- Ranges],
+            Dbs = [physical_db_name(LogicalDb, Id) || Id <- lists:sort(ShardIds)],
             {ok, Dbs};
         {error, _} = Err ->
             Err
