@@ -1,13 +1,17 @@
 # GitLab CI/CD for Barrel DocDB
-# Builds Erlang tests and deploys MkDocs documentation
+# Builds Erlang tests, Docker images, and deploys MkDocs documentation
 
 stages:
   - test
+  - build
   - pages
 
 variables:
   # Cache rebar3 dependencies
   REBAR_CACHE_DIR: "$CI_PROJECT_DIR/.cache/rebar3"
+  # Docker image name
+  DOCKER_IMAGE: $CI_REGISTRY_IMAGE
+  DOCKER_TAG: $CI_COMMIT_REF_SLUG
 
 # Erlang tests
 test:
@@ -28,6 +32,40 @@ test:
   rules:
     - if: $CI_COMMIT_BRANCH
     - if: $CI_MERGE_REQUEST_ID
+
+# Docker image build
+docker:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    # Build Docker image
+    - docker build -t $DOCKER_IMAGE:$DOCKER_TAG .
+    # Tag as latest for main branch
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        docker tag $DOCKER_IMAGE:$DOCKER_TAG $DOCKER_IMAGE:latest
+      fi
+    # Push images
+    - docker push $DOCKER_IMAGE:$DOCKER_TAG
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        docker push $DOCKER_IMAGE:latest
+      fi
+  rules:
+    # Build on main branch
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    # Build on tags (releases)
+    - if: $CI_COMMIT_TAG
+    # Manual build on other branches
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+      allow_failure: true
 
 # MkDocs documentation deployment to GitLab Pages
 pages:
