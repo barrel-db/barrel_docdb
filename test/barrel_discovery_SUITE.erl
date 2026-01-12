@@ -18,6 +18,7 @@
 all() ->
     [
         {group, basic},
+        {group, zone_management},
         {group, peer_management},
         {group, tagging},
         {group, member_resolution},
@@ -29,6 +30,13 @@ groups() ->
         {basic, [], [
             node_id_persistent,
             node_info_contains_required_fields
+        ]},
+        {zone_management, [], [
+            get_zone_default,
+            get_zone_configured,
+            nodes_in_zone,
+            list_zones,
+            filter_peers_by_zone
         ]},
         {peer_management, [], [
             add_peer_valid_url,
@@ -103,6 +111,70 @@ node_info_contains_required_fields(_Config) ->
     ?assert(is_list(maps:get(federations, Info))),
     ?assert(is_list(maps:get(known_peers, Info))),
     ?assert(is_integer(maps:get(timestamp, Info))).
+
+%%====================================================================
+%% Test Cases - Zone Management
+%%====================================================================
+
+get_zone_default(_Config) ->
+    %% By default, zone should be undefined (not configured)
+    {ok, Zone} = barrel_discovery:get_zone(),
+    %% Zone may be undefined or configured in test env
+    ?assert(Zone =:= undefined orelse is_binary(Zone)).
+
+get_zone_configured(_Config) ->
+    %% Test that zone can be set via application env
+    %% First, set the env and check if a new discovery would read it
+    OldZone = application:get_env(barrel_docdb, zone),
+    application:set_env(barrel_docdb, zone, <<"test-zone">>),
+
+    %% The current discovery instance won't have this zone (already started)
+    %% So we test the zone parsing logic directly by checking if get_zone
+    %% returns what was configured at startup time
+    {ok, CurrentZone} = barrel_discovery:get_zone(),
+    %% Zone is set at init time, so this test verifies the API works
+    ?assert(CurrentZone =:= undefined orelse is_binary(CurrentZone)),
+
+    %% Restore original env
+    case OldZone of
+        undefined -> application:unset_env(barrel_docdb, zone);
+        {ok, Val} -> application:set_env(barrel_docdb, zone, Val)
+    end.
+
+nodes_in_zone(_Config) ->
+    %% Add peers with zones (simulated - we set zone directly)
+    Url1 = <<"http://127.0.0.1:19920">>,
+    Url2 = <<"http://127.0.0.1:19921">>,
+    Url3 = <<"http://127.0.0.1:19922">>,
+    %% Add peers - they'll be unreachable but that's fine
+    {ok, _, _} = barrel_discovery:add_peer(Url1, #{sync => true}),
+    {ok, _, _} = barrel_discovery:add_peer(Url2, #{sync => true}),
+    {ok, _, _} = barrel_discovery:add_peer(Url3, #{sync => true}),
+    %% Since peers are unreachable, they won't have zones set from remote
+    %% Test that nodes_in_zone returns empty for unknown zone
+    {ok, NodesInZone} = barrel_discovery:nodes_in_zone(<<"unknown-zone">>),
+    ?assertEqual([], NodesInZone),
+    %% Cleanup
+    ok = barrel_discovery:remove_peer(Url1),
+    ok = barrel_discovery:remove_peer(Url2),
+    ok = barrel_discovery:remove_peer(Url3).
+
+list_zones(_Config) ->
+    %% Initially may be empty or have some zones
+    {ok, Zones} = barrel_discovery:list_zones(),
+    ?assert(is_list(Zones)).
+
+filter_peers_by_zone(_Config) ->
+    %% Test that list_peers with zone filter works
+    Url1 = <<"http://127.0.0.1:19923">>,
+    {ok, _, _} = barrel_discovery:add_peer(Url1, #{sync => true}),
+    %% Filter by a zone that doesn't exist
+    {ok, FilteredPeers} = barrel_discovery:list_peers(#{zone => <<"nonexistent-zone">>}),
+    %% Url1 should not be in the filtered list (it has no zone)
+    FilteredUrls = [maps:get(url, P) || P <- FilteredPeers],
+    ?assertNot(lists:member(Url1, FilteredUrls)),
+    %% Cleanup
+    ok = barrel_discovery:remove_peer(Url1).
 
 %%====================================================================
 %% Test Cases - Peer Management

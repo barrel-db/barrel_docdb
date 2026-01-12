@@ -1,0 +1,112 @@
+# barrel_docdb 4-node multi-region cluster for VDB testing
+# 2 nodes in us-east zone, 2 nodes in eu-west zone
+
+services:
+  barrel-east1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: barrel-east1
+    hostname: barrel-east1
+    environment:
+      - BARREL_NODE_NAME=barrel@barrel-east1
+      - BARREL_HTTP_PORT=8080
+      - BARREL_DATA_DIR=/data
+      - BARREL_COOKIE=barrel_vdb_cluster
+      - BARREL_LOG_LEVEL=info
+      - BARREL_ZONE=us-east
+      - BARREL_DOCDB_ADMIN_KEY=test_admin_key_for_docker_tests
+    ports:
+      - "8081:8080"
+    volumes:
+      - barrel_east1_data:/data
+    networks:
+      - barrel_vdb_net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  barrel-east2:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: barrel-east2
+    hostname: barrel-east2
+    environment:
+      - BARREL_NODE_NAME=barrel@barrel-east2
+      - BARREL_HTTP_PORT=8080
+      - BARREL_DATA_DIR=/data
+      - BARREL_COOKIE=barrel_vdb_cluster
+      - BARREL_LOG_LEVEL=info
+      - BARREL_ZONE=us-east
+      - BARREL_DOCDB_ADMIN_KEY=test_admin_key_for_docker_tests
+    ports:
+      - "8082:8080"
+    volumes:
+      - barrel_east2_data:/data
+    networks:
+      - barrel_vdb_net
+    depends_on:
+      barrel-east1:
+        condition: service_healthy
+
+  barrel-west1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: barrel-west1
+    hostname: barrel-west1
+    environment:
+      - BARREL_NODE_NAME=barrel@barrel-west1
+      - BARREL_HTTP_PORT=8080
+      - BARREL_DATA_DIR=/data
+      - BARREL_COOKIE=barrel_vdb_cluster
+      - BARREL_LOG_LEVEL=info
+      - BARREL_ZONE=eu-west
+      - BARREL_DOCDB_ADMIN_KEY=test_admin_key_for_docker_tests
+    ports:
+      - "8083:8080"
+    volumes:
+      - barrel_west1_data:/data
+    networks:
+      - barrel_vdb_net
+    depends_on:
+      barrel-east1:
+        condition: service_healthy
+
+  barrel-west2:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: barrel-west2
+    hostname: barrel-west2
+    environment:
+      - BARREL_NODE_NAME=barrel@barrel-west2
+      - BARREL_HTTP_PORT=8080
+      - BARREL_DATA_DIR=/data
+      - BARREL_COOKIE=barrel_vdb_cluster
+      - BARREL_LOG_LEVEL=info
+      - BARREL_ZONE=eu-west
+      - BARREL_DOCDB_ADMIN_KEY=test_admin_key_for_docker_tests
+    ports:
+      - "8084:8080"
+    volumes:
+      - barrel_west2_data:/data
+    networks:
+      - barrel_vdb_net
+    depends_on:
+      barrel-east1:
+        condition: service_healthy
+
+volumes:
+  barrel_east1_data:
+  barrel_east2_data:
+  barrel_west1_data:
+  barrel_west2_data:
+
+networks:
+  barrel_vdb_net:
+    driver: bridge

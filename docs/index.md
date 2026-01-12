@@ -46,6 +46,22 @@ Sync anywhere. Query anything. Your data, wherever you need it.
 
     [:octicons-arrow-right-24: Advanced Guide](advanced-features.md)
 
+-   :bricks: __Virtual Databases (VDB)__
+
+    ---
+
+    Automatic sharding for horizontal scalability across multiple nodes
+
+    [:octicons-arrow-right-24: VDB Guide](vdb.md)
+
+-   :globe_with_meridians: __Multi-Datacenter Sharding__
+
+    ---
+
+    Zone-aware deployment across regions with automatic replication
+
+    [:octicons-arrow-right-24: Sharding Guide](sharding.md)
+
 </div>
 
 ## What is Barrel DocDB?
@@ -58,6 +74,8 @@ Barrel DocDB is a production-ready document database built on Erlang/OTP that pr
 - **Peer-to-Peer Replication** with configurable patterns (chain, group, fanout)
 - **Federated Queries** across multiple databases with merged results
 - **Tiered Storage** with automatic TTL/capacity-based migration between hot/warm/cold tiers
+- **Virtual Databases (VDB)** for automatic sharding with scatter-gather queries
+- **Multi-Datacenter** deployment with zone-aware replication and shard placement
 - **HTTP API** with REST endpoints, SSE streaming, and Prometheus metrics
 
 ## Why Barrel DocDB?

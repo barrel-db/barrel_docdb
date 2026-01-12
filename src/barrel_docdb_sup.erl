@@ -133,6 +133,17 @@ init([]) ->
         modules => [barrel_db_sup]
     },
 
+    %% VDB (Virtual Database) supervisor for sharded databases
+    %% Manages VDB registry and future shard-related processes
+    VdbSup = #{
+        id => barrel_vdb_sup,
+        start => {barrel_vdb_sup, start_link, []},
+        restart => permanent,
+        shutdown => infinity,
+        type => supervisor,
+        modules => [barrel_vdb_sup]
+    },
+
     %% Replication task manager for persistent replication tasks
     RepTasks = #{
         id => barrel_rep_tasks,
@@ -188,7 +199,7 @@ init([]) ->
     },
 
     %% Base child specs (always started)
-    BaseSpecs = [Metrics, Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, RepPolicy, ApiKeys, Discovery],
+    BaseSpecs = [Metrics, Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, VdbSup, RepTasks, RepPolicy, ApiKeys, Discovery],
 
     %% Conditionally add HTTP server
     ChildSpecs = case HttpEnabled of

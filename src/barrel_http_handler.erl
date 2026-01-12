@@ -513,6 +513,34 @@ handle_action(doc_tier_ttl, <<"GET">>, Req) ->
             throw({error, 404, <<"Database not found">>})
     end;
 
+%% VDB (Virtual Database / Sharded Database) operations
+handle_action(vdb_list, <<"GET">>, Req) ->
+    handle_vdb_list(Req);
+handle_action(vdb_list, <<"POST">>, Req) ->
+    handle_vdb_create(Req);
+handle_action(vdb_info, <<"GET">>, Req) ->
+    handle_vdb_info(Req);
+handle_action(vdb_info, <<"DELETE">>, Req) ->
+    handle_vdb_delete(Req);
+handle_action(vdb_shards, <<"GET">>, Req) ->
+    handle_vdb_shards(Req);
+handle_action(vdb_replication, <<"GET">>, Req) ->
+    handle_vdb_replication(Req);
+handle_action(vdb_changes, <<"GET">>, Req) ->
+    handle_vdb_changes(Req);
+handle_action(vdb_changes, <<"POST">>, Req) ->
+    handle_vdb_changes(Req);
+handle_action(vdb_bulk_docs, <<"POST">>, Req) ->
+    handle_vdb_bulk_docs(Req);
+handle_action(vdb_find, <<"POST">>, Req) ->
+    handle_vdb_find(Req);
+handle_action(vdb_doc, <<"GET">>, Req) ->
+    handle_vdb_get_doc(Req);
+handle_action(vdb_doc, <<"PUT">>, Req) ->
+    handle_vdb_put_doc(Req);
+handle_action(vdb_doc, <<"DELETE">>, Req) ->
+    handle_vdb_delete_doc(Req);
+
 %% Database info
 handle_action(db_info, <<"GET">>, Req) ->
     DbName = cowboy_req:binding(db, Req),
@@ -853,6 +881,445 @@ handle_bulk_docs(Req0) ->
     ),
     Body = encode_response(Results, Req1),
     {201, response_headers(Req1), Body, Req1}.
+
+%%====================================================================
+%% VDB (Virtual Database) Handlers
+%%====================================================================
+
+%% List all VDBs
+handle_vdb_list(Req) ->
+    {ok, VdbList} = barrel_vdb:list(),
+    Body = encode_response(#{<<"vdbs">> => VdbList}, Req),
+    {200, response_headers(Req), Body, Req}.
+
+%% Create a new VDB
+handle_vdb_create(Req0) ->
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    Spec = decode_request_body(ReqBody, Req1),
+    Name = maps:get(<<"name">>, Spec),
+    Opts = maps:without([<<"name">>], Spec),
+    %% Convert binary keys to atom keys for options
+    InternalOpts = convert_vdb_opts(Opts),
+    case barrel_vdb:create(Name, InternalOpts) of
+        ok ->
+            Response = #{<<"ok">> => true, <<"name">> => Name},
+            Body = encode_response(Response, Req1),
+            {201, response_headers(Req1), Body, Req1};
+        {error, already_exists} ->
+            throw({error, 409, <<"VDB already exists">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%% Get VDB info
+handle_vdb_info(Req) ->
+    VdbName = cowboy_req:binding(vdb, Req),
+    case barrel_vdb:info(VdbName) of
+        {ok, Info} ->
+            %% Convert atom keys to binary for JSON/CBOR
+            SafeInfo = sanitize_vdb_info(Info),
+            Body = encode_response(SafeInfo, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"VDB not found">>})
+    end.
+
+%% Delete VDB
+handle_vdb_delete(Req) ->
+    VdbName = cowboy_req:binding(vdb, Req),
+    case barrel_vdb:delete(VdbName) of
+        ok ->
+            Body = encode_response(#{<<"ok">> => true}, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"VDB not found">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%% Get VDB shard assignments
+handle_vdb_shards(Req) ->
+    VdbName = cowboy_req:binding(vdb, Req),
+    case barrel_shard_map:get_all_assignments(VdbName) of
+        {ok, Assignments} ->
+            %% Get ranges too for complete shard info
+            {ok, Ranges} = barrel_shard_map:get_ranges(VdbName),
+            SafeAssignments = [sanitize_shard_assignment(A) || A <- Assignments],
+            SafeRanges = [sanitize_shard_range(R) || R <- Ranges],
+            Response = #{
+                <<"shards">> => SafeAssignments,
+                <<"ranges">> => SafeRanges
+            },
+            Body = encode_response(Response, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"VDB not found">>})
+    end.
+
+%% Get VDB replication status
+handle_vdb_replication(Req) ->
+    VdbName = cowboy_req:binding(vdb, Req),
+    case barrel_vdb_replication:get_status(VdbName) of
+        {ok, Status} ->
+            %% Convert atom keys to binary and sanitize values
+            SafeStatus = sanitize_replication_status(Status),
+            Body = encode_response(SafeStatus, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"VDB not found">>})
+    end.
+
+%% Get VDB changes (merged from all shards)
+handle_vdb_changes(Req0) ->
+    VdbName = cowboy_req:binding(vdb, Req0),
+    %% Parse query string and body for options
+    Qs = cowboy_req:parse_qs(Req0),
+    {BodyOpts, Req1} = case cowboy_req:method(Req0) of
+        <<"POST">> ->
+            {ok, ReqBody, R} = cowboy_req:read_body(Req0),
+            {decode_request_body(ReqBody, R), R};
+        _ ->
+            {#{}, Req0}
+    end,
+    %% Parse options from query string (already parsed)
+    QsOpts = parse_vdb_changes_qs(Qs),
+    Opts = maps:merge(BodyOpts, QsOpts),
+    Since = maps:get(<<"since">>, Opts, maps:get(since, Opts, first)),
+    InternalOpts = convert_changes_opts(Opts),
+    case barrel_vdb:get_changes(VdbName, Since, InternalOpts) of
+        {ok, Changes} ->
+            %% Sanitize changes for JSON encoding (convert HLC timestamps)
+            SafeChanges = sanitize_vdb_changes(Changes),
+            Body = encode_response(SafeChanges, Req1),
+            {200, response_headers(Req1), Body, Req1};
+        {error, not_found} ->
+            throw({error, 404, <<"VDB not found">>})
+    end.
+
+%% VDB bulk docs
+handle_vdb_bulk_docs(Req0) ->
+    VdbName = cowboy_req:binding(vdb, Req0),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    Spec = decode_request_body(ReqBody, Req1),
+    Docs = maps:get(<<"docs">>, Spec, []),
+    case barrel_vdb:bulk_docs(VdbName, Docs) of
+        {ok, Results} ->
+            Body = encode_response(Results, Req1),
+            {201, response_headers(Req1), Body, Req1};
+        {error, not_found} ->
+            throw({error, 404, <<"VDB not found">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%% VDB find (scatter-gather query)
+handle_vdb_find(Req0) ->
+    VdbName = cowboy_req:binding(vdb, Req0),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    QuerySpec0 = decode_request_body(ReqBody, Req1),
+    %% Convert binary keys to atoms for internal API
+    QuerySpec = convert_query_spec(QuerySpec0),
+    Opts = extract_query_opts(QuerySpec),
+    case barrel_vdb:find(VdbName, QuerySpec, Opts) of
+        {ok, Results} ->
+            Response = #{
+                <<"docs">> => Results,
+                <<"total">> => length(Results)
+            },
+            Body = encode_response(Response, Req1),
+            {200, response_headers(Req1), Body, Req1};
+        {error, not_found} ->
+            throw({error, 404, <<"VDB not found">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%% Get VDB document (routed to correct shard)
+handle_vdb_get_doc(Req) ->
+    VdbName = cowboy_req:binding(vdb, Req),
+    DocId = cowboy_req:binding(doc_id, Req),
+    Qs = cowboy_req:parse_qs(Req),
+    Opts = parse_doc_opts(Qs),
+    case barrel_vdb:get_doc(VdbName, DocId, Opts) of
+        {ok, Doc} ->
+            Body = encode_doc_response(Doc, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Document not found">>});
+        {error, {vdb_not_found, _}} ->
+            throw({error, 404, <<"VDB not found">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%% Put VDB document (routed to correct shard)
+handle_vdb_put_doc(Req0) ->
+    VdbName = cowboy_req:binding(vdb, Req0),
+    DocId = cowboy_req:binding(doc_id, Req0),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    Doc0 = decode_request_body(ReqBody, Req1),
+    %% Ensure doc ID matches URL
+    Doc = Doc0#{<<"id">> => DocId},
+    Qs = cowboy_req:parse_qs(Req1),
+    Opts = parse_doc_opts(Qs),
+    case barrel_vdb:put_doc(VdbName, Doc, Opts) of
+        {ok, Result} ->
+            Body = encode_response(Result, Req1),
+            {201, response_headers(Req1), Body, Req1};
+        {error, conflict} ->
+            throw({error, 409, <<"Document update conflict">>});
+        {error, {vdb_not_found, _}} ->
+            throw({error, 404, <<"VDB not found">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%% Delete VDB document (routed to correct shard)
+handle_vdb_delete_doc(Req) ->
+    VdbName = cowboy_req:binding(vdb, Req),
+    DocId = cowboy_req:binding(doc_id, Req),
+    Qs = cowboy_req:parse_qs(Req),
+    Opts = parse_doc_opts(Qs),
+    case barrel_vdb:delete_doc(VdbName, DocId, Opts) of
+        {ok, Result} ->
+            Body = encode_response(Result, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Document not found">>});
+        {error, {vdb_not_found, _}} ->
+            throw({error, 404, <<"VDB not found">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%% Convert VDB creation options from binary to atom keys
+convert_vdb_opts(Opts) ->
+    maps:fold(
+        fun(<<"shard_count">>, V, Acc) -> Acc#{shard_count => V};
+           (<<"hash_function">>, <<"phash2">>, Acc) -> Acc#{hash_function => phash2};
+           (<<"hash_function">>, <<"xxhash">>, Acc) -> Acc#{hash_function => xxhash};
+           (<<"placement">>, V, Acc) -> Acc#{placement => convert_placement_opts(V)};
+           (_, _, Acc) -> Acc
+        end,
+        #{},
+        Opts
+    ).
+
+convert_placement_opts(Opts) ->
+    maps:fold(
+        fun(<<"replica_factor">>, V, Acc) -> Acc#{replica_factor => V};
+           (<<"zones">>, V, Acc) -> Acc#{zones => V};
+           (_, _, Acc) -> Acc
+        end,
+        #{},
+        Opts
+    ).
+
+%% Sanitize VDB info for JSON/CBOR encoding
+sanitize_vdb_info(Info) ->
+    maps:fold(
+        fun(name, V, Acc) -> Acc#{<<"name">> => V};
+           (shard_count, V, Acc) -> Acc#{<<"shard_count">> => V};
+           (hash_function, V, Acc) -> Acc#{<<"hash_function">> => atom_to_binary(V, utf8)};
+           (placement, V, Acc) -> Acc#{<<"placement">> => sanitize_placement(V)};
+           (created_at, V, Acc) -> Acc#{<<"created_at">> => V};
+           (total_docs, V, Acc) -> Acc#{<<"total_docs">> => V};
+           (total_disk_size, V, Acc) -> Acc#{<<"total_disk_size">> => V};
+           (shards, V, Acc) -> Acc#{<<"shards">> => V};
+           (assignments, V, Acc) -> Acc#{<<"assignments">> => [sanitize_shard_assignment(A) || A <- V]};
+           (_, _, Acc) -> Acc
+        end,
+        #{},
+        Info
+    ).
+
+sanitize_placement(Placement) ->
+    maps:fold(
+        fun(replica_factor, V, Acc) -> Acc#{<<"replica_factor">> => V};
+           (zones, V, Acc) -> Acc#{<<"zones">> => V};
+           (constraints, V, Acc) -> Acc#{<<"constraints">> => V};
+           (_, _, Acc) -> Acc
+        end,
+        #{},
+        Placement
+    ).
+
+sanitize_shard_assignment(Assignment) ->
+    maps:fold(
+        fun(shard_id, V, Acc) -> Acc#{<<"shard_id">> => V};
+           (primary, V, Acc) -> Acc#{<<"primary">> => V};
+           (replicas, V, Acc) -> Acc#{<<"replicas">> => V};
+           (status, V, Acc) when is_atom(V) -> Acc#{<<"status">> => atom_to_binary(V, utf8)};
+           (status, V, Acc) -> Acc#{<<"status">> => V};
+           (_, _, Acc) -> Acc
+        end,
+        #{},
+        Assignment
+    ).
+
+sanitize_shard_range(Range) ->
+    maps:fold(
+        fun(shard_id, V, Acc) -> Acc#{<<"shard_id">> => V};
+           (start_hash, V, Acc) -> Acc#{<<"start_hash">> => V};
+           (end_hash, V, Acc) -> Acc#{<<"end_hash">> => V};
+           (_, _, Acc) -> Acc
+        end,
+        #{},
+        Range
+    ).
+
+%% Sanitize replication status for JSON encoding
+sanitize_replication_status(Status) ->
+    maps:fold(
+        fun(vdb_name, V, Acc) -> Acc#{<<"vdb_name">> => V};
+           (replica_factor, V, Acc) -> Acc#{<<"replica_factor">> => V};
+           (shard_count, V, Acc) -> Acc#{<<"shard_count">> => V};
+           (policies, V, Acc) when is_map(V) ->
+               %% Convert policy counts
+               SafePolicies = maps:fold(
+                   fun(K, Val, PAcc) when is_atom(K) ->
+                       PAcc#{atom_to_binary(K, utf8) => Val};
+                      (K, Val, PAcc) ->
+                       PAcc#{K => Val}
+                   end,
+                   #{},
+                   V
+               ),
+               Acc#{<<"policies">> => SafePolicies};
+           (shards, V, Acc) when is_map(V) ->
+               %% Convert shard statuses (keyed by shard id integer)
+               SafeShards = maps:fold(
+                   fun(ShardId, ShardStatus, SAcc) when is_integer(ShardId) ->
+                       SAcc#{integer_to_binary(ShardId) => sanitize_shard_replication_status(ShardStatus)};
+                      (ShardId, ShardStatus, SAcc) ->
+                       SAcc#{ShardId => sanitize_shard_replication_status(ShardStatus)}
+                   end,
+                   #{},
+                   V
+               ),
+               Acc#{<<"shards">> => SafeShards};
+           (K, V, Acc) when is_atom(K) ->
+               Acc#{atom_to_binary(K, utf8) => V};
+           (K, V, Acc) ->
+               Acc#{K => V}
+        end,
+        #{},
+        Status
+    ).
+
+%% Sanitize individual shard replication status
+sanitize_shard_replication_status(Status) when is_map(Status) ->
+    maps:fold(
+        fun(policy_found, V, Acc) -> Acc#{<<"policy_found">> => V};
+           (policy_name, V, Acc) -> Acc#{<<"policy_name">> => V};
+           (policy_enabled, V, Acc) -> Acc#{<<"policy_enabled">> => V};
+           (task_count, V, Acc) -> Acc#{<<"task_count">> => V};
+           (tasks, V, Acc) when is_list(V) ->
+               Acc#{<<"tasks">> => [sanitize_json_value(T) || T <- V]};
+           (primary, V, Acc) -> Acc#{<<"primary">> => V};
+           (replicas, V, Acc) -> Acc#{<<"replicas">> => V};
+           (shard_status, V, Acc) when is_atom(V) ->
+               Acc#{<<"shard_status">> => atom_to_binary(V, utf8)};
+           (shard_status, V, Acc) -> Acc#{<<"shard_status">> => V};
+           (K, V, Acc) when is_atom(K) ->
+               Acc#{atom_to_binary(K, utf8) => sanitize_json_value(V)};
+           (K, V, Acc) ->
+               Acc#{K => sanitize_json_value(V)}
+        end,
+        #{},
+        Status
+    );
+sanitize_shard_replication_status(Status) ->
+    Status.
+
+%% Convert changes opts from query string
+convert_changes_opts(Opts) ->
+    maps:fold(
+        fun(<<"limit">>, V, Acc) -> Acc#{limit => V};
+           (limit, V, Acc) -> Acc#{limit => V};
+           (<<"include_docs">>, V, Acc) -> Acc#{include_docs => V};
+           (include_docs, V, Acc) -> Acc#{include_docs => V};
+           (_, _, Acc) -> Acc
+        end,
+        #{},
+        Opts
+    ).
+
+%% Extract query options from query spec
+extract_query_opts(QuerySpec) ->
+    maps:fold(
+        fun(limit, V, Acc) -> Acc#{limit => V};
+           (offset, V, Acc) -> Acc#{offset => V};
+           (sort, V, Acc) -> Acc#{sort => V};
+           (order_by, V, Acc) -> Acc#{order_by => V};
+           (_, _, Acc) -> Acc
+        end,
+        #{},
+        QuerySpec
+    ).
+
+%% Sanitize VDB changes response for JSON encoding
+sanitize_vdb_changes(Changes) ->
+    ChangesList = maps:get(changes, Changes, []),
+    LastSeq = maps:get(last_seq, Changes, 0),
+    HasMore = maps:get(has_more, Changes, false),
+    #{
+        <<"changes">> => [sanitize_json_value(C) || C <- ChangesList],
+        <<"last_seq">> => format_hlc_for_json(LastSeq),
+        <<"has_more">> => HasMore
+    }.
+
+%% Recursively sanitize a value for JSON encoding
+sanitize_json_value({timestamp, Physical, Logical}) ->
+    %% Format HLC as "physical:logical" string
+    iolist_to_binary(io_lib:format("~B:~B", [Physical, Logical]));
+sanitize_json_value(Map) when is_map(Map) ->
+    maps:fold(
+        fun(K, V, Acc) ->
+            Key = if is_atom(K) -> atom_to_binary(K, utf8); true -> K end,
+            Acc#{Key => sanitize_json_value(V)}
+        end,
+        #{},
+        Map
+    );
+sanitize_json_value(List) when is_list(List) ->
+    [sanitize_json_value(V) || V <- List];
+sanitize_json_value(V) ->
+    V.
+
+%% Format HLC timestamp for JSON (convert tuple to string)
+format_hlc_for_json({timestamp, Physical, Logical}) ->
+    %% Format as "physical:logical" string
+    iolist_to_binary(io_lib:format("~B:~B", [Physical, Logical]));
+format_hlc_for_json(V) when is_integer(V) ->
+    V;
+format_hlc_for_json(V) when is_binary(V) ->
+    V;
+format_hlc_for_json(_) ->
+    0.
+
+%% Parse VDB changes options from query string (already parsed as proplist)
+parse_vdb_changes_qs(Qs) ->
+    lists:foldl(
+        fun({<<"since">>, V}, Acc) ->
+                Since = case V of
+                    <<"0">> -> first;
+                    <<"first">> -> first;
+                    HlcBin -> HlcBin
+                end,
+                Acc#{since => Since};
+           ({<<"limit">>, V}, Acc) ->
+                Acc#{limit => binary_to_integer(V)};
+           ({<<"include_docs">>, <<"true">>}, Acc) ->
+                Acc#{include_docs => true};
+           ({<<"include_docs">>, <<"false">>}, Acc) ->
+                Acc#{include_docs => false};
+           (_, Acc) ->
+                Acc
+        end,
+        #{},
+        Qs
+    ).
 
 %%====================================================================
 %% Peer Discovery Handlers
@@ -1401,8 +1868,14 @@ convert_query_spec(Spec) when is_map(Spec) ->
     BaseSpec = maps:fold(
         fun(<<"where">>, V, Acc) ->
                 Acc#{where => convert_where_clauses(V)};
+           (<<"selector">>, V, Acc) when is_map(V) ->
+                %% Pass through selector for VDB (CouchDB-style)
+                Acc#{<<"selector">> => V};
            (<<"order_by">>, V, Acc) ->
                 Acc#{order_by => convert_order_by(V)};
+           (<<"sort">>, V, Acc) ->
+                %% Also handle "sort" as alias for order_by
+                Acc#{sort => V};
            (<<"limit">>, V, Acc) when is_integer(V) ->
                 Acc#{limit => V};
            (<<"offset">>, V, Acc) when is_integer(V) ->
@@ -1420,8 +1893,8 @@ convert_query_spec(Spec) when is_map(Spec) ->
         Spec
     ),
     %% Ensure where clause is present (required by query compiler)
-    %% If no where clause, use "exists id" condition to match all documents
-    case maps:is_key(where, BaseSpec) of
+    %% If no where clause and no selector, use "exists id" condition to match all documents
+    case maps:is_key(where, BaseSpec) orelse maps:is_key(<<"selector">>, BaseSpec) of
         true -> BaseSpec;
         false -> BaseSpec#{where => [{exists, [<<"id">>]}]}
     end.

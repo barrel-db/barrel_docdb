@@ -91,8 +91,10 @@ init_per_suite(Config) ->
     application:ensure_all_started(barrel_docdb),
     application:ensure_all_started(cowboy),
     application:ensure_all_started(hackney),
-    %% Start HTTP server at suite level (not stopped until end_per_suite)
-    {ok, _Pid} = barrel_http_server:start_link(#{port => ?PORT}),
+    %% Start HTTP server at suite level (stopped in end_per_suite)
+    %% Unlink so it survives process changes between init/end_per_suite
+    {ok, HttpPid} = barrel_http_server:start_link(#{port => ?PORT}),
+    unlink(HttpPid),
     %% Create a test API key for authentication
     {ok, ApiKey, _} = barrel_http_api_keys:create_key(#{
         name => <<"http-suite-key">>,
@@ -102,8 +104,7 @@ init_per_suite(Config) ->
     [{api_key, ApiKey} | Config].
 
 end_per_suite(_Config) ->
-    %% Stop HTTP server at suite level
-    catch barrel_http_server:stop(),
+    barrel_http_server:stop(),
     ok.
 
 init_per_group(http_tests, Config) ->
