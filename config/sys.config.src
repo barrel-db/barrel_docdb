@@ -3,9 +3,20 @@
         {data_dir, "${BARREL_DATA_DIR:-data/barrel_docdb}"},
         {default_store, barrel_store_rocksdb},
         %% HTTP server configuration
-        {http_enabled, true},
+        {http_enabled, ${BARREL_HTTP_ENABLED:-true}},
         {http_port, ${BARREL_HTTP_PORT:-8080}},
         {http_acceptors, ${BARREL_HTTP_ACCEPTORS:-100}},
+        {http_max_connections, ${BARREL_HTTP_MAX_CONNECTIONS:-infinity}},
+        %% HTTP/2 and TLS configuration
+        %% BARREL_HTTP_PROTOCOLS: comma-separated list (http2,http | http2 | http)
+        {http_protocols, [http2, http]},
+        %% TLS configuration (enables HTTPS with HTTP/2 ALPN)
+        %% Set BARREL_HTTP_TLS_ENABLED=true and provide cert/key paths
+        {http_tls_enabled, ${BARREL_HTTP_TLS_ENABLED:-false}},
+        {http_certfile, "${BARREL_HTTP_CERTFILE:-}"},
+        {http_keyfile, "${BARREL_HTTP_KEYFILE:-}"},
+        {http_cacertfile, "${BARREL_HTTP_CACERTFILE:-}"},
+        {http_verify, ${BARREL_HTTP_VERIFY:-verify_none}},
         %% Zone configuration for multi-datacenter deployments
         {zone, "${BARREL_ZONE:-}"}
     ]},

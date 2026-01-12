@@ -2,6 +2,107 @@
 
 Barrel DocDB provides a RESTful HTTP API for all operations. The server listens on port 8080 by default.
 
+## Server Configuration
+
+### Starting the HTTP Server
+
+```erlang
+%% Basic start (HTTP/1.1 and HTTP/2 cleartext)
+barrel_http_server:start_link(#{port => 8080}).
+
+%% With TLS (HTTPS with HTTP/2 ALPN)
+barrel_http_server:start_link(#{
+    port => 8443,
+    certfile => "/path/to/cert.pem",
+    keyfile => "/path/to/key.pem"
+}).
+
+%% Full configuration
+barrel_http_server:start_link(#{
+    port => 8443,
+    num_acceptors => 100,
+    max_connections => 10000,
+    protocols => [http2, http],
+    certfile => "/path/to/cert.pem",
+    keyfile => "/path/to/key.pem",
+    cacertfile => "/path/to/ca.pem",
+    verify => verify_peer
+}).
+```
+
+### Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `port` | integer | 8080 | Listen port |
+| `num_acceptors` | integer | 100 | Number of acceptor processes |
+| `max_connections` | integer | infinity | Maximum concurrent connections |
+| `protocols` | list | `[http2, http]` | Enabled protocols |
+| `certfile` | string | - | Path to TLS certificate (enables HTTPS) |
+| `keyfile` | string | - | Path to TLS private key |
+| `cacertfile` | string | - | Path to CA certificate (optional) |
+| `verify` | atom | `verify_none` | TLS verification: `verify_none` or `verify_peer` |
+
+### HTTP/2 Support
+
+The server supports HTTP/2 with automatic degradation to HTTP/1.1:
+
+**HTTPS Mode (recommended for production):**
+
+- Uses ALPN (Application-Layer Protocol Negotiation) to negotiate HTTP/2 or HTTP/1.1
+- Requires TLS certificates (`certfile` and `keyfile`)
+- Clients that support HTTP/2 will use it automatically
+- Legacy clients fall back to HTTP/1.1
+
+**HTTP Mode (cleartext):**
+
+- Supports HTTP/2 cleartext (h2c) via:
+  - HTTP/2 prior knowledge (client sends HTTP/2 preface directly)
+  - HTTP/1.1 Upgrade header
+- Falls back to HTTP/1.1 for clients that don't support h2c
+- Suitable for internal/trusted networks
+
+### Get Server Info
+
+```erlang
+{ok, Info} = barrel_http_server:get_info().
+%% Info = #{port => 8080, tls => false, protocols => [http2, http], http2 => true, http11 => true}
+```
+
+### Environment Variables (for Releases)
+
+When running as a release, configure the HTTP server via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BARREL_HTTP_ENABLED` | `true` | Enable/disable HTTP server |
+| `BARREL_HTTP_PORT` | `8080` | Listen port |
+| `BARREL_HTTP_ACCEPTORS` | `100` | Number of acceptor processes |
+| `BARREL_HTTP_MAX_CONNECTIONS` | `infinity` | Maximum concurrent connections |
+| `BARREL_HTTP_TLS_ENABLED` | `false` | Enable HTTPS with HTTP/2 ALPN |
+| `BARREL_HTTP_CERTFILE` | - | Path to TLS certificate |
+| `BARREL_HTTP_KEYFILE` | - | Path to TLS private key |
+| `BARREL_HTTP_CACERTFILE` | - | Path to CA certificate (optional) |
+| `BARREL_HTTP_VERIFY` | `verify_none` | TLS verification (`verify_none` or `verify_peer`) |
+
+**Example - HTTPS with HTTP/2:**
+
+```bash
+export BARREL_HTTP_PORT=8443
+export BARREL_HTTP_TLS_ENABLED=true
+export BARREL_HTTP_CERTFILE=/etc/barrel/server.pem
+export BARREL_HTTP_KEYFILE=/etc/barrel/server-key.pem
+./bin/barrel_docdb start
+```
+
+**Example - HTTP/1.1 only:**
+
+```bash
+# In sys.config.src, protocols can be configured
+# For HTTP/1.1 only, edit sys.config:
+# {http_protocols, [http]}
+```
+
 ## Content Types
 
 The API supports both JSON and CBOR:

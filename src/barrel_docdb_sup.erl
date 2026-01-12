@@ -187,11 +187,10 @@ init([]) ->
 
     %% HTTP server for REST API (optional, controlled by http_enabled config)
     HttpEnabled = application:get_env(barrel_docdb, http_enabled, false),
-    HttpPort = application:get_env(barrel_docdb, http_port, 8080),
-    HttpAcceptors = application:get_env(barrel_docdb, http_acceptors, 100),
+    HttpOpts = build_http_opts(),
     HttpServer = #{
         id => barrel_http_server,
-        start => {barrel_http_server, start_link, [#{port => HttpPort, num_acceptors => HttpAcceptors}]},
+        start => {barrel_http_server, start_link, [HttpOpts]},
         restart => permanent,
         shutdown => 5000,
         type => worker,
@@ -208,3 +207,54 @@ init([]) ->
     end,
 
     {ok, {SupFlags, ChildSpecs}}.
+
+%%====================================================================
+%% Internal functions
+%%====================================================================
+
+%% @private
+%% Build HTTP server options from application environment
+build_http_opts() ->
+    %% Basic options
+    Opts0 = #{
+        port => application:get_env(barrel_docdb, http_port, 8080),
+        num_acceptors => application:get_env(barrel_docdb, http_acceptors, 100),
+        max_connections => application:get_env(barrel_docdb, http_max_connections, infinity),
+        protocols => application:get_env(barrel_docdb, http_protocols, [http2, http])
+    },
+
+    %% TLS options (only add if TLS is enabled and cert/key are provided)
+    TlsEnabled = application:get_env(barrel_docdb, http_tls_enabled, false),
+    CertFile = application:get_env(barrel_docdb, http_certfile, undefined),
+    KeyFile = application:get_env(barrel_docdb, http_keyfile, undefined),
+
+    Opts1 = case TlsEnabled andalso is_valid_path(CertFile) andalso is_valid_path(KeyFile) of
+        true ->
+            TlsOpts = #{
+                certfile => CertFile,
+                keyfile => KeyFile
+            },
+            %% Add optional CA file
+            TlsOpts1 = case application:get_env(barrel_docdb, http_cacertfile, undefined) of
+                undefined -> TlsOpts;
+                "" -> TlsOpts;
+                CaFile -> TlsOpts#{cacertfile => CaFile}
+            end,
+            %% Add verify mode
+            TlsOpts2 = case application:get_env(barrel_docdb, http_verify, verify_none) of
+                verify_peer -> TlsOpts1#{verify => verify_peer};
+                _ -> TlsOpts1#{verify => verify_none}
+            end,
+            maps:merge(Opts0, TlsOpts2);
+        false ->
+            Opts0
+    end,
+    Opts1.
+
+%% @private
+%% Check if path is valid (non-empty string/binary)
+is_valid_path(undefined) -> false;
+is_valid_path("") -> false;
+is_valid_path(<<>>) -> false;
+is_valid_path(Path) when is_list(Path); is_binary(Path) -> true;
+is_valid_path(_) -> false.
