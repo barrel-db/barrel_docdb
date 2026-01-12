@@ -67,6 +67,10 @@ nav:
     - Tiered Storage: tiered-storage.md
     - Replication Policies: replication-policies.md
     - Metrics: metrics.md
+    - Advanced Features: advanced-features.md
+  - VDB (Virtual Database):
+    - Overview: vdb.md
+    - Multi-Datacenter Sharding: sharding.md
   - HTTP API: api/http.md
   - Erlang API: api/erlang.md
   - Architecture: design.md
