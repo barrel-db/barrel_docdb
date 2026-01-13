@@ -374,15 +374,21 @@ do_pull_config(VdbName, PeerUrl) ->
 
     try
         case hackney:get(Url, Headers, <<>>, Options) of
-            {ok, 200, _RespHeaders, ClientRef} ->
+            {ok, 200, RespHeaders, ClientRef} ->
+                _ = barrel_hlc:maybe_sync_from_header(
+                    proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
                 {ok, Body} = hackney:body(ClientRef),
                 Config = json:decode(Body),
                 %% Store locally
                 import_config(VdbName, Config);
-            {ok, 404, _RespHeaders, ClientRef} ->
+            {ok, 404, RespHeaders, ClientRef} ->
+                _ = barrel_hlc:maybe_sync_from_header(
+                    proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
                 hackney:body(ClientRef),
                 {error, not_found};
-            {ok, Status, _RespHeaders, ClientRef} ->
+            {ok, Status, RespHeaders, ClientRef} ->
+                _ = barrel_hlc:maybe_sync_from_header(
+                    proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
                 hackney:body(ClientRef),
                 {error, {http_error, Status}};
             {error, Reason} ->
@@ -598,7 +604,9 @@ do_sync_from_peer(PeerUrl) ->
 
     try
         case hackney:get(Url, Headers, <<>>, Options) of
-            {ok, 200, _RespHeaders, ClientRef} ->
+            {ok, 200, RespHeaders, ClientRef} ->
+                _ = barrel_hlc:maybe_sync_from_header(
+                    proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
                 {ok, Body} = hackney:body(ClientRef),
                 Response = json:decode(Body),
                 VdbList = maps:get(<<"vdbs">>, Response, []),
@@ -613,7 +621,9 @@ do_sync_from_peer(PeerUrl) ->
                     end
                 end, VdbList),
                 ok;
-            {ok, _Status, _RespHeaders, ClientRef} ->
+            {ok, _Status, RespHeaders, ClientRef} ->
+                _ = barrel_hlc:maybe_sync_from_header(
+                    proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
                 hackney:body(ClientRef),
                 {error, peer_error};
             {error, Reason} ->
