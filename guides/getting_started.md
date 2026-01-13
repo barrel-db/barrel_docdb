@@ -33,7 +33,7 @@ This guide walks you through installing and using Barrel DocDB. You'll have a wo
 
     ```erlang
     {deps, [
-        {barrel_docdb, "0.2.0"}
+        {barrel_docdb, "0.3.0"}
     ]}.
     ```
 
