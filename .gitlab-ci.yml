@@ -18,13 +18,12 @@ test:
   stage: test
   image: erlang:27
   cache:
-    key: rebar3-$CI_COMMIT_REF_SLUG
+    key: rebar3-deps-v1
     paths:
       - .cache/rebar3
-      - _build
   before_script:
-    # Install build tools for native dependencies (rocksdb, hackney QUIC)
-    - apt-get update && apt-get install -y cmake build-essential libssl-dev liblz4-dev libsnappy-dev
+    # Install build tools for native dependencies (rocksdb)
+    - apt-get update && apt-get install -y cmake build-essential libssl-dev zlib1g-dev
     - rebar3 --version
   script:
     - rebar3 compile
