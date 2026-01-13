@@ -462,10 +462,14 @@ query_remote_member(Url, QuerySpec, Timeout) ->
     Options = [{recv_timeout, Timeout}, {connect_timeout, 5000}],
 
     case hackney:post(FindUrl, Headers, QueryJson, Options) of
-        {ok, 200, _RespHeaders, ClientRef} ->
+        {ok, 200, RespHeaders, ClientRef} ->
+            _ = barrel_hlc:maybe_sync_from_header(
+                proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
             {ok, Body} = hackney:body(ClientRef),
             parse_remote_response(Body);
-        {ok, Status, _RespHeaders, ClientRef} ->
+        {ok, Status, RespHeaders, ClientRef} ->
+            _ = barrel_hlc:maybe_sync_from_header(
+                proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
             {ok, Body} = hackney:body(ClientRef),
             {error, {http_error, Status, Body}};
         {error, Reason} ->
