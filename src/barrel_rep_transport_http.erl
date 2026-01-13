@@ -245,6 +245,8 @@ http_get(Endpoint, Url) ->
     Opts = request_options(Endpoint),
     case hackney:get(Url, Headers, <<>>, Opts) of
         {ok, Status, RespHeaders, Ref} ->
+            _ = barrel_hlc:maybe_sync_from_header(
+                proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
             {ok, Body} = hackney:body(Ref),
             {ok, Status, RespHeaders, Body};
         {error, _} = Error ->
@@ -257,6 +259,8 @@ http_post(Endpoint, Url, ReqBody) ->
     Opts = request_options(Endpoint),
     case hackney:post(Url, Headers, Body, Opts) of
         {ok, Status, RespHeaders, Ref} ->
+            _ = barrel_hlc:maybe_sync_from_header(
+                proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
             {ok, RespBody} = hackney:body(Ref),
             {ok, Status, RespHeaders, RespBody};
         {error, _} = Error ->
@@ -269,6 +273,8 @@ http_put(Endpoint, Url, ReqBody) ->
     Opts = request_options(Endpoint),
     case hackney:put(Url, Headers, Body, Opts) of
         {ok, Status, RespHeaders, Ref} ->
+            _ = barrel_hlc:maybe_sync_from_header(
+                proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
             {ok, RespBody} = hackney:body(Ref),
             {ok, Status, RespHeaders, RespBody};
         {error, _} = Error ->
@@ -280,6 +286,8 @@ http_delete(Endpoint, Url) ->
     Opts = request_options(Endpoint),
     case hackney:delete(Url, Headers, <<>>, Opts) of
         {ok, Status, RespHeaders, Ref} ->
+            _ = barrel_hlc:maybe_sync_from_header(
+                proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
             {ok, Body} = hackney:body(Ref),
             {ok, Status, RespHeaders, Body};
         {error, _} = Error ->
