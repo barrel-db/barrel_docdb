@@ -21,7 +21,8 @@
     clock_now/1,
     clock_update/1,
     clock_timestamp/1,
-    clock_causality/1
+    clock_causality/1,
+    maybe_sync_from_header/1
 ]).
 
 %% Test cases - encoding/decoding
@@ -57,7 +58,8 @@ groups() ->
             clock_now,
             clock_update,
             clock_timestamp,
-            clock_causality
+            clock_causality,
+            maybe_sync_from_header
         ]},
         {encoding, [sequence], [
             encode_decode,
@@ -177,6 +179,26 @@ clock_causality(_Config) ->
 
     barrel_hlc:stop(Clock1),
     barrel_hlc:stop(Clock2),
+    ok.
+
+maybe_sync_from_header(_Config) ->
+    %% Test that maybe_sync_from_header handles various inputs
+
+    %% undefined should return ok silently
+    ?assertEqual(ok, barrel_hlc:maybe_sync_from_header(undefined)),
+
+    %% Valid base64-encoded HLC should sync
+    TS = #timestamp{wall_time = erlang:system_time(millisecond) + 1000, logical = 10},
+    HlcBin = barrel_hlc:encode(TS),
+    HlcBase64 = base64:encode(HlcBin),
+    ?assertEqual(ok, barrel_hlc:maybe_sync_from_header(HlcBase64)),
+
+    %% Invalid base64 should return ok (silently ignored)
+    ?assertEqual(ok, barrel_hlc:maybe_sync_from_header(<<"not-valid-base64!!!">>)),
+
+    %% Valid base64 but invalid HLC binary should return ok (silently ignored)
+    ?assertEqual(ok, barrel_hlc:maybe_sync_from_header(base64:encode(<<"short">>))),
+
     ok.
 
 %%====================================================================

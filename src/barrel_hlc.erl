@@ -23,7 +23,8 @@
     timestamp/0,
     get_hlc/0,
     sync_hlc/1,
-    new_hlc/0
+    new_hlc/0,
+    maybe_sync_from_header/1
 ]).
 
 %% Instance-based operations (for testing or custom clocks)
@@ -106,6 +107,21 @@ sync_hlc(RemoteTS) ->
 -spec new_hlc() -> timestamp().
 new_hlc() ->
     now().
+
+%% @doc Sync HLC from a base64-encoded HTTP header value.
+%% Silently ignores undefined or invalid values.
+-spec maybe_sync_from_header(binary() | undefined) -> ok.
+maybe_sync_from_header(undefined) ->
+    ok;
+maybe_sync_from_header(HlcBase64) ->
+    try
+        HlcBin = base64:decode(HlcBase64),
+        Hlc = decode(HlcBin),
+        _ = sync_hlc(Hlc),
+        ok
+    catch
+        _:_ -> ok
+    end.
 
 %% @doc Generate a new timestamp for a local event using global clock.
 -spec now() -> timestamp().
