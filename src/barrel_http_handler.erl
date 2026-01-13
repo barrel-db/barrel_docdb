@@ -2472,9 +2472,12 @@ request_content_type(Req) ->
         _ -> json
     end.
 
-%% Response headers with content type
+%% Response headers with content type and HLC for clock sync
 response_headers(Req) ->
-    #{<<"content-type">> => response_content_type(Req)}.
+    Hlc = barrel_hlc:get_hlc(),
+    HlcBin = barrel_hlc:encode(Hlc),
+    #{<<"content-type">> => response_content_type(Req),
+      <<"x-barrel-hlc">> => base64:encode(HlcBin)}.
 
 %%====================================================================
 %% Encoding/Decoding
