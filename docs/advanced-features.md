@@ -560,6 +560,92 @@ curl -X POST "http://localhost:8080/db/cache/_tier/config" \
 
 ---
 
+## Clock Synchronization (HLC)
+
+Barrel DocDB uses Hybrid Logical Clocks (HLC) to maintain causal ordering across distributed nodes. HLC combines physical wall clock time with a logical counter, ensuring that events are correctly ordered even when physical clocks drift.
+
+### Automatic Synchronization
+
+Clock synchronization happens automatically during all inter-node communication:
+
+- **Discovery**: When nodes discover each other
+- **Replication**: During document sync between databases
+- **Federation**: When querying remote members
+- **VDB Sync**: When synchronizing virtual database configurations
+
+Every HTTP response from Barrel DocDB includes an `x-barrel-hlc` header containing the current HLC timestamp (base64-encoded). Clients automatically sync their local clock when they receive responses.
+
+### Check Current HLC
+
+You can see the current HLC in any response header:
+
+```bash
+curl -v http://localhost:8080/health 2>&1 | grep -i x-barrel-hlc
+```
+
+Output:
+```
+< x-barrel-hlc: AAAB1aBcdefghijklmnopqrs==
+```
+
+### Manual Clock Sync
+
+For explicit clock synchronization between nodes, use the `_sync_hlc` endpoint:
+
+```bash
+# Get current HLC from node A
+HLC_A=$(curl -s http://node-a:8080/health -D - -o /dev/null | grep -i x-barrel-hlc | cut -d' ' -f2 | tr -d '\r')
+
+# Sync node B with node A's clock
+curl -X POST "http://node-b:8080/db/mydb/_sync_hlc" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $API_KEY" \
+  -d "{\"hlc\": \"$HLC_A\"}"
+```
+
+Response:
+```json
+{
+  "hlc": "{timestamp,1736500000000,42}",
+  "db": "mydb"
+}
+```
+
+### Why HLC Matters
+
+HLC ensures:
+
+1. **Causal ordering**: Events that causally depend on each other are correctly ordered
+2. **Conflict detection**: During replication, conflicts are detected based on HLC timestamps
+3. **Change feed consistency**: The `_changes` feed returns events in HLC order
+4. **Cross-node consistency**: All nodes agree on event ordering regardless of clock drift
+
+### HLC in Changes Feed
+
+The changes feed uses HLC for the `last_seq` value:
+
+```bash
+curl "http://localhost:8080/db/mydb/_changes?since=first" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+Response:
+```json
+{
+  "results": [...],
+  "last_seq": "{timestamp,1736500000000,42}"
+}
+```
+
+Use the `last_seq` value to resume the changes feed from where you left off:
+
+```bash
+curl "http://localhost:8080/db/mydb/_changes?since={timestamp,1736500000000,42}" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+---
+
 ## Combined Example: Multi-Region Architecture
 
 This example shows a multi-region setup with federation, replication policies, and tiered storage.
