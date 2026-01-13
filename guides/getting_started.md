@@ -1,215 +1,484 @@
-# Getting Started with barrel_docdb
+# Getting Started
 
-barrel_docdb is an embeddable document database for Erlang applications. It provides:
+This guide walks you through installing and using Barrel DocDB. You'll have a working database in under 5 minutes.
 
-- **Document storage** with automatic revision management (MVCC)
-- **Binary attachments** stored efficiently with RocksDB BlobDB
-- **Secondary indexes** (views) for querying documents by custom keys
-- **Changes feed** for tracking all document modifications
-- **Replication** for syncing databases
+## Prerequisites
+
+- **Erlang/OTP 27+** (for embedded use or building from source)
+- **Docker** (optional, for standalone deployment)
 
 ## Installation
 
-Add barrel_docdb to your `rebar.config` dependencies:
+=== "Docker (Standalone)"
 
-```erlang
-{deps, [
-    {barrel_docdb, "0.2.0"}
-]}.
-```
+    The fastest way to run Barrel DocDB as a standalone server:
 
-## Quick Start
+    ```bash
+    docker run -d \
+      --name barrel \
+      -p 8080:8080 \
+      -v barrel_data:/data \
+      registry.gitlab.enki.io/barrel-db/barrel_docdb:latest
+    ```
 
-### Starting the Application
+    Verify it's running:
 
-```erlang
-%% Start the application
-application:ensure_all_started(barrel_docdb).
-```
+    ```bash
+    curl http://localhost:8080/health
+    ```
 
-### Creating a Database
+=== "Erlang (Embedded)"
 
-```erlang
-%% Create a database with default settings
-{ok, _Pid} = barrel_docdb:create_db(<<"mydb">>).
+    Add to your `rebar.config`:
 
-%% Create with custom data directory
-{ok, _Pid} = barrel_docdb:create_db(<<"mydb">>, #{
-    data_dir => "/var/lib/barrel"
-}).
-```
+    ```erlang
+    {deps, [
+        {barrel_docdb, "0.2.0"}
+    ]}.
+    ```
 
-### Working with Documents
+    Then fetch dependencies:
 
-Documents are Erlang maps with automatic ID and revision management:
+    ```bash
+    rebar3 get-deps
+    rebar3 compile
+    ```
 
-```erlang
-%% Create a document (ID auto-generated)
-{ok, Result} = barrel_docdb:put_doc(<<"mydb">>, #{
-    <<"type">> => <<"user">>,
-    <<"name">> => <<"Alice">>,
-    <<"email">> => <<"alice@example.com">>
-}),
-DocId = maps:get(<<"id">>, Result),
-Rev = maps:get(<<"rev">>, Result).
+=== "Build from Source"
 
-%% Create a document with specific ID
-{ok, _} = barrel_docdb:put_doc(<<"mydb">>, #{
-    <<"id">> => <<"user:alice">>,
-    <<"name">> => <<"Alice">>
-}).
+    Clone and build:
 
-%% Retrieve a document
-{ok, Doc} = barrel_docdb:get_doc(<<"mydb">>, <<"user:alice">>).
+    ```bash
+    git clone https://gitlab.enki.io/barrel-db/barrel_docdb.git
+    cd barrel_docdb
+    rebar3 compile
+    rebar3 shell
+    ```
 
-%% Update a document (must include _rev)
-{ok, _} = barrel_docdb:put_doc(<<"mydb">>, Doc#{
-    <<"name">> => <<"Alice Smith">>
-}).
+## Your First Database
 
-%% Delete a document
-{ok, _} = barrel_docdb:delete_doc(<<"mydb">>, DocId).
-```
+=== "HTTP API"
 
-### Document IDs and Revisions
+    ### Create a Database
 
-- `<<"id">>` - The document identifier (string). Auto-generated if not provided.
-- `<<"_rev">>` - The revision identifier. Required for updates to prevent conflicts.
-- `<<"_deleted">>` - Set to `true` for deleted documents.
+    ```bash
+    curl -X POST http://localhost:8080/db/myapp
+    ```
 
-### Iterating Over Documents
+    Response:
 
-```erlang
-%% Count all documents
-{ok, Count} = barrel_docdb:fold_docs(<<"mydb">>,
-    fun(_Doc, Acc) -> {ok, Acc + 1} end,
-    0
-).
+    ```json
+    {"name": "myapp", "doc_count": 0}
+    ```
 
-%% Collect all user documents
-{ok, Users} = barrel_docdb:fold_docs(<<"mydb">>,
-    fun(Doc, Acc) ->
-        case maps:get(<<"type">>, Doc, undefined) of
-            <<"user">> -> {ok, [Doc | Acc]};
-            _ -> {ok, Acc}
-        end
-    end,
-    []
-).
-```
+    ### Store a Document
+
+    Create a document with an auto-generated ID:
+
+    ```bash
+    curl -X POST http://localhost:8080/db/myapp \
+      -H "Content-Type: application/json" \
+      -d '{
+        "type": "user",
+        "name": "Alice",
+        "email": "alice@example.com",
+        "role": "admin"
+      }'
+    ```
+
+    Response:
+
+    ```json
+    {"id": "d7f3e2a1...", "rev": "1-abc123..."}
+    ```
+
+    Or store with a specific ID:
+
+    ```bash
+    curl -X PUT http://localhost:8080/db/myapp/user-alice \
+      -H "Content-Type: application/json" \
+      -d '{
+        "type": "user",
+        "name": "Alice",
+        "email": "alice@example.com"
+      }'
+    ```
+
+    ### Retrieve a Document
+
+    ```bash
+    curl http://localhost:8080/db/myapp/user-alice
+    ```
+
+    Response:
+
+    ```json
+    {
+      "id": "user-alice",
+      "_rev": "1-abc123...",
+      "type": "user",
+      "name": "Alice",
+      "email": "alice@example.com"
+    }
+    ```
+
+    ### Update a Document
+
+    Include the `_rev` field from the previous response:
+
+    ```bash
+    curl -X PUT http://localhost:8080/db/myapp/user-alice \
+      -H "Content-Type: application/json" \
+      -d '{
+        "_rev": "1-abc123...",
+        "type": "user",
+        "name": "Alice Smith",
+        "email": "alice@example.com",
+        "role": "admin"
+      }'
+    ```
+
+    ### Delete a Document
+
+    ```bash
+    curl -X DELETE "http://localhost:8080/db/myapp/user-alice?rev=2-def456..."
+    ```
+
+=== "Erlang API"
+
+    ### Start the Application
+
+    ```erlang
+    application:ensure_all_started(barrel_docdb).
+    ```
+
+    ### Create a Database
+
+    ```erlang
+    {ok, _Info} = barrel_docdb:create_db(<<"myapp">>).
+    ```
+
+    ### Store a Document
+
+    With auto-generated ID:
+
+    ```erlang
+    {ok, #{<<"id">> := DocId, <<"rev">> := Rev}} =
+        barrel_docdb:put_doc(<<"myapp">>, #{
+            <<"type">> => <<"user">>,
+            <<"name">> => <<"Alice">>,
+            <<"email">> => <<"alice@example.com">>
+        }).
+    ```
+
+    With specific ID:
+
+    ```erlang
+    {ok, #{<<"rev">> := Rev}} =
+        barrel_docdb:put_doc(<<"myapp">>, #{
+            <<"id">> => <<"user-alice">>,
+            <<"type">> => <<"user">>,
+            <<"name">> => <<"Alice">>
+        }).
+    ```
+
+    ### Retrieve a Document
+
+    ```erlang
+    {ok, Doc} = barrel_docdb:get_doc(<<"myapp">>, <<"user-alice">>).
+    %% Doc = #{<<"id">> => <<"user-alice">>, <<"_rev">> => <<"1-...">>, ...}
+    ```
+
+    ### Update a Document
+
+    ```erlang
+    {ok, #{<<"rev">> := NewRev}} =
+        barrel_docdb:put_doc(<<"myapp">>, Doc#{
+            <<"name">> => <<"Alice Smith">>,
+            <<"role">> => <<"admin">>
+        }).
+    ```
+
+    ### Delete a Document
+
+    ```erlang
+    {ok, _} = barrel_docdb:delete_doc(<<"myapp">>, <<"user-alice">>, Rev).
+    ```
+
+## Querying Documents
+
+Barrel DocDB provides declarative queries with automatic path indexing. No need to create indexes manually.
+
+=== "HTTP API"
+
+    Find all users:
+
+    ```bash
+    curl -X POST http://localhost:8080/db/myapp/_find \
+      -H "Content-Type: application/json" \
+      -d '{
+        "where": [{"path": ["type"], "value": "user"}]
+      }'
+    ```
+
+    Find admins:
+
+    ```bash
+    curl -X POST http://localhost:8080/db/myapp/_find \
+      -H "Content-Type: application/json" \
+      -d '{
+        "where": [
+          {"path": ["type"], "value": "user"},
+          {"path": ["role"], "value": "admin"}
+        ]
+      }'
+    ```
+
+    With pagination:
+
+    ```bash
+    curl -X POST http://localhost:8080/db/myapp/_find \
+      -H "Content-Type: application/json" \
+      -d '{
+        "where": [{"path": ["type"], "value": "user"}],
+        "limit": 10,
+        "offset": 0
+      }'
+    ```
+
+=== "Erlang API"
+
+    Find all users:
+
+    ```erlang
+    {ok, Users, _Meta} = barrel_docdb:find(<<"myapp">>, #{
+        where => [{path, [<<"type">>], <<"user">>}]
+    }).
+    ```
+
+    Find admins:
+
+    ```erlang
+    {ok, Admins, _Meta} = barrel_docdb:find(<<"myapp">>, #{
+        where => [
+            {path, [<<"type">>], <<"user">>},
+            {path, [<<"role">>], <<"admin">>}
+        ]
+    }).
+    ```
+
+    With pagination:
+
+    ```erlang
+    {ok, Results, #{total := Total}} = barrel_docdb:find(<<"myapp">>, #{
+        where => [{path, [<<"type">>], <<"user">>}],
+        limit => 10,
+        offset => 0
+    }).
+    ```
+
+## Watching for Changes
+
+Subscribe to real-time changes using MQTT-style path patterns.
+
+=== "HTTP API (SSE)"
+
+    Stream all changes:
+
+    ```bash
+    curl http://localhost:8080/db/myapp/_changes/stream
+    ```
+
+    Long-poll for changes:
+
+    ```bash
+    curl "http://localhost:8080/db/myapp/_changes?feed=longpoll&timeout=30000"
+    ```
+
+    Get changes since a specific point:
+
+    ```bash
+    curl "http://localhost:8080/db/myapp/_changes?since=5"
+    ```
+
+=== "Erlang API"
+
+    Subscribe to all changes:
+
+    ```erlang
+    {ok, SubRef} = barrel_docdb:subscribe(<<"myapp">>, <<"#">>),
+    receive
+        {barrel_change, SubRef, Change} ->
+            io:format("Change: ~p~n", [Change])
+    end.
+    ```
+
+    Subscribe to user changes only:
+
+    ```erlang
+    {ok, SubRef} = barrel_docdb:subscribe(<<"myapp">>, <<"type/user/#">>).
+    ```
+
+    Unsubscribe:
+
+    ```erlang
+    barrel_docdb:unsubscribe(SubRef).
+    ```
 
 ## Working with Attachments
 
-Attachments let you store binary data (files, images, etc.) associated with documents:
+Store binary files (images, documents, etc.) alongside your documents.
+
+=== "HTTP API"
+
+    Store an attachment:
+
+    ```bash
+    curl -X PUT http://localhost:8080/db/myapp/user-alice/_attachments/photo.jpg \
+      -H "Content-Type: image/jpeg" \
+      --data-binary @photo.jpg
+    ```
+
+    Retrieve an attachment:
+
+    ```bash
+    curl http://localhost:8080/db/myapp/user-alice/_attachments/photo.jpg > photo.jpg
+    ```
+
+    Delete an attachment:
+
+    ```bash
+    curl -X DELETE http://localhost:8080/db/myapp/user-alice/_attachments/photo.jpg
+    ```
+
+=== "Erlang API"
+
+    Store an attachment:
+
+    ```erlang
+    Data = <<"Hello, World!">>,
+    {ok, _} = barrel_docdb:put_attachment(<<"myapp">>, <<"user-alice">>,
+        <<"greeting.txt">>, Data).
+    ```
+
+    Retrieve an attachment:
+
+    ```erlang
+    {ok, Binary} = barrel_docdb:get_attachment(<<"myapp">>, <<"user-alice">>,
+        <<"greeting.txt">>).
+    ```
+
+    List attachments:
+
+    ```erlang
+    AttNames = barrel_docdb:list_attachments(<<"myapp">>, <<"user-alice">>).
+    %% Returns [<<"greeting.txt">>]
+    ```
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BARREL_DATA_DIR` | `data/barrel_docdb` | Data directory |
+| `BARREL_HTTP_PORT` | `8080` | HTTP server port |
+| `BARREL_HTTP_ENABLED` | `true` | Enable HTTP server |
+
+### Erlang Configuration
+
+In `sys.config`:
 
 ```erlang
-%% Store an attachment
-Data = <<"Hello, World!">>,
-{ok, _} = barrel_docdb:put_attachment(<<"mydb">>, <<"doc1">>,
-    <<"greeting.txt">>, Data).
-
-%% Retrieve an attachment
-{ok, Binary} = barrel_docdb:get_attachment(<<"mydb">>, <<"doc1">>,
-    <<"greeting.txt">>).
-
-%% List attachments for a document
-AttNames = barrel_docdb:list_attachments(<<"mydb">>, <<"doc1">>).
-%% Returns [<<"greeting.txt">>]
-
-%% Delete an attachment
-ok = barrel_docdb:delete_attachment(<<"mydb">>, <<"doc1">>,
-    <<"greeting.txt">>).
-```
-
-## Creating Views (Secondary Indexes)
-
-Views allow you to query documents by custom keys.
-
-### Define a View Module
-
-```erlang
--module(by_type_view).
--behaviour(barrel_view).
--export([version/0, map/1]).
-
-%% Increment version when changing the map function
-version() -> 1.
-
-%% Emit {Key, Value} pairs for each document
-map(#{<<"type">> := Type, <<"name">> := Name}) ->
-    [{Type, Name}];
-map(_) ->
-    [].
-```
-
-### Register and Query the View
-
-```erlang
-%% Register the view
-ok = barrel_docdb:register_view(<<"mydb">>, <<"by_type">>, #{
-    module => by_type_view
-}).
-
-%% Wait for the view to be up-to-date
-{ok, _Seq} = barrel_docdb:refresh_view(<<"mydb">>, <<"by_type">>).
-
-%% Query the view
-{ok, Results} = barrel_docdb:query_view(<<"mydb">>, <<"by_type">>, #{
-    start_key => <<"user">>,
-    end_key => <<"user">>
-}).
-
-%% Each result has: key, value, id
-lists:foreach(fun(#{key := Key, value := Value, id := DocId}) ->
-    io:format("~s: ~s (doc: ~s)~n", [Key, Value, DocId])
-end, Results).
-```
-
-## Tracking Changes
-
-The changes feed tracks all document modifications using HLC timestamps:
-
-```erlang
-%% Get all changes since the beginning
-{ok, Changes, LastHlc} = barrel_docdb:get_changes(<<"mydb">>, first).
-
-%% Get changes with options
-{ok, Changes2, _} = barrel_docdb:get_changes(<<"mydb">>, LastHlc, #{
-    limit => 100,
-    include_docs => true
-}).
-
-%% Process each change
-lists:foreach(fun(Change) ->
-    DocId = maps:get(id, Change),
-    Hlc = maps:get(hlc, Change),
-    IsDeleted = maps:get(deleted, Change, false),
-    io:format("Change at ~p: ~s (~s)~n",
-        [Hlc, DocId, if IsDeleted -> "deleted"; true -> "updated" end])
-end, Changes).
-```
-
-See the [Changes & Subscriptions Guide](changes.md) for more details on real-time notifications.
-
-## Database Management
-
-```erlang
-%% List all open databases
-DbNames = barrel_docdb:list_dbs().
-
-%% Get database info
-{ok, Info} = barrel_docdb:db_info(<<"mydb">>).
-
-%% Close a database (can be reopened with create_db)
-ok = barrel_docdb:close_db(<<"mydb">>).
-
-%% Delete a database and all its data
-ok = barrel_docdb:delete_db(<<"mydb">>).
+[
+  {barrel_docdb, [
+    {data_dir, "data/barrel_docdb"},
+    {http_port, 8080},
+    {http_enabled, true}
+  ]}
+].
 ```
 
 ## Next Steps
 
-- [Query Guide](queries.md) - Declarative queries for finding documents
-- [Changes & Subscriptions](changes.md) - Real-time change notifications
-- [Replication Guide](replication.md) - Sync databases with filtering
-- [Erlang API Reference](api/erlang.md) - Complete API documentation
+Now that you have Barrel DocDB running, explore these features:
+
+<div class="grid cards" markdown>
+
+-   :mag: **[Queries](queries.md)**
+
+    ---
+
+    Advanced query syntax, operators, and filtering
+
+-   :zap: **[Changes Feed](changes.md)**
+
+    ---
+
+    Real-time subscriptions and MQTT-style patterns
+
+-   :arrows_counterclockwise: **[Replication](replication.md)**
+
+    ---
+
+    Sync data between nodes with filtering
+
+-   :globe_with_meridians: **[Federation](federation.md)**
+
+    ---
+
+    Query across multiple databases
+
+-   :file_folder: **[Tiered Storage](tiered-storage.md)**
+
+    ---
+
+    Hot/warm/cold data tiers with automatic migration
+
+-   :books: **[HTTP API Reference](api/http.md)**
+
+    ---
+
+    Complete endpoint documentation
+
+</div>
+
+## Troubleshooting
+
+!!! warning "Document Update Fails with Conflict"
+
+    If you get a conflict error when updating, ensure you're including the current `_rev` value from the document. Barrel uses MVCC (Multi-Version Concurrency Control) to prevent lost updates.
+
+    ```bash
+    # Get the current revision first
+    curl http://localhost:8080/db/myapp/doc1
+
+    # Then include _rev in your update
+    curl -X PUT http://localhost:8080/db/myapp/doc1 \
+      -H "Content-Type: application/json" \
+      -d '{"_rev": "1-abc...", "name": "updated"}'
+    ```
+
+!!! warning "Connection Refused"
+
+    Check that the HTTP server is running:
+
+    ```bash
+    curl http://localhost:8080/health
+    ```
+
+    If using Docker, verify the container is running:
+
+    ```bash
+    docker ps | grep barrel
+    ```
+
+!!! tip "Enable HTTP/2 for Better Performance"
+
+    For production deployments, enable HTTPS with HTTP/2:
+
+    ```bash
+    export BARREL_HTTP_TLS_ENABLED=true
+    export BARREL_HTTP_CERTFILE=/path/to/cert.pem
+    export BARREL_HTTP_KEYFILE=/path/to/key.pem
+    ```
