@@ -19,6 +19,7 @@
     http_get_doc/1,
     http_put_rev/1,
     http_revsdiff/1,
+    http_revsdiff_batch/1,
     http_get_changes/1,
     http_local_docs/1,
     http_db_info/1,
@@ -83,6 +84,7 @@ groups() ->
             http_get_doc,
             http_put_rev,
             http_revsdiff,
+            http_revsdiff_batch,
             http_get_changes,
             http_local_docs,
             http_db_info
@@ -332,6 +334,46 @@ http_revsdiff(Config) ->
     %% Check revsdiff - unknown rev should be missing
     {ok, Missing2, _} = barrel_rep_transport_http:revsdiff(Endpoint, DocId, [<<"2-unknown">>]),
     [<<"2-unknown">>] = Missing2,
+
+    ok.
+
+http_revsdiff_batch(Config) ->
+    Endpoint = proplists:get_value(endpoint, Config),
+
+    %% Create two documents
+    DocId1 = <<"batch_http_doc1">>,
+    DocId2 = <<"batch_http_doc2">>,
+    {ok, #{<<"rev">> := Rev1}} = barrel_docdb:put_doc(<<"http_test">>, #{<<"id">> => DocId1, <<"value">> => 1}),
+    {ok, #{<<"rev">> := Rev2}} = barrel_docdb:put_doc(<<"http_test">>, #{<<"id">> => DocId2, <<"value">> => 2}),
+
+    %% Test batch revsdiff via direct HTTP request
+    #{url := BaseUrl, bearer_token := BearerToken} = Endpoint,
+    Url = <<BaseUrl/binary, "/_revsdiff">>,
+    ReqBody = #{<<"revs">> => #{
+        DocId1 => [Rev1, <<"2-fake123">>],
+        DocId2 => [Rev2],
+        <<"nonexistent">> => [<<"1-abc">>]
+    }},
+    EncodedBody = json:encode(ReqBody),
+    Headers = [
+        {<<"content-type">>, <<"application/json">>},
+        {<<"authorization">>, <<"Bearer ", BearerToken/binary>>}
+    ],
+    {ok, 200, _RespHeaders, RespBody} = hackney:request(post, Url, Headers, EncodedBody, []),
+    {ok, RespBodyBin} = hackney:body(RespBody),
+    Results = json:decode(RespBodyBin),
+
+    %% Check DocId1 result - only fake rev should be missing
+    #{DocId1 := Result1} = Results,
+    [<<"2-fake123">>] = maps:get(<<"missing">>, Result1),
+
+    %% Check DocId2 result - nothing missing
+    #{DocId2 := Result2} = Results,
+    [] = maps:get(<<"missing">>, Result2),
+
+    %% Check nonexistent doc - all revs missing
+    #{<<"nonexistent">> := Result3} = Results,
+    [<<"1-abc">>] = maps:get(<<"missing">>, Result3),
 
     ok.
 

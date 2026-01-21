@@ -35,7 +35,8 @@ groups() ->
         {revsdiff, [sequence], [
             revsdiff_missing_all,
             revsdiff_missing_some,
-            revsdiff_missing_none
+            revsdiff_missing_none,
+            revsdiff_batch
         ]},
         {put_rev, [sequence], [
             put_rev_new_doc,
@@ -247,6 +248,39 @@ revsdiff_missing_none(_Config) ->
     %% Check revsdiff - existing rev is not missing
     {ok, Missing, _} = barrel_docdb:revsdiff(Db, DocId, [Rev1]),
     ?assertEqual([], Missing),
+
+    ok.
+
+revsdiff_batch(_Config) ->
+    Db = <<"test_db">>,
+
+    %% Create two documents
+    {ok, #{<<"id">> := DocId1, <<"rev">> := Rev1}} =
+        barrel_docdb:put_doc(Db, #{<<"id">> => <<"batch_doc1">>, <<"value">> => 1}),
+    {ok, #{<<"id">> := DocId2, <<"rev">> := Rev2}} =
+        barrel_docdb:put_doc(Db, #{<<"id">> => <<"batch_doc2">>, <<"value">> => 2}),
+
+    %% Test batch revsdiff with multiple documents
+    RevsMap = #{
+        DocId1 => [Rev1, <<"2-fake123">>],  % Rev1 exists, fake doesn't
+        DocId2 => [Rev2],                    % Rev2 exists
+        <<"nonexistent">> => [<<"1-abc">>]   % Doc doesn't exist
+    },
+
+    {ok, Results} = barrel_docdb:revsdiff_batch(Db, RevsMap),
+
+    %% Check DocId1 result - only fake rev should be missing
+    #{DocId1 := Result1} = Results,
+    ?assertEqual([<<"2-fake123">>], maps:get(missing, Result1)),
+
+    %% Check DocId2 result - nothing missing
+    #{DocId2 := Result2} = Results,
+    ?assertEqual([], maps:get(missing, Result2)),
+
+    %% Check nonexistent doc - all revs missing
+    #{<<"nonexistent">> := Result3} = Results,
+    ?assertEqual([<<"1-abc">>], maps:get(missing, Result3)),
+    ?assertEqual([], maps:get(possible_ancestors, Result3)),
 
     ok.
 

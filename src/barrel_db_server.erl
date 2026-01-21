@@ -31,7 +31,8 @@
 %% Replication API
 -export([
     put_rev/4,
-    revsdiff/3
+    revsdiff/3,
+    revsdiff_batch/2
 ]).
 
 %% Local document API (for checkpoints, not replicated)
@@ -165,6 +166,14 @@ put_rev(Pid, Doc, History, Deleted) ->
 -spec revsdiff(pid(), binary(), [binary()]) -> {ok, [binary()], [binary()]}.
 revsdiff(Pid, DocId, RevIds) ->
     gen_server:call(Pid, {revsdiff, DocId, RevIds}).
+
+%% @doc Get revisions difference for multiple documents (batch)
+%% Takes a map of DocId => [RevIds] and returns a map of
+%% DocId => #{missing => [...], possible_ancestors => [...]}
+-spec revsdiff_batch(pid(), #{binary() => [binary()]}) ->
+    {ok, #{binary() => #{missing => [binary()], possible_ancestors => [binary()]}}}.
+revsdiff_batch(Pid, RevsMap) when is_map(RevsMap) ->
+    gen_server:call(Pid, {revsdiff_batch, RevsMap}).
 
 %%====================================================================
 %% Local Document API functions
@@ -360,6 +369,11 @@ handle_call({put_rev, Doc, History, Deleted}, _From,
 handle_call({revsdiff, DocId, RevIds}, _From,
             #state{name = DbName, store_ref = StoreRef} = State) ->
     Result = do_revsdiff(StoreRef, DbName, DocId, RevIds),
+    {reply, Result, State};
+
+handle_call({revsdiff_batch, RevsMap}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_revsdiff_batch(StoreRef, DbName, RevsMap),
     {reply, Result, State};
 
 %% Local document operations
@@ -1340,6 +1354,30 @@ do_revsdiff(StoreRef, DbName, DocId, RevIds) ->
             %% Document doesn't exist - all revisions are missing
             {ok, RevIds, []}
     end.
+
+%% @doc Get revisions difference for multiple documents (batch)
+%% Returns {ok, ResultMap} where ResultMap is DocId => #{missing => [...], possible_ancestors => [...]}
+do_revsdiff_batch(StoreRef, DbName, RevsMap) ->
+    Result = maps:fold(
+        fun(DocId, RevIds, Acc) ->
+            case do_revsdiff(StoreRef, DbName, DocId, RevIds) of
+                {ok, Missing, PossibleAncestors} ->
+                    maps:put(DocId, #{
+                        missing => Missing,
+                        possible_ancestors => PossibleAncestors
+                    }, Acc);
+                {error, _Reason} ->
+                    %% On error, treat all revisions as missing
+                    maps:put(DocId, #{
+                        missing => RevIds,
+                        possible_ancestors => []
+                    }, Acc)
+            end
+        end,
+        #{},
+        RevsMap
+    ),
+    {ok, Result}.
 
 %%====================================================================
 %% Local Document Operations

@@ -2195,17 +2195,35 @@ format_seq_for_rep(_) ->
 handle_revsdiff(Req0) ->
     DbName = cowboy_req:binding(db, Req0),
     {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
-    #{<<"id">> := DocId, <<"revs">> := RevIds} = decode_request_body(ReqBody, Req1),
-    case barrel_docdb:revsdiff(DbName, DocId, RevIds) of
-        {ok, Missing, Ancestors} ->
-            Response = #{
-                <<"missing">> => Missing,
-                <<"possible_ancestors">> => Ancestors
-            },
-            Body = encode_response(Response, Req1),
-            {200, response_headers(Req1), Body, Req1};
-        {error, Reason} ->
-            throw({error, 500, format_error(Reason)})
+    RequestBody = decode_request_body(ReqBody, Req1),
+    %% Support both single-doc and batch formats:
+    %% Single-doc: {"id": DocId, "revs": [RevIds]}
+    %% Batch: {"revs": {DocId => [RevIds], ...}} (no "id" key, "revs" is a map)
+    case RequestBody of
+        #{<<"id">> := DocId, <<"revs">> := RevIds} when is_list(RevIds) ->
+            %% Single document format
+            case barrel_docdb:revsdiff(DbName, DocId, RevIds) of
+                {ok, Missing, Ancestors} ->
+                    Response = #{
+                        <<"missing">> => Missing,
+                        <<"possible_ancestors">> => Ancestors
+                    },
+                    Body = encode_response(Response, Req1),
+                    {200, response_headers(Req1), Body, Req1};
+                {error, Reason} ->
+                    throw({error, 500, format_error(Reason)})
+            end;
+        #{<<"revs">> := RevsMap} when is_map(RevsMap) ->
+            %% Batch format: map of DocId => [RevIds]
+            case barrel_docdb:revsdiff_batch(DbName, RevsMap) of
+                {ok, Results} ->
+                    Body = encode_response(Results, Req1),
+                    {200, response_headers(Req1), Body, Req1};
+                {error, Reason} ->
+                    throw({error, 500, format_error(Reason)})
+            end;
+        _ ->
+            throw({error, 400, <<"Invalid revsdiff request format">>})
     end.
 
 handle_put_rev(Req0) ->

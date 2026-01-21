@@ -130,7 +130,8 @@
 %% Replication primitives
 -export([
     put_rev/4,
-    revsdiff/3
+    revsdiff/3,
+    revsdiff_batch/2
 ]).
 
 %% Local documents (for checkpoints, not replicated)
@@ -1376,6 +1377,37 @@ put_rev(Db, Doc, History, Deleted) ->
 revsdiff(Db, DocId, RevIds) ->
     with_db(Db, fun(Pid) ->
         barrel_db_server:revsdiff(Pid, DocId, RevIds)
+    end).
+
+%% @doc Compare revisions for multiple documents (batch).
+%%
+%% Takes a map of `DocId => [RevIds]' and returns a map of
+%% `DocId => #{missing => [...], possible_ancestors => [...]}'.
+%%
+%% This is useful for replication when checking multiple documents at once.
+%%
+%% == Example ==
+%% ```
+%% RevsMap = #{
+%%     <<"doc1">> => [<<"1-abc123">>],
+%%     <<"doc2">> => [<<"1-def456">>, <<"2-ghi789">>]
+%% },
+%% {ok, Results} = barrel_docdb:revsdiff_batch(<<"mydb">>, RevsMap),
+%% %% Results = #{
+%% %%     <<"doc1">> => #{missing => [<<"1-abc123">>], possible_ancestors => []},
+%% %%     <<"doc2">> => #{missing => [], possible_ancestors => [<<"1-def456">>]}
+%% %% }
+%% '''
+%%
+%% @param Db Database name or pid
+%% @param RevsMap Map of DocId => [RevIds] to check
+%% @returns `{ok, ResultMap}' where ResultMap is DocId => #{missing => [...], possible_ancestors => [...]}
+%% @see revsdiff/3
+-spec revsdiff_batch(binary() | pid(), #{binary() => [binary()]}) ->
+    {ok, #{binary() => #{missing => [binary()], possible_ancestors => [binary()]}}}.
+revsdiff_batch(Db, RevsMap) when is_map(RevsMap) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:revsdiff_batch(Pid, RevsMap)
     end).
 
 %%====================================================================
