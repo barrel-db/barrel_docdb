@@ -189,8 +189,8 @@ count_docs() {
     local result=$(curl -sf -X POST "$url/db/$db/_find" \
         -H "Content-Type: application/json" \
         -H "$AUTH_HEADER" \
-        -d '{"selector": {}, "limit": 10000}' 2>/dev/null)
-    # _find returns results in 'results' field, not 'docs'
+        -d '{"where": {}, "limit": 10000}' 2>/dev/null)
+    # _find returns results in 'results' field
     echo "$result" | jq -r '.results | length' 2>/dev/null || echo "0"
 }
 
