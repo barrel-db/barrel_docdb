@@ -23,7 +23,8 @@ test:
       - .cache/rebar3
   before_script:
     # Install build tools for native dependencies (rocksdb)
-    - apt-get update && apt-get install -y cmake build-essential libssl-dev zlib1g-dev
+    # Clear apt lists first to avoid GPG signature errors with stale Docker cache
+    - rm -rf /var/lib/apt/lists/* && apt-get update && apt-get install -y cmake build-essential libssl-dev zlib1g-dev
     - rebar3 --version
   script:
     - rebar3 compile
