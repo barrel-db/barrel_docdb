@@ -157,7 +157,8 @@ resolve_conflict(Pid, DocId, BaseRev, Resolution) ->
 %%====================================================================
 
 %% @doc Put a document with explicit revision history (for replication)
--spec put_rev(pid(), map(), [binary()], boolean()) -> {ok, map()} | {error, term()}.
+%% Returns {ok, DocId, RevId} on success.
+-spec put_rev(pid(), map(), [binary()], boolean()) -> {ok, binary(), binary()} | {error, term()}.
 put_rev(Pid, Doc, History, Deleted) ->
     gen_server:call(Pid, {put_rev, Doc, History, Deleted}).
 

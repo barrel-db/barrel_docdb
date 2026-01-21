@@ -298,6 +298,46 @@ barrel_docdb:unsubscribe(Ref).
 
 ## Changes Feed
 
+### barrel_docdb:get_changes/2,3
+
+Get changes since an HLC timestamp.
+
+```erlang
+-spec get_changes(Db, Since) -> {ok, Changes, LastHlc} | {error, term()}
+    when Db :: binary() | pid(),
+         Since :: barrel_hlc:timestamp() | first,
+         Changes :: [map()],
+         LastHlc :: barrel_hlc:timestamp().
+
+-spec get_changes(Db, Since, Opts) -> {ok, Changes, LastHlc} | {error, term()}
+    when Db :: binary() | pid(),
+         Since :: barrel_hlc:timestamp() | first,
+         Opts :: map(),
+         Changes :: [map()],
+         LastHlc :: barrel_hlc:timestamp().
+```
+
+**Options:**
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `limit` | integer() | Maximum changes to return |
+| `include_docs` | boolean() | Include full documents |
+| `descending` | boolean() | Reverse order |
+| `doc_ids` | [binary()] | Filter to specific document IDs |
+
+**Example:**
+```erlang
+%% Get all changes
+{ok, Changes, LastHlc} = barrel_docdb:get_changes(<<"mydb">>, first).
+
+%% Get incremental changes
+{ok, NewChanges, NewHlc} = barrel_docdb:get_changes(<<"mydb">>, LastHlc).
+
+%% With options
+{ok, Changes, _} = barrel_docdb:get_changes(<<"mydb">>, first, #{limit => 100}).
+```
+
 ### barrel_changes:fold/4
 
 Fold over changes since a sequence.
@@ -312,6 +352,80 @@ Fold over changes since a sequence.
     fun(Change, Acc) -> {ok, [Change | Acc]} end,
     []
 ).
+```
+
+---
+
+## Replication Primitives
+
+These low-level functions are used by replication transports. Most users should use `barrel_rep:replicate/2,3` instead.
+
+### barrel_docdb:put_rev/4
+
+Put a document with explicit revision history (for replication).
+
+```erlang
+-spec put_rev(Db, Doc, History, Deleted) -> {ok, DocId, RevId} | {error, term()}
+    when Db :: binary() | pid(),
+         Doc :: map(),
+         History :: [binary()],
+         Deleted :: boolean(),
+         DocId :: binary(),
+         RevId :: binary().
+```
+
+**Example:**
+```erlang
+Doc = #{<<"id">> => <<"doc1">>, <<"value">> => <<"replicated">>},
+History = [<<"2-abc123">>, <<"1-def456">>],
+{ok, DocId, Rev} = barrel_docdb:put_rev(<<"mydb">>, Doc, History, false).
+```
+
+### barrel_docdb:revsdiff/3
+
+Find missing revisions for a single document.
+
+```erlang
+-spec revsdiff(Db, DocId, RevIds) -> {ok, Missing, PossibleAncestors} | {error, term()}
+    when Db :: binary() | pid(),
+         DocId :: binary(),
+         RevIds :: [binary()],
+         Missing :: [binary()],
+         PossibleAncestors :: [binary()].
+```
+
+**Example:**
+```erlang
+{ok, Missing, Ancestors} = barrel_docdb:revsdiff(<<"mydb">>,
+    <<"doc1">>,
+    [<<"3-abc">>, <<"2-def">>, <<"1-ghi">>]
+).
+%% Missing = revisions we don't have
+%% Ancestors = our revisions that could be ancestors
+```
+
+### barrel_docdb:revsdiff_batch/2
+
+Find missing revisions for multiple documents (batch).
+
+```erlang
+-spec revsdiff_batch(Db, RevsMap) -> {ok, ResultMap}
+    when Db :: binary() | pid(),
+         RevsMap :: #{binary() => [binary()]},
+         ResultMap :: #{binary() => #{missing => [binary()], possible_ancestors => [binary()]}}.
+```
+
+**Example:**
+```erlang
+RevsMap = #{
+    <<"doc1">> => [<<"1-abc123">>],
+    <<"doc2">> => [<<"1-def456">>, <<"2-ghi789">>]
+},
+{ok, Results} = barrel_docdb:revsdiff_batch(<<"mydb">>, RevsMap).
+%% Results = #{
+%%     <<"doc1">> => #{missing => [<<"1-abc123">>], possible_ancestors => []},
+%%     <<"doc2">> => #{missing => [], possible_ancestors => [<<"1-def456">>]}
+%% }
 ```
 
 ---
