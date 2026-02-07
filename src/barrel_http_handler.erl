@@ -69,8 +69,9 @@ maybe_authenticate(metrics, _Req) ->
 maybe_authenticate(node_info, _Req) ->
     %% Node info is public (for discovery)
     ok;
-maybe_authenticate(Action, Req) when Action =:= keys; Action =:= key ->
-    %% Key management requires admin authentication
+maybe_authenticate(Action, Req) when Action =:= keys; Action =:= key;
+                                     Action =:= admin_usage; Action =:= admin_db_usage ->
+    %% Key management and admin endpoints require admin authentication
     authenticate_admin(Req);
 maybe_authenticate(Action, Req) ->
     %% Check if any API keys are configured
@@ -91,44 +92,78 @@ get_db_from_action(_Action, Req) ->
     cowboy_req:binding(db, Req, undefined).
 
 %% @doc Authenticate request via bearer token
+%% Supports both API keys (ak_*) and JWT tokens (bdb_*)
 authenticate(Req, DbName) ->
     case extract_bearer_token(Req) of
         undefined ->
             throw({error, 401, <<"Authorization required">>});
         Token ->
-            Result = case DbName of
-                undefined ->
-                    %% No database context - global validation
-                    barrel_http_api_keys:validate_key(Token);
-                _ ->
-                    %% Database-specific validation
-                    barrel_http_api_keys:validate_key(Token, DbName)
-            end,
+            Result = validate_token(Token, DbName),
             case Result of
-                {ok, _KeyInfo} ->
+                {ok, _AuthContext} ->
                     ok;
                 {error, invalid_key} ->
                     throw({error, 401, <<"Invalid API key">>});
+                {error, invalid_signature} ->
+                    throw({error, 401, <<"Invalid token signature">>});
+                {error, token_expired} ->
+                    throw({error, 401, <<"Token expired">>});
+                {error, {invalid_type, _}} ->
+                    throw({error, 401, <<"Invalid token type for this service">>});
+                {error, {missing_claims, _}} ->
+                    throw({error, 401, <<"Token missing required claims">>});
+                {error, jwt_not_configured} ->
+                    throw({error, 401, <<"JWT authentication not configured">>});
                 {error, access_denied} ->
-                    throw({error, 403, <<"Access denied to this database">>})
+                    throw({error, 403, <<"Access denied to this database">>});
+                {error, _} ->
+                    throw({error, 401, <<"Invalid token">>})
             end
     end.
 
 %% @doc Authenticate request requiring admin privileges
+%% Supports both API keys (ak_*) and JWT tokens (bdb_*)
 authenticate_admin(Req) ->
     case extract_bearer_token(Req) of
         undefined ->
             throw({error, 401, <<"Authorization required">>});
         Token ->
-            case barrel_http_api_keys:validate_key(Token) of
+            case validate_token_admin(Token) of
                 {ok, #{is_admin := true}} ->
                     ok;
                 {ok, _} ->
                     throw({error, 403, <<"Admin access required">>});
                 {error, invalid_key} ->
-                    throw({error, 401, <<"Invalid API key">>})
+                    throw({error, 401, <<"Invalid API key">>});
+                {error, invalid_signature} ->
+                    throw({error, 401, <<"Invalid token signature">>});
+                {error, token_expired} ->
+                    throw({error, 401, <<"Token expired">>});
+                {error, jwt_not_configured} ->
+                    throw({error, 401, <<"JWT authentication not configured">>});
+                {error, _} ->
+                    throw({error, 401, <<"Invalid token">>})
             end
     end.
+
+%% @doc Validate a token by routing to appropriate validator based on prefix
+validate_token(<<"ak_", _/binary>> = Token, undefined) ->
+    barrel_http_api_keys:validate_key(Token);
+validate_token(<<"ak_", _/binary>> = Token, DbName) ->
+    barrel_http_api_keys:validate_key(Token, DbName);
+validate_token(<<"bdb_", _/binary>> = Token, DbName) ->
+    barrel_docdb_jwt:validate_token(Token, DbName);
+validate_token(_, _) ->
+    %% Unknown token prefix - try as API key for backwards compatibility
+    {error, invalid_key}.
+
+%% @doc Validate a token for admin access
+validate_token_admin(<<"ak_", _/binary>> = Token) ->
+    barrel_http_api_keys:validate_key(Token);
+validate_token_admin(<<"bdb_", _/binary>> = Token) ->
+    barrel_docdb_jwt:validate_token(Token);
+validate_token_admin(_) ->
+    {error, invalid_key}.
 
 %% @doc Extract bearer token from Authorization header
 extract_bearer_token(Req) ->
@@ -653,6 +688,12 @@ handle_action(key, <<"GET">>, Req) ->
     handle_get_key(Req);
 handle_action(key, <<"DELETE">>, Req) ->
     handle_delete_key(Req);
+
+%% Admin usage endpoints (admin only)
+handle_action(admin_usage, <<"GET">>, Req) ->
+    handle_admin_usage(Req);
+handle_action(admin_db_usage, <<"GET">>, Req) ->
+    handle_admin_db_usage(Req);
 
 %% Attachments
 handle_action(attachments, <<"GET">>, Req) ->
@@ -2697,6 +2738,37 @@ handle_delete_key(Req) ->
             throw({error, 404, <<"Key not found">>});
         {error, cannot_delete_last_admin_key} ->
             throw({error, 400, <<"Cannot delete the last admin key">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%%====================================================================
+%% Admin Usage Handlers
+%%====================================================================
+
+%% @doc Get usage statistics for all databases
+handle_admin_usage(Req) ->
+    case barrel_docdb_usage:get_all_usage() of
+        {ok, Stats} ->
+            Response = #{
+                <<"databases">> => Stats,
+                <<"total_databases">> => length(Stats)
+            },
+            Body = encode_response(Response, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%% @doc Get usage statistics for a specific database
+handle_admin_db_usage(Req) ->
+    DbName = cowboy_req:binding(db, Req),
+    case barrel_docdb_usage:get_db_usage(DbName) of
+        {ok, Stats} ->
+            Body = encode_response(Stats, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Database not found">>});
         {error, Reason} ->
             throw({error, 500, format_error(Reason)})
     end.

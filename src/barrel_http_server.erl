@@ -164,6 +164,10 @@ build_dispatch() ->
             {"/keys", barrel_http_handler, #{action => keys}},
             {"/keys/:key_prefix", barrel_http_handler, #{action => key}},
 
+            %% Admin usage endpoints
+            {"/admin/usage", barrel_http_handler, #{action => admin_usage}},
+            {"/admin/databases/:db/usage", barrel_http_handler, #{action => admin_db_usage}},
+
             %% Federation endpoints
             {"/_federation", barrel_http_handler, #{action => federations}},
             {"/_federation/:name", barrel_http_handler, #{action => federation}},

@@ -18,7 +18,13 @@
         {http_cacertfile, "${BARREL_HTTP_CACERTFILE:-}"},
         {http_verify, ${BARREL_HTTP_VERIFY:-verify_none}},
         %% Zone configuration for multi-datacenter deployments
-        {zone, "${BARREL_ZONE:-}"}
+        {zone, "${BARREL_ZONE:-}"},
+        %% JWT authentication for barreldb-console tokens
+        %% Set BARREL_CONSOLE_PUBLIC_KEY to path of console's public key PEM file
+        %% Enables bdb_ token authentication (ES256 JWT from barreldb-console)
+        {console_public_key, "${BARREL_CONSOLE_PUBLIC_KEY:-}"},
+        %% Use OTP json module for jose library
+        {jose_json_module, json}
     ]},
     {kernel, [
         {logger_level, ${BARREL_LOG_LEVEL:-info}},
