@@ -48,6 +48,7 @@
     %% Authentication options
     bearer_token => binary(),           % Bearer token for Authorization header
     basic_auth => {binary(), binary()}, % {Username, Password} for Basic auth
+    peer_auth => boolean(),             % Use Ed25519 peer authentication (default: true)
     %% SSL/TLS options
     ssl_options => [ssl:tls_client_option()], % Custom SSL options
     insecure => boolean()               % Skip certificate verification (NOT recommended)
@@ -241,7 +242,8 @@ sync_hlc(Endpoint, LocalHlc) ->
 %%====================================================================
 
 http_get(Endpoint, Url) ->
-    Headers = request_headers(Endpoint),
+    Path = extract_path(Url),
+    Headers = request_headers(Endpoint, <<"GET">>, Path, <<>>),
     Opts = request_options(Endpoint),
     case hackney:get(Url, Headers, <<>>, Opts) of
         {ok, Status, RespHeaders, Ref} ->
@@ -254,8 +256,9 @@ http_get(Endpoint, Url) ->
     end.
 
 http_post(Endpoint, Url, ReqBody) ->
-    Headers = request_headers(Endpoint),
+    Path = extract_path(Url),
     Body = encode_body(Endpoint, ReqBody),
+    Headers = request_headers(Endpoint, <<"POST">>, Path, Body),
     Opts = request_options(Endpoint),
     case hackney:post(Url, Headers, Body, Opts) of
         {ok, Status, RespHeaders, Ref} ->
@@ -268,8 +271,9 @@ http_post(Endpoint, Url, ReqBody) ->
     end.
 
 http_put(Endpoint, Url, ReqBody) ->
-    Headers = request_headers(Endpoint),
+    Path = extract_path(Url),
     Body = encode_body(Endpoint, ReqBody),
+    Headers = request_headers(Endpoint, <<"PUT">>, Path, Body),
     Opts = request_options(Endpoint),
     case hackney:put(Url, Headers, Body, Opts) of
         {ok, Status, RespHeaders, Ref} ->
@@ -282,7 +286,8 @@ http_put(Endpoint, Url, ReqBody) ->
     end.
 
 http_delete(Endpoint, Url) ->
-    Headers = request_headers(Endpoint),
+    Path = extract_path(Url),
+    Headers = request_headers(Endpoint, <<"DELETE">>, Path, <<>>),
     Opts = request_options(Endpoint),
     case hackney:delete(Url, Headers, <<>>, Opts) of
         {ok, Status, RespHeaders, Ref} ->
@@ -294,18 +299,19 @@ http_delete(Endpoint, Url) ->
             Error
     end.
 
-%% Build request headers including authentication
-request_headers(Endpoint) ->
+%% Build request headers including authentication and peer signing
+request_headers(Endpoint, Method, Path, Body) ->
     ContentTypeHeaders = content_type_headers(Endpoint),
     AuthHeaders = auth_headers(Endpoint),
-    ContentTypeHeaders ++ AuthHeaders.
+    PeerAuthHeaders = peer_auth_headers(Endpoint, Method, Path, Body),
+    ContentTypeHeaders ++ AuthHeaders ++ PeerAuthHeaders.
 
 content_type_headers(#{content_type := cbor}) ->
     [{<<"Content-Type">>, ?CT_CBOR}, {<<"Accept">>, ?CT_CBOR}];
 content_type_headers(_) ->
     [{<<"Content-Type">>, ?CT_JSON}, {<<"Accept">>, ?CT_JSON}].
 
-%% Build authentication headers
+%% Build authentication headers (bearer token or basic auth)
 auth_headers(#{bearer_token := Token}) when is_binary(Token) ->
     [{<<"Authorization">>, <<"Bearer ", Token/binary>>}];
 auth_headers(#{basic_auth := {User, Pass}}) ->
@@ -313,6 +319,37 @@ auth_headers(#{basic_auth := {User, Pass}}) ->
     [{<<"Authorization">>, <<"Basic ", Credentials/binary>>}];
 auth_headers(_) ->
     [].
+
+%% Build Ed25519 peer authentication headers
+%% Disabled by default until full peer trust system is implemented.
+%% Enable with peer_auth => true when peers are explicitly trusted.
+peer_auth_headers(#{peer_auth := true}, Method, Path, Body) ->
+    barrel_peer_auth:build_signed_headers(Method, Path, Body);
+peer_auth_headers(_Endpoint, _Method, _Path, _Body) ->
+    [].
+
+%% Extract path from URL for signing
+extract_path(Url) when is_binary(Url) ->
+    case uri_string:parse(Url) of
+        #{path := Path} ->
+            %% Include query string if present
+            case uri_string:parse(Url) of
+                #{query := Query} -> <<Path/binary, "?", Query/binary>>;
+                _ -> Path
+            end;
+        _ ->
+            %% Fallback: extract everything after host
+            case binary:match(Url, <<"://">>) of
+                {Pos, Len} ->
+                    Rest = binary:part(Url, Pos + Len, byte_size(Url) - Pos - Len),
+                    case binary:match(Rest, <<"/">>) of
+                        {PathPos, _} -> binary:part(Rest, PathPos, byte_size(Rest) - PathPos);
+                        nomatch -> <<"/">>
+                    end;
+                nomatch ->
+                    Url
+            end
+    end.
 
 %% Build request options including SSL and timeout
 request_options(Endpoint) ->

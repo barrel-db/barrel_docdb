@@ -174,6 +174,16 @@ init([]) ->
         modules => [barrel_http_api_keys]
     },
 
+    %% Peer authentication for P2P replication (Ed25519 signing)
+    PeerAuth = #{
+        id => barrel_peer_auth,
+        start => {barrel_peer_auth, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [barrel_peer_auth]
+    },
+
     %% Discovery service for peer-to-peer federation
     %% Provides node info endpoint (/.well-known/barrel) and peer gossip
     Discovery = #{
@@ -198,7 +208,7 @@ init([]) ->
     },
 
     %% Base child specs (always started)
-    BaseSpecs = [Metrics, Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, VdbSup, RepTasks, RepPolicy, ApiKeys, Discovery],
+    BaseSpecs = [Metrics, Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, VdbSup, RepTasks, RepPolicy, ApiKeys, PeerAuth, Discovery],
 
     %% Conditionally add HTTP server
     ChildSpecs = case HttpEnabled of

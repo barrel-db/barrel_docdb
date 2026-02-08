@@ -8,8 +8,8 @@ BARREL3="http://127.0.0.1:8093"
 BARREL4="http://127.0.0.1:8094"
 BARREL5="http://127.0.0.1:8095"
 
-# API key for authentication
-API_KEY="test_admin_key_for_docker_tests"
+# API key for authentication (must start with ak_ prefix)
+API_KEY="ak_test_admin_key_for_docker"
 AUTH_HEADER="Authorization: Bearer $API_KEY"
 
 # Colors for output

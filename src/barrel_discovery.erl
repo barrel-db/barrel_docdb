@@ -63,7 +63,9 @@
     list_tags/0,
     %% Federation helpers
     resolve_member/1,
-    resolve_peers_with_db/1
+    resolve_peers_with_db/1,
+    %% Peer authentication
+    get_peer_public_key/1
 ]).
 
 %% gen_server callbacks
@@ -83,13 +85,14 @@
 -type peer_info() :: #{
     url := binary(),
     node_id => binary(),
+    public_key => binary(),           %% Ed25519 public key (raw binary)
     zone => binary(),
     version => binary(),
     databases => [binary()],
     federations => [binary()],
     tags => [binary()],
     last_seen => integer(),
-    status => active | unreachable
+    status => active | unreachable | pending
 }.
 
 %% Federation member reference types
@@ -244,6 +247,19 @@ resolve_member(Ref) ->
 -spec resolve_peers_with_db(binary()) -> {ok, [binary()]}.
 resolve_peers_with_db(DbName) when is_binary(DbName) ->
     gen_server:call(?SERVER, {resolve_peers_with_db, DbName}).
+
+%% @doc Get a peer's public key by node ID.
+%% Used for verifying signed requests from peers.
+-spec get_peer_public_key(binary()) -> {ok, binary()} | {error, not_found | no_public_key}.
+get_peer_public_key(PeerId) when is_binary(PeerId) ->
+    case do_get_peer_by_node_id(PeerId) of
+        {ok, #{public_key := PubKey}} when is_binary(PubKey), byte_size(PubKey) =:= 32 ->
+            {ok, PubKey};
+        {ok, _} ->
+            {error, no_public_key};
+        {error, not_found} ->
+            {error, not_found}
+    end.
 
 %% @doc Add a DNS domain for periodic discovery
 %% The domain will be queried via SRV records periodically
@@ -471,8 +487,15 @@ build_node_info(NodeId, Zone) ->
     {ok, Peers} = do_list_peers(),
     PeerUrls = [maps:get(url, P) || P <- Peers, maps:get(status, P, active) =:= active],
 
+    %% Get public key for P2P authentication
+    PublicKey = case barrel_peer_auth:get_public_key_base64() of
+        {ok, PubKeyB64} -> PubKeyB64;
+        _ -> undefined
+    end,
+
     BaseInfo = #{
         node_id => NodeId,
+        public_key => PublicKey,
         version => barrel_version(),
         databases => Databases,
         vdbs => Vdbs,
@@ -527,12 +550,14 @@ do_add_peer_sync(Url, Tags) ->
     DocId = peer_doc_id(Url),
     case fetch_peer_info(Url) of
         {ok, Info} ->
-            PeerInfo = Info#{
+            %% Decode public key from base64 if present
+            PeerInfo0 = Info#{
                 url => Url,
                 tags => Tags,
                 last_seen => erlang:system_time(millisecond),
                 status => active
             },
+            PeerInfo = decode_peer_public_key(PeerInfo0),
             ok = barrel_docdb:put_system_doc(DocId, PeerInfo),
             {ok, PeerInfo};
         {error, Reason} ->
@@ -564,12 +589,13 @@ async_fetch_peer_info(Url, Tags) ->
     DocId = peer_doc_id(Url),
     PeerInfo = case fetch_peer_info(Url) of
         {ok, Info} ->
-            Info#{
+            PeerInfo0 = Info#{
                 url => Url,
                 tags => Tags,
                 last_seen => erlang:system_time(millisecond),
                 status => active
-            };
+            },
+            decode_peer_public_key(PeerInfo0);
         {error, _} ->
             #{
                 url => Url,
@@ -942,3 +968,16 @@ do_refresh_dns_domains() ->
         _ ->
             ok
     end.
+
+%% @private Decode public key from base64 in peer info.
+%% The /.well-known/barrel endpoint returns public_key as base64.
+%% We decode it to raw binary for storage and verification.
+decode_peer_public_key(#{<<"public_key">> := PubKeyB64} = Info) when is_binary(PubKeyB64) ->
+    case barrel_peer_auth:decode_public_key(PubKeyB64) of
+        {ok, PubKey} ->
+            Info#{public_key => PubKey};
+        {error, _} ->
+            maps:remove(<<"public_key">>, Info)
+    end;
+decode_peer_public_key(Info) ->
+    Info.
