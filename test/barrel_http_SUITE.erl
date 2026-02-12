@@ -40,7 +40,12 @@
     tier_capacity/1,
     tier_doc_get/1,
     tier_doc_ttl/1,
-    tier_run_migration/1
+    tier_run_migration/1,
+    %% Usage tests
+    admin_usage_all/1,
+    admin_usage_single_db/1,
+    admin_usage_not_found/1,
+    admin_usage_requires_auth/1
 ]).
 
 -define(PORT, 18080).
@@ -51,7 +56,7 @@
 %%====================================================================
 
 all() ->
-    [{group, http_tests}, {group, policy_tests}, {group, tier_tests}].
+    [{group, http_tests}, {group, policy_tests}, {group, tier_tests}, {group, usage_tests}].
 
 groups() ->
     [
@@ -84,6 +89,12 @@ groups() ->
             tier_doc_get,
             tier_doc_ttl,
             tier_run_migration
+        ]},
+        {usage_tests, [sequence], [
+            admin_usage_all,
+            admin_usage_single_db,
+            admin_usage_not_found,
+            admin_usage_requires_auth
         ]}
     ].
 
@@ -125,6 +136,10 @@ init_per_group(tier_tests, Config) ->
     %% Create test databases for tier tests
     {ok, _} = barrel_docdb:create_db(<<"tier_test_db">>),
     {ok, _} = barrel_docdb:create_db(<<"tier_warm_db">>),
+    Config;
+init_per_group(usage_tests, Config) ->
+    %% Create test database for usage tests
+    {ok, _} = barrel_docdb:create_db(<<"usage_http_test_db">>),
     Config.
 
 %% Helper to get auth header
@@ -149,6 +164,10 @@ end_per_group(tier_tests, _Config) ->
     %% Clean up tier test databases
     barrel_docdb:delete_db(<<"tier_test_db">>),
     barrel_docdb:delete_db(<<"tier_warm_db">>),
+    ok;
+end_per_group(usage_tests, _Config) ->
+    %% Clean up usage test database
+    barrel_docdb:delete_db(<<"usage_http_test_db">>),
     ok.
 
 init_per_testcase(_TestCase, Config) ->
@@ -163,21 +182,19 @@ end_per_testcase(_TestCase, _Config) ->
 
 %% @doc Test health endpoint
 health_check(_Config) ->
-    {ok, 200, _Headers, Ref} = hackney:get(?BASE_URL ++ "/health", [], <<>>, []),
-    {ok, Body} = hackney:body(Ref),
+    {ok, 200, _Headers, Body} = hackney:get(?BASE_URL ++ "/health", [], <<>>, []),
     #{<<"status">> := <<"ok">>} = json:decode(Body),
     ok.
 
 %% @doc Test getting a non-existent document
 get_doc_not_found(Config) ->
     Auth = auth_header(Config),
-    {ok, 404, _Headers, Ref} = hackney:get(
+    {ok, 404, _Headers, Body} = hackney:get(
         ?BASE_URL ++ "/db/testdb/nonexistent",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     #{<<"error">> := <<"Document not found">>} = json:decode(Body),
     ok.
 
@@ -189,7 +206,7 @@ put_and_get_doc_json(Config) ->
     DocJson = iolist_to_binary(json:encode(Doc)),
 
     %% PUT document
-    {ok, 201, _PutHeaders, PutRef} = hackney:put(
+    {ok, 201, _PutHeaders, PutBody} = hackney:put(
         ?BASE_URL ++ "/db/testdb/" ++ binary_to_list(DocId),
         [Auth,
          {<<"Content-Type">>, <<"application/json">>},
@@ -197,18 +214,16 @@ put_and_get_doc_json(Config) ->
         DocJson,
         []
     ),
-    {ok, PutBody} = hackney:body(PutRef),
     #{<<"id">> := DocId, <<"rev">> := Rev} = json:decode(PutBody),
     true = is_binary(Rev),
 
     %% GET document
-    {ok, 200, _GetHeaders, GetRef} = hackney:get(
+    {ok, 200, _GetHeaders, GetBody} = hackney:get(
         ?BASE_URL ++ "/db/testdb/" ++ binary_to_list(DocId),
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, GetBody} = hackney:body(GetRef),
     #{<<"name">> := <<"Alice">>, <<"age">> := 30} = json:decode(GetBody),
     ok.
 
@@ -220,7 +235,7 @@ put_and_get_doc_cbor(Config) ->
     DocCbor = barrel_docdb_codec_cbor:encode_cbor(Doc),
 
     %% PUT document with CBOR
-    {ok, 201, _PutHeaders, PutRef} = hackney:put(
+    {ok, 201, _PutHeaders, PutBody} = hackney:put(
         ?BASE_URL ++ "/db/testdb/" ++ binary_to_list(DocId),
         [Auth,
          {<<"Content-Type">>, <<"application/cbor">>},
@@ -228,18 +243,16 @@ put_and_get_doc_cbor(Config) ->
         DocCbor,
         []
     ),
-    {ok, PutBody} = hackney:body(PutRef),
     #{<<"id">> := DocId, <<"rev">> := Rev} = barrel_docdb_codec_cbor:decode_cbor(PutBody),
     true = is_binary(Rev),
 
     %% GET document with CBOR
-    {ok, 200, _GetHeaders, GetRef} = hackney:get(
+    {ok, 200, _GetHeaders, GetBody} = hackney:get(
         ?BASE_URL ++ "/db/testdb/" ++ binary_to_list(DocId),
         [Auth, {<<"Accept">>, <<"application/cbor">>}],
         <<>>,
         []
     ),
-    {ok, GetBody} = hackney:body(GetRef),
     #{<<"name">> := <<"Bob">>, <<"age">> := 25} = barrel_docdb_codec_cbor:decode_cbor(GetBody),
     ok.
 
@@ -252,7 +265,7 @@ cbor_zero_copy_get_doc(Config) ->
     DocCbor = barrel_docdb_codec_cbor:encode_cbor(Doc),
 
     %% PUT document with CBOR
-    {ok, 201, _PutHeaders, PutRef} = hackney:put(
+    {ok, 201, _PutHeaders, PutBody} = hackney:put(
         ?BASE_URL ++ "/db/testdb/" ++ binary_to_list(DocId),
         [Auth,
          {<<"Content-Type">>, <<"application/cbor">>},
@@ -260,11 +273,10 @@ cbor_zero_copy_get_doc(Config) ->
         DocCbor,
         []
     ),
-    {ok, PutBody} = hackney:body(PutRef),
     #{<<"id">> := DocId, <<"rev">> := Rev} = barrel_docdb_codec_cbor:decode_cbor(PutBody),
 
     %% GET document with CBOR - should use zero-copy path
-    {ok, 200, GetHeaders, GetRef} = hackney:get(
+    {ok, 200, GetHeaders, GetBody} = hackney:get(
         ?BASE_URL ++ "/db/testdb/" ++ binary_to_list(DocId),
         [Auth, {<<"Accept">>, <<"application/cbor">>}],
         <<>>,
@@ -273,7 +285,6 @@ cbor_zero_copy_get_doc(Config) ->
     %% Verify Content-Type is CBOR
     <<"application/cbor">> = proplists:get_value(<<"content-type">>, GetHeaders),
 
-    {ok, GetBody} = hackney:body(GetRef),
     DecodedDoc = barrel_docdb_codec_cbor:decode_cbor(GetBody),
 
     %% Verify document content and metadata
@@ -298,7 +309,7 @@ cbor_zero_copy_find(Config) ->
     },
     QueryCbor = barrel_docdb_codec_cbor:encode_cbor(Query),
 
-    {ok, 200, FindHeaders, FindRef} = hackney:post(
+    {ok, 200, FindHeaders, FindBody} = hackney:post(
         ?BASE_URL ++ "/db/testdb/_find",
         [Auth,
          {<<"Content-Type">>, <<"application/cbor">>},
@@ -309,7 +320,6 @@ cbor_zero_copy_find(Config) ->
     %% Verify Content-Type is CBOR
     <<"application/cbor">> = proplists:get_value(<<"content-type">>, FindHeaders),
 
-    {ok, FindBody} = hackney:body(FindRef),
     #{<<"results">> := Results, <<"meta">> := _Meta} = barrel_docdb_codec_cbor:decode_cbor(FindBody),
 
     %% Verify we got results (should have docs from earlier tests)
@@ -328,26 +338,24 @@ delete_doc(Config) ->
     DocJson = iolist_to_binary(json:encode(Doc)),
 
     %% PUT document first
-    {ok, 201, _PutHeaders, PutRef} = hackney:put(
+    {ok, 201, _PutHeaders, PutBody} = hackney:put(
         ?BASE_URL ++ "/db/testdb/" ++ binary_to_list(DocId),
         [Auth, {<<"Content-Type">>, <<"application/json">>}],
         DocJson,
         []
     ),
-    {ok, PutBody} = hackney:body(PutRef),
     #{<<"rev">> := Rev} = json:decode(PutBody),
 
     %% DELETE document
-    {ok, 200, _DelHeaders, DelRef} = hackney:delete(
+    {ok, 200, _DelHeaders, _DelBody} = hackney:delete(
         ?BASE_URL ++ "/db/testdb/" ++ binary_to_list(DocId) ++ "?rev=" ++ binary_to_list(Rev),
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, _DelBody} = hackney:body(DelRef),
 
     %% Verify deleted
-    {ok, 404, _GetHeaders, _GetRef} = hackney:get(
+    {ok, 404, _GetHeaders, _GetBody} = hackney:get(
         ?BASE_URL ++ "/db/testdb/" ++ binary_to_list(DocId),
         [Auth],
         <<>>,
@@ -364,13 +372,12 @@ get_changes(Config) ->
     {ok, _} = barrel_docdb:put_doc(<<"testdb">>, Doc#{<<"id">> => DocId}),
 
     %% Get changes
-    {ok, 200, _Headers, Ref} = hackney:get(
+    {ok, 200, _Headers, Body} = hackney:get(
         ?BASE_URL ++ "/db/testdb/_changes",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     #{<<"results">> := Results} = json:decode(Body),
     true = is_list(Results),
     true = length(Results) > 0,
@@ -386,13 +393,12 @@ get_changes_with_filter(Config) ->
 
     %% Get changes with filter matching users/*/profile
     %% Note: + must be URL-encoded as %2B to not be treated as space
-    {ok, 200, _Headers, Ref} = hackney:get(
+    {ok, 200, _Headers, Body} = hackney:get(
         ?BASE_URL ++ "/db/testdb/_changes?filter=users/%2B/profile",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     #{<<"results">> := Results} = json:decode(Body),
 
     %% Should only have user profile documents
@@ -406,25 +412,23 @@ get_changes_with_filter(Config) ->
 get_changes_longpoll_timeout(Config) ->
     Auth = auth_header(Config),
     %% Get the current last_seq first
-    {ok, 200, _, Ref0} = hackney:get(
+    {ok, 200, _, Body0} = hackney:get(
         ?BASE_URL ++ "/db/testdb/_changes",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body0} = hackney:body(Ref0),
     #{<<"last_seq">> := LastSeq} = json:decode(Body0),
 
     %% Long poll with short timeout - should return empty after timeout
     StartTime = erlang:monotonic_time(millisecond),
-    {ok, 200, _Headers, Ref} = hackney:get(
+    {ok, 200, _Headers, Body} = hackney:get(
         ?BASE_URL ++ "/db/testdb/_changes?feed=longpoll&timeout=500&since=" ++ binary_to_list(LastSeq),
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         [{recv_timeout, 5000}]
     ),
     EndTime = erlang:monotonic_time(millisecond),
-    {ok, Body} = hackney:body(Ref),
 
     %% Should have waited at least 400ms (allowing some tolerance)
     Elapsed = EndTime - StartTime,
@@ -503,7 +507,7 @@ bulk_docs(Config) ->
     ],
     ReqBody = iolist_to_binary(json:encode(#{<<"docs">> => Docs})),
 
-    {ok, 201, _Headers, Ref} = hackney:post(
+    {ok, 201, _Headers, Body} = hackney:post(
         ?BASE_URL ++ "/db/testdb/_bulk_docs",
         [Auth,
          {<<"Content-Type">>, <<"application/json">>},
@@ -511,7 +515,6 @@ bulk_docs(Config) ->
         ReqBody,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     Results = json:decode(Body),
     3 = length(Results),
 
@@ -540,7 +543,7 @@ policy_create(Config) ->
     },
     ReqBody = iolist_to_binary(json:encode(PolicySpec)),
 
-    {ok, 201, _Headers, Ref} = hackney:post(
+    {ok, 201, _Headers, Body} = hackney:post(
         ?BASE_URL ++ "/_policies",
         [Auth,
          {<<"Content-Type">>, <<"application/json">>},
@@ -548,11 +551,10 @@ policy_create(Config) ->
         ReqBody,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     #{<<"ok">> := true, <<"name">> := <<"test_fanout">>} = json:decode(Body),
 
     %% Try to create duplicate
-    {ok, 409, _Headers2, Ref2} = hackney:post(
+    {ok, 409, _Headers2, _Body2} = hackney:post(
         ?BASE_URL ++ "/_policies",
         [Auth,
          {<<"Content-Type">>, <<"application/json">>},
@@ -560,7 +562,6 @@ policy_create(Config) ->
         ReqBody,
         []
     ),
-    {ok, _} = hackney:body(Ref2),
     ok.
 
 %% @doc Test getting a policy via HTTP
@@ -568,26 +569,24 @@ policy_get(Config) ->
     Auth = auth_header(Config),
 
     %% Get existing policy
-    {ok, 200, _Headers, Ref} = hackney:get(
+    {ok, 200, _Headers, Body} = hackney:get(
         ?BASE_URL ++ "/_policies/test_fanout",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     Policy = json:decode(Body),
     <<"test_fanout">> = maps:get(<<"name">>, Policy),
     <<"fanout">> = maps:get(<<"pattern">>, Policy),
     <<"source_db">> = maps:get(<<"source">>, Policy),
 
     %% Get non-existing policy
-    {ok, 404, _Headers2, Ref2} = hackney:get(
+    {ok, 404, _Headers2, _Body2} = hackney:get(
         ?BASE_URL ++ "/_policies/nonexistent",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, _} = hackney:body(Ref2),
     ok.
 
 %% @doc Test listing policies via HTTP
@@ -602,7 +601,7 @@ policy_list(Config) ->
         <<"database">> => <<"mydb">>
     },
     ReqBody = iolist_to_binary(json:encode(PolicySpec)),
-    {ok, 201, _, CreateRef} = hackney:post(
+    {ok, 201, _, _CreateBody} = hackney:post(
         ?BASE_URL ++ "/_policies",
         [Auth,
          {<<"Content-Type">>, <<"application/json">>},
@@ -610,16 +609,14 @@ policy_list(Config) ->
         ReqBody,
         []
     ),
-    {ok, _} = hackney:body(CreateRef),
 
     %% List all policies
-    {ok, 200, _Headers, Ref} = hackney:get(
+    {ok, 200, _Headers, Body} = hackney:get(
         ?BASE_URL ++ "/_policies",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     #{<<"policies">> := Policies} = json:decode(Body),
     true = length(Policies) >= 2,
 
@@ -634,44 +631,40 @@ policy_enable_disable(Config) ->
     Auth = auth_header(Config),
 
     %% Check initial state (disabled by default)
-    {ok, 200, _Headers, Ref} = hackney:get(
+    {ok, 200, _Headers, Body} = hackney:get(
         ?BASE_URL ++ "/_policies/test_fanout",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     #{<<"enabled">> := false} = json:decode(Body),
 
     %% Enable policy (may fail to actually start tasks but API should work)
-    {ok, _Status1, _Headers2, Ref2} = hackney:post(
+    {ok, _Status1, _Headers2, _Body2} = hackney:post(
         ?BASE_URL ++ "/_policies/test_fanout/_enable",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, _} = hackney:body(Ref2),
     %% Enable may succeed (200) or fail (400/500) if tasks can't be started
     %% (e.g., databases don't exist). The important thing is the API works.
 
     %% Disable policy
-    {ok, 200, _Headers3, Ref3} = hackney:post(
+    {ok, 200, _Headers3, Body3} = hackney:post(
         ?BASE_URL ++ "/_policies/test_fanout/_disable",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body3} = hackney:body(Ref3),
     #{<<"ok">> := true} = json:decode(Body3),
 
     %% Verify disabled
-    {ok, 200, _Headers4, Ref4} = hackney:get(
+    {ok, 200, _Headers4, Body4} = hackney:get(
         ?BASE_URL ++ "/_policies/test_fanout",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body4} = hackney:body(Ref4),
     #{<<"enabled">> := false} = json:decode(Body4),
     ok.
 
@@ -679,13 +672,12 @@ policy_enable_disable(Config) ->
 policy_status(Config) ->
     Auth = auth_header(Config),
 
-    {ok, 200, _Headers, Ref} = hackney:get(
+    {ok, 200, _Headers, Body} = hackney:get(
         ?BASE_URL ++ "/_policies/test_fanout/_status",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     Status = json:decode(Body),
     <<"test_fanout">> = maps:get(<<"name">>, Status),
     <<"fanout">> = maps:get(<<"pattern">>, Status),
@@ -693,13 +685,12 @@ policy_status(Config) ->
     _ = maps:get(<<"task_count">>, Status),
 
     %% Non-existing policy status
-    {ok, 404, _Headers2, Ref2} = hackney:get(
+    {ok, 404, _Headers2, _Body2} = hackney:get(
         ?BASE_URL ++ "/_policies/nonexistent/_status",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, _} = hackney:body(Ref2),
     ok.
 
 %% @doc Test deleting a policy via HTTP
@@ -707,41 +698,37 @@ policy_delete(Config) ->
     Auth = auth_header(Config),
 
     %% Delete test_fanout policy
-    {ok, 200, _Headers, Ref} = hackney:delete(
+    {ok, 200, _Headers, Body} = hackney:delete(
         ?BASE_URL ++ "/_policies/test_fanout",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     #{<<"ok">> := true} = json:decode(Body),
 
     %% Verify deleted
-    {ok, 404, _Headers2, Ref2} = hackney:get(
+    {ok, 404, _Headers2, _Body2} = hackney:get(
         ?BASE_URL ++ "/_policies/test_fanout",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, _} = hackney:body(Ref2),
 
     %% Delete non-existing policy
-    {ok, 404, _Headers3, Ref3} = hackney:delete(
+    {ok, 404, _Headers3, _Body3} = hackney:delete(
         ?BASE_URL ++ "/_policies/nonexistent",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, _} = hackney:body(Ref3),
 
     %% Delete test_chain too
-    {ok, 200, _Headers4, Ref4} = hackney:delete(
+    {ok, 200, _Headers4, _Body4} = hackney:delete(
         ?BASE_URL ++ "/_policies/test_chain",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, _} = hackney:body(Ref4),
     ok.
 
 %%====================================================================
@@ -759,7 +746,7 @@ tier_config_set(Config) ->
     },
     ReqBody = iolist_to_binary(json:encode(TierConfig)),
 
-    {ok, 200, _Headers, Ref} = hackney:post(
+    {ok, 200, _Headers, Body} = hackney:post(
         ?BASE_URL ++ "/db/tier_test_db/_tier/config",
         [Auth,
          {<<"Content-Type">>, <<"application/json">>},
@@ -767,7 +754,6 @@ tier_config_set(Config) ->
         ReqBody,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     #{<<"ok">> := true} = json:decode(Body),
     ok.
 
@@ -775,13 +761,12 @@ tier_config_set(Config) ->
 tier_config_get(Config) ->
     Auth = auth_header(Config),
 
-    {ok, 200, _Headers, Ref} = hackney:get(
+    {ok, 200, _Headers, Body} = hackney:get(
         ?BASE_URL ++ "/db/tier_test_db/_tier/config",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     TierConfig = json:decode(Body),
     true = maps:get(<<"enabled">>, TierConfig),
     <<"tier_warm_db">> = maps:get(<<"warm_db">>, TierConfig),
@@ -791,13 +776,12 @@ tier_config_get(Config) ->
 tier_capacity(Config) ->
     Auth = auth_header(Config),
 
-    {ok, 200, _Headers, Ref} = hackney:get(
+    {ok, 200, _Headers, Body} = hackney:get(
         ?BASE_URL ++ "/db/tier_test_db/_tier/capacity",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     CapacityInfo = json:decode(Body),
     %% Should have size_bytes or similar field
     true = is_map(CapacityInfo),
@@ -810,7 +794,7 @@ tier_doc_get(Config) ->
     %% First create a document
     Doc = #{<<"_id">> => <<"tier_test_doc">>, <<"value">> => <<"test">>},
     DocBody = iolist_to_binary(json:encode(Doc)),
-    {ok, 201, _, PutRef} = hackney:put(
+    {ok, 201, _, _PutBody} = hackney:put(
         ?BASE_URL ++ "/db/tier_test_db/tier_test_doc",
         [Auth,
          {<<"Content-Type">>, <<"application/json">>},
@@ -818,16 +802,14 @@ tier_doc_get(Config) ->
         DocBody,
         []
     ),
-    {ok, _} = hackney:body(PutRef),
 
     %% Get document tier
-    {ok, 200, _Headers, Ref} = hackney:get(
+    {ok, 200, _Headers, Body} = hackney:get(
         ?BASE_URL ++ "/db/tier_test_db/tier_test_doc/_tier",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     TierInfo = json:decode(Body),
     <<"tier_test_doc">> = maps:get(<<"doc_id">>, TierInfo),
     ok.
@@ -839,7 +821,7 @@ tier_doc_ttl(Config) ->
     %% Set TTL
     TTLSpec = #{<<"ttl">> => 3600},
     TTLBody = iolist_to_binary(json:encode(TTLSpec)),
-    {ok, 200, _Headers, SetRef} = hackney:post(
+    {ok, 200, _Headers, SetBody} = hackney:post(
         ?BASE_URL ++ "/db/tier_test_db/tier_test_doc/_tier/ttl",
         [Auth,
          {<<"Content-Type">>, <<"application/json">>},
@@ -847,17 +829,15 @@ tier_doc_ttl(Config) ->
         TTLBody,
         []
     ),
-    {ok, SetBody} = hackney:body(SetRef),
     #{<<"ok">> := true} = json:decode(SetBody),
 
     %% Get TTL
-    {ok, 200, _Headers2, GetRef} = hackney:get(
+    {ok, 200, _Headers2, GetBody} = hackney:get(
         ?BASE_URL ++ "/db/tier_test_db/tier_test_doc/_tier/ttl",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, GetBody} = hackney:body(GetRef),
     TTLInfo = json:decode(GetBody),
     true = is_map(TTLInfo),
     ok.
@@ -866,13 +846,115 @@ tier_doc_ttl(Config) ->
 tier_run_migration(Config) ->
     Auth = auth_header(Config),
 
-    {ok, 200, _Headers, Ref} = hackney:post(
+    {ok, 200, _Headers, Body} = hackney:post(
         ?BASE_URL ++ "/db/tier_test_db/_tier/run_migration",
         [Auth, {<<"Accept">>, <<"application/json">>}],
         <<>>,
         []
     ),
-    {ok, Body} = hackney:body(Ref),
     Result = json:decode(Body),
     true = maps:get(<<"ok">>, Result),
+    ok.
+
+%%====================================================================
+%% Usage HTTP API Tests
+%%====================================================================
+
+%% @doc Test getting usage stats for all databases
+admin_usage_all(Config) ->
+    Auth = auth_header(Config),
+
+    %% hackney 3.x returns body directly in 4th element
+    {ok, 200, _Headers, Body} = hackney:get(
+        ?BASE_URL ++ "/admin/usage",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    Response = json:decode(Body),
+
+    %% Verify response structure
+    true = is_map(Response),
+    Databases = maps:get(<<"databases">>, Response),
+    TotalDatabases = maps:get(<<"total_databases">>, Response),
+    true = is_list(Databases),
+    true = is_integer(TotalDatabases),
+    true = TotalDatabases >= 0,
+    true = length(Databases) =:= TotalDatabases,
+
+    %% If we have databases, verify their structure
+    lists:foreach(fun(DbStats) ->
+        true = is_map(DbStats),
+        true = maps:is_key(<<"database">>, DbStats),
+        true = maps:is_key(<<"document_count">>, DbStats),
+        true = maps:is_key(<<"storage_bytes">>, DbStats),
+        true = maps:is_key(<<"memtable_size">>, DbStats),
+        true = maps:is_key(<<"sst_files_size">>, DbStats),
+        true = maps:is_key(<<"last_updated">>, DbStats)
+    end, Databases),
+    ok.
+
+%% @doc Test getting usage stats for a single database
+admin_usage_single_db(Config) ->
+    Auth = auth_header(Config),
+    DbName = <<"usage_http_test_db">>,
+
+    %% hackney 3.x returns body directly in 4th element
+    {ok, 200, _Headers, Body} = hackney:get(
+        ?BASE_URL ++ "/admin/databases/" ++ binary_to_list(DbName) ++ "/usage",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    Stats = json:decode(Body),
+
+    %% Verify response structure
+    true = is_map(Stats),
+    DbName = maps:get(<<"database">>, Stats),
+    true = is_integer(maps:get(<<"document_count">>, Stats)),
+    true = is_integer(maps:get(<<"storage_bytes">>, Stats)),
+    true = is_integer(maps:get(<<"memtable_size">>, Stats)),
+    true = is_integer(maps:get(<<"sst_files_size">>, Stats)),
+    true = is_integer(maps:get(<<"last_updated">>, Stats)),
+
+    %% Verify values are non-negative
+    true = maps:get(<<"document_count">>, Stats) >= 0,
+    true = maps:get(<<"storage_bytes">>, Stats) >= 0,
+    ok.
+
+%% @doc Test getting usage stats for a non-existent database
+admin_usage_not_found(Config) ->
+    Auth = auth_header(Config),
+
+    %% hackney 3.x returns body directly in 4th element
+    {ok, 404, _Headers, Body} = hackney:get(
+        ?BASE_URL ++ "/admin/databases/nonexistent_db_12345/usage",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+    Response = json:decode(Body),
+
+    %% Verify error response
+    <<"Database not found">> = maps:get(<<"error">>, Response),
+    ok.
+
+%% @doc Test that usage endpoints require authentication
+admin_usage_requires_auth(_Config) ->
+    %% hackney 3.x returns body directly in 4th element
+    %% Try without auth header
+    {ok, 401, _Headers, _Body} = hackney:get(
+        ?BASE_URL ++ "/admin/usage",
+        [{<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
+
+    %% Also test single db endpoint
+    {ok, 401, _Headers2, _Body2} = hackney:get(
+        ?BASE_URL ++ "/admin/databases/testdb/usage",
+        [{<<"Accept">>, <<"application/json">>}],
+        <<>>,
+        []
+    ),
     ok.

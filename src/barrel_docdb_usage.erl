@@ -40,9 +40,14 @@
 %% Returns a map with storage metrics from RocksDB.
 -spec get_db_usage(binary()) -> {ok, map()} | {error, term()}.
 get_db_usage(DbName) when is_binary(DbName) ->
-    case barrel_docdb:get_db(DbName) of
-        {ok, #{store_ref := DbRef}} ->
-            collect_stats(DbName, DbRef);
+    case barrel_docdb:db_pid(DbName) of
+        {ok, Pid} ->
+            case barrel_db_server:get_store_ref(Pid) of
+                {ok, DbRef} ->
+                    collect_stats(DbName, DbRef);
+                {error, Reason} ->
+                    {error, Reason}
+            end;
         {error, not_found} ->
             {error, not_found};
         {error, Reason} ->
