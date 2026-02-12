@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-02-12
+
+### Added
+
+#### JWT Authentication
+- ES256 (ECDSA P-256) JWT token validation for API authentication
+- Token format: `bdb_<base64-encoded-JWT>` prefix for barrel_docdb tokens
+- Required claims validation: `sub`, `typ`, `oid`, `prm`, `exp`
+- Workspace isolation via optional `wid` claim
+- Permission-based access control with `is_admin` flag
+- File-based or inline PEM key configuration
+
+#### Usage Reporting
+- New `barrel_docdb_usage` module for database statistics
+- `GET /admin/usage` - Get usage stats for all databases
+- `GET /admin/databases/:db/usage` - Get stats for specific database
+- Stats include: document_count, storage_bytes, memtable_size, sst_files_size
+
+#### Ed25519 Peer Authentication for P2P Replication
+- `barrel_peer_auth` gen_server for Ed25519 key management
+- Automatic keypair generation on startup
+- Request signing with canonical format: `timestamp|peer_id|method|path|body_hash`
+- 5-minute timestamp window for replay protection
+- HTTP headers: `X-Peer-Id`, `X-Peer-Timestamp`, `X-Peer-Signature`
+- Public key exposed via `/.well-known/barrel` discovery endpoint
+- Optional `peer_auth` option in HTTP transport (disabled by default)
+
+### Fixed
+
+#### SSE Changes Stream Reliability
+- Reduced heartbeat interval from 60s to 30s (below Cowboy's idle_timeout)
+- Added `idle_timeout => 120000` to Cowboy protocol options
+- Added `request_timeout => infinity` for long-running SSE streams
+- Fixed `since=now` parameter crash (was calling `barrel_hlc:encode(now)`)
+- Simplified `parse_since/1` to only accept valid base64-encoded HLC binaries
+
+#### API Compatibility
+- Fixed `barrel_docdb_usage` to use `db_pid/1` + `get_store_ref/1` API
+- Updated all HTTP tests for hackney 3.x API (body in 4th tuple element)
+
+### Changed
+- Upgraded hackney to 3.0.2
+- Default heartbeat for SSE streams changed from 60s to 30s
+
+### Tests Added
+- `barrel_docdb_usage_SUITE` - 6 tests for usage statistics module
+- `barrel_docdb_jwt_SUITE` - 10 tests for JWT authentication
+- `barrel_peer_auth_tests` - 11 EUnit tests for peer authentication
+- HTTP usage endpoint tests (4 tests in barrel_http_SUITE)
+- SSE stream tests: `changes_stream_since_now`, `changes_stream_heartbeat`
+
 ## [0.2.0] - 2025-01-12
 
 ### Added

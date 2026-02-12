@@ -345,3 +345,228 @@ Configuration: 1000 documents per type, 100 iterations
 - RocksDB handles large values efficiently via BlobDB (values > 4KB stored in separate blob files)
 - Recommended: Keep documents under 16 MB for optimal performance
 - For large binary data, use attachments (`barrel_att`) which are stored separately
+
+---
+
+## JWT Authentication
+
+Barrel DocDB supports JWT (JSON Web Token) authentication for secure API access.
+
+### Token Format
+
+Tokens must be prefixed with `bdb_` followed by the base64-encoded JWT:
+
+```
+Authorization: Bearer bdb_eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+### Required Claims
+
+| Claim | Description |
+|-------|-------------|
+| `sub` | Subject (key ID) |
+| `typ` | Token type (must be `docdb`) |
+| `oid` | Organization/owner ID |
+| `prm` | Permissions list |
+| `exp` | Expiration timestamp |
+
+### Optional Claims
+
+| Claim | Description |
+|-------|-------------|
+| `wid` | Workspace ID (null = all workspaces) |
+| `iat` | Issued at timestamp |
+
+### Configuration
+
+```erlang
+%% Configure with inline PEM key
+application:set_env(barrel_docdb, console_public_key_pem, <<"-----BEGIN PUBLIC KEY-----\n...">>).
+
+%% Or with file path
+application:set_env(barrel_docdb, console_public_key, "/path/to/public_key.pem").
+```
+
+### Permission Checking
+
+```erlang
+%% In barrel_docdb_jwt module
+{ok, Identity} = barrel_docdb_jwt:validate_token(Token),
+true = barrel_docdb_jwt:check_permission(Identity, <<"write">>),
+IsAdmin = maps:get(is_admin, Identity, false).
+```
+
+---
+
+## Usage Reporting
+
+Get storage statistics for databases via the admin API.
+
+### API Endpoints
+
+#### Get All Database Usage
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/admin/usage
+```
+
+Response:
+```json
+{
+  "databases": [
+    {
+      "database": "mydb",
+      "document_count": 15420,
+      "storage_bytes": 104857600,
+      "memtable_size": 2097152,
+      "sst_files_size": 100663296,
+      "last_updated": 1707753600000
+    }
+  ],
+  "total_databases": 1
+}
+```
+
+#### Get Single Database Usage
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/admin/databases/mydb/usage
+```
+
+Response:
+```json
+{
+  "database": "mydb",
+  "document_count": 15420,
+  "storage_bytes": 104857600,
+  "memtable_size": 2097152,
+  "sst_files_size": 100663296,
+  "last_updated": 1707753600000
+}
+```
+
+### Programmatic Access
+
+```erlang
+%% Get stats for single database
+{ok, Stats} = barrel_docdb_usage:get_db_usage(<<"mydb">>).
+
+%% Get stats for all databases
+{ok, AllStats} = barrel_docdb_usage:get_all_usage().
+```
+
+---
+
+## Ed25519 Peer Authentication
+
+Secure P2P replication with Ed25519 digital signatures.
+
+### How It Works
+
+1. Each node generates an Ed25519 keypair on startup
+2. Private key stored at `data/barrel_docdb/peer_key` (mode 600)
+3. Public key exposed via `/.well-known/barrel` endpoint
+4. Outgoing replication requests are signed
+5. Receiving node verifies signature against known peer keys
+
+### Signature Format
+
+Canonical string for signing:
+```
+timestamp|peer_id|method|path|body_hash
+```
+
+Where:
+- `timestamp` - milliseconds since epoch
+- `peer_id` - node identifier
+- `method` - HTTP method (GET, POST, etc.)
+- `path` - request path
+- `body_hash` - SHA-256 hex of request body
+
+### HTTP Headers
+
+| Header | Description |
+|--------|-------------|
+| `X-Peer-Id` | Node identifier |
+| `X-Peer-Timestamp` | Request timestamp (ms) |
+| `X-Peer-Signature` | Base64-encoded Ed25519 signature |
+
+### Discovery
+
+```bash
+curl http://localhost:8080/.well-known/barrel
+```
+
+Response includes:
+```json
+{
+  "node_id": "node1@example.com",
+  "public_key": "MCowBQYDK2VwAyEA...",
+  ...
+}
+```
+
+### Enabling Peer Auth
+
+```erlang
+%% In replication endpoint config
+Endpoint = #{
+    url => "http://peer:8080",
+    peer_auth => true  %% Enable Ed25519 signing
+}.
+```
+
+---
+
+## SSE Changes Stream
+
+Real-time change notifications via Server-Sent Events (SSE).
+
+### Endpoint
+
+```
+GET /db/:db/_changes/stream
+```
+
+### Query Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `since` | `first` | Start position (0, first, or base64 HLC) |
+| `filter` | - | MQTT-style pattern (e.g., `users/+/profile`) |
+| `include_docs` | `false` | Include full documents |
+| `heartbeat` | `30000` | Heartbeat interval in ms (minimum 1000) |
+
+### Event Types
+
+```
+event: change
+data: {"id":"doc1","rev":"1-abc","hlc":"..."}
+
+event: heartbeat
+data: {}
+
+event: error
+data: {"error":"Database error"}
+```
+
+### Example
+
+```bash
+curl -N -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8080/db/mydb/_changes/stream?since=first&heartbeat=5000"
+```
+
+### Connection Reliability
+
+The SSE handler is configured for long-lived connections:
+
+- **Heartbeat**: Sent every 30 seconds (configurable) to keep connection alive
+- **Idle Timeout**: Server allows 120 seconds of inactivity
+- **Request Timeout**: Infinite (no server-side timeout for SSE)
+
+### Notes
+
+- The `since=now` parameter is supported and starts from the current position
+- Invalid `since` values fall back to `first`
+- Heartbeats prevent proxy/load balancer timeouts
