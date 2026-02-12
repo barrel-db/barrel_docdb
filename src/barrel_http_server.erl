@@ -260,6 +260,11 @@ start_clear_listener(Port, NumAcceptors, MaxConnections, Protocols, Dispatch) ->
         stream_handlers => [cowboy_stream_h],
         %% Enable HTTP/2 cleartext (h2c) with HTTP/1.1 fallback
         protocols => Protocols,
+        %% Idle timeout for HTTP/1.1 connections - set high for SSE streams
+        %% SSE handler sends heartbeats every 30s, so 120s gives good margin
+        idle_timeout => 120000,
+        %% Request timeout - allow long-running requests like SSE
+        request_timeout => infinity,
         %% HTTP/2 settings
         max_concurrent_streams => 100,
         initial_connection_window_size => 65535 * 4,
@@ -318,6 +323,11 @@ start_tls_listener(Port, NumAcceptors, MaxConnections, Protocols, Dispatch, Opts
         env => #{dispatch => Dispatch},
         stream_handlers => [cowboy_stream_h],
         protocols => Protocols,
+        %% Idle timeout for HTTP/1.1 connections - set high for SSE streams
+        %% SSE handler sends heartbeats every 30s, so 120s gives good margin
+        idle_timeout => 120000,
+        %% Request timeout - allow long-running requests like SSE
+        request_timeout => infinity,
         %% HTTP/2 settings
         max_concurrent_streams => 100,
         initial_connection_window_size => 65535 * 4,

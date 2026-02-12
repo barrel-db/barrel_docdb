@@ -26,6 +26,8 @@
     get_changes_with_filter/1,
     get_changes_longpoll_timeout/1,
     changes_stream_basic/1,
+    changes_stream_since_now/1,
+    changes_stream_heartbeat/1,
     bulk_docs/1,
     %% Policy tests
     policy_create/1,
@@ -72,6 +74,8 @@ groups() ->
             get_changes_with_filter,
             get_changes_longpoll_timeout,
             changes_stream_basic,
+            changes_stream_since_now,
+            changes_stream_heartbeat,
             bulk_docs
         ]},
         {policy_tests, [sequence], [
@@ -494,6 +498,85 @@ receive_sse_event(Ref, Timeout) ->
             end
     after Timeout ->
         ct:log("SSE timeout after ~p ms", [Timeout]),
+        false
+    end.
+
+%% @doc Test SSE stream with since=now doesn't crash
+%% This regression test ensures the server handles since=now without crashing
+%% (previously caused barrel_hlc:encode(now) crash)
+changes_stream_since_now(Config) ->
+    Auth = auth_header(Config),
+    %% Start streaming request with since=now - should not crash
+    StreamUrl = ?BASE_URL ++ "/db/testdb/_changes/stream?since=now&heartbeat=1000",
+    {ok, Ref} = hackney:get(StreamUrl, [Auth], <<>>, [async]),
+
+    %% Wait for headers - if we get 200, the server didn't crash
+    receive
+        {hackney_response, Ref, {status, 200, _}} -> ok;
+        {hackney_response, Ref, {status, Status, _}} ->
+            ct:fail("Unexpected status ~p for since=now", [Status])
+    after 2000 ->
+        ct:fail("Timeout waiting for SSE response with since=now")
+    end,
+
+    %% Wait for headers
+    receive
+        {hackney_response, Ref, {headers, Headers}} ->
+            <<"text/event-stream">> = proplists:get_value(<<"content-type">>, Headers)
+    after 2000 ->
+        ct:fail("Timeout waiting for SSE headers")
+    end,
+
+    %% Close the stream
+    hackney:close(Ref),
+    ok.
+
+%% @doc Test SSE stream sends heartbeat events
+%% Verifies the heartbeat mechanism keeps the connection alive
+changes_stream_heartbeat(Config) ->
+    Auth = auth_header(Config),
+    %% Start streaming with short heartbeat (1 second)
+    StreamUrl = ?BASE_URL ++ "/db/testdb/_changes/stream?heartbeat=1000",
+    {ok, Ref} = hackney:get(StreamUrl, [Auth], <<>>, [async]),
+
+    %% Wait for headers
+    receive
+        {hackney_response, Ref, {status, 200, _}} -> ok
+    after 2000 ->
+        ct:fail("Timeout waiting for SSE response")
+    end,
+
+    receive
+        {hackney_response, Ref, {headers, _Headers}} -> ok
+    after 2000 ->
+        ct:fail("Timeout waiting for SSE headers")
+    end,
+
+    %% Wait for heartbeat event (should arrive within ~1.5 seconds)
+    ReceivedHeartbeat = receive_heartbeat_event(Ref, 2000),
+    true = ReceivedHeartbeat,
+
+    %% Close the stream
+    hackney:close(Ref),
+    ok.
+
+%% Helper to receive heartbeat events specifically
+receive_heartbeat_event(Ref, Timeout) ->
+    receive
+        {hackney_response, Ref, done} ->
+            false;
+        {hackney_response, Ref, {error, Reason}} ->
+            ct:log("SSE error: ~p", [Reason]),
+            false;
+        {hackney_response, Ref, Chunk} when is_binary(Chunk) ->
+            ct:log("SSE chunk: ~p", [Chunk]),
+            %% Check specifically for heartbeat event
+            case binary:match(Chunk, <<"event: heartbeat">>) of
+                nomatch -> receive_heartbeat_event(Ref, Timeout);
+                _ -> true
+            end
+    after Timeout ->
+        ct:log("Heartbeat timeout after ~p ms", [Timeout]),
         false
     end.
 

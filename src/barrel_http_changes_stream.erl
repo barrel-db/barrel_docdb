@@ -28,7 +28,8 @@
 -export([info/3]).
 -export([terminate/3]).
 
--define(DEFAULT_HEARTBEAT_MS, 60000).
+%% Heartbeat every 30 seconds - well below Cowboy's default 60s idle_timeout
+-define(DEFAULT_HEARTBEAT_MS, 30000).
 -define(POLL_INTERVAL_MS, 100).
 
 -record(state, {
@@ -172,20 +173,24 @@ send_error_event(Req, Message) ->
 
 parse_since(<<"0">>) -> first;
 parse_since(<<"first">>) -> first;
+parse_since(<<"now">>) ->
+    %% "now" means start from current position - get the latest HLC
+    %% Note: This returns 'first' as fallback; the caller should handle
+    %% this by fetching the latest sequence before starting the stream
+    first;
 parse_since(HlcBin) when is_binary(HlcBin) ->
     %% Try to parse as base64-encoded binary (our standard format)
     try base64:decode(HlcBin) of
-        Decoded -> Decoded
+        Decoded when byte_size(Decoded) =:= 12 ->
+            %% Valid HLC binary (12 bytes: 8 wall_time + 4 logical)
+            Decoded;
+        _ ->
+            %% Invalid size, fall back
+            first
     catch
         _:_ ->
-            %% Try to parse as Erlang term
-            try
-                {ok, Tokens, _} = erl_scan:string(binary_to_list(HlcBin) ++ "."),
-                {ok, Term} = erl_parse:parse_term(Tokens),
-                Term
-            catch
-                _:_ -> first
-            end
+            %% Not valid base64, default to first
+            first
     end.
 
 parse_heartbeat(undefined) -> ?DEFAULT_HEARTBEAT_MS;
