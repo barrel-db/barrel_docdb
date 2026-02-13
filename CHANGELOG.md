@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-02-13
+
+### Fixed
+- SSE changes stream now correctly includes document bodies when `include_docs=true`
+- Fixed `get_changes_full_scan` to route to filtered path when `include_docs` is requested
+- Fixed `get_changes_filtered` to set `NeedsDoc` flag when `include_docs=true`
+
+### Added
+- `changes_stream_include_docs` test to verify document bodies in SSE events
+
 ## [0.3.1] - 2026-02-13
 
 ### Verified
