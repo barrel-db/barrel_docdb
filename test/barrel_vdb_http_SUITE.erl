@@ -102,8 +102,7 @@ create_vdb(Config) ->
         <<"name">> => <<"test_http_create">>,
         <<"shard_count">> => 4
     }),
-    {ok, 201, _Headers, Ref} = hackney:post(Url, json_headers(Config), Body, []),
-    {ok, RespBody} = hackney:body(Ref),
+    {ok, 201, _Headers, RespBody} = hackney:post(Url, json_headers(Config), Body, []),
     Result = json:decode(RespBody),
     ?assertEqual(true, maps:get(<<"ok">>, Result)),
     ?assertEqual(<<"test_http_create">>, maps:get(<<"name">>, Result)),
@@ -116,8 +115,7 @@ create_vdb_already_exists(Config) ->
     %% Try to create again via HTTP
     Url = ?BASE_URL ++ "/vdb",
     Body = json:encode(#{<<"name">> => <<"test_http_dup">>}),
-    {ok, 409, _Headers, Ref} = hackney:post(Url, json_headers(Config), Body, []),
-    {ok, RespBody} = hackney:body(Ref),
+    {ok, 409, _Headers, RespBody} = hackney:post(Url, json_headers(Config), Body, []),
     Result = json:decode(RespBody),
     ?assert(maps:is_key(<<"error">>, Result)).
 
@@ -127,8 +125,7 @@ list_vdbs(Config) ->
     ?assertEqual(ok, barrel_vdb:create(<<"test_http_list_b">>, #{shard_count => 2})),
     %% List via HTTP
     Url = ?BASE_URL ++ "/vdb",
-    {ok, 200, _Headers, Ref} = hackney:get(Url, json_headers(Config), <<>>, []),
-    {ok, RespBody} = hackney:body(Ref),
+    {ok, 200, _Headers, RespBody} = hackney:get(Url, json_headers(Config), <<>>, []),
     Result = json:decode(RespBody),
     VdbList = maps:get(<<"vdbs">>, Result),
     ?assert(lists:member(<<"test_http_list_a">>, VdbList)),
@@ -139,8 +136,7 @@ get_vdb_info(Config) ->
     ?assertEqual(ok, barrel_vdb:create(<<"test_http_info">>, #{shard_count => 4})),
     %% Get info via HTTP
     Url = ?BASE_URL ++ "/vdb/test_http_info",
-    {ok, 200, _Headers, Ref} = hackney:get(Url, json_headers(Config), <<>>, []),
-    {ok, RespBody} = hackney:body(Ref),
+    {ok, 200, _Headers, RespBody} = hackney:get(Url, json_headers(Config), <<>>, []),
     Result = json:decode(RespBody),
     ?assertEqual(<<"test_http_info">>, maps:get(<<"name">>, Result)),
     ?assertEqual(4, maps:get(<<"shard_count">>, Result)),
@@ -152,8 +148,7 @@ get_vdb_shards(Config) ->
     ?assertEqual(ok, barrel_vdb:create(<<"test_http_shards">>, #{shard_count => 3})),
     %% Get shards via HTTP
     Url = ?BASE_URL ++ "/vdb/test_http_shards/_shards",
-    {ok, 200, _Headers, Ref} = hackney:get(Url, json_headers(Config), <<>>, []),
-    {ok, RespBody} = hackney:body(Ref),
+    {ok, 200, _Headers, RespBody} = hackney:get(Url, json_headers(Config), <<>>, []),
     Result = json:decode(RespBody),
     Shards = maps:get(<<"shards">>, Result),
     Ranges = maps:get(<<"ranges">>, Result),
@@ -166,8 +161,7 @@ delete_vdb(Config) ->
     ?assert(barrel_vdb:exists(<<"test_http_delete">>)),
     %% Delete via HTTP
     Url = ?BASE_URL ++ "/vdb/test_http_delete",
-    {ok, 200, _Headers, Ref} = hackney:delete(Url, json_headers(Config), <<>>, []),
-    {ok, RespBody} = hackney:body(Ref),
+    {ok, 200, _Headers, RespBody} = hackney:delete(Url, json_headers(Config), <<>>, []),
     Result = json:decode(RespBody),
     ?assertEqual(true, maps:get(<<"ok">>, Result)),
     %% Verify VDB was deleted
@@ -187,8 +181,7 @@ put_doc(Config) ->
     %% Put document via HTTP
     Url = ?BASE_URL ++ "/vdb/test_http_put/mydoc",
     Body = json:encode(#{<<"name">> => <<"Test Document">>}),
-    {ok, 201, _Headers, Ref} = hackney:put(Url, json_headers(Config), Body, []),
-    {ok, RespBody} = hackney:body(Ref),
+    {ok, 201, _Headers, RespBody} = hackney:put(Url, json_headers(Config), Body, []),
     Result = json:decode(RespBody),
     ?assertEqual(<<"mydoc">>, maps:get(<<"id">>, Result)),
     ?assert(is_binary(maps:get(<<"rev">>, Result))).
@@ -202,8 +195,7 @@ get_doc(Config) ->
     }),
     %% Get document via HTTP
     Url = ?BASE_URL ++ "/vdb/test_http_get/getme",
-    {ok, 200, _Headers, Ref} = hackney:get(Url, json_headers(Config), <<>>, []),
-    {ok, RespBody} = hackney:body(Ref),
+    {ok, 200, _Headers, RespBody} = hackney:get(Url, json_headers(Config), <<>>, []),
     Result = json:decode(RespBody),
     ?assertEqual(<<"getme">>, maps:get(<<"id">>, Result)),
     ?assertEqual(42, maps:get(<<"value">>, Result)).
@@ -221,8 +213,7 @@ delete_doc(Config) ->
     {ok, _} = barrel_vdb:put_doc(<<"test_http_deldoc">>, #{<<"id">> => <<"todelete">>}),
     %% Delete document via HTTP
     Url = ?BASE_URL ++ "/vdb/test_http_deldoc/todelete",
-    {ok, 200, _Headers, Ref} = hackney:delete(Url, json_headers(Config), <<>>, []),
-    {ok, RespBody} = hackney:body(Ref),
+    {ok, 200, _Headers, RespBody} = hackney:delete(Url, json_headers(Config), <<>>, []),
     Result = json:decode(RespBody),
     ?assertEqual(<<"todelete">>, maps:get(<<"id">>, Result)),
     %% Verify document was deleted
@@ -240,8 +231,7 @@ bulk_docs(Config) ->
             #{<<"id">> => <<"bulk3">>, <<"n">> => 3}
         ]
     }),
-    {ok, 201, _Headers, Ref} = hackney:post(Url, json_headers(Config), Body, []),
-    {ok, RespBody} = hackney:body(Ref),
+    {ok, 201, _Headers, RespBody} = hackney:post(Url, json_headers(Config), Body, []),
     Result = json:decode(RespBody),
     ?assertEqual(3, length(Result)),
     %% Verify documents exist
@@ -263,8 +253,7 @@ find_all(Config) ->
     %% Find via HTTP
     Url = ?BASE_URL ++ "/vdb/test_http_find/_find",
     Body = json:encode(#{}),
-    {ok, 200, _Headers, Ref} = hackney:post(Url, json_headers(Config), Body, []),
-    {ok, RespBody} = hackney:body(Ref),
+    {ok, 200, _Headers, RespBody} = hackney:post(Url, json_headers(Config), Body, []),
     Result = json:decode(RespBody),
     Docs = maps:get(<<"docs">>, Result),
     ?assertEqual(10, length(Docs)).
@@ -278,8 +267,7 @@ find_with_selector(Config) ->
     %% Find with selector via HTTP
     Url = ?BASE_URL ++ "/vdb/test_http_findsel/_find",
     Body = json:encode(#{<<"selector">> => #{<<"type">> => <<"x">>}}),
-    {ok, 200, _Headers, Ref} = hackney:post(Url, json_headers(Config), Body, []),
-    {ok, RespBody} = hackney:body(Ref),
+    {ok, 200, _Headers, RespBody} = hackney:post(Url, json_headers(Config), Body, []),
     Result = json:decode(RespBody),
     Docs = maps:get(<<"docs">>, Result),
     ?assertEqual(2, length(Docs)),
@@ -295,8 +283,7 @@ get_changes(Config) ->
     end, lists:seq(1, 5)),
     %% Get changes via HTTP
     Url = ?BASE_URL ++ "/vdb/test_http_changes/_changes",
-    {ok, 200, _Headers, Ref} = hackney:get(Url, json_headers(Config), <<>>, []),
-    {ok, RespBody} = hackney:body(Ref),
+    {ok, 200, _Headers, RespBody} = hackney:get(Url, json_headers(Config), <<>>, []),
     Result = json:decode(RespBody),
     ?assert(maps:is_key(<<"changes">>, Result)),
     ?assert(maps:is_key(<<"last_seq">>, Result)),

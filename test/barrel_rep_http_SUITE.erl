@@ -359,8 +359,7 @@ http_revsdiff_batch(Config) ->
         {<<"content-type">>, <<"application/json">>},
         {<<"authorization">>, <<"Bearer ", BearerToken/binary>>}
     ],
-    {ok, 200, _RespHeaders, RespBody} = hackney:request(post, Url, Headers, EncodedBody, []),
-    {ok, RespBodyBin} = hackney:body(RespBody),
+    {ok, 200, _RespHeaders, RespBodyBin} = hackney:request(post, Url, Headers, EncodedBody, []),
     Results = json:decode(RespBodyBin),
 
     %% Check DocId1 result - only fake rev should be missing
@@ -601,8 +600,7 @@ key_list(Config) ->
     Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>},
                {<<"Content-Type">>, <<"application/json">>}],
 
-    {ok, 200, _RespHeaders, ClientRef} = hackney:get(Url, Headers, <<>>, []),
-    {ok, Body} = hackney:body(ClientRef),
+    {ok, 200, _RespHeaders, Body} = hackney:get(Url, Headers, <<>>, []),
     Keys = json:decode(Body),
 
     %% Should have at least the test suite key
@@ -623,8 +621,7 @@ key_create(Config) ->
         <<"databases">> => [<<"key_test_db">>]
     }),
 
-    {ok, 201, _RespHeaders, ClientRef} = hackney:post(Url, Headers, ReqBody, []),
-    {ok, Body} = hackney:body(ClientRef),
+    {ok, 201, _RespHeaders, Body} = hackney:post(Url, Headers, ReqBody, []),
     Result = json:decode(Body),
 
     %% Should return the full key on creation
@@ -645,8 +642,7 @@ key_get(Config) ->
     Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>},
                {<<"Content-Type">>, <<"application/json">>}],
 
-    {ok, 200, _RespHeaders, ClientRef} = hackney:get(Url, Headers, <<>>, []),
-    {ok, Body} = hackney:body(ClientRef),
+    {ok, 200, _RespHeaders, Body} = hackney:get(Url, Headers, <<>>, []),
     Result = json:decode(Body),
 
     #{<<"name">> := <<"test-created-key">>} = Result,
@@ -665,13 +661,11 @@ key_delete(Config) ->
     Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>},
                {<<"Content-Type">>, <<"application/json">>}],
 
-    {ok, 200, _RespHeaders, ClientRef} = hackney:delete(Url, Headers, <<>>, []),
-    {ok, Body} = hackney:body(ClientRef),
+    {ok, 200, _RespHeaders, Body} = hackney:delete(Url, Headers, <<>>, []),
     #{<<"ok">> := true} = json:decode(Body),
 
     %% Verify it's gone
-    {ok, 404, _, ClientRef2} = hackney:get(Url, Headers, <<>>, []),
-    hackney:body(ClientRef2),
+    {ok, 404, _, _Body2} = hackney:get(Url, Headers, <<>>, []),
 
     ok.
 
@@ -688,8 +682,7 @@ key_admin_required(Config) ->
                {<<"Content-Type">>, <<"application/json">>}],
 
     %% Should be forbidden (403)
-    {ok, 403, _RespHeaders, ClientRef} = hackney:get(Url, Headers, <<>>, []),
-    {ok, Body} = hackney:body(ClientRef),
+    {ok, 403, _RespHeaders, Body} = hackney:get(Url, Headers, <<>>, []),
     #{<<"error">> := <<"Admin access required">>} = json:decode(Body),
 
     %% Clean up
@@ -712,14 +705,12 @@ key_per_database(_Config) ->
     Url1 = <<?BASE_URL/binary, "/db/key_test_db">>,
     Headers1 = [{<<"Authorization">>, <<"Bearer ", DbKey/binary>>},
                 {<<"Content-Type">>, <<"application/json">>}],
-    {ok, 200, _, ClientRef1} = hackney:get(Url1, Headers1, <<>>, []),
-    hackney:body(ClientRef1),
+    {ok, 200, _, _Body1} = hackney:get(Url1, Headers1, <<>>, []),
 
     %% Should NOT be able to access http_test db
     ensure_db(<<"http_test">>),
     Url2 = <<?BASE_URL/binary, "/db/http_test">>,
-    {ok, 403, _, ClientRef2} = hackney:get(Url2, Headers1, <<>>, []),
-    {ok, Body2} = hackney:body(ClientRef2),
+    {ok, 403, _, Body2} = hackney:get(Url2, Headers1, <<>>, []),
     #{<<"error">> := <<"Access denied to this database">>} = json:decode(Body2),
 
     %% Clean up
@@ -735,10 +726,8 @@ key_per_database(_Config) ->
 
     Headers2 = [{<<"Authorization">>, <<"Bearer ", AllDbKey/binary>>},
                 {<<"Content-Type">>, <<"application/json">>}],
-    {ok, 200, _, ClientRef3} = hackney:get(Url1, Headers2, <<>>, []),
-    hackney:body(ClientRef3),
-    {ok, 200, _, ClientRef4} = hackney:get(Url2, Headers2, <<>>, []),
-    hackney:body(ClientRef4),
+    {ok, 200, _, _Body3} = hackney:get(Url1, Headers2, <<>>, []),
+    {ok, 200, _, _Body4} = hackney:get(Url2, Headers2, <<>>, []),
 
     %% Clean up
     barrel_http_api_keys:delete_key(AllDbKeyPrefix),
@@ -756,8 +745,7 @@ attachment_put(Config) ->
                {<<"Content-Type">>, <<"application/octet-stream">>}],
     AttData = <<"fake png data for testing">>,
 
-    {ok, 201, _RespHeaders, ClientRef} = hackney:put(Url, Headers, AttData, []),
-    {ok, Body} = hackney:body(ClientRef),
+    {ok, 201, _RespHeaders, Body} = hackney:put(Url, Headers, AttData, []),
     Result = json:decode(Body),
 
     #{<<"ok">> := true, <<"name">> := <<"image.png">>} = Result,
@@ -771,8 +759,7 @@ attachment_get(Config) ->
     Url = <<?BASE_URL/binary, "/db/att_test_db/att_test_doc/_attachments/image.png">>,
     Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
 
-    {ok, 200, RespHeaders, ClientRef} = hackney:get(Url, Headers, <<>>, []),
-    {ok, Body} = hackney:body(ClientRef),
+    {ok, 200, RespHeaders, Body} = hackney:get(Url, Headers, <<>>, []),
 
     %% Should return the raw binary data
     <<"fake png data for testing">> = Body,
@@ -790,15 +777,13 @@ attachment_list(Config) ->
     Url1 = <<?BASE_URL/binary, "/db/att_test_db/att_test_doc/_attachments/readme.txt">>,
     Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>},
                {<<"Content-Type">>, <<"application/octet-stream">>}],
-    {ok, 201, _, ClientRef1} = hackney:put(Url1, Headers, <<"readme content">>, []),
-    hackney:body(ClientRef1),
+    {ok, 201, _, _Body1} = hackney:put(Url1, Headers, <<"readme content">>, []),
 
     %% List attachments
     Url2 = <<?BASE_URL/binary, "/db/att_test_db/att_test_doc/_attachments">>,
     Headers2 = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>},
                 {<<"Accept">>, <<"application/json">>}],
-    {ok, 200, _RespHeaders, ClientRef2} = hackney:get(Url2, Headers2, <<>>, []),
-    {ok, Body} = hackney:body(ClientRef2),
+    {ok, 200, _RespHeaders, Body} = hackney:get(Url2, Headers2, <<>>, []),
     Attachments = json:decode(Body),
 
     %% Should have both attachments
@@ -813,13 +798,11 @@ attachment_delete(Config) ->
     Url = <<?BASE_URL/binary, "/db/att_test_db/att_test_doc/_attachments/readme.txt">>,
     Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
 
-    {ok, 200, _RespHeaders, ClientRef} = hackney:delete(Url, Headers, <<>>, []),
-    {ok, Body} = hackney:body(ClientRef),
+    {ok, 200, _RespHeaders, Body} = hackney:delete(Url, Headers, <<>>, []),
     #{<<"ok">> := true} = json:decode(Body),
 
     %% Verify it's gone
-    {ok, 404, _, ClientRef2} = hackney:get(Url, Headers, <<>>, []),
-    hackney:body(ClientRef2),
+    {ok, 404, _, _Body2} = hackney:get(Url, Headers, <<>>, []),
 
     ok.
 
@@ -828,8 +811,7 @@ attachment_not_found(Config) ->
     Url = <<?BASE_URL/binary, "/db/att_test_db/att_test_doc/_attachments/nonexistent.xyz">>,
     Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
 
-    {ok, 404, _RespHeaders, ClientRef} = hackney:get(Url, Headers, <<>>, []),
-    {ok, Body} = hackney:body(ClientRef),
+    {ok, 404, _RespHeaders, Body} = hackney:get(Url, Headers, <<>>, []),
     #{<<"error">> := <<"Attachment not found">>} = json:decode(Body),
 
     ok.
@@ -846,8 +828,7 @@ query_find_basic(Config) ->
 
     %% Query all documents
     ReqBody = json:encode(#{}),
-    {ok, 200, _RespHeaders, ClientRef} = hackney:post(Url, Headers, ReqBody, []),
-    {ok, Body} = hackney:body(ClientRef),
+    {ok, 200, _RespHeaders, Body} = hackney:post(Url, Headers, ReqBody, []),
     #{<<"results">> := Results, <<"meta">> := _Meta} = json:decode(Body),
 
     %% Should have 10 documents
@@ -867,8 +848,7 @@ query_find_with_where(Config) ->
             #{<<"path">> => [<<"type">>], <<"op">> => <<"eq">>, <<"value">> => <<"even">>}
         ]
     }),
-    {ok, 200, _RespHeaders, ClientRef} = hackney:post(Url, Headers, ReqBody, []),
-    {ok, Body} = hackney:body(ClientRef),
+    {ok, 200, _RespHeaders, Body} = hackney:post(Url, Headers, ReqBody, []),
     #{<<"results">> := Results} = json:decode(Body),
 
     %% Should have 5 even documents (2, 4, 6, 8, 10)
@@ -894,8 +874,7 @@ query_find_with_pagination(Config) ->
 
     %% First page with limit
     ReqBody1 = json:encode(#{<<"limit">> => 3}),
-    {ok, 200, _, ClientRef1} = hackney:post(Url, Headers, ReqBody1, []),
-    {ok, Body1} = hackney:body(ClientRef1),
+    {ok, 200, _, Body1} = hackney:post(Url, Headers, ReqBody1, []),
     #{<<"results">> := Results1, <<"meta">> := Meta1} = json:decode(Body1),
 
     %% Should have at most 3 documents (limit respected)
@@ -912,8 +891,7 @@ query_find_with_pagination(Config) ->
             true = Continuation =/= undefined,
             %% Continue with next page
             ReqBody2 = json:encode(#{<<"continuation">> => Continuation, <<"limit">> => 3}),
-            {ok, 200, _, ClientRef2} = hackney:post(Url, Headers, ReqBody2, []),
-            {ok, Body2} = hackney:body(ClientRef2),
+            {ok, 200, _, Body2} = hackney:post(Url, Headers, ReqBody2, []),
             #{<<"results">> := Results2} = json:decode(Body2),
             true = length(Results2) > 0;
         false ->
@@ -942,8 +920,7 @@ view_create(Config) ->
         <<"where">> => []  %% Empty where clause is invalid
     }),
 
-    {ok, 400, _RespHeaders, ClientRef} = hackney:post(Url, Headers, ReqBody, []),
-    {ok, _Body} = hackney:body(ClientRef),
+    {ok, 400, _RespHeaders, _Body} = hackney:post(Url, Headers, ReqBody, []),
     %% 400 is expected for invalid view spec
     ok.
 
@@ -952,8 +929,7 @@ view_list(Config) ->
     Url = <<?BASE_URL/binary, "/db/views_test_db/_views">>,
     Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
 
-    {ok, 200, _RespHeaders, ClientRef} = hackney:get(Url, Headers, <<>>, []),
-    {ok, Body} = hackney:body(ClientRef),
+    {ok, 200, _RespHeaders, Body} = hackney:get(Url, Headers, <<>>, []),
     Views = json:decode(Body),
 
     %% Should return a list (even if empty)
@@ -967,8 +943,7 @@ view_query(Config) ->
     Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
 
     %% Query a non-existent view should return 404
-    {ok, 404, _RespHeaders, ClientRef} = hackney:get(Url, Headers, <<>>, []),
-    {ok, _Body} = hackney:body(ClientRef),
+    {ok, 404, _RespHeaders, _Body} = hackney:get(Url, Headers, <<>>, []),
 
     ok.
 
@@ -978,8 +953,7 @@ view_delete(Config) ->
     Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
 
     %% Delete a non-existent view should return 404
-    {ok, 404, _RespHeaders, ClientRef} = hackney:delete(Url, Headers, <<>>, []),
-    {ok, _Body} = hackney:body(ClientRef),
+    {ok, 404, _RespHeaders, _Body} = hackney:delete(Url, Headers, <<>>, []),
 
     ok.
 
