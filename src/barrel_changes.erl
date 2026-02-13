@@ -392,10 +392,11 @@ get_changes_full_scan(StoreRef, DbName, Since, Opts) ->
     DocIds = maps:get(doc_ids, Opts, undefined),
     PathPatterns = maps:get(paths, Opts, undefined),
     QuerySpec = maps:get(query, Opts, undefined),
+    IncludeDocs = maps:get(include_docs, Opts, false),
 
-    %% Fast path: no filters - use compact format for efficiency
-    case {DocIds, PathPatterns, QuerySpec} of
-        {undefined, undefined, undefined} ->
+    %% Fast path: no filters and no include_docs - use compact format for efficiency
+    case {DocIds, PathPatterns, QuerySpec, IncludeDocs} of
+        {undefined, undefined, undefined, false} ->
             get_changes_fast(StoreRef, DbName, Since, Opts);
         _ ->
             get_changes_filtered(StoreRef, DbName, Since, Opts)
@@ -465,8 +466,9 @@ get_changes_filtered(StoreRef, DbName, Since, Opts) ->
     %% If query filter specified, compile it
     CompiledQuery = compile_query(QuerySpec),
 
-    %% Do we need doc body for filtering?
-    NeedsDoc = PathMatcher =/= undefined orelse CompiledQuery =/= undefined,
+    %% Do we need doc body for filtering or include_docs?
+    IncludeDocs = maps:get(include_docs, Opts, false),
+    NeedsDoc = PathMatcher =/= undefined orelse CompiledQuery =/= undefined orelse IncludeDocs,
 
     %% Use chunked processing with batch doc fetching for efficiency
     case NeedsDoc of

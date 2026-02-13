@@ -28,6 +28,7 @@
     changes_stream_basic/1,
     changes_stream_since_now/1,
     changes_stream_heartbeat/1,
+    changes_stream_include_docs/1,
     bulk_docs/1,
     %% Policy tests
     policy_create/1,
@@ -76,6 +77,7 @@ groups() ->
             changes_stream_basic,
             changes_stream_since_now,
             changes_stream_heartbeat,
+            changes_stream_include_docs,
             bulk_docs
         ]},
         {policy_tests, [sequence], [
@@ -578,6 +580,99 @@ receive_heartbeat_event(Ref, Timeout) ->
     after Timeout ->
         ct:log("Heartbeat timeout after ~p ms", [Timeout]),
         false
+    end.
+
+%% @doc Test SSE stream with include_docs=true
+%% Verifies that document bodies are included in change events
+changes_stream_include_docs(Config) ->
+    Auth = auth_header(Config),
+
+    %% First, create a document with known content
+    DocId = <<"stream_include_docs_test">>,
+    DocBody = #{<<"id">> => DocId, <<"name">> => <<"Test Doc">>, <<"value">> => 42},
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, DocBody),
+
+    %% Start streaming with include_docs=true, starting from beginning to catch the doc
+    StreamUrl = ?BASE_URL ++ "/db/testdb/_changes/stream?include_docs=true&heartbeat=5000",
+    {ok, Ref} = hackney:get(StreamUrl, [Auth], <<>>, [async]),
+
+    %% Wait for headers
+    receive
+        {hackney_response, Ref, {status, 200, _}} -> ok
+    after 2000 ->
+        ct:fail("Timeout waiting for SSE response")
+    end,
+
+    receive
+        {hackney_response, Ref, {headers, _Headers}} -> ok
+    after 2000 ->
+        ct:fail("Timeout waiting for SSE headers")
+    end,
+
+    %% Wait for change event that includes doc body
+    {ok, ChangeJson} = receive_change_with_doc(Ref, DocId, 5000),
+    ct:log("Received change with doc: ~p", [ChangeJson]),
+
+    %% Verify the change includes the doc field with expected content
+    Change = json:decode(ChangeJson),
+    true = maps:is_key(<<"doc">>, Change),
+    Doc = maps:get(<<"doc">>, Change),
+    <<"Test Doc">> = maps:get(<<"name">>, Doc),
+    42 = maps:get(<<"value">>, Doc),
+
+    %% Close the stream
+    hackney:close(Ref),
+    ok.
+
+%% Helper to receive change event with doc body for a specific document
+receive_change_with_doc(Ref, TargetDocId, Timeout) ->
+    receive
+        {hackney_response, Ref, done} ->
+            {error, stream_closed};
+        {hackney_response, Ref, {error, Reason}} ->
+            ct:log("SSE error: ~p", [Reason]),
+            {error, Reason};
+        {hackney_response, Ref, Chunk} when is_binary(Chunk) ->
+            ct:log("SSE chunk: ~p", [Chunk]),
+            %% Parse SSE event
+            case parse_sse_change_event(Chunk) of
+                {ok, DataJson} ->
+                    %% Check if this is our target doc and has doc field
+                    case json:decode(DataJson) of
+                        #{<<"id">> := TargetDocId, <<"doc">> := _} ->
+                            {ok, DataJson};
+                        _ ->
+                            receive_change_with_doc(Ref, TargetDocId, Timeout)
+                    end;
+                _ ->
+                    receive_change_with_doc(Ref, TargetDocId, Timeout)
+            end
+    after Timeout ->
+        ct:log("Timeout waiting for change with doc after ~p ms", [Timeout]),
+        {error, timeout}
+    end.
+
+%% Parse SSE change event and extract the JSON data
+parse_sse_change_event(Chunk) ->
+    case binary:match(Chunk, <<"event: change">>) of
+        nomatch ->
+            {error, not_change_event};
+        _ ->
+            %% Find data line
+            case binary:match(Chunk, <<"data: ">>) of
+                nomatch ->
+                    {error, no_data};
+                {Start, Len} ->
+                    DataStart = Start + Len,
+                    %% Find end of line
+                    RestChunk = binary:part(Chunk, DataStart, byte_size(Chunk) - DataStart),
+                    case binary:match(RestChunk, <<"\n">>) of
+                        nomatch ->
+                            {ok, RestChunk};
+                        {EndPos, _} ->
+                            {ok, binary:part(RestChunk, 0, EndPos)}
+                    end
+            end
     end.
 
 %% @doc Test bulk docs
