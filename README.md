@@ -1,6 +1,21 @@
+<div align="center">
+
 # barrel_docdb
 
-An embeddable document database for Erlang with MVCC, declarative queries, real-time subscriptions, peer-to-peer replication, and multi-tier storage.
+**Embeddable document database for Erlang with MVCC, declarative queries, and P2P replication**
+
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Status](https://img.shields.io/badge/Status-Alpha-orange.svg)]()
+
+[Documentation](https://docs.barrel-db.eu/docdb) |
+[Examples](./examples) |
+[barrel-db.eu](https://barrel-db.eu)
+
+</div>
+
+---
+
+> **Alpha Software** - API may change. Feedback welcome via [GitLab Issues](https://gitlab.enki.io/barrel-db/barrel_docdb/-/issues).
 
 ## Overview
 
@@ -406,6 +421,17 @@ barrel_docdb_sup
 | `barrel_tier:find/2,3` | Query across tiers |
 | `barrel_tier:migrate_expired/1,2` | Manual migration |
 
+## Support
+
+| Channel | For |
+|---------|-----|
+| [GitLab Issues](https://gitlab.enki.io/barrel-db/barrel_docdb/-/issues) | Bug reports, feature requests |
+| [Email](mailto:support@barrel-db.eu) | Commercial inquiries |
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE) for details.
+
+---
+
+Built by [Enki Multimedia](https://enki-multimedia.eu) | [barrel-db.eu](https://barrel-db.eu)
