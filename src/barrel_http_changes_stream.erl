@@ -36,6 +36,7 @@
     db_name :: binary(),
     since :: term(),
     filter_fun :: fun((map()) -> boolean()) | undefined,
+    filter_opts :: map(),  %% doc_ids, query, paths for backend
     include_docs :: boolean(),
     heartbeat_ms :: pos_integer(),
     heartbeat_ref :: reference() | undefined,
@@ -59,11 +60,23 @@ init(Req0, _State) ->
                 Req0),
             {ok, Req, undefined};
         {ok, _Info} ->
-            %% Parse options
+            %% Parse options from query string
             Since = parse_since(proplists:get_value(<<"since">>, Qs, <<"first">>)),
             IncludeDocs = proplists:get_value(<<"include_docs">>, Qs, <<"false">>) =:= <<"true">>,
             HeartbeatMs = parse_heartbeat(proplists:get_value(<<"heartbeat">>, Qs)),
             FilterFun = parse_filter(DbName, proplists:get_value(<<"filter">>, Qs)),
+
+            %% Parse filter options from query string
+            FilterOpts0 = parse_filter_opts_from_qs(Qs),
+
+            %% Read POST body for doc_ids and query filters
+            {FilterOpts, Req1} = case cowboy_req:method(Req0) of
+                <<"POST">> ->
+                    {ok, Body, ReqWithBody} = cowboy_req:read_body(Req0),
+                    {merge_body_filter_opts(Body, FilterOpts0), ReqWithBody};
+                _ ->
+                    {FilterOpts0, Req0}
+            end,
 
             %% Start SSE response
             Headers = #{
@@ -72,13 +85,14 @@ init(Req0, _State) ->
                 <<"connection">> => <<"keep-alive">>,
                 <<"access-control-allow-origin">> => <<"*">>
             },
-            Req = cowboy_req:stream_reply(200, Headers, Req0),
+            Req = cowboy_req:stream_reply(200, Headers, Req1),
 
             %% Initialize state
             State = #state{
                 db_name = DbName,
                 since = Since,
                 filter_fun = FilterFun,
+                filter_opts = FilterOpts,
                 include_docs = IncludeDocs,
                 heartbeat_ms = HeartbeatMs
             },
@@ -93,12 +107,14 @@ init(Req0, _State) ->
 info(poll_changes, Req, #state{db_name = DbName,
                                since = Since,
                                filter_fun = FilterFun,
+                               filter_opts = FilterOpts,
                                include_docs = IncludeDocs} = State) ->
-    %% Get changes since last position
-    Opts = case IncludeDocs of
+    %% Build options: merge filter_opts with include_docs and limit
+    BaseOpts = case IncludeDocs of
         true -> #{include_docs => true, limit => 100};
         false -> #{limit => 100}
     end,
+    Opts = maps:merge(FilterOpts, BaseOpts),
 
     case barrel_docdb:get_changes(DbName, Since, Opts) of
         {ok, [], _LastHlc} ->
@@ -259,3 +275,90 @@ format_hlc(Other) ->
 
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref).
+
+%% @doc Parse filter options from query string (path, doc_ids)
+parse_filter_opts_from_qs(Qs) ->
+    Opts0 = case proplists:get_value(<<"path">>, Qs) of
+        undefined -> #{};
+        Path -> #{paths => [Path]}
+    end,
+    case proplists:get_value(<<"doc_ids">>, Qs) of
+        undefined -> Opts0;
+        DocIdsBin ->
+            %% Comma-separated doc_ids
+            DocIds = binary:split(DocIdsBin, <<",">>, [global]),
+            Opts0#{doc_ids => DocIds}
+    end.
+
+%% @doc Merge doc_ids and query from POST body into filter options
+merge_body_filter_opts(<<>>, Opts) -> Opts;
+merge_body_filter_opts(Body, Opts) ->
+    try json:decode(Body) of
+        BodyMap when is_map(BodyMap) ->
+            Opts1 = case maps:get(<<"doc_ids">>, BodyMap, undefined) of
+                undefined -> Opts;
+                DocIds when is_list(DocIds) -> Opts#{doc_ids => DocIds};
+                _ -> Opts
+            end,
+            case maps:get(<<"query">>, BodyMap, undefined) of
+                undefined -> Opts1;
+                Query when is_map(Query) -> Opts1#{query => convert_query_spec(Query)};
+                _ -> Opts1
+            end;
+        _ -> Opts
+    catch
+        _:_ -> Opts
+    end.
+
+%% @doc Convert JSON query spec to internal format
+%% Converts binary keys to atoms and normalizes the structure
+convert_query_spec(Spec) when is_map(Spec) ->
+    BaseSpec = maps:fold(
+        fun(<<"where">>, V, Acc) ->
+                Acc#{where => convert_where_clauses(V)};
+           (<<"selector">>, V, Acc) when is_map(V) ->
+                Acc#{<<"selector">> => V};
+           (<<"limit">>, V, Acc) when is_integer(V) ->
+                Acc#{limit => V};
+           (<<"offset">>, V, Acc) when is_integer(V) ->
+                Acc#{offset => V};
+           (_, _, Acc) ->
+                Acc
+        end,
+        #{},
+        Spec
+    ),
+    %% Ensure where clause is present
+    case maps:is_key(where, BaseSpec) orelse maps:is_key(<<"selector">>, BaseSpec) of
+        true -> BaseSpec;
+        false -> BaseSpec#{where => [{exists, [<<"id">>]}]}
+    end.
+
+convert_where_clauses(Clauses) when is_list(Clauses) ->
+    lists:map(fun convert_where_clause/1, Clauses);
+convert_where_clauses(_) ->
+    [].
+
+convert_where_clause(#{<<"path">> := Path, <<"op">> := <<"eq">>, <<"value">> := Value}) ->
+    {path, Path, Value};
+convert_where_clause(#{<<"path">> := Path, <<"op">> := Op, <<"value">> := Value}) ->
+    {compare, Path, convert_op(Op), Value};
+convert_where_clause(#{<<"path">> := Path, <<"value">> := Value}) ->
+    {path, Path, Value};
+convert_where_clause(#{<<"path">> := Path, <<"op">> := <<"exists">>}) ->
+    {exists, Path};
+convert_where_clause(#{<<"path">> := Path, <<"op">> := <<"missing">>}) ->
+    {missing, Path};
+convert_where_clause(#{<<"path">> := Path, <<"op">> := <<"in">>, <<"value">> := Value}) when is_list(Value) ->
+    {in, Path, Value};
+convert_where_clause(_) ->
+    {error, invalid_clause}.
+
+convert_op(<<"ne">>) -> '=/=';
+convert_op(<<"gt">>) -> '>';
+convert_op(<<"gte">>) -> '>=';
+convert_op(<<"lt">>) -> '<';
+convert_op(<<"lte">>) -> '=<';
+convert_op(<<"==">>) -> '==';
+convert_op(Op) when is_binary(Op) -> binary_to_atom(Op);
+convert_op(Op) -> Op.

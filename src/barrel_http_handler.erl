@@ -777,17 +777,26 @@ handle_delete_doc(Req) ->
 
 handle_get_changes(Req0) ->
     DbName = cowboy_req:binding(db, Req0),
-    {Since, Feed, FilterPattern, Opts} = parse_changes_opts(Req0),
-    Timeout = maps:get(timeout, Opts, 60000),
+    {Since, Feed, FilterPattern, Opts0} = parse_changes_opts(Req0),
+    Timeout = maps:get(timeout, Opts0, 60000),
+
+    %% Read POST body for doc_ids and query filters
+    {Opts, Req1} = case cowboy_req:method(Req0) of
+        <<"POST">> ->
+            {ok, Body, Req} = cowboy_req:read_body(Req0),
+            {merge_body_opts(Body, Opts0), Req};
+        _ ->
+            {Opts0, Req0}
+    end,
 
     %% Create filter function if pattern provided
     FilterFun = create_filter_fun(FilterPattern),
 
     case Feed of
         longpoll ->
-            handle_longpoll_changes(DbName, Since, FilterFun, Opts, Timeout, Req0);
+            handle_longpoll_changes(DbName, Since, FilterFun, Opts, Timeout, Req1);
         normal ->
-            handle_normal_changes(DbName, Since, FilterFun, Opts, Req0)
+            handle_normal_changes(DbName, Since, FilterFun, Opts, Req1)
     end.
 
 %% Normal poll - return changes immediately
@@ -2652,6 +2661,13 @@ parse_changes_opts(Req) ->
                 Acc#{descending => true};
            ({<<"timeout">>, TimeoutBin}, Acc) ->
                 Acc#{timeout => binary_to_integer(TimeoutBin)};
+           ({<<"path">>, PathBin}, Acc) ->
+                %% Single path converts to paths list for backend
+                Acc#{paths => [PathBin]};
+           ({<<"doc_ids">>, DocIdsBin}, Acc) ->
+                %% Comma-separated doc_ids from query string
+                DocIds = binary:split(DocIdsBin, <<",">>, [global]),
+                Acc#{doc_ids => DocIds};
            (_, Acc) ->
                 Acc
         end,
@@ -2659,6 +2675,28 @@ parse_changes_opts(Req) ->
         Qs
     ),
     {Since, Feed, FilterPattern, Opts}.
+
+%% @doc Merge doc_ids and query from POST body into options
+merge_body_opts(<<>>, Opts) -> Opts;
+merge_body_opts(Body, Opts) ->
+    try json:decode(Body) of
+        BodyMap when is_map(BodyMap) ->
+            Opts1 = case maps:get(<<"doc_ids">>, BodyMap, undefined) of
+                undefined -> Opts;
+                DocIds when is_list(DocIds) -> Opts#{doc_ids => DocIds};
+                _ -> Opts
+            end,
+            case maps:get(<<"query">>, BodyMap, undefined) of
+                undefined -> Opts1;
+                Query when is_map(Query) ->
+                    %% Use convert_query_spec to normalize the query format
+                    Opts1#{query => convert_query_spec(Query)};
+                _ -> Opts1
+            end;
+        _ -> Opts
+    catch
+        _:_ -> Opts
+    end.
 
 %%====================================================================
 %% HLC Formatting

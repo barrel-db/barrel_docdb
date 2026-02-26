@@ -24,11 +24,15 @@
     delete_doc/1,
     get_changes/1,
     get_changes_with_filter/1,
+    get_changes_with_doc_ids/1,
+    get_changes_with_query/1,
     get_changes_longpoll_timeout/1,
     changes_stream_basic/1,
     changes_stream_since_now/1,
     changes_stream_heartbeat/1,
     changes_stream_include_docs/1,
+    changes_stream_with_doc_ids/1,
+    changes_stream_with_query/1,
     bulk_docs/1,
     %% Policy tests
     policy_create/1,
@@ -73,11 +77,15 @@ groups() ->
             delete_doc,
             get_changes,
             get_changes_with_filter,
+            get_changes_with_doc_ids,
+            get_changes_with_query,
             get_changes_longpoll_timeout,
             changes_stream_basic,
             changes_stream_since_now,
             changes_stream_heartbeat,
             changes_stream_include_docs,
+            changes_stream_with_doc_ids,
+            changes_stream_with_query,
             bulk_docs
         ]},
         {policy_tests, [sequence], [
@@ -414,6 +422,68 @@ get_changes_with_filter(Config) ->
     false = lists:member(<<"orders/123">>, ResultIds),
     ok.
 
+%% @doc Test changes feed with doc_ids filter via POST
+get_changes_with_doc_ids(Config) ->
+    Auth = auth_header(Config),
+    %% Create some test documents
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, #{<<"id">> => <<"docids_test_1">>, <<"val">> => 1}),
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, #{<<"id">> => <<"docids_test_2">>, <<"val">> => 2}),
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, #{<<"id">> => <<"docids_test_3">>, <<"val">> => 3}),
+
+    %% Get changes filtered to only doc_ids 1 and 3
+    ReqBody = iolist_to_binary(json:encode(#{
+        <<"doc_ids">> => [<<"docids_test_1">>, <<"docids_test_3">>]
+    })),
+    {ok, 200, _Headers, Body} = hackney:post(
+        ?BASE_URL ++ "/db/testdb/_changes",
+        [Auth,
+         {<<"Content-Type">>, <<"application/json">>},
+         {<<"Accept">>, <<"application/json">>}],
+        ReqBody,
+        []
+    ),
+    #{<<"results">> := Results} = json:decode(Body),
+
+    %% Should only have docs 1 and 3
+    ResultIds = [maps:get(<<"id">>, R) || R <- Results],
+    true = lists:member(<<"docids_test_1">>, ResultIds),
+    false = lists:member(<<"docids_test_2">>, ResultIds),
+    true = lists:member(<<"docids_test_3">>, ResultIds),
+    ok.
+
+%% @doc Test changes feed with query filter via POST
+get_changes_with_query(Config) ->
+    Auth = auth_header(Config),
+    %% Create some test documents with different types
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, #{<<"id">> => <<"query_test_order_1">>, <<"type">> => <<"order">>, <<"total">> => 100}),
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, #{<<"id">> => <<"query_test_order_2">>, <<"type">> => <<"order">>, <<"total">> => 200}),
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, #{<<"id">> => <<"query_test_user_1">>, <<"type">> => <<"user">>, <<"name">> => <<"Test">>}),
+
+    %% Get changes filtered by query matching type=order
+    ReqBody = iolist_to_binary(json:encode(#{
+        <<"query">> => #{
+            <<"where">> => [
+                #{<<"path">> => [<<"type">>], <<"op">> => <<"==">>, <<"value">> => <<"order">>}
+            ]
+        }
+    })),
+    {ok, 200, _Headers, Body} = hackney:post(
+        ?BASE_URL ++ "/db/testdb/_changes?include_docs=true",
+        [Auth,
+         {<<"Content-Type">>, <<"application/json">>},
+         {<<"Accept">>, <<"application/json">>}],
+        ReqBody,
+        []
+    ),
+    #{<<"results">> := Results} = json:decode(Body),
+
+    %% Should only have order documents
+    ResultIds = [maps:get(<<"id">>, R) || R <- Results],
+    true = lists:member(<<"query_test_order_1">>, ResultIds),
+    true = lists:member(<<"query_test_order_2">>, ResultIds),
+    false = lists:member(<<"query_test_user_1">>, ResultIds),
+    ok.
+
 %% @doc Test long poll changes with timeout (no new changes)
 get_changes_longpoll_timeout(Config) ->
     Auth = auth_header(Config),
@@ -673,6 +743,116 @@ parse_sse_change_event(Chunk) ->
                             {ok, binary:part(RestChunk, 0, EndPos)}
                     end
             end
+    end.
+
+%% @doc Test SSE stream with doc_ids filter via POST
+changes_stream_with_doc_ids(Config) ->
+    Auth = auth_header(Config),
+    %% Create test documents
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, #{<<"id">> => <<"stream_docids_1">>, <<"val">> => 1}),
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, #{<<"id">> => <<"stream_docids_2">>, <<"val">> => 2}),
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, #{<<"id">> => <<"stream_docids_3">>, <<"val">> => 3}),
+
+    %% Start streaming with doc_ids filter via POST
+    StreamUrl = ?BASE_URL ++ "/db/testdb/_changes/stream?heartbeat=5000",
+    ReqBody = iolist_to_binary(json:encode(#{
+        <<"doc_ids">> => [<<"stream_docids_1">>, <<"stream_docids_3">>]
+    })),
+    {ok, Ref} = hackney:post(StreamUrl, [Auth, {<<"Content-Type">>, <<"application/json">>}], ReqBody, [async]),
+
+    %% Wait for headers
+    receive
+        {hackney_response, Ref, {status, 200, _}} -> ok
+    after 2000 ->
+        ct:fail("Timeout waiting for SSE response")
+    end,
+
+    receive
+        {hackney_response, Ref, {headers, Headers}} ->
+            <<"text/event-stream">> = proplists:get_value(<<"content-type">>, Headers)
+    after 2000 ->
+        ct:fail("Timeout waiting for SSE headers")
+    end,
+
+    %% Collect changes - should only get docs 1 and 3
+    ReceivedIds = receive_sse_doc_ids(Ref, [], 3000),
+    ct:log("Received doc IDs: ~p", [ReceivedIds]),
+
+    %% Verify we got docs 1 and 3 but not 2
+    true = lists:member(<<"stream_docids_1">>, ReceivedIds),
+    false = lists:member(<<"stream_docids_2">>, ReceivedIds),
+    true = lists:member(<<"stream_docids_3">>, ReceivedIds),
+
+    hackney:close(Ref),
+    ok.
+
+%% @doc Test SSE stream with query filter via POST
+changes_stream_with_query(Config) ->
+    Auth = auth_header(Config),
+    %% Create test documents with different types
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, #{<<"id">> => <<"stream_query_order_1">>, <<"type">> => <<"order">>, <<"total">> => 50}),
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, #{<<"id">> => <<"stream_query_order_2">>, <<"type">> => <<"order">>, <<"total">> => 75}),
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, #{<<"id">> => <<"stream_query_user_1">>, <<"type">> => <<"user">>, <<"name">> => <<"Stream Test">>}),
+
+    %% Start streaming with query filter via POST
+    StreamUrl = ?BASE_URL ++ "/db/testdb/_changes/stream?heartbeat=5000&include_docs=true",
+    ReqBody = iolist_to_binary(json:encode(#{
+        <<"query">> => #{
+            <<"where">> => [
+                #{<<"path">> => [<<"type">>], <<"op">> => <<"==">>, <<"value">> => <<"order">>}
+            ]
+        }
+    })),
+    {ok, Ref} = hackney:post(StreamUrl, [Auth, {<<"Content-Type">>, <<"application/json">>}], ReqBody, [async]),
+
+    %% Wait for headers
+    receive
+        {hackney_response, Ref, {status, 200, _}} -> ok
+    after 2000 ->
+        ct:fail("Timeout waiting for SSE response")
+    end,
+
+    receive
+        {hackney_response, Ref, {headers, Headers}} ->
+            <<"text/event-stream">> = proplists:get_value(<<"content-type">>, Headers)
+    after 2000 ->
+        ct:fail("Timeout waiting for SSE headers")
+    end,
+
+    %% Collect changes - should only get order docs
+    ReceivedIds = receive_sse_doc_ids(Ref, [], 3000),
+    ct:log("Received doc IDs: ~p", [ReceivedIds]),
+
+    %% Verify we got order docs but not user doc
+    true = lists:member(<<"stream_query_order_1">>, ReceivedIds),
+    true = lists:member(<<"stream_query_order_2">>, ReceivedIds),
+    false = lists:member(<<"stream_query_user_1">>, ReceivedIds),
+
+    hackney:close(Ref),
+    ok.
+
+%% Helper to receive SSE events and collect doc IDs
+receive_sse_doc_ids(Ref, Acc, Timeout) ->
+    receive
+        {hackney_response, Ref, done} ->
+            Acc;
+        {hackney_response, Ref, {error, _Reason}} ->
+            Acc;
+        {hackney_response, Ref, Chunk} when is_binary(Chunk) ->
+            %% Try to extract doc ID from change event
+            case parse_sse_change_event(Chunk) of
+                {ok, JsonData} ->
+                    case catch json:decode(JsonData) of
+                        #{<<"id">> := Id} ->
+                            receive_sse_doc_ids(Ref, [Id | Acc], Timeout);
+                        _ ->
+                            receive_sse_doc_ids(Ref, Acc, Timeout)
+                    end;
+                _ ->
+                    receive_sse_doc_ids(Ref, Acc, Timeout)
+            end
+    after Timeout ->
+        Acc
     end.
 
 %% @doc Test bulk docs
