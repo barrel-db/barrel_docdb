@@ -299,11 +299,9 @@ http_put_doc(DbName, ApiKey, Doc) ->
     Url = ?BASE_URL ++ "/db/" ++ binary_to_list(DbName) ++ "/" ++ binary_to_list(DocId),
     Body = json:encode(Doc),
     case hackney:put(Url, http_headers(ApiKey), Body, [{pool, false}]) of
-        {ok, Status, _, Ref} when Status >= 200, Status < 300 ->
-            {ok, RespBody} = hackney:body(Ref),
+        {ok, Status, _, RespBody} when Status >= 200, Status < 300 ->
             {ok, json:decode(RespBody)};
-        {ok, Status, _, Ref} ->
-            hackney:body(Ref),
+        {ok, Status, _, _RespBody} ->
             {error, {http_status, Status}};
         {error, Reason} ->
             {error, Reason}
@@ -312,11 +310,9 @@ http_put_doc(DbName, ApiKey, Doc) ->
 http_get_doc(DbName, ApiKey, DocId) ->
     Url = ?BASE_URL ++ "/db/" ++ binary_to_list(DbName) ++ "/" ++ binary_to_list(DocId),
     case hackney:get(Url, http_headers(ApiKey), <<>>, [{pool, false}]) of
-        {ok, 200, _, Ref} ->
-            {ok, RespBody} = hackney:body(Ref),
+        {ok, 200, _, RespBody} ->
             {ok, json:decode(RespBody)};
-        {ok, Status, _, Ref} ->
-            hackney:body(Ref),
+        {ok, Status, _, _RespBody} ->
             {error, {http_status, Status}};
         {error, Reason} ->
             {error, Reason}
@@ -331,11 +327,9 @@ http_vdb_put_doc(VdbName, ApiKey, Doc) ->
     Url = ?BASE_URL ++ "/vdb/" ++ binary_to_list(VdbName) ++ "/" ++ binary_to_list(DocId),
     Body = json:encode(Doc),
     case hackney:put(Url, http_headers(ApiKey), Body, [{pool, false}]) of
-        {ok, Status, _, Ref} when Status >= 200, Status < 300 ->
-            {ok, RespBody} = hackney:body(Ref),
+        {ok, Status, _, RespBody} when Status >= 200, Status < 300 ->
             {ok, json:decode(RespBody)};
-        {ok, Status, _, Ref} ->
-            hackney:body(Ref),
+        {ok, Status, _, _RespBody} ->
             {error, {http_status, Status}};
         {error, Reason} ->
             {error, Reason}
@@ -344,11 +338,9 @@ http_vdb_put_doc(VdbName, ApiKey, Doc) ->
 http_vdb_get_doc(VdbName, ApiKey, DocId) ->
     Url = ?BASE_URL ++ "/vdb/" ++ binary_to_list(VdbName) ++ "/" ++ binary_to_list(DocId),
     case hackney:get(Url, http_headers(ApiKey), <<>>, [{pool, false}]) of
-        {ok, 200, _, Ref} ->
-            {ok, RespBody} = hackney:body(Ref),
+        {ok, 200, _, RespBody} ->
             {ok, json:decode(RespBody)};
-        {ok, Status, _, Ref} ->
-            hackney:body(Ref),
+        {ok, Status, _, _RespBody} ->
             {error, {http_status, Status}};
         {error, Reason} ->
             {error, Reason}
@@ -360,11 +352,9 @@ http_vdb_find(VdbName, ApiKey, Query) ->
     JsonQuery = query_to_json(Query),
     Body = json:encode(JsonQuery),
     case hackney:post(Url, http_headers(ApiKey), Body, [{pool, false}]) of
-        {ok, 200, _, Ref} ->
-            {ok, RespBody} = hackney:body(Ref),
+        {ok, 200, _, RespBody} ->
             {ok, json:decode(RespBody)};
-        {ok, Status, _, Ref} ->
-            hackney:body(Ref),
+        {ok, Status, _, _RespBody} ->
             {error, {http_status, Status}};
         {error, Reason} ->
             {error, Reason}

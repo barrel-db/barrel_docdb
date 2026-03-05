@@ -246,10 +246,9 @@ http_get(Endpoint, Url) ->
     Headers = request_headers(Endpoint, <<"GET">>, Path, <<>>),
     Opts = request_options(Endpoint),
     case hackney:get(Url, Headers, <<>>, Opts) of
-        {ok, Status, RespHeaders, Ref} ->
+        {ok, Status, RespHeaders, Body} ->
             _ = barrel_hlc:maybe_sync_from_header(
                 proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
-            {ok, Body} = hackney:body(Ref),
             {ok, Status, RespHeaders, Body};
         {error, _} = Error ->
             Error
@@ -261,10 +260,9 @@ http_post(Endpoint, Url, ReqBody) ->
     Headers = request_headers(Endpoint, <<"POST">>, Path, Body),
     Opts = request_options(Endpoint),
     case hackney:post(Url, Headers, Body, Opts) of
-        {ok, Status, RespHeaders, Ref} ->
+        {ok, Status, RespHeaders, RespBody} ->
             _ = barrel_hlc:maybe_sync_from_header(
                 proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
-            {ok, RespBody} = hackney:body(Ref),
             {ok, Status, RespHeaders, RespBody};
         {error, _} = Error ->
             Error
@@ -276,10 +274,9 @@ http_put(Endpoint, Url, ReqBody) ->
     Headers = request_headers(Endpoint, <<"PUT">>, Path, Body),
     Opts = request_options(Endpoint),
     case hackney:put(Url, Headers, Body, Opts) of
-        {ok, Status, RespHeaders, Ref} ->
+        {ok, Status, RespHeaders, RespBody} ->
             _ = barrel_hlc:maybe_sync_from_header(
                 proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
-            {ok, RespBody} = hackney:body(Ref),
             {ok, Status, RespHeaders, RespBody};
         {error, _} = Error ->
             Error
@@ -290,10 +287,9 @@ http_delete(Endpoint, Url) ->
     Headers = request_headers(Endpoint, <<"DELETE">>, Path, <<>>),
     Opts = request_options(Endpoint),
     case hackney:delete(Url, Headers, <<>>, Opts) of
-        {ok, Status, RespHeaders, Ref} ->
+        {ok, Status, RespHeaders, Body} ->
             _ = barrel_hlc:maybe_sync_from_header(
                 proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
-            {ok, Body} = hackney:body(Ref),
             {ok, Status, RespHeaders, Body};
         {error, _} = Error ->
             Error

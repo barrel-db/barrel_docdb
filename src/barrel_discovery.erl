@@ -710,19 +710,17 @@ fetch_peer_info(Url) ->
 
     try
         case hackney:get(InfoUrl, Headers, <<>>, Options) of
-            {ok, 200, RespHeaders, ClientRef} ->
+            {ok, 200, RespHeaders, Body} ->
                 _ = barrel_hlc:maybe_sync_from_header(
                     proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
-                {ok, Body} = hackney:body(ClientRef),
                 try
                     {ok, json:decode(Body)}
                 catch
                     _:_ -> {error, invalid_json}
                 end;
-            {ok, Status, RespHeaders, ClientRef} ->
+            {ok, Status, RespHeaders, _Body} ->
                 _ = barrel_hlc:maybe_sync_from_header(
                     proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
-                hackney:body(ClientRef),  %% Consume body
                 {error, {http_error, Status}};
             {error, Reason} ->
                 {error, {connection_error, Reason}}
