@@ -47,7 +47,9 @@
     remove_peer/1,
     list_peers/0,
     list_peers/1,
+    list_peers_json/0,
     get_peer/1,
+    get_peer_json/1,
     get_peer_by_node_id/1,
     %% Discovery
     discover_from/1,
@@ -209,6 +211,22 @@ add_peer(Url, Opts) when is_binary(Url), is_map(Opts) ->
 -spec list_peers(map()) -> {ok, [peer_info()]}.
 list_peers(Filter) when is_map(Filter) ->
     gen_server:call(?SERVER, {list_peers, Filter}).
+
+%% @doc List all known peers with JSON-safe encoding.
+%% Binary public keys are encoded to base64 for JSON output.
+-spec list_peers_json() -> {ok, [map()]}.
+list_peers_json() ->
+    {ok, Peers} = gen_server:call(?SERVER, list_peers),
+    {ok, [encode_peer_for_json(P) || P <- Peers]}.
+
+%% @doc Get peer info with JSON-safe encoding.
+%% Binary public key is encoded to base64 for JSON output.
+-spec get_peer_json(binary()) -> {ok, map()} | {error, not_found}.
+get_peer_json(Url) when is_binary(Url) ->
+    case gen_server:call(?SERVER, {get_peer, Url}) of
+        {ok, Peer} -> {ok, encode_peer_for_json(Peer)};
+        Error -> Error
+    end.
 
 %% @doc Get peer by node ID instead of URL
 -spec get_peer_by_node_id(binary()) -> {ok, peer_info()} | {error, not_found}.
@@ -978,4 +996,11 @@ decode_peer_public_key(#{<<"public_key">> := PubKeyB64} = Info) when is_binary(P
             maps:remove(<<"public_key">>, Info)
     end;
 decode_peer_public_key(Info) ->
+    Info.
+
+%% @private Encode peer info for JSON output.
+%% Raw 32-byte Ed25519 public keys cannot be JSON-encoded directly.
+encode_peer_for_json(#{public_key := PubKey} = Info) when is_binary(PubKey), byte_size(PubKey) =:= 32 ->
+    Info#{public_key => base64:encode(PubKey)};
+encode_peer_for_json(Info) ->
     Info.

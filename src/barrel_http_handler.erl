@@ -212,7 +212,7 @@ handle_action(node_info, <<"GET">>, Req) ->
 
 %% Peer management: list all peers
 handle_action(peers, <<"GET">>, Req) ->
-    {ok, Peers} = barrel_discovery:list_peers(),
+    {ok, Peers} = barrel_discovery:list_peers_json(),
     Body = encode_response(#{<<"peers">> => Peers}, Req),
     {200, response_headers(Req), Body, Req};
 
@@ -224,7 +224,7 @@ handle_action(peers, <<"POST">>, Req) ->
 handle_action(peer, <<"GET">>, Req) ->
     PeerUrlEncoded = cowboy_req:binding(peer_url, Req),
     PeerUrl = uri_string:unquote(PeerUrlEncoded),
-    case barrel_discovery:get_peer(PeerUrl) of
+    case barrel_discovery:get_peer_json(PeerUrl) of
         {ok, PeerInfo} ->
             Body = encode_response(PeerInfo, Req),
             {200, response_headers(Req), Body, Req};
