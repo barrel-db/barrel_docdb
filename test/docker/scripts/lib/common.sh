@@ -107,6 +107,16 @@ add_peer() {
         -d "{\"url\": \"$peer_url\"}"
 }
 
+# Add peer with synchronous option (waits for peer to become active)
+add_peer_sync() {
+    local url=$1
+    local peer_url=$2
+    curl -sf -X POST "$url/_peers" \
+        -H "Content-Type: application/json" \
+        -H "$AUTH_HEADER" \
+        -d "{\"url\": \"$peer_url\", \"sync\": true}"
+}
+
 # Assert equals
 assert_eq() {
     local expected=$1

@@ -1294,7 +1294,7 @@ convert_rebalance_opts(Data) ->
 
 %% Convert VDB creation options from binary to atom keys
 convert_vdb_opts(Opts) ->
-    maps:fold(
+    BaseOpts = maps:fold(
         fun(<<"shard_count">>, V, Acc) -> Acc#{shard_count => V};
            (<<"hash_function">>, <<"phash2">>, Acc) -> Acc#{hash_function => phash2};
            (<<"hash_function">>, <<"xxhash">>, Acc) -> Acc#{hash_function => xxhash};
@@ -1303,7 +1303,14 @@ convert_vdb_opts(Opts) ->
         end,
         #{},
         Opts
-    ).
+    ),
+    %% Handle top-level replica_factor by merging into placement
+    case maps:get(<<"replica_factor">>, Opts, undefined) of
+        undefined -> BaseOpts;
+        ReplicaFactor ->
+            Placement = maps:get(placement, BaseOpts, #{}),
+            BaseOpts#{placement => Placement#{replica_factor => ReplicaFactor}}
+    end.
 
 convert_placement_opts(Opts) ->
     maps:fold(
@@ -1529,9 +1536,23 @@ handle_add_peer(Req0) ->
     {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
     Spec = decode_request_body(ReqBody, Req1),
     Url = maps:get(<<"url">>, Spec),
-    case barrel_discovery:add_peer(Url) of
+    Sync = maps:get(<<"sync">>, Spec, false),
+    Tags = maps:get(<<"tags">>, Spec, []),
+    Opts = #{sync => Sync, tags => Tags},
+    case barrel_discovery:add_peer(Url, Opts) of
         ok ->
             Response = #{<<"ok">> => true, <<"url">> => Url},
+            Body = encode_response(Response, Req1),
+            {202, response_headers(Req1), Body, Req1};
+        {ok, PeerInfo} ->
+            Response = #{<<"ok">> => true, <<"url">> => Url,
+                        <<"peer">> => barrel_discovery:encode_peer_for_json(PeerInfo)},
+            Body = encode_response(Response, Req1),
+            {201, response_headers(Req1), Body, Req1};
+        {ok, PeerInfo, {unreachable, _}} ->
+            Response = #{<<"ok">> => true, <<"url">> => Url,
+                        <<"peer">> => barrel_discovery:encode_peer_for_json(PeerInfo),
+                        <<"warning">> => <<"peer unreachable">>},
             Body = encode_response(Response, Req1),
             {201, response_headers(Req1), Body, Req1};
         {error, {invalid_remote_url, _}} ->
