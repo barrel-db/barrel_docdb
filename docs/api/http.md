@@ -367,10 +367,11 @@ GET /db/:db/_changes
 
 | Parameter | Description |
 |-----------|-------------|
-| `since` | Start from sequence (use `first` for beginning) |
+| `since` | Start from sequence (use `first` for beginning, `now` for future changes) |
 | `limit` | Maximum changes to return |
 | `feed` | `normal` or `longpoll` |
 | `timeout` | Long-poll timeout in ms |
+| `include_docs` | Include full document body (default: false) |
 
 **Example:**
 ```bash
@@ -385,6 +386,14 @@ GET /db/:db/_changes/stream
 
 Server-Sent Events stream for real-time updates.
 
+**Query Parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `since` | Start from sequence (use `now` for only new changes) |
+| `include_docs` | Include full document body |
+| `heartbeat` | Heartbeat interval in ms (default: 30000) |
+
 **Example:**
 ```bash
 curl http://localhost:8080/db/mydb/_changes/stream
@@ -396,6 +405,46 @@ data: {"seq": "1-abc", "id": "doc1", "changes": [{"rev": "1-xyz"}]}
 
 data: {"seq": "2-def", "id": "doc2", "changes": [{"rev": "1-uvw"}]}
 ```
+
+### Filtered Changes
+
+Filter changes by specific document IDs or query conditions.
+
+#### Filter by Document IDs
+
+Subscribe to changes for specific documents only:
+
+```bash
+curl "http://localhost:8080/db/mydb/_changes?doc_ids=doc1,doc2,doc3"
+```
+
+Or via POST body:
+
+```bash
+curl -X POST http://localhost:8080/db/mydb/_changes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "doc_ids": ["doc1", "doc2", "doc3"],
+    "since": "first"
+  }'
+```
+
+#### Filter by Query
+
+Filter changes using query conditions:
+
+```bash
+curl -X POST http://localhost:8080/db/mydb/_changes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": {
+      "where": [{"path": ["type"], "value": "user"}]
+    },
+    "include_docs": true
+  }'
+```
+
+This returns only changes to documents matching the query conditions.
 
 ---
 
@@ -485,8 +534,28 @@ POST /_federation
 ```json
 {
   "name": "all_users",
-  "members": ["local_db", "http://nodeB:8080/users"]
+  "members": ["local_db", "http://nodeB:8080/users"],
+  "auth": {
+    "bearer_token": "ak_api_key"
+  }
 }
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Federation name (required) |
+| `members` | array | List of local databases or remote URLs (required) |
+| `auth` | object | Authentication for remote members (optional) |
+| `query` | object | Default query filter (optional) |
+
+**Authentication Options:**
+
+```json
+// Bearer token
+{"auth": {"bearer_token": "ak_your_key"}}
+
+// Basic auth
+{"auth": {"basic_auth": {"username": "user", "password": "pass"}}}
 ```
 
 ### Query Federation
@@ -495,7 +564,16 @@ POST /_federation
 POST /_federation/:name/_find
 ```
 
-Same query format as `/db/:db/_find`.
+Same query format as `/db/:db/_find`, with optional per-query auth override:
+
+```json
+{
+  "where": [{"path": ["type"], "value": "user"}],
+  "auth": {
+    "bearer_token": "ak_override_key"
+  }
+}
+```
 
 ---
 

@@ -88,6 +88,97 @@ barrel_federation:create(<<"active_users">>, [
 %% Finds active admins (both conditions apply)
 ```
 
+## Authentication
+
+When querying remote federation members that require authentication, you can configure auth at two levels:
+
+### Federation-Level Authentication
+
+Set default authentication when creating the federation. This applies to all queries.
+
+=== "Erlang API"
+
+    ```erlang
+    %% Bearer token authentication
+    barrel_federation:create(<<"secure_users">>, [
+        <<"local_users">>,
+        <<"http://secure.example.com:8080/users">>
+    ], #{
+        auth => #{bearer_token => <<"ak_your_api_key">>}
+    }).
+
+    %% Basic authentication
+    barrel_federation:create(<<"secure_users">>, [
+        <<"local_users">>,
+        <<"http://secure.example.com:8080/users">>
+    ], #{
+        auth => #{basic_auth => {<<"admin">>, <<"password">>}}
+    }).
+    ```
+
+=== "HTTP API"
+
+    ```bash
+    # Bearer token
+    curl -X POST http://localhost:8080/_federation \
+      -H "Content-Type: application/json" \
+      -d '{
+        "name": "secure_users",
+        "members": ["local_users", "http://secure.example.com:8080/users"],
+        "auth": {
+          "bearer_token": "ak_your_api_key"
+        }
+      }'
+
+    # Basic auth
+    curl -X POST http://localhost:8080/_federation \
+      -H "Content-Type: application/json" \
+      -d '{
+        "name": "secure_users",
+        "members": ["local_users", "http://secure.example.com:8080/users"],
+        "auth": {
+          "basic_auth": {
+            "username": "admin",
+            "password": "secret"
+          }
+        }
+      }'
+    ```
+
+### Per-Query Authentication Override
+
+Override the federation's default auth for a specific query:
+
+=== "Erlang API"
+
+    ```erlang
+    {ok, Results, Meta} = barrel_federation:find(<<"secure_users">>, #{
+        where => [{path, [<<"role">>], <<"admin">>}]
+    }, #{
+        auth => #{bearer_token => <<"ak_different_key">>}
+    }).
+    ```
+
+=== "HTTP API"
+
+    ```bash
+    curl -X POST http://localhost:8080/_federation/secure_users/_find \
+      -H "Content-Type: application/json" \
+      -d '{
+        "where": [{"path": ["role"], "value": "admin"}],
+        "auth": {
+          "bearer_token": "ak_different_key"
+        }
+      }'
+    ```
+
+### Supported Authentication Methods
+
+| Method | Config Key | Description |
+|--------|------------|-------------|
+| Bearer Token | `bearer_token` | API key or JWT token sent as `Authorization: Bearer <token>` |
+| Basic Auth | `basic_auth` | Username/password sent as `Authorization: Basic <base64>` |
+
 ## Managing Federation Members
 
 ### Add a Member
