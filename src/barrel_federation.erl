@@ -63,7 +63,8 @@
 ]).
 
 %% Exported for testing
--export([validate_remote_url/1]).
+-export([validate_remote_url/1, add_auth_headers/2]).
+-ignore_xref([validate_remote_url/1, add_auth_headers/2]).
 
 %% Types
 -export_type([federation/0, member/0]).
@@ -89,10 +90,17 @@
 }.
 
 -type query_spec() :: map().
+
+-type auth_config() :: #{
+    bearer_token => binary(),
+    basic_auth => {binary(), binary()}
+}.
+
 -type query_opts() :: #{
     timeout => pos_integer(),  % Query timeout per member (default: 30000ms)
     merge_strategy => newest | all,  % How to handle duplicates (default: newest)
-    chunk_size => pos_integer()
+    chunk_size => pos_integer(),
+    auth => auth_config()  % Per-query auth override
 }.
 
 %%====================================================================
@@ -113,9 +121,10 @@ create(Name, Members, Options) when is_binary(Name), is_list(Members) ->
     %% Validate members exist
     case validate_members(Members) of
         ok ->
-            %% Extract query from options if present
+            %% Extract query and auth from options if present
             Query = maps:get(query, Options, undefined),
-            CleanOptions = maps:remove(query, Options),
+            Auth = maps:get(auth, Options, undefined),
+            CleanOptions = maps:without([query, auth], Options),
 
             Federation = #{
                 name => Name,
@@ -130,12 +139,18 @@ create(Name, Members, Options) when is_binary(Name), is_list(Members) ->
                 _ -> Federation#{query => Query}
             end,
 
+            %% Add auth if specified
+            FederationWithAuth = case Auth of
+                undefined -> FederationWithQuery;
+                _ -> FederationWithQuery#{auth => Auth}
+            end,
+
             %% Store as system document
             DocId = federation_doc_id(Name),
-            case barrel_docdb:put_system_doc(DocId, FederationWithQuery) of
+            case barrel_docdb:put_system_doc(DocId, FederationWithAuth) of
                 ok ->
                     %% Cache in persistent_term
-                    persistent_term:put({barrel_federation, Name}, FederationWithQuery),
+                    persistent_term:put({barrel_federation, Name}, FederationWithAuth),
                     %% Trigger discovery for remote members
                     trigger_discovery(Members),
                     ok;
@@ -260,6 +275,12 @@ find(FederationName, QuerySpec, Opts) ->
             Timeout = maps:get(timeout, Opts, 30000),
             MergeStrategy = maps:get(merge_strategy, Opts, newest),
 
+            %% Get auth from opts (per-query override) or from federation config
+            Auth = case maps:get(auth, Opts, undefined) of
+                undefined -> maps:get(auth, Federation, undefined);
+                QueryAuth -> QueryAuth
+            end,
+
             %% Merge stored query with provided query
             StoredQuery = maps:get(query, Federation, #{}),
             MergedQuery = merge_queries(StoredQuery, QuerySpec),
@@ -268,7 +289,7 @@ find(FederationName, QuerySpec, Opts) ->
             ResolvedMembers = resolve_members(Members),
 
             %% Execute queries in parallel
-            Results = parallel_query(ResolvedMembers, MergedQuery, Timeout),
+            Results = parallel_query(ResolvedMembers, MergedQuery, Timeout, Auth),
 
             %% Merge results
             {MergedDocs, SourceCounts} = merge_results(Results, MergeStrategy),
@@ -416,7 +437,7 @@ update_federation(Name, Federation) ->
     end.
 
 %% @private Execute query across members in parallel
-parallel_query(Members, QuerySpec, Timeout) ->
+parallel_query(Members, QuerySpec, Timeout, Auth) ->
     Parent = self(),
     Ref = make_ref(),
 
@@ -425,7 +446,7 @@ parallel_query(Members, QuerySpec, Timeout) ->
         fun(Member) ->
             spawn_link(fun() ->
                 Result = try
-                    query_member(Member, QuerySpec, Timeout)
+                    query_member(Member, QuerySpec, Timeout, Auth)
                 catch
                     _:Reason ->
                         {error, Reason}
@@ -440,16 +461,16 @@ parallel_query(Members, QuerySpec, Timeout) ->
     collect_results(Ref, Members, Timeout, #{}).
 
 %% @private Query a single member (local or remote)
-query_member(Member, QuerySpec, Timeout) ->
+query_member(Member, QuerySpec, Timeout, Auth) ->
     case is_remote_member(Member) of
         true ->
-            query_remote_member(Member, QuerySpec, Timeout);
+            query_remote_member(Member, QuerySpec, Timeout, Auth);
         false ->
             barrel_docdb:find(Member, QuerySpec)
     end.
 
 %% @private Query a remote member via HTTP
-query_remote_member(Url, QuerySpec, Timeout) ->
+query_remote_member(Url, QuerySpec, Timeout, Auth) ->
     %% Parse URL and add /_find endpoint
     FindUrl = <<Url/binary, "/_find">>,
 
@@ -457,8 +478,9 @@ query_remote_member(Url, QuerySpec, Timeout) ->
     QueryJson = json:encode(query_spec_to_json(QuerySpec)),
 
     %% Make HTTP request using hackney
-    Headers = [{<<"Content-Type">>, <<"application/json">>},
-               {<<"Accept">>, <<"application/json">>}],
+    BaseHeaders = [{<<"Content-Type">>, <<"application/json">>},
+                   {<<"Accept">>, <<"application/json">>}],
+    Headers = add_auth_headers(BaseHeaders, Auth),
     Options = [{recv_timeout, Timeout}, {connect_timeout, 5000}],
 
     case hackney:post(FindUrl, Headers, QueryJson, Options) of
@@ -473,6 +495,15 @@ query_remote_member(Url, QuerySpec, Timeout) ->
         {error, Reason} ->
             {error, {connection_error, Reason}}
     end.
+
+%% @private Add authentication headers based on auth config
+add_auth_headers(Headers, #{bearer_token := Token}) ->
+    [{<<"Authorization">>, <<"Bearer ", Token/binary>>} | Headers];
+add_auth_headers(Headers, #{basic_auth := {User, Pass}}) ->
+    Credentials = base64:encode(<<User/binary, ":", Pass/binary>>),
+    [{<<"Authorization">>, <<"Basic ", Credentials/binary>>} | Headers];
+add_auth_headers(Headers, _) ->
+    Headers.
 
 %% @private Convert query spec to JSON-encodable format
 query_spec_to_json(QuerySpec) when is_map(QuerySpec) ->

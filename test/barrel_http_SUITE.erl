@@ -52,7 +52,11 @@
     admin_usage_all/1,
     admin_usage_single_db/1,
     admin_usage_not_found/1,
-    admin_usage_requires_auth/1
+    admin_usage_requires_auth/1,
+    %% Federation tests
+    federation_create_with_bearer_auth/1,
+    federation_create_with_basic_auth/1,
+    federation_find_with_auth_override/1
 ]).
 
 -define(PORT, 18080).
@@ -63,7 +67,7 @@
 %%====================================================================
 
 all() ->
-    [{group, http_tests}, {group, policy_tests}, {group, tier_tests}, {group, usage_tests}].
+    [{group, http_tests}, {group, policy_tests}, {group, tier_tests}, {group, usage_tests}, {group, federation_tests}].
 
 groups() ->
     [
@@ -109,6 +113,11 @@ groups() ->
             admin_usage_single_db,
             admin_usage_not_found,
             admin_usage_requires_auth
+        ]},
+        {federation_tests, [sequence], [
+            federation_create_with_bearer_auth,
+            federation_create_with_basic_auth,
+            federation_find_with_auth_override
         ]}
     ].
 
@@ -154,6 +163,10 @@ init_per_group(tier_tests, Config) ->
 init_per_group(usage_tests, Config) ->
     %% Create test database for usage tests
     {ok, _} = barrel_docdb:create_db(<<"usage_http_test_db">>),
+    Config;
+init_per_group(federation_tests, Config) ->
+    %% Create test database for federation tests
+    {ok, _} = barrel_docdb:create_db(<<"fed_http_test_db">>),
     Config.
 
 %% Helper to get auth header
@@ -182,6 +195,13 @@ end_per_group(tier_tests, _Config) ->
 end_per_group(usage_tests, _Config) ->
     %% Clean up usage test database
     barrel_docdb:delete_db(<<"usage_http_test_db">>),
+    ok;
+end_per_group(federation_tests, _Config) ->
+    %% Clean up federation test database and federations
+    barrel_docdb:delete_db(<<"fed_http_test_db">>),
+    catch barrel_federation:delete(<<"http_bearer_fed">>),
+    catch barrel_federation:delete(<<"http_basic_fed">>),
+    catch barrel_federation:delete(<<"http_override_fed">>),
     ok.
 
 init_per_testcase(_TestCase, Config) ->
@@ -1315,4 +1335,137 @@ admin_usage_requires_auth(_Config) ->
         <<>>,
         []
     ),
+    ok.
+
+%%====================================================================
+%% Federation Tests
+%%====================================================================
+
+%% @doc Test creating federation with bearer token auth via HTTP API
+federation_create_with_bearer_auth(Config) ->
+    Auth = auth_header(Config),
+
+    %% Create federation with bearer auth
+    FedSpec = #{
+        <<"name">> => <<"http_bearer_fed">>,
+        <<"members">> => [<<"fed_http_test_db">>],
+        <<"auth">> => #{
+            <<"bearer_token">> => <<"ak_test_bearer_token">>
+        }
+    },
+    SpecJson = iolist_to_binary(json:encode(FedSpec)),
+
+    {ok, 201, _Headers, Body} = hackney:post(
+        ?BASE_URL ++ "/_federation",
+        [Auth,
+         {<<"Content-Type">>, <<"application/json">>},
+         {<<"Accept">>, <<"application/json">>}],
+        SpecJson,
+        []
+    ),
+    #{<<"ok">> := true, <<"name">> := <<"http_bearer_fed">>} = json:decode(Body),
+
+    %% Verify federation was created with auth
+    {ok, Fed} = barrel_federation:get(<<"http_bearer_fed">>),
+    true = maps:is_key(auth, Fed),
+    #{bearer_token := <<"ak_test_bearer_token">>} = maps:get(auth, Fed),
+    ok.
+
+%% @doc Test creating federation with basic auth via HTTP API
+federation_create_with_basic_auth(Config) ->
+    Auth = auth_header(Config),
+
+    %% Create federation with basic auth
+    FedSpec = #{
+        <<"name">> => <<"http_basic_fed">>,
+        <<"members">> => [<<"fed_http_test_db">>],
+        <<"auth">> => #{
+            <<"basic_auth">> => #{
+                <<"username">> => <<"admin">>,
+                <<"password">> => <<"secret123">>
+            }
+        }
+    },
+    SpecJson = iolist_to_binary(json:encode(FedSpec)),
+
+    {ok, 201, _Headers, Body} = hackney:post(
+        ?BASE_URL ++ "/_federation",
+        [Auth,
+         {<<"Content-Type">>, <<"application/json">>},
+         {<<"Accept">>, <<"application/json">>}],
+        SpecJson,
+        []
+    ),
+    #{<<"ok">> := true, <<"name">> := <<"http_basic_fed">>} = json:decode(Body),
+
+    %% Verify federation was created with auth
+    {ok, Fed} = barrel_federation:get(<<"http_basic_fed">>),
+    true = maps:is_key(auth, Fed),
+    #{basic_auth := {<<"admin">>, <<"secret123">>}} = maps:get(auth, Fed),
+    ok.
+
+%% @doc Test querying federation with auth override via HTTP API
+federation_find_with_auth_override(Config) ->
+    Auth = auth_header(Config),
+
+    %% Create federation with default auth
+    FedSpec = #{
+        <<"name">> => <<"http_override_fed">>,
+        <<"members">> => [<<"fed_http_test_db">>],
+        <<"auth">> => #{
+            <<"bearer_token">> => <<"ak_default_token">>
+        }
+    },
+    SpecJson = iolist_to_binary(json:encode(FedSpec)),
+
+    {ok, 201, _Headers, _Body} = hackney:post(
+        ?BASE_URL ++ "/_federation",
+        [Auth,
+         {<<"Content-Type">>, <<"application/json">>},
+         {<<"Accept">>, <<"application/json">>}],
+        SpecJson,
+        []
+    ),
+
+    %% Add a test document
+    Doc = #{<<"id">> => <<"fed_test_doc">>, <<"type">> => <<"test">>},
+    DocJson = iolist_to_binary(json:encode(Doc)),
+    {ok, 201, _, _} = hackney:put(
+        ?BASE_URL ++ "/db/fed_http_test_db/fed_test_doc",
+        [Auth,
+         {<<"Content-Type">>, <<"application/json">>},
+         {<<"Accept">>, <<"application/json">>}],
+        DocJson,
+        []
+    ),
+
+    %% Query with auth override
+    QuerySpec = #{
+        <<"where">> => [#{
+            <<"path">> => [<<"type">>],
+            <<"op">> => <<"eq">>,
+            <<"value">> => <<"test">>
+        }],
+        <<"auth">> => #{
+            <<"bearer_token">> => <<"ak_override_token">>
+        }
+    },
+    QueryJson = iolist_to_binary(json:encode(QuerySpec)),
+
+    {ok, 200, _Headers2, Body2} = hackney:post(
+        ?BASE_URL ++ "/_federation/http_override_fed/_find",
+        [Auth,
+         {<<"Content-Type">>, <<"application/json">>},
+         {<<"Accept">>, <<"application/json">>}],
+        QueryJson,
+        []
+    ),
+
+    Response = json:decode(Body2),
+    Results = maps:get(<<"results">>, Response),
+    true = length(Results) >= 1,
+
+    %% Find our test document
+    DocIds = [maps:get(<<"id">>, R) || R <- Results],
+    true = lists:member(<<"fed_test_doc">>, DocIds),
     ok.

@@ -19,7 +19,8 @@ all() ->
         {group, federation_crud},
         {group, federation_query},
         {group, stored_query},
-        {group, remote_federation}
+        {group, remote_federation},
+        {group, federation_auth}
     ].
 
 groups() ->
@@ -47,6 +48,15 @@ groups() ->
             remote_url_validation,
             create_federation_with_remote,
             create_federation_with_domain
+        ]},
+        {federation_auth, [sequence], [
+            create_federation_with_bearer_auth,
+            create_federation_with_basic_auth,
+            auth_stored_in_config,
+            query_auth_override,
+            add_auth_headers_bearer,
+            add_auth_headers_basic,
+            add_auth_headers_undefined
         ]}
     ].
 
@@ -112,6 +122,17 @@ init_per_group(federation_query, Config) ->
     {ok, _} = barrel_docdb:create_db(Db3Name, #{data_dir => DataDir ++ "/db3"}),
 
     [{db1, Db1Name}, {db2, Db2Name}, {db3, Db3Name}, {data_dir, DataDir} | Config];
+init_per_group(federation_auth, Config) ->
+    %% Create test database for auth tests
+    DbName = <<"auth_test_db">>,
+    DataDir = "/tmp/barrel_auth_test",
+    os:cmd("rm -rf " ++ DataDir),
+    case barrel_docdb:open_db(DbName) of
+        {ok, _} -> barrel_docdb:delete_db(DbName);
+        _ -> ok
+    end,
+    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => DataDir}),
+    [{db_name, DbName}, {data_dir, DataDir} | Config];
 init_per_group(_Group, Config) ->
     Config.
 
@@ -144,6 +165,16 @@ end_per_group(remote_federation, Config) ->
     DbName = proplists:get_value(db_name, Config),
     barrel_docdb:delete_db(DbName),
     catch barrel_federation:delete(<<"mixed_fed">>),
+    DataDir = proplists:get_value(data_dir, Config),
+    os:cmd("rm -rf " ++ DataDir),
+    ok;
+end_per_group(federation_auth, Config) ->
+    DbName = proplists:get_value(db_name, Config),
+    barrel_docdb:delete_db(DbName),
+    catch barrel_federation:delete(<<"bearer_auth_fed">>),
+    catch barrel_federation:delete(<<"basic_auth_fed">>),
+    catch barrel_federation:delete(<<"auth_config_fed">>),
+    catch barrel_federation:delete(<<"auth_override_fed">>),
     DataDir = proplists:get_value(data_dir, Config),
     os:cmd("rm -rf " ++ DataDir),
     ok;
@@ -617,4 +648,147 @@ set_query_on_existing(Config) ->
     ?assertEqual(<<"order1">>, maps:get(<<"id">>, OrderResult)),
 
     ct:pal("set_query/2 works correctly"),
+    ok.
+
+%%====================================================================
+%% Authentication Tests
+%%====================================================================
+
+create_federation_with_bearer_auth(Config) ->
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Create federation with bearer token auth
+    FedName = <<"bearer_auth_fed">>,
+    Auth = #{bearer_token => <<"ak_test_api_key_12345">>},
+    ok = barrel_federation:create(FedName, [DbName], #{auth => Auth}),
+
+    %% Verify federation was created with auth
+    {ok, Fed} = barrel_federation:get(FedName),
+    ?assert(maps:is_key(auth, Fed)),
+    ?assertEqual(Auth, maps:get(auth, Fed)),
+
+    ct:pal("Created federation with bearer auth: ~p", [maps:get(auth, Fed)]),
+    ok.
+
+create_federation_with_basic_auth(Config) ->
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Create federation with basic auth
+    FedName = <<"basic_auth_fed">>,
+    Auth = #{basic_auth => {<<"admin">>, <<"secret_password">>}},
+    ok = barrel_federation:create(FedName, [DbName], #{auth => Auth}),
+
+    %% Verify federation was created with auth
+    {ok, Fed} = barrel_federation:get(FedName),
+    ?assert(maps:is_key(auth, Fed)),
+    ?assertEqual(Auth, maps:get(auth, Fed)),
+
+    ct:pal("Created federation with basic auth: ~p", [maps:get(auth, Fed)]),
+    ok.
+
+auth_stored_in_config(Config) ->
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Create federation with auth and other options
+    FedName = <<"auth_config_fed">>,
+    Auth = #{bearer_token => <<"ak_stored_token">>},
+    Query = #{where => [{path, [<<"type">>], <<"test">>}]},
+    ok = barrel_federation:create(FedName, [DbName], #{
+        auth => Auth,
+        query => Query,
+        description => <<"test federation">>
+    }),
+
+    %% Verify all options are stored correctly
+    {ok, Fed} = barrel_federation:get(FedName),
+    ?assert(maps:is_key(auth, Fed)),
+    ?assert(maps:is_key(query, Fed)),
+    ?assertEqual(Auth, maps:get(auth, Fed)),
+    ?assertEqual(Query, maps:get(query, Fed)),
+
+    %% Auth should NOT be in options (it's at top level)
+    Options = maps:get(options, Fed),
+    ?assertNot(maps:is_key(auth, Options)),
+
+    ct:pal("Auth stored correctly in config, separate from options"),
+    ok.
+
+query_auth_override(Config) ->
+    DbName = proplists:get_value(db_name, Config),
+
+    %% Create federation with default auth
+    FedName = <<"auth_override_fed">>,
+    DefaultAuth = #{bearer_token => <<"ak_default_token">>},
+    ok = barrel_federation:create(FedName, [DbName], #{auth => DefaultAuth}),
+
+    %% Add a test document
+    {ok, _} = barrel_docdb:put_doc(DbName, #{
+        <<"id">> => <<"auth_test_doc">>,
+        <<"type">> => <<"auth_test">>
+    }),
+
+    %% Query with per-query auth override
+    OverrideAuth = #{bearer_token => <<"ak_override_token">>},
+    {ok, Results, _Meta} = barrel_federation:find(FedName, #{
+        where => [{path, [<<"type">>], <<"auth_test">>}]
+    }, #{auth => OverrideAuth}),
+
+    %% Should get results (local query doesn't use auth, but config is valid)
+    ?assertEqual(1, length(Results)),
+    [Doc] = Results,
+    ?assertEqual(<<"auth_test_doc">>, maps:get(<<"id">>, Doc)),
+
+    ct:pal("Query with auth override works correctly"),
+    ok.
+
+add_auth_headers_bearer(_Config) ->
+    %% Test add_auth_headers with bearer token
+    BaseHeaders = [{<<"Content-Type">>, <<"application/json">>}],
+    Auth = #{bearer_token => <<"ak_test_token">>},
+
+    %% Call internal function via module
+    Headers = barrel_federation:add_auth_headers(BaseHeaders, Auth),
+
+    %% Should have Authorization header prepended
+    ?assertEqual(2, length(Headers)),
+    {<<"Authorization">>, AuthValue} = hd(Headers),
+    ?assertEqual(<<"Bearer ak_test_token">>, AuthValue),
+
+    ct:pal("Bearer auth header: ~p", [AuthValue]),
+    ok.
+
+add_auth_headers_basic(_Config) ->
+    %% Test add_auth_headers with basic auth
+    BaseHeaders = [{<<"Content-Type">>, <<"application/json">>}],
+    Auth = #{basic_auth => {<<"user">>, <<"pass">>}},
+
+    %% Call internal function via module
+    Headers = barrel_federation:add_auth_headers(BaseHeaders, Auth),
+
+    %% Should have Authorization header prepended
+    ?assertEqual(2, length(Headers)),
+    {<<"Authorization">>, AuthValue} = hd(Headers),
+
+    %% Verify it's a valid Basic auth header
+    ExpectedCredentials = base64:encode(<<"user:pass">>),
+    ExpectedHeader = <<"Basic ", ExpectedCredentials/binary>>,
+    ?assertEqual(ExpectedHeader, AuthValue),
+
+    ct:pal("Basic auth header: ~p", [AuthValue]),
+    ok.
+
+add_auth_headers_undefined(_Config) ->
+    %% Test add_auth_headers with no auth
+    BaseHeaders = [{<<"Content-Type">>, <<"application/json">>},
+                   {<<"Accept">>, <<"application/json">>}],
+
+    %% Call with undefined auth
+    Headers1 = barrel_federation:add_auth_headers(BaseHeaders, undefined),
+    ?assertEqual(BaseHeaders, Headers1),
+
+    %% Call with empty map
+    Headers2 = barrel_federation:add_auth_headers(BaseHeaders, #{}),
+    ?assertEqual(BaseHeaders, Headers2),
+
+    ct:pal("No auth headers added when auth is undefined/empty"),
     ok.

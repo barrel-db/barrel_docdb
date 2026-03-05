@@ -1571,10 +1571,16 @@ handle_create_federation(Req0) ->
     Name = maps:get(<<"name">>, Spec),
     Members = maps:get(<<"members">>, Spec, []),
     Options0 = maps:get(<<"options">>, Spec, #{}),
+    %% Extract auth config if present
+    Auth = convert_auth_config(maps:get(<<"auth">>, Spec, undefined)),
+    Options1 = case Auth of
+        undefined -> Options0;
+        _ -> Options0#{auth => Auth}
+    end,
     %% Convert query spec if present
     Options = case maps:get(<<"query">>, Spec, undefined) of
-        undefined -> Options0;
-        QuerySpec -> Options0#{query => convert_query_spec(QuerySpec)}
+        undefined -> Options1;
+        QuerySpec -> Options1#{query => convert_query_spec(QuerySpec)}
     end,
     case barrel_federation:create(Name, Members, Options) of
         ok ->
@@ -1592,7 +1598,13 @@ handle_federation_find(Req0) ->
     {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
     QuerySpec0 = decode_request_body(ReqBody, Req1),
     QuerySpec = convert_query_spec(QuerySpec0),
-    Opts = maps:get(<<"options">>, QuerySpec0, #{}),
+    Opts0 = maps:get(<<"options">>, QuerySpec0, #{}),
+    %% Extract auth if provided in request (per-query override)
+    Auth = convert_auth_config(maps:get(<<"auth">>, QuerySpec0, undefined)),
+    Opts = case Auth of
+        undefined -> Opts0;
+        _ -> Opts0#{auth => Auth}
+    end,
     case barrel_federation:find(Name, QuerySpec, Opts) of
         {ok, Results, Meta} ->
             FormattedMeta = format_federation_meta(Meta),
@@ -2119,6 +2131,14 @@ convert_query_spec(Spec) when is_map(Spec) ->
         true -> BaseSpec;
         false -> BaseSpec#{where => [{exists, [<<"id">>]}]}
     end.
+
+%% Convert auth config from JSON format to internal format
+convert_auth_config(undefined) -> undefined;
+convert_auth_config(#{<<"bearer_token">> := Token}) ->
+    #{bearer_token => Token};
+convert_auth_config(#{<<"basic_auth">> := #{<<"username">> := U, <<"password">> := P}}) ->
+    #{basic_auth => {U, P}};
+convert_auth_config(_) -> undefined.
 
 convert_where_clauses(Clauses) when is_list(Clauses) ->
     lists:map(fun convert_where_clause/1, Clauses);
