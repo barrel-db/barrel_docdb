@@ -228,6 +228,6 @@ barrel_federation:create(<<"all_users">>, [
 
 ## Community & Support
 
-- [:fontawesome-brands-gitlab: GitLab Repository](https://gitlab.enki.io/barrel-db/barrel_docdb)
+- [:fontawesome-brands-github: GitHub Repository](https://github.com/barrel-db/barrel_docdb)
 - [:material-file-document: API Reference](api/http.md)
-- [:material-bug: Report Issues](https://gitlab.enki.io/barrel-db/barrel_docdb/-/issues)
+- [:material-bug: Report Issues](https://github.com/barrel-db/barrel_docdb/issues)
