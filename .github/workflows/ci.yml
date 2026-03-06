@@ -16,7 +16,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          apt-get update && apt-get install -y cmake build-essential libssl-dev zlib1g-dev
+          apt-get update && apt-get install -y cmake build-essential libssl-dev zlib1g-dev libsnappy-dev liblz4-dev libzstd-dev
           git config --global --add safe.directory '*'
 
       - name: Cache rebar3
