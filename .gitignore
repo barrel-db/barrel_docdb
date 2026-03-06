@@ -1,7 +1,6 @@
 # Rebar3 artifacts
 _build/
 _checkouts/
-rebar.lock
 
 # IDE
 .idea/
