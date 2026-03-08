@@ -70,8 +70,15 @@ maybe_authenticate(node_info, _Req) ->
     %% Node info is public (for discovery)
     ok;
 maybe_authenticate(Action, Req) when Action =:= keys; Action =:= key;
-                                     Action =:= admin_usage; Action =:= admin_db_usage ->
-    %% Key management and admin endpoints require admin authentication
+                                     Action =:= admin_usage; Action =:= admin_db_usage;
+                                     %% Federation management
+                                     Action =:= federations; Action =:= federation;
+                                     Action =:= federation_member; Action =:= federation_find;
+                                     %% Replication policy management
+                                     Action =:= policies; Action =:= policy;
+                                     Action =:= policy_enable; Action =:= policy_disable;
+                                     Action =:= policy_status ->
+    %% Key management, federation, policy, and admin endpoints require admin authentication
     authenticate_admin(Req);
 maybe_authenticate(Action, Req) ->
     %% Check if any API keys are configured
@@ -241,7 +248,7 @@ handle_action(peer, <<"DELETE">>, Req) ->
 
 %% Federation: list all
 handle_action(federations, <<"GET">>, Req) ->
-    {ok, Feds} = barrel_federation:list(),
+    {ok, Feds} = barrel_federation:list_safe(),
     Body = encode_response(#{<<"federations">> => Feds}, Req),
     {200, response_headers(Req), Body, Req};
 
@@ -252,7 +259,7 @@ handle_action(federations, <<"POST">>, Req) ->
 %% Federation: get/delete
 handle_action(federation, <<"GET">>, Req) ->
     Name = cowboy_req:binding(name, Req),
-    case barrel_federation:get(Name) of
+    case barrel_federation:get_safe(Name) of
         {ok, Fed} ->
             Body = encode_response(Fed, Req),
             {200, response_headers(Req), Body, Req};

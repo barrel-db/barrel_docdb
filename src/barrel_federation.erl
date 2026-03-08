@@ -53,7 +53,9 @@
     create/3,
     delete/1,
     get/1,
+    get_safe/1,
     list/0,
+    list_safe/0,
     find/1,
     find/2,
     find/3,
@@ -204,6 +206,26 @@ list() ->
     ) of
         {ok, Federations} -> {ok, lists:reverse(Federations)};
         {error, _} -> {ok, []}
+    end.
+
+%% @doc Get federation for API response (auth stripped)
+-spec get_safe(federation_name()) -> {ok, federation()} | {error, not_found}.
+get_safe(Name) ->
+    case get(Name) of
+        {ok, Federation} ->
+            {ok, maps:remove(auth, Federation)};
+        Error ->
+            Error
+    end.
+
+%% @doc List federations for API response (auth stripped)
+-spec list_safe() -> {ok, [federation()]}.
+list_safe() ->
+    case list() of
+        {ok, Federations} ->
+            {ok, [maps:remove(auth, F) || F <- Federations]};
+        Error ->
+            Error
     end.
 
 %% @doc Add a member to an existing federation
