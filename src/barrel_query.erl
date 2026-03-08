@@ -370,9 +370,9 @@ execute_chunked_with_snapshot(StoreRef, DbName, Plan, ChunkSize, StartKey, Snaps
         {multi_index, IndexConditions} ->
             execute_multi_index_chunked(StoreRef, DbName, IndexConditions, Plan, ChunkSize, StartKey, Snapshot);
         needs_body ->
-            %% For body-fetch queries, fall back to non-chunked for now
-            %% TODO: Implement chunked body-fetch queries
-            %% Note: We call execute_direct to avoid infinite loop with auto-pagination
+            %% Body-fetch queries require loading full documents, which doesn't
+            %% support efficient chunked iteration. Fall back to direct execution.
+            %% This may increase memory usage for large result sets.
             maybe_release_snapshot(Snapshot),
             {ok, Results, LastSeq} = execute_direct(StoreRef, DbName, Plan),
             {ok, Results, #{last_seq => LastSeq, has_more => false}}
@@ -495,10 +495,10 @@ execute_pure_exists_chunked(StoreRef, DbName, Path, Plan, ChunkSize, StartKey, S
     case HasMore of
         true ->
             Token = barrel_query_cursor:create(
-                StoreRef, DbName, pure_exists, LastCollectedKey, Snapshot),
+                StoreRef, DbName, pure_exists, LastCollectedKey, ActualSnapshot),
             {ok, FinalResults, #{last_seq => LastSeq, has_more => true, continuation => Token}};
         false ->
-            maybe_release_snapshot(Snapshot),
+            maybe_release_snapshot(ActualSnapshot),
             {ok, FinalResults, #{last_seq => LastSeq, has_more => false}}
     end.
 
@@ -550,10 +550,10 @@ execute_pure_prefix_chunked(StoreRef, DbName, Path, Prefix, Plan, ChunkSize, Sta
     case HasMore of
         true ->
             Token = barrel_query_cursor:create(
-                StoreRef, DbName, pure_prefix, LastCollectedKey, Snapshot),
+                StoreRef, DbName, pure_prefix, LastCollectedKey, ActualSnapshot),
             {ok, FinalResults, #{last_seq => LastSeq, has_more => true, continuation => Token}};
         false ->
-            maybe_release_snapshot(Snapshot),
+            maybe_release_snapshot(ActualSnapshot),
             {ok, FinalResults, #{last_seq => LastSeq, has_more => false}}
     end.
 
@@ -2239,11 +2239,21 @@ execute_pure_compare(StoreRef, DbName, Path, Op, Value, Plan, Snapshot) ->
         end
     end,
 
-    %% Use optimized fold without key decoding
-    _ = Snapshot,  %% TODO: Add snapshot support
-    {_, _, Results} = barrel_ars_index:fold_compare_docids(
-        StoreRef, DbName, Path, Op, Value, FoldFun, {#{}, 0, []}
+    %% Use provided snapshot or create a temporary one for consistency
+    {ActualSnapshot, CreatedSnapshot} = case Snapshot of
+        undefined ->
+            {ok, S} = barrel_store_rocksdb:snapshot(StoreRef),
+            {S, true};
+        S -> {S, false}
+    end,
+    {_, _, Results} = barrel_ars_index:fold_compare_docids_with_snapshot(
+        StoreRef, DbName, Path, Op, Value, FoldFun, {#{}, 0, []}, ActualSnapshot
     ),
+    %% Only release if we created the snapshot
+    case CreatedSnapshot of
+        true -> maybe_release_snapshot(ActualSnapshot);
+        false -> ok
+    end,
 
     %% Apply offset and limit (results are in reverse order)
     Results1 = lists:reverse(Results),

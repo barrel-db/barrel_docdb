@@ -27,7 +27,7 @@
 -export([posting_get/2, posting_get_binary/2, posting_multi_get/2]).
 -export([fold_range_posting/5, fold_range_posting_reverse/5]).
 -export([fold_range_posting_prefix/5, fold_range_posting_prefix_with_snapshot/6]).
--export([fold_range_posting_compare/5]).
+-export([fold_range_posting_compare/5, fold_range_posting_compare_with_snapshot/6]).
 
 %% Body column family operations (BlobDB enabled)
 -export([body_put/3, body_put/4, body_get/2, body_multi_get/2, body_multi_get/3, body_delete/2]).
@@ -659,6 +659,22 @@ fold_range_posting_compare(#{ref := Ref, posting_cf := PostingCF}, StartKey, End
             {iterate_upper_bound, EndKey},
             {total_order_seek, false},
             {readahead_size, 1048576}],  %% 1MB readahead for sequential range scans
+    {ok, Iter} = rocksdb:iterator(Ref, PostingCF, Opts),
+    try
+        fold_posting_loop(rocksdb:iterator_move(Iter, first), Iter, Fun, Acc0)
+    after
+        rocksdb:iterator_close(Iter)
+    end.
+
+%% @doc Fold over posting list entries for compare/range queries with snapshot.
+%% Same as fold_range_posting_compare but uses a snapshot for consistent reads.
+-spec fold_range_posting_compare_with_snapshot(db_ref(), binary(), binary(), fun(), term(), snapshot()) -> term().
+fold_range_posting_compare_with_snapshot(#{ref := Ref, posting_cf := PostingCF}, StartKey, EndKey, Fun, Acc0, Snapshot) ->
+    Opts = [{iterate_lower_bound, StartKey},
+            {iterate_upper_bound, EndKey},
+            {snapshot, Snapshot},
+            {total_order_seek, false},
+            {readahead_size, 1048576}],
     {ok, Iter} = rocksdb:iterator(Ref, PostingCF, Opts),
     try
         fold_posting_loop(rocksdb:iterator_move(Iter, first), Iter, Fun, Acc0)

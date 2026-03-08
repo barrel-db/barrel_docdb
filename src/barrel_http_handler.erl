@@ -2502,9 +2502,15 @@ handle_put_attachment_stream(DbName, DocId, AttName, ContentType, Req0) ->
                             Body = encode_response(Response, Req1),
                             {201, response_headers(Req1), Body, Req1};
                         {error, Reason} ->
+                            barrel_docdb:abort_attachment_writer(FinalWriter),
                             throw({error, 500, format_error(Reason)})
                     end;
+                {error, Reason, FailedWriter} ->
+                    barrel_docdb:abort_attachment_writer(FailedWriter),
+                    throw({error, 500, format_error(Reason)});
                 {error, Reason} ->
+                    %% Writer state unknown - best effort cleanup
+                    barrel_docdb:abort_attachment_writer(Writer),
                     throw({error, 500, format_error(Reason)})
             end;
         {error, Reason} ->
@@ -2520,16 +2526,16 @@ stream_upload_body(Req, Writer) ->
             case barrel_docdb:write_attachment_chunk(Writer, Data) of
                 {ok, FinalWriter} ->
                     {ok, FinalWriter, Req1};
-                {error, _} = Error ->
-                    Error
+                {error, Reason} ->
+                    {error, Reason, Writer}
             end;
         {more, Data, Req1} ->
             %% More data coming
             case barrel_docdb:write_attachment_chunk(Writer, Data) of
                 {ok, NewWriter} ->
                     stream_upload_body(Req1, NewWriter);
-                {error, _} = Error ->
-                    Error
+                {error, Reason} ->
+                    {error, Reason, Writer}
             end
     end.
 

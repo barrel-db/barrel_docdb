@@ -100,7 +100,8 @@
     close_attachment_stream/1,
     open_attachment_writer/4,
     write_attachment_chunk/2,
-    finish_attachment_writer/1
+    finish_attachment_writer/1,
+    abort_attachment_writer/1
 ]).
 
 %% Views
@@ -942,6 +943,17 @@ write_attachment_chunk(Writer, Data) ->
 -spec finish_attachment_writer(map()) -> {ok, map()} | {error, term()}.
 finish_attachment_writer(Writer) ->
     barrel_att_store:finish_stream(Writer).
+
+%% @doc Abort an attachment writer and clean up partial data.
+%%
+%% Use this to clean up when an upload fails or is cancelled before
+%% finish_attachment_writer/1 is called.
+%%
+%% @param Writer The writer to abort
+%% @returns `ok'
+-spec abort_attachment_writer(map()) -> ok.
+abort_attachment_writer(Writer) ->
+    barrel_att_store:abort_stream(Writer).
 
 %%====================================================================
 %% Views

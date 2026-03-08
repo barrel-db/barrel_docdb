@@ -25,7 +25,7 @@
 
 %% Streaming API
 -export([put_stream/5, put_stream/6]).
--export([write_chunk/2, finish_stream/1]).
+-export([write_chunk/2, finish_stream/1, abort_stream/1]).
 -export([get_stream/4, read_chunk/1, close_stream/1]).
 -export([get_info/4]).
 
@@ -563,6 +563,22 @@ finish_stream(#{type := write, att_ref := #{ref := Ref}, db_name := DbName,
         {error, _} = Error ->
             Error
     end.
+
+%% @doc Abort a put stream and clean up any written chunks
+-spec abort_stream(map()) -> ok.
+abort_stream(#{type := write, att_ref := #{ref := Ref}, db_name := DbName,
+               doc_id := DocId, att_name := AttName, chunk_index := ChunkIndex}) ->
+    %% Delete any chunks that were written
+    lists:foreach(
+        fun(Index) ->
+            ChunkKey = make_chunk_key(DbName, DocId, AttName, Index),
+            rocksdb:delete(Ref, ChunkKey, [])
+        end,
+        lists:seq(0, ChunkIndex - 1)
+    ),
+    ok;
+abort_stream(_) ->
+    ok.
 
 %% @doc Open a stream for reading an attachment
 -spec get_stream(att_ref(), db_name(), docid(), binary()) ->

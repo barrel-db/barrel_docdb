@@ -24,6 +24,7 @@
     fold_path_values_reverse/5, fold_path_values_reverse/6,
     fold_path_values_compare/7,
     fold_compare_docids/7,
+    fold_compare_docids_with_snapshot/8,
     fold_prefix/6, fold_prefix/7,
     fold_posting/5, fold_posting/6,
     fold_prefix_posting/6,
@@ -586,6 +587,33 @@ fold_compare_docids(StoreRef, DbName, Path, Op, Value, Fun, Acc0) ->
     end,
     try
         barrel_store_rocksdb:fold_range_posting_compare(StoreRef, StartKey, EndKey, FoldFun, Acc0)
+    catch
+        throw:{stop, Result} -> Result
+    end.
+
+%% @doc Fold over DocIds matching a comparison operator with snapshot.
+%% Same as fold_compare_docids but uses a snapshot for consistent reads.
+-spec fold_compare_docids_with_snapshot(store_ref(), db_name(), [term()],
+                          '>' | '<' | '>=' | '=<', term(), fun(), term(),
+                          barrel_store_rocksdb:snapshot()) -> term().
+fold_compare_docids_with_snapshot(StoreRef, DbName, Path, Op, Value, Fun, Acc0, Snapshot) ->
+    {StartKey, EndKey} = compare_range_keys(DbName, Path, Op, Value),
+    FoldFun = fun(_Key, DocIds, Acc) ->
+        NewAcc = lists:foldl(
+            fun(DocId, InnerAcc) ->
+                case Fun(DocId, InnerAcc) of
+                    {ok, Updated} -> Updated;
+                    {stop, StopAcc} -> throw({stop, StopAcc})
+                end
+            end,
+            Acc,
+            DocIds
+        ),
+        {ok, NewAcc}
+    end,
+    try
+        barrel_store_rocksdb:fold_range_posting_compare_with_snapshot(
+            StoreRef, StartKey, EndKey, FoldFun, Acc0, Snapshot)
     catch
         throw:{stop, Result} -> Result
     end.
