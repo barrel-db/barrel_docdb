@@ -1183,7 +1183,7 @@ extract_paths_from_conditions([_ | Rest], Acc) ->
 
 %% @private Convert a path list to an MQTT-style pattern with # wildcard.
 %% This allows matching any value at the path.
-%% Example: [<<"type">>] -> <<"type/#">>
+%% Example: `[&lt;&lt;"type"&gt;&gt;]' to `&lt;&lt;"type/#"&gt;&gt;'
 path_to_pattern([]) ->
     <<"#">>;
 path_to_pattern(Path) ->
@@ -1486,8 +1486,8 @@ is_valid_path_component(_) -> false.
 %%====================================================================
 
 %% @doc Select read profile based on limit and cardinality.
-%% - point: Small result sets (limit <= 10), keep blocks in cache
-%% - short_range: Medium scans (limit <= 200 or cardinality <= 200), auto-readahead
+%% - point: Small result sets (limit =&lt; 10), keep blocks in cache
+%% - short_range: Medium scans (limit =&lt; 200 or cardinality =&lt; 200), auto-readahead
 %% - long_scan: Large/unbounded scans, prefetch aggressively, avoid cache pollution
 -spec select_read_profile(undefined | pos_integer(), non_neg_integer()) -> read_profile().
 select_read_profile(Limit, _Cardinality) when is_integer(Limit), Limit =< 10 ->

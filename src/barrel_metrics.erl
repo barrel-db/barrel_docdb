@@ -9,7 +9,7 @@
 %%% - HTTP request latencies
 %%% - Peer connectivity
 %%%
-%%% Metrics are exposed via the `/metrics` HTTP endpoint in Prometheus
+%%% Metrics are exposed via the '/metrics' HTTP endpoint in Prometheus
 %%% text format for scraping.
 %%%
 %%% @end

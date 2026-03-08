@@ -5,7 +5,7 @@
 %%% posting list keys. Uses ETS for read cache and RocksDB for
 %%% persistence.
 %%%
-%%% Path format: [<<"field1">>, <<"field2">>] -> PathId (32-bit integer)
+%%% Path format: `[&lt;&lt;"field1"&gt;&gt;, &lt;&lt;"field2"&gt;&gt;]' to PathId (32-bit integer)
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_path_dict).

@@ -917,7 +917,7 @@ write_change_ops(DbName, Hlc, DocInfo) ->
 
 %% @doc Return batch operation to update change bucket.
 %% Buckets store {MinHlc, MaxHlc, Count} in compact binary format.
-%% Format: <<MinHlc:12/binary, MaxHlc:12/binary, Count:32>>
+%% Format: `&lt;&lt;MinHlc:12/binary, MaxHlc:12/binary, Count:32&gt;&gt;'
 -spec update_change_bucket_ops(barrel_store_rocksdb:db_ref(), db_name(),
                                 barrel_hlc:timestamp()) -> [{put, binary(), binary()}].
 update_change_bucket_ops(StoreRef, DbName, Hlc) ->
@@ -957,7 +957,7 @@ delete_old_change(StoreRef, DbName, OldHlc, _DocId) ->
 %%====================================================================
 
 %% @doc Encode change to compact binary format.
-%% Format: <<DocIdLen:16, DocId/binary, RevLen:16, Rev/binary, Deleted:8, NumConflicts:16, HasDoc:8, [DocCbor/binary]>>
+%% Format: `&lt;&lt;DocIdLen:16, DocId/binary, RevLen:16, Rev/binary, Deleted:8, NumConflicts:16, HasDoc:8, [DocCbor/binary]&gt;&gt;'
 %% Stores conflict count for quick check; optionally includes doc body for filtering.
 -spec encode_change(doc_info()) -> binary().
 encode_change(DocInfo) ->
@@ -1048,7 +1048,7 @@ write_path_index_ops(DbName, Hlc, DocInfo) ->
     end,
 
     %% Create index entry value using compact binary format
-    %% Format: <<DocIdLen:16, DocId, RevLen:16, Rev, Deleted:8, NumConflicts:16, HasDoc:8>>
+    %% Format: DocIdLen:16, DocId, RevLen:16, Rev, Deleted:8, NumConflicts:16, HasDoc:8
     ChangeValue = encode_change(#{id => DocId, rev => Rev, deleted => Deleted}),
 
     %% Index each topic and all its prefixes

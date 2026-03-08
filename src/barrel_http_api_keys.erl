@@ -89,7 +89,7 @@ validate_key(Key, DbName) ->
 %% @doc Create a new API key
 %% Options:
 %%   - name: Key name (required)
-%%   - permissions: List of permission binaries (default: [<<"read">>])
+%%   - permissions: List of permission binaries (default: `[&lt;&lt;"read"&gt;&gt;]')
 %%   - databases: 'all' for global access, or list of db names (default: all)
 %%   - is_admin: Whether this is an admin key (default: false)
 -spec create_key(map()) -> {ok, binary(), map()} | {error, term()}.

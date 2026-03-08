@@ -15,10 +15,10 @@
 %%% Example:
 %%% ```
 %%% %% Sync VDB config to all peers
-%%% ok = barrel_vdb_sync:broadcast_config(<<"users">>).
+%%% ok = barrel_vdb_sync:broadcast_config(&lt;&lt;"users"&gt;&gt;).
 %%%
 %%% %% Pull VDB config from peers (if local doesn't exist)
-%%% {ok, Config} = barrel_vdb_sync:ensure_config(<<"users">>).
+%%% {ok, Config} = barrel_vdb_sync:ensure_config(&lt;&lt;"users"&gt;&gt;).
 %%%
 %%% %% Get list of VDBs known across the cluster
 %%% {ok, VDBs} = barrel_vdb_sync:list_cluster_vdbs().

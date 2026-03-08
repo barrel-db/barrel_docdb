@@ -404,9 +404,9 @@ fold_range_long_scan(#{ref := Ref}, StartKey, EndKey, Fun, Acc0) ->
 
 %% @doc Fold over a key range with auto-selected read profile based on limit.
 %% Automatically chooses appropriate RocksDB read options:
-%% - Limit <= 10: point profile (fill_cache=true)
-%% - Limit <= 100: short_range profile (fill_cache=true)
-%% - Limit > 100 or infinity: long_scan profile (fill_cache=false, readahead)
+%% - Limit =&lt; 10: point profile (fill_cache=true)
+%% - Limit =&lt; 100: short_range profile (fill_cache=true)
+%% - Limit &gt; 100 or infinity: long_scan profile (fill_cache=false, readahead)
 %%
 %% This is the recommended function for range queries with known limits.
 -spec fold_range_limit(db_ref(), binary(), binary(), fun(), term(),
@@ -439,8 +439,8 @@ fold_range_posting_with_snapshot(#{ref := Ref, posting_cf := PostingCF}, StartKe
 %%====================================================================
 
 %% @doc Convert read profile to RocksDB read options
-%% - point: Small result sets (limit <= 10), keep blocks in cache
-%% - short_range: Medium result sets (limit <= 100), fill cache
+%% - point: Small result sets (limit =&lt; 10), keep blocks in cache
+%% - short_range: Medium result sets (limit =&lt; 100), fill cache
 %% - long_scan: Large/unbounded scans, prefetch aggressively, avoid cache pollution
 %%
 %% Cache Hygiene Rules:
@@ -800,9 +800,9 @@ body_multi_get(DbRef, Keys) ->
 
 %% @doc Get multiple values from body CF with explicit read profile.
 %% BlobDB has different I/O characteristics than LSM - use appropriate profile:
-%% - point: Small batches (<50 keys), cache friendly
+%% - point: Small batches (&lt;50 keys), cache friendly
 %% - short_range: Medium batches (50-200 keys), auto readahead
-%% - long_scan: Large batches (>200 keys), avoid cache pollution, explicit readahead
+%% - long_scan: Large batches (&gt;200 keys), avoid cache pollution, explicit readahead
 -spec body_multi_get(db_ref(), [binary()], read_profile()) ->
     [{ok, binary()} | not_found | {error, term()}].
 body_multi_get(#{ref := Ref, body_cf := BodyCF}, Keys, Profile) ->
@@ -951,8 +951,8 @@ put_entity(#{ref := Ref}, Key, Columns, Opts) ->
 
 %% @doc Encode entity columns to fixed binary format
 %% Format v2 (with TTL/tier extension):
-%%   <<RevLen:16, Rev/binary, Deleted:8, HlcLen:16, Hlc/binary, TreeLen:32, Tree/binary,
-%%     CreatedAtLen:16, CreatedAt/binary, ExpiresAt:64, Tier:8>>
+%%   `&lt;&lt;RevLen:16, Rev/binary, Deleted:8, HlcLen:16, Hlc/binary, TreeLen:32, Tree/binary,
+%%     CreatedAtLen:16, CreatedAt/binary, ExpiresAt:64, Tier:8&gt;&gt;'
 %% Backward compatible: old data without extension uses defaults.
 -spec encode_entity([{binary(), term()}]) -> binary().
 encode_entity(Columns) ->
@@ -1057,10 +1057,10 @@ get_stats(#{ref := Ref}) ->
 
 %% @doc Get a specific RocksDB property
 %% Common properties:
-%%   - <<"rocksdb.estimate-live-data-size">> - estimated size of live data
-%%   - <<"rocksdb.total-sst-files-size">> - total size of SST files
-%%   - <<"rocksdb.estimate-num-keys">> - estimated number of keys
-%%   - <<"rocksdb.cur-size-all-mem-tables">> - current size of all memtables
+%%   - "rocksdb.estimate-live-data-size" - estimated size of live data
+%%   - "rocksdb.total-sst-files-size" - total size of SST files
+%%   - "rocksdb.estimate-num-keys" - estimated number of keys
+%%   - "rocksdb.cur-size-all-mem-tables" - current size of all memtables
 -spec get_property(db_ref(), binary()) -> {ok, binary()} | {error, term()}.
 get_property(#{ref := Ref}, Property) when is_binary(Property) ->
     rocksdb:get_property(Ref, Property).

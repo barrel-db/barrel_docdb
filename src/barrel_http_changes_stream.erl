@@ -5,20 +5,22 @@
 %%% document change notifications over a persistent HTTP connection.
 %%%
 %%% Usage:
-%%%   GET /db/:db/_changes/stream?since=0&filter=users/+/profile
+%%%   `GET /db/:db/_changes/stream?since=0&amp;filter=users/+/profile'
 %%%
 %%% Supports:
-%%%   - `since` - Start position (0, first, or HLC)
-%%%   - `filter` - MQTT-style pattern (uses barrel_sub)
-%%%   - `include_docs` - Include full documents
-%%%   - `heartbeat` - Heartbeat interval in ms (default: 60000)
+%%%   - 'since' - Start position (0, first, or HLC)
+%%%   - 'filter' - MQTT-style pattern (uses barrel_sub)
+%%%   - 'include_docs' - Include full documents
+%%%   - 'heartbeat' - Heartbeat interval in ms (default: 60000)
 %%%
 %%% SSE Event format:
-%%%   event: change
-%%%   data: {"id":"doc1","rev":"1-abc","hlc":"..."}
+%%% ```
+%%% event: change
+%%% data: {"id":"doc1","rev":"1-abc","hlc":"..."}
 %%%
-%%%   event: heartbeat
-%%%   data: {}
+%%% event: heartbeat
+%%% data: {}
+%%% '''
 %%%
 %%% @end
 %%%-------------------------------------------------------------------

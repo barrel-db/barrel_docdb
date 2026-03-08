@@ -48,9 +48,9 @@ multi_get_current_bodies(DbName, DocIds) ->
 
 %% @doc Batch get current bodies with explicit read profile.
 %% Read profiles optimize I/O based on batch size:
-%% - point: Small batches (<50), cache friendly
+%% - point: Small batches (&lt;50), cache friendly
 %% - short_range: Medium batches (50-200), auto readahead
-%% - long_scan: Large batches (>200), prefetch 2MB, avoid cache pollution
+%% - long_scan: Large batches (&gt;200), prefetch 2MB, avoid cache pollution
 -spec multi_get_current_bodies(db_name(), [docid()], read_profile()) ->
     [{ok, binary()} | not_found | {error, term()}].
 multi_get_current_bodies(DbName, DocIds, Profile) ->

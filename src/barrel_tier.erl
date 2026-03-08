@@ -17,25 +17,29 @@
 %%% using capacity-based auto-migration to actually free space.
 %%%
 %%% Configuration is stored per-database in a local document
-%%% (`_local/_tier_config`) and cached in persistent_term for fast access.
+%%% ('_local/_tier_config') and cached in persistent_term for fast access.
 %%%
 %%% == Setup Examples ==
 %%%
 %%% Metadata-only (TTL and tier tagging):
-%%%   barrel_tier:configure(<<"mydb">>, #{
-%%%       enabled => true,
-%%%       hot_threshold => 7 * 24 * 3600,    %% 7 days
-%%%       warm_threshold => 30 * 24 * 3600   %% 30 days
-%%%   }).
+%%% ```
+%%% barrel_tier:configure(&lt;&lt;"mydb"&gt;&gt;, #{
+%%%     enabled =&gt; true,
+%%%     hot_threshold =&gt; 7 * 24 * 3600,
+%%%     warm_threshold =&gt; 30 * 24 * 3600
+%%% }).
+%%% '''
 %%%
 %%% Physical migration (capacity-based):
-%%%   barrel_tier:configure(<<"mydb">>, #{
-%%%       enabled => true,
-%%%       auto_migrate => true,
-%%%       capacity_limit => 10_000_000_000,  %% 10GB
-%%%       warm_db => <<"mydb_warm">>,        %% Required for capacity migration
-%%%       cold_db => <<"mydb_cold">>         %% Optional
-%%%   }).
+%%% ```
+%%% barrel_tier:configure(&lt;&lt;"mydb"&gt;&gt;, #{
+%%%     enabled =&gt; true,
+%%%     auto_migrate =&gt; true,
+%%%     capacity_limit =&gt; 10000000000,
+%%%     warm_db =&gt; &lt;&lt;"mydb_warm"&gt;&gt;,
+%%%     cold_db =&gt; &lt;&lt;"mydb_cold"&gt;&gt;
+%%% }).
+%%% '''
 %%%
 %%% @end
 %%%-------------------------------------------------------------------

@@ -668,7 +668,7 @@ path_posting_end(DbName, PathPrefix) ->
 %% @doc Value-first posting list key for fast equality queries.
 %% Key format: prefix | db_name | value_prefix | encoded_path
 %% Value is truncated to 128 bytes max for efficient prefix scans.
-%% Path is the field path WITHOUT the value (e.g., [<<"type">>] for type=user)
+%% Path is the field path WITHOUT the value (e.g., `[&lt;&lt;"type"&gt;&gt;]' for type=user)
 -spec value_posting_key(db_name(), term(), [term()]) -> binary().
 value_posting_key(DbName, Value, Path) ->
     TruncatedValue = truncate_value(Value),

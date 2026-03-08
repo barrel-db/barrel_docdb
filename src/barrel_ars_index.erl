@@ -260,7 +260,7 @@ docid_get_value(StoreRef, DbName, DocId, Path) ->
     end.
 
 %% @doc Check if a DocId's value at a path satisfies a comparison.
-%% Op is one of: '>' | '<' | '>=' | '=<' | '=/=' | '=='
+%% Op is one of: '&gt;' | '&lt;' | '&gt;=' | '=&lt;' | '=/=' | '=='
 %% Returns true if the condition is satisfied, false otherwise.
 -spec docid_satisfies_compare(store_ref(), db_name(), docid(), [term()], atom(), term()) ->
     boolean().
@@ -535,10 +535,10 @@ fold_path_values_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0, _Profile) ->
     end.
 
 %% @doc Fold over path values matching a comparison operator.
-%% Supports: '>' | '<' | '>=' | '=<' for range queries.
+%% Supports: '&gt;' | '&lt;' | '&gt;=' | '=&lt;' for range queries.
 %% Uses posting lists with proper range bounds.
-%% Example: fold_path_values_compare(S, Db, [<<"age">>], '>', 50, Fun, Acc)
-%%   finds all docs where age > 50
+%% Example: `fold_path_values_compare(S, Db, [&lt;&lt;"age"&gt;&gt;], '&gt;', 50, Fun, Acc)'
+%%   finds all docs where age &gt; 50
 -spec fold_path_values_compare(store_ref(), db_name(), [term()],
                                 '>' | '<' | '>=' | '=<', term(), fun(), term()) -> term().
 fold_path_values_compare(StoreRef, DbName, Path, Op, Value, Fun, Acc0) ->
@@ -643,7 +643,7 @@ compare_range_keys(DbName, Path, '=<', Value) ->
 %% @doc Fold over path index entries matching a value prefix.
 %% Uses interval scan: [path, prefix] to [path, prefix ++ 0xFF]
 %% Much faster than collecting all values and filtering.
-%% Example: fold_prefix(S, Db, [<<"name">>], <<"John">>, Fun, Acc)
+%% Example: `fold_prefix(S, Db, [&lt;&lt;"name"&gt;&gt;], &lt;&lt;"John"&gt;&gt;, Fun, Acc)'
 %%   matches: John, Johnny, Johnson, etc.
 %% Uses posting lists internally.
 -spec fold_prefix(store_ref(), db_name(), [term()], binary(), fun(), term()) -> term().
@@ -697,7 +697,7 @@ fold_posting(StoreRef, DbName, PathPrefix, Fun, Acc0) ->
 %% Much more efficient for pure prefix queries with early termination.
 %% Uses prefix bloom optimization for faster key lookup.
 %% The callback receives (Key, DocIds, Acc) for each posting list.
-%% Example: fold_prefix_posting(S, Db, [<<"name">>], <<"John">>, Fun, Acc)
+%% Example: `fold_prefix_posting(S, Db, [&lt;&lt;"name"&gt;&gt;], &lt;&lt;"John"&gt;&gt;, Fun, Acc)'
 %%   matches: John, Johnny, Johnson, etc.
 -spec fold_prefix_posting(store_ref(), db_name(), [term()], binary(), fun(), term()) -> term().
 fold_prefix_posting(StoreRef, DbName, Path, Prefix, Fun, Acc0) when is_binary(Prefix) ->
@@ -843,7 +843,7 @@ posting_bitmap_contains(Postings, DocId) ->
 %%   {ok, NewAcc} - continue iteration
 %%   {stop, FinalAcc} - stop iteration early
 %%
-%% Example: fold_value_index(S, Db, <<"user">>, [<<"type">>], Fun, Acc)
+%% Example: `fold_value_index(S, Db, &lt;&lt;"user"&gt;&gt;, [&lt;&lt;"type"&gt;&gt;], Fun, Acc)'
 %%   finds all docs where type = "user"
 -spec fold_value_index(store_ref(), db_name(), term(), [term()], fun(), term()) -> term().
 fold_value_index(StoreRef, DbName, Value, FieldPath, Fun, Acc0) ->

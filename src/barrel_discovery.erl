@@ -235,7 +235,7 @@ get_peer_by_node_id(NodeId) when is_binary(NodeId) ->
 
 %% @doc Discover peers from DNS SRV records
 %% Looks up _barrel._tcp.Domain for SRV records
-%% Example: discover_from_dns(<<"example.com">>) looks up _barrel._tcp.example.com
+%% Example: `discover_from_dns(&lt;&lt;"example.com"&gt;&gt;)' looks up _barrel._tcp.example.com
 -spec discover_from_dns(binary()) -> ok | {error, term()}.
 discover_from_dns(Domain) when is_binary(Domain) ->
     gen_server:call(?SERVER, {discover_from_dns, Domain}, 30000).
