@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-03-08
+
+### Fixed
+- Snapshot handle leak in chunked exists/prefix query paths where temporary
+  snapshots were never released
+- Streaming attachment uploads now clean up orphaned chunks on failure via
+  new `abort_stream/1` function
+
+### Added
+- `abort_attachment_writer/1` API to clean up partial attachment uploads
+- Snapshot support for pure compare queries ensuring read consistency
+- `fold_compare_docids_with_snapshot/8` in barrel_ars_index
+- `fold_range_posting_compare_with_snapshot/6` in barrel_store_rocksdb
+
 ## [0.4.0] - 2026-03-05
 
 ### Added
