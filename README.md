@@ -15,7 +15,7 @@
 
 ---
 
-> **Alpha Software** - API may change. Feedback welcome via [GitLab Issues](https://gitlab.enki.io/barrel-db/barrel_docdb/-/issues).
+> **Alpha Software** - API may change. Feedback welcome via [GitHub Issues](https://github.com/barrel-db/barrel_docdb/issues).
 
 ## Overview
 
@@ -430,7 +430,7 @@ barrel_docdb_sup
 
 | Channel | For |
 |---------|-----|
-| [GitLab Issues](https://gitlab.enki.io/barrel-db/barrel_docdb/-/issues) | Bug reports, feature requests |
+| [GitHub Issues](https://github.com/barrel-db/barrel_docdb/issues) | Bug reports, feature requests |
 | [Email](mailto:support@barrel-db.eu) | Commercial inquiries |
 
 ## License
