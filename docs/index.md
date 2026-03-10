@@ -101,9 +101,14 @@ Barrel DocDB can run as a **standalone server** accessible via HTTP from any lan
     curl http://localhost:8080/health
 
     # Create database
-    curl -X POST http://localhost:8080/db/mydb
+    curl -X PUT http://localhost:8080/db/mydb
 
-    # Put document
+    # Create document (auto-generated ID)
+    curl -X POST http://localhost:8080/db/mydb \
+      -H "Content-Type: application/json" \
+      -d '{"type": "user", "name": "Alice"}'
+
+    # Or with specific ID
     curl -X PUT http://localhost:8080/db/mydb/doc1 \
       -H "Content-Type: application/json" \
       -d '{"type": "user", "name": "Alice"}'
@@ -209,7 +214,7 @@ barrel_federation:create(<<"all_users">>, [
 
     ```erlang
     {deps, [
-        {barrel_docdb, "0.3.0"}
+        {barrel_docdb, "0.4.1"}
     ]}.
     ```
 

@@ -14,7 +14,7 @@ Thank you for your interest in contributing to Barrel DocDB!
 
 ```bash
 # Clone the repository
-git clone https://gitlab.enki.io/barrel-db/barrel_docdb.git
+git clone https://github.com/barrel-db/barrel_docdb.git
 cd barrel_docdb
 
 # Compile
@@ -85,7 +85,7 @@ When reporting issues, please include:
 
 ## Questions?
 
-- Open an issue on GitLab
+- Open an issue on [GitHub](https://github.com/barrel-db/barrel_docdb/issues)
 - Check existing documentation
 
 ## License

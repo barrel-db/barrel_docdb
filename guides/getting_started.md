@@ -33,7 +33,7 @@ This guide walks you through installing and using Barrel DocDB. You'll have a wo
 
     ```erlang
     {deps, [
-        {barrel_docdb, "0.3.0"}
+        {barrel_docdb, "0.4.1"}
     ]}.
     ```
 
@@ -49,7 +49,7 @@ This guide walks you through installing and using Barrel DocDB. You'll have a wo
     Clone and build:
 
     ```bash
-    git clone https://gitlab.enki.io/barrel-db/barrel_docdb.git
+    git clone https://github.com/barrel-db/barrel_docdb.git
     cd barrel_docdb
     rebar3 compile
     rebar3 shell
@@ -62,7 +62,7 @@ This guide walks you through installing and using Barrel DocDB. You'll have a wo
     ### Create a Database
 
     ```bash
-    curl -X POST http://localhost:8080/db/myapp
+    curl -X PUT http://localhost:8080/db/myapp
     ```
 
     Response:

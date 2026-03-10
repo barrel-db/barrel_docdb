@@ -82,9 +82,14 @@ Start the HTTP server (port 8080 by default):
 curl http://localhost:8080/health
 
 # Create database
-curl -X POST http://localhost:8080/db/mydb
+curl -X PUT http://localhost:8080/db/mydb
 
-# Put document
+# Create document with auto-generated ID
+curl -X POST http://localhost:8080/db/mydb \
+  -H "Content-Type: application/json" \
+  -d '{"type": "user", "name": "Alice"}'
+
+# Or create document with specific ID
 curl -X PUT http://localhost:8080/db/mydb/doc1 \
   -H "Content-Type: application/json" \
   -d '{"type": "user", "name": "Alice"}'
@@ -364,7 +369,7 @@ Add to your `rebar.config`:
 
 ```erlang
 {deps, [
-    {barrel_docdb, "0.3.0"}
+    {barrel_docdb, "0.4.1"}
 ]}.
 ```
 

@@ -623,6 +623,8 @@ handle_action(db_info, <<"DELETE">>, Req) ->
         {error, Reason} ->
             throw({error, 500, format_error(Reason)})
     end;
+handle_action(db_info, <<"POST">>, Req) ->
+    handle_post_doc(Req);
 
 %% Document operations
 handle_action(doc, <<"GET">>, Req) ->
@@ -751,6 +753,23 @@ handle_put_doc(Req0) ->
     Doc0 = decode_request_body(ReqBody, Req1),
     %% Ensure doc has the ID from URL
     Doc = Doc0#{<<"id">> => DocId},
+    case barrel_docdb:put_doc(DbName, Doc) of
+        {ok, Result} ->
+            Body = encode_response(Result, Req1),
+            {201, response_headers(Req1), Body, Req1};
+        {error, conflict} ->
+            throw({error, 409, <<"Document update conflict">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+%% @doc Create a document with auto-generated ID.
+%% POST /db/:db
+handle_post_doc(Req0) ->
+    DbName = cowboy_req:binding(db, Req0),
+    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    Doc = decode_request_body(ReqBody, Req1),
+    %% Don't set ID - let barrel_docdb auto-generate it
     case barrel_docdb:put_doc(DbName, Doc) of
         {ok, Result} ->
             Body = encode_response(Result, Req1),

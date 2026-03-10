@@ -118,7 +118,7 @@ Set the `Content-Type` and `Accept` headers accordingly.
 |----------|---------|-------------|
 | `/health` | GET | Health check |
 | `/metrics` | GET | Prometheus metrics |
-| `/db/:db` | GET, PUT, DELETE | Database operations |
+| `/db/:db` | GET, PUT, POST, DELETE | Database (PUT=create db, POST=create doc with auto-ID) |
 | `/db/:db/:doc_id` | GET, PUT, DELETE | Document operations |
 | `/db/:db/_find` | POST | Query documents |
 | `/db/:db/_changes` | GET | Changes feed |
@@ -179,12 +179,12 @@ Returns metrics in Prometheus text format.
 ### Create Database
 
 ```bash
-POST /db/:db
+PUT /db/:db
 ```
 
 **Example:**
 ```bash
-curl -X POST http://localhost:8080/db/mydb
+curl -X PUT http://localhost:8080/db/mydb
 ```
 
 **Response:** `201 Created`
@@ -216,7 +216,34 @@ DELETE /db/:db
 
 ## Document Operations
 
-### Create/Update Document
+### Create Document (Auto-Generated ID)
+
+```bash
+POST /db/:db
+```
+
+Creates a new document with an auto-generated ID.
+
+**Headers:**
+- `Content-Type: application/json`
+
+**Example:**
+```bash
+curl -X POST http://localhost:8080/db/mydb \
+  -H "Content-Type: application/json" \
+  -d '{"type": "user", "name": "Alice", "email": "alice@example.com"}'
+```
+
+**Response:**
+```json
+{
+  "ok": true,
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "rev": "1-abc123"
+}
+```
+
+### Create/Update Document (Specific ID)
 
 ```bash
 PUT /db/:db/:doc_id

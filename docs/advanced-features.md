@@ -738,7 +738,7 @@ curl "http://localhost:8080/_policies/my_policy/_status" \
 curl -X POST "http://localhost:8080/db/mydb/_find" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $API_KEY" \
-  -d '{"selector": {}, "limit": 0}'
+  -d '{"where": [], "limit": 0}'
 ```
 
 ### Check Changes Feed

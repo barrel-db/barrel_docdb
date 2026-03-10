@@ -355,7 +355,7 @@ Use `explain/2` to see how queries execute:
 
 ### Configuration Tuning
 
-See [Architecture](design.md) for RocksDB tuning:
+See [Architecture](../DESIGN.md) for RocksDB tuning:
 
 - Adjust block cache size for your memory budget
 - Configure write buffer size for write-heavy workloads
