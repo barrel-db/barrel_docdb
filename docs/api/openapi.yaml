@@ -1,0 +1,1248 @@
+openapi: 3.0.3
+info:
+  title: Barrel DocDB API
+  description: |
+    Barrel DocDB is an Erlang document database with MVCC, declarative queries,
+    real-time subscriptions, and multi-master replication.
+
+    ## Authentication
+
+    Most endpoints require authentication via Bearer token:
+    - API Key: `Authorization: Bearer ak_<key>`
+    - JWT Token: `Authorization: Bearer bdb_<jwt>`
+
+    ## Content Types
+
+    The API supports:
+    - `application/json` (default)
+    - `application/cbor` (binary, more efficient)
+  version: 0.4.2
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+  contact:
+    url: https://github.com/barrel-db/barrel_docdb
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+
+tags:
+  - name: Health
+    description: Health and metrics endpoints
+  - name: Database
+    description: Database management operations
+  - name: Documents
+    description: Document CRUD operations
+  - name: Queries
+    description: Query and find operations
+  - name: Changes
+    description: Changes feed and subscriptions
+  - name: Attachments
+    description: Binary attachment operations
+  - name: Replication
+    description: Replication and sync operations
+  - name: Views
+    description: Materialized views
+  - name: Tiered Storage
+    description: Hot/warm/cold tier management
+  - name: Federation
+    description: Cross-database federation
+  - name: VDB
+    description: Virtual (sharded) databases
+  - name: Admin
+    description: Administrative operations
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      description: Returns system health status and basic metrics
+      operationId: getHealth
+      security: []
+      responses:
+        '200':
+          description: System is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /metrics:
+    get:
+      tags: [Health]
+      summary: Prometheus metrics
+      description: Returns metrics in Prometheus text format
+      operationId: getMetrics
+      security: []
+      responses:
+        '200':
+          description: Prometheus metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /.well-known/barrel:
+    get:
+      tags: [Health]
+      summary: Node discovery info
+      description: Returns node information for peer discovery
+      operationId: getNodeInfo
+      security: []
+      responses:
+        '200':
+          description: Node information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeInfo'
+
+  /db/{db}:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    get:
+      tags: [Database]
+      summary: Get database info
+      operationId: getDatabaseInfo
+      responses:
+        '200':
+          description: Database information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseInfo'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Database]
+      summary: Create database
+      operationId: createDatabase
+      responses:
+        '201':
+          description: Database created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResult'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    post:
+      tags: [Documents]
+      summary: Create document with auto-generated ID
+      operationId: createDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Document'
+      responses:
+        '201':
+          description: Document created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentResult'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Database]
+      summary: Delete database
+      operationId: deleteDatabase
+      responses:
+        '200':
+          description: Database deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResult'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /db/{db}/{docId}:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      tags: [Documents]
+      summary: Get document
+      operationId: getDocument
+      parameters:
+        - name: rev
+          in: query
+          description: Specific revision to retrieve
+          schema:
+            type: string
+        - name: revs
+          in: query
+          description: Include revision history
+          schema:
+            type: boolean
+        - name: conflicts
+          in: query
+          description: Include conflicting revisions
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Document found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Documents]
+      summary: Create or update document
+      operationId: putDocument
+      parameters:
+        - name: If-Match
+          in: header
+          description: Expected current revision (for updates)
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Document'
+      responses:
+        '201':
+          description: Document created/updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentResult'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags: [Documents]
+      summary: Delete document
+      operationId: deleteDocument
+      parameters:
+        - name: If-Match
+          in: header
+          required: true
+          description: Current revision
+          schema:
+            type: string
+        - name: rev
+          in: query
+          description: Current revision (alternative to If-Match)
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Document deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentResult'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /db/{db}/_find:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    post:
+      tags: [Queries]
+      summary: Query documents
+      description: Find documents matching query conditions
+      operationId: findDocuments
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuerySpec'
+      responses:
+        '200':
+          description: Query results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResult'
+
+  /db/{db}/_changes:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    get:
+      tags: [Changes]
+      summary: Get changes feed
+      operationId: getChanges
+      parameters:
+        - name: since
+          in: query
+          description: Start position (0, first, or HLC timestamp)
+          schema:
+            type: string
+            default: first
+        - name: limit
+          in: query
+          description: Maximum changes to return
+          schema:
+            type: integer
+        - name: include_docs
+          in: query
+          description: Include full documents
+          schema:
+            type: boolean
+            default: false
+        - name: feed
+          in: query
+          description: Feed type
+          schema:
+            type: string
+            enum: [normal, longpoll]
+        - name: timeout
+          in: query
+          description: Long-poll timeout in milliseconds
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Changes list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangesResult'
+
+  /db/{db}/_changes/stream:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    get:
+      tags: [Changes]
+      summary: Stream changes (SSE)
+      description: Server-Sent Events stream of changes
+      operationId: streamChanges
+      parameters:
+        - name: since
+          in: query
+          description: Start position
+          schema:
+            type: string
+            default: first
+        - name: filter
+          in: query
+          description: MQTT-style path filter pattern
+          schema:
+            type: string
+        - name: include_docs
+          in: query
+          description: Include full documents
+          schema:
+            type: boolean
+            default: false
+        - name: heartbeat
+          in: query
+          description: Heartbeat interval in milliseconds
+          schema:
+            type: integer
+            default: 30000
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /db/{db}/_bulk_docs:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    post:
+      tags: [Documents]
+      summary: Bulk document operations
+      operationId: bulkDocs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                docs:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/Document'
+              required: [docs]
+      responses:
+        '200':
+          description: Results for each document
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DocumentResult'
+
+  /db/{db}/{docId}/_attachments:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      tags: [Attachments]
+      summary: List attachments
+      operationId: listAttachments
+      responses:
+        '200':
+          description: Attachment list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  attachments:
+                    type: array
+                    items:
+                      type: string
+
+  /db/{db}/{docId}/_attachments/{attName}:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/DocumentId'
+      - name: attName
+        in: path
+        required: true
+        description: Attachment name
+        schema:
+          type: string
+    get:
+      tags: [Attachments]
+      summary: Get attachment
+      operationId: getAttachment
+      responses:
+        '200':
+          description: Attachment data
+          content:
+            '*/*':
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Attachments]
+      summary: Upload attachment
+      operationId: putAttachment
+      requestBody:
+        required: true
+        content:
+          '*/*':
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          description: Attachment created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResult'
+    delete:
+      tags: [Attachments]
+      summary: Delete attachment
+      operationId: deleteAttachment
+      responses:
+        '200':
+          description: Attachment deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResult'
+
+  /db/{db}/_views:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    get:
+      tags: [Views]
+      summary: List views
+      operationId: listViews
+      responses:
+        '200':
+          description: View list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  views:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ViewInfo'
+    post:
+      tags: [Views]
+      summary: Create view
+      operationId: createView
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ViewDefinition'
+      responses:
+        '201':
+          description: View created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResult'
+
+  /db/{db}/_views/{viewId}:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - name: viewId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Views]
+      summary: Get view info
+      operationId: getView
+      responses:
+        '200':
+          description: View information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ViewInfo'
+    delete:
+      tags: [Views]
+      summary: Delete view
+      operationId: deleteView
+      responses:
+        '200':
+          description: View deleted
+
+  /db/{db}/_views/{viewId}/_query:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - name: viewId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Views]
+      summary: Query view
+      operationId: queryView
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Query results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResult'
+    post:
+      tags: [Views]
+      summary: Query view with body
+      operationId: queryViewPost
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                limit:
+                  type: integer
+                offset:
+                  type: integer
+      responses:
+        '200':
+          description: Query results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResult'
+
+  /db/{db}/_views/{viewId}/_refresh:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - name: viewId
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Views]
+      summary: Refresh view
+      operationId: refreshView
+      responses:
+        '200':
+          description: View refreshed
+
+  /db/{db}/_replicate:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    post:
+      tags: [Replication]
+      summary: Trigger one-shot replication
+      operationId: replicate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplicationSpec'
+      responses:
+        '200':
+          description: Replication result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplicationResult'
+
+  /db/{db}/_local/{docId}:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      tags: [Replication]
+      summary: Get local document
+      description: Local documents are not replicated (used for checkpoints)
+      operationId: getLocalDoc
+      responses:
+        '200':
+          description: Local document
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Replication]
+      summary: Put local document
+      operationId: putLocalDoc
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Document'
+      responses:
+        '201':
+          description: Local document saved
+    delete:
+      tags: [Replication]
+      summary: Delete local document
+      operationId: deleteLocalDoc
+      responses:
+        '200':
+          description: Local document deleted
+
+  /db/{db}/_tier/config:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    get:
+      tags: [Tiered Storage]
+      summary: Get tier configuration
+      operationId: getTierConfig
+      responses:
+        '200':
+          description: Tier configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TierConfig'
+    post:
+      tags: [Tiered Storage]
+      summary: Set tier configuration
+      operationId: setTierConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TierConfig'
+      responses:
+        '200':
+          description: Configuration updated
+
+  /db/{db}/_tier/capacity:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    get:
+      tags: [Tiered Storage]
+      summary: Get tier capacity
+      operationId: getTierCapacity
+      responses:
+        '200':
+          description: Capacity information
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  storage_bytes:
+                    type: integer
+                  doc_count:
+                    type: integer
+
+  /_federation:
+    get:
+      tags: [Federation]
+      summary: List federations
+      operationId: listFederations
+      responses:
+        '200':
+          description: Federation list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  federations:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FederationInfo'
+    post:
+      tags: [Federation]
+      summary: Create federation
+      operationId: createFederation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FederationDefinition'
+      responses:
+        '201':
+          description: Federation created
+
+  /_federation/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Federation]
+      summary: Get federation info
+      operationId: getFederation
+      responses:
+        '200':
+          description: Federation information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FederationInfo'
+    delete:
+      tags: [Federation]
+      summary: Delete federation
+      operationId: deleteFederation
+      responses:
+        '200':
+          description: Federation deleted
+
+  /_federation/{name}/_find:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Federation]
+      summary: Query across federation
+      operationId: federationFind
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuerySpec'
+      responses:
+        '200':
+          description: Federated query results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResult'
+
+  /_policies:
+    get:
+      tags: [Replication]
+      summary: List replication policies
+      operationId: listPolicies
+      responses:
+        '200':
+          description: Policy list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  policies:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PolicyInfo'
+    post:
+      tags: [Replication]
+      summary: Create replication policy
+      operationId: createPolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PolicyDefinition'
+      responses:
+        '201':
+          description: Policy created
+
+  /_policies/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Replication]
+      summary: Get policy info
+      operationId: getPolicy
+      responses:
+        '200':
+          description: Policy information
+    put:
+      tags: [Replication]
+      summary: Update policy
+      operationId: updatePolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PolicyDefinition'
+      responses:
+        '200':
+          description: Policy updated
+    delete:
+      tags: [Replication]
+      summary: Delete policy
+      operationId: deletePolicy
+      responses:
+        '200':
+          description: Policy deleted
+
+  /_policies/{name}/_enable:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Replication]
+      summary: Enable policy
+      operationId: enablePolicy
+      responses:
+        '200':
+          description: Policy enabled
+
+  /_policies/{name}/_disable:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Replication]
+      summary: Disable policy
+      operationId: disablePolicy
+      responses:
+        '200':
+          description: Policy disabled
+
+  /admin/usage:
+    get:
+      tags: [Admin]
+      summary: Get usage statistics
+      operationId: getUsage
+      responses:
+        '200':
+          description: Usage statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageStats'
+
+  /admin/databases/{db}/usage:
+    parameters:
+      - $ref: '#/components/parameters/DatabaseName'
+    get:
+      tags: [Admin]
+      summary: Get database usage
+      operationId: getDatabaseUsage
+      responses:
+        '200':
+          description: Database usage statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseUsage'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: API key (ak_*) or JWT token (bdb_*)
+
+  parameters:
+    DatabaseName:
+      name: db
+      in: path
+      required: true
+      description: Database name
+      schema:
+        type: string
+    DocumentId:
+      name: docId
+      in: path
+      required: true
+      description: Document ID
+      schema:
+        type: string
+
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: Conflict (revision mismatch)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        reason:
+          type: string
+
+    OperationResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+
+    Document:
+      type: object
+      properties:
+        _id:
+          type: string
+          description: Document ID
+        _rev:
+          type: string
+          description: Revision ID
+        _deleted:
+          type: boolean
+          description: Deletion flag
+      additionalProperties: true
+
+    DocumentResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        id:
+          type: string
+        rev:
+          type: string
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        version:
+          type: string
+        uptime_seconds:
+          type: integer
+        databases:
+          type: array
+          items:
+            type: string
+        node:
+          type: string
+        memory:
+          type: object
+          properties:
+            total_bytes:
+              type: integer
+            process_bytes:
+              type: integer
+        processes:
+          type: object
+          properties:
+            count:
+              type: integer
+            limit:
+              type: integer
+
+    NodeInfo:
+      type: object
+      properties:
+        node_id:
+          type: string
+        version:
+          type: string
+        public_key:
+          type: string
+          description: Base64-encoded Ed25519 public key
+        zone:
+          type: string
+        databases:
+          type: array
+          items:
+            type: string
+
+    DatabaseInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        doc_count:
+          type: integer
+        update_seq:
+          type: string
+
+    QuerySpec:
+      type: object
+      properties:
+        where:
+          type: array
+          description: Query conditions
+          items:
+            type: object
+        select:
+          type: array
+          items:
+            type: string
+        order_by:
+          type: string
+        limit:
+          type: integer
+        offset:
+          type: integer
+        include_docs:
+          type: boolean
+          default: true
+      required: [where]
+
+    QueryResult:
+      type: object
+      properties:
+        docs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Document'
+        total:
+          type: integer
+        has_more:
+          type: boolean
+        continuation:
+          type: string
+
+    ChangesResult:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              rev:
+                type: string
+              deleted:
+                type: boolean
+              hlc:
+                type: string
+        last_seq:
+          type: string
+
+    ViewInfo:
+      type: object
+      properties:
+        id:
+          type: string
+        query:
+          $ref: '#/components/schemas/QuerySpec'
+
+    ViewDefinition:
+      type: object
+      properties:
+        id:
+          type: string
+        query:
+          $ref: '#/components/schemas/QuerySpec'
+      required: [id, query]
+
+    ReplicationSpec:
+      type: object
+      properties:
+        target:
+          type: string
+          description: Target database URL
+        filter:
+          type: object
+          properties:
+            paths:
+              type: array
+              items:
+                type: string
+            query:
+              $ref: '#/components/schemas/QuerySpec'
+        batch_size:
+          type: integer
+        checkpoint_size:
+          type: integer
+      required: [target]
+
+    ReplicationResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        docs_read:
+          type: integer
+        docs_written:
+          type: integer
+        doc_read_failures:
+          type: integer
+        doc_write_failures:
+          type: integer
+        start_seq:
+          type: string
+        last_seq:
+          type: string
+
+    TierConfig:
+      type: object
+      properties:
+        warm_db:
+          type: string
+        cold_db:
+          type: string
+        ttl:
+          type: integer
+          description: TTL in seconds before migration
+        capacity:
+          type: integer
+          description: Max bytes before migration
+
+    FederationInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        members:
+          type: array
+          items:
+            type: string
+        query:
+          $ref: '#/components/schemas/QuerySpec'
+
+    FederationDefinition:
+      type: object
+      properties:
+        name:
+          type: string
+        members:
+          type: array
+          items:
+            type: string
+        query:
+          $ref: '#/components/schemas/QuerySpec'
+      required: [name, members]
+
+    PolicyInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        source:
+          type: string
+        target:
+          type: string
+        direction:
+          type: string
+          enum: [push, pull, both]
+        status:
+          type: string
+          enum: [enabled, disabled]
+
+    PolicyDefinition:
+      type: object
+      properties:
+        name:
+          type: string
+        source:
+          type: string
+        target:
+          type: string
+        direction:
+          type: string
+          enum: [push, pull, both]
+        filter:
+          type: object
+      required: [name, source, target]
+
+    UsageStats:
+      type: object
+      properties:
+        databases:
+          type: array
+          items:
+            $ref: '#/components/schemas/DatabaseUsage'
+        total_databases:
+          type: integer
+
+    DatabaseUsage:
+      type: object
+      properties:
+        database:
+          type: string
+        document_count:
+          type: integer
+        storage_bytes:
+          type: integer
+        memtable_size:
+          type: integer
+        sst_files_size:
+          type: integer
+        last_updated:
+          type: integer
+
+security:
+  - bearerAuth: []

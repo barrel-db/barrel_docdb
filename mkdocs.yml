@@ -53,8 +53,10 @@ nav:
   - VDB (Virtual Database):
     - Overview: vdb.md
     - Multi-Datacenter Sharding: sharding.md
-  - HTTP API: api/http.md
-  - Erlang API: api/erlang.md
+  - API Reference:
+    - HTTP API: api/http.md
+    - OpenAPI: api/openapi.md
+    - Erlang API: api/erlang.md
   - Architecture: design.md
   - Benchmarks: benchmarks.md
   - Development:
