@@ -33,6 +33,7 @@
     execute/3,
     execute/4,
     match/2,
+    matches/2,
     explain/1,
     extract_paths/1
 ]).
@@ -1121,6 +1122,15 @@ can_lazy_check_condition(_) ->
 match(#query_plan{conditions = Conditions, bindings = Bindings}, Doc)
   when is_map(Doc) ->
     case matches_conditions(Doc, Conditions, Bindings) of
+        {true, _BoundVars} -> true;
+        false -> false
+    end.
+
+%% @doc Check if a document matches raw conditions (without compilation).
+%% Convenience function for simple filtering without query planning.
+-spec matches(map(), [condition()]) -> boolean().
+matches(Doc, Conditions) when is_map(Doc), is_list(Conditions) ->
+    case matches_conditions(Doc, Conditions, #{}) of
         {true, _BoundVars} -> true;
         false -> false
     end.

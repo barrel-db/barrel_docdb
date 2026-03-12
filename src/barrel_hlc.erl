@@ -126,12 +126,12 @@ maybe_sync_from_header(HlcBase64) ->
 %% @doc Generate a new timestamp for a local event using global clock.
 -spec now() -> timestamp().
 now() ->
-    hlc:now(?GLOBAL_CLOCK).
+    hlc:now(get_clock()).
 
 %% @doc Update the global clock with a remote timestamp.
 -spec update(timestamp()) -> {ok, timestamp()} | {error, clock_skew}.
 update(RemoteTS) ->
-    case hlc:update(?GLOBAL_CLOCK, RemoteTS) of
+    case hlc:update(get_clock(), RemoteTS) of
         {ok, NewTS} ->
             {ok, NewTS};
         {timeahead, _} ->
@@ -141,7 +141,15 @@ update(RemoteTS) ->
 %% @doc Get the current global timestamp without advancing the clock.
 -spec timestamp() -> timestamp().
 timestamp() ->
-    hlc:timestamp(?GLOBAL_CLOCK).
+    hlc:timestamp(get_clock()).
+
+%% @private Get the global clock pid
+-spec get_clock() -> pid().
+get_clock() ->
+    case whereis(?GLOBAL_CLOCK) of
+        undefined -> error({not_started, ?GLOBAL_CLOCK});
+        Pid -> Pid
+    end.
 
 %%====================================================================
 %% Instance-based Clock Management

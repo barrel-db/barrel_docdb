@@ -67,7 +67,9 @@
     resolve_member/1,
     resolve_peers_with_db/1,
     %% Peer authentication
-    get_peer_public_key/1
+    get_peer_public_key/1,
+    %% JSON encoding
+    encode_peer_for_json/1
 ]).
 
 %% gen_server callbacks

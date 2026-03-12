@@ -458,7 +458,7 @@ get_changes_filtered(StoreRef, DbName, Since, Opts) ->
         undefined ->
             undefined;
         Patterns when is_list(Patterns) ->
-            Trie = match_trie:new(public),
+            Trie = match_trie:new(protected),
             lists:foreach(fun(P) -> match_trie:insert(Trie, P) end, Patterns),
             Trie
     end,

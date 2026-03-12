@@ -186,7 +186,7 @@ do_subscribe(DbName, QueryPlan, Pid, State) ->
     %% Get or create trie for this database and insert patterns
     Trie = case maps:get(DbName, Tries, undefined) of
         undefined ->
-            match_trie:new(public);
+            match_trie:new(protected);
         T ->
             T
     end,
