@@ -1,8 +1,11 @@
 name: Docker
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
+  push:
     tags: ['v*']
 
 env:
@@ -12,12 +15,15 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'push' || github.event.workflow_run.conclusion == 'success' }}
     permissions:
       contents: read
       packages: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
