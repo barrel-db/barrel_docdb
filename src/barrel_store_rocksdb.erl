@@ -510,7 +510,7 @@ build_db_options(Options) ->
     case maps:get(rate_limit_bytes_per_sec, Options, 0) of
         0 -> BaseOpts;
         RateLimit ->
-            case rocksdb:new_rate_limiter(RateLimit) of
+            case rocksdb:new_rate_limiter(RateLimit, false) of
                 {ok, Limiter} -> [{rate_limiter, Limiter} | BaseOpts];
                 _ -> BaseOpts
             end
