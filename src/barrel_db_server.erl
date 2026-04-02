@@ -24,6 +24,7 @@
     get_docs/3,
     delete_doc/3,
     fold_docs/3,
+    fold_docs/4,
     resolve_conflict/4,
     get_conflicts/2
 ]).
@@ -136,6 +137,11 @@ delete_doc(Pid, DocId, Opts) ->
 -spec fold_docs(pid(), fun(), term()) -> {ok, term()}.
 fold_docs(Pid, Fun, Acc) ->
     gen_server:call(Pid, {fold_docs, Fun, Acc}, infinity).
+
+%% @doc Fold over all documents with options
+-spec fold_docs(pid(), fun(), term(), map()) -> {ok, term()}.
+fold_docs(Pid, Fun, Acc, Opts) when is_map(Opts) ->
+    gen_server:call(Pid, {fold_docs, Fun, Acc, Opts}, infinity).
 
 %% @doc Get conflicts for a document
 %% Returns list of conflicting revision IDs (excluding the winner)
@@ -347,7 +353,12 @@ handle_call({delete_doc, DocId, Opts}, _From,
 
 handle_call({fold_docs, Fun, Acc}, _From,
             #state{name = DbName, store_ref = StoreRef} = State) ->
-    Result = do_fold_docs(StoreRef, DbName, Fun, Acc),
+    Result = do_fold_docs(StoreRef, DbName, Fun, Acc, #{}),
+    {reply, Result, State};
+
+handle_call({fold_docs, Fun, Acc, Opts}, _From,
+            #state{name = DbName, store_ref = StoreRef} = State) ->
+    Result = do_fold_docs(StoreRef, DbName, Fun, Acc, Opts),
     {reply, Result, State};
 
 %% Conflict operations
@@ -1141,11 +1152,14 @@ do_delete_doc(StoreRef, DbName, DocId, Opts) ->
     end.
 
 %% @doc Fold over all documents (using wide column entity)
+%% Options:
+%%   - include_deleted: boolean() - include deleted documents (default: false)
 %% Note: Uses regular key iteration since wide columns are stored per-key
-do_fold_docs(StoreRef, DbName, Fun, Acc) ->
+do_fold_docs(StoreRef, DbName, Fun, Acc, Opts) ->
     StartKey = barrel_store_keys:doc_entity_prefix(DbName),
     EndKey = barrel_store_keys:doc_entity_end(DbName),
     PrefixLen = byte_size(StartKey),
+    IncludeDeleted = maps:get(include_deleted, Opts, false),
 
     FoldFun = fun(Key, _Value, AccIn) ->
         %% Extract DocId from key (after prefix)
@@ -1155,11 +1169,11 @@ do_fold_docs(StoreRef, DbName, Fun, Acc) ->
             {ok, Columns} ->
                 Rev = proplists:get_value(?COL_REV, Columns),
                 Deleted = bin_to_deleted(proplists:get_value(?COL_DELETED, Columns, <<"false">>)),
-                case Deleted of
-                    true ->
+                case {Deleted, IncludeDeleted} of
+                    {true, false} ->
                         %% Skip deleted documents
                         {ok, AccIn};
-                    false ->
+                    _ ->
                         %% Get document body from body CF (current body, no rev in key)
                         BodyKey = barrel_store_keys:doc_body(DbName, DocId),
                         DocBody = case barrel_store_rocksdb:body_get(StoreRef, BodyKey) of
