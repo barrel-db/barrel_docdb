@@ -10,7 +10,6 @@
         rocksdb,
         hlc,
         match_trie,
-        bitmap,
         cowboy,
         hackney,
         prometheus
