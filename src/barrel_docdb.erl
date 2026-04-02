@@ -80,6 +80,7 @@
     delete_doc/2,
     delete_doc/3,
     fold_docs/3,
+    fold_docs/4,
     get_conflicts/2,
     resolve_conflict/4
 ]).
@@ -675,6 +676,25 @@ delete_doc(Db, DocId, Opts) ->
 fold_docs(Db, Fun, Acc) ->
     with_db(Db, fun(Pid) ->
         barrel_db_server:fold_docs(Pid, Fun, Acc)
+    end).
+
+%% @doc Fold over all documents with options.
+%%
+%% Same as fold_docs/3 but accepts an options map.
+%%
+%% == Options ==
+%% - `include_deleted': boolean() - include deleted documents (default: false)
+%%
+%% @param Db Database name or pid
+%% @param Fun Callback function `fun((Doc, Acc) -> {ok, Acc} | {stop, Acc} | stop)'
+%% @param Acc Initial accumulator value
+%% @param Opts Options map
+%% @returns `{ok, FinalAcc}'
+-spec fold_docs(binary() | pid(), fun((map(), term()) -> {ok, term()} | {stop, term()} | stop), term(), map()) ->
+    {ok, term()}.
+fold_docs(Db, Fun, Acc, Opts) when is_map(Opts) ->
+    with_db(Db, fun(Pid) ->
+        barrel_db_server:fold_docs(Pid, Fun, Acc, Opts)
     end).
 
 %% @doc Get list of conflicting revisions for a document.
