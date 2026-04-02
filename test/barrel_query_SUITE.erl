@@ -31,7 +31,8 @@
     compile_regex_prefix/1,
     compile_invalid_spec/1,
     compile_invalid_condition/1,
-    compile_invalid_operator/1
+    compile_invalid_operator/1,
+    matches_function/1
 ]).
 
 %% Test cases - validation
@@ -100,7 +101,8 @@ groups() ->
             compile_regex_prefix,
             compile_invalid_spec,
             compile_invalid_condition,
-            compile_invalid_operator
+            compile_invalid_operator,
+            matches_function
         ]},
         {validation, [sequence], [
             validate_valid_spec,
@@ -311,6 +313,29 @@ compile_invalid_operator(_Config) ->
         where => [{compare, [<<"age">>], 'invalid_op', 18}]
     },
     {error, {invalid_operator, invalid_op}} = barrel_query:compile(Spec),
+    ok.
+
+matches_function(_Config) ->
+    %% Test matches/2 function - simple condition matching without compiled plan
+    Doc = #{<<"type">> => <<"user">>, <<"age">> => 30, <<"name">> => <<"Alice">>},
+
+    %% Test equality condition
+    ?assert(barrel_query:matches(Doc, [{path, [<<"type">>], <<"user">>}])),
+    ?assertNot(barrel_query:matches(Doc, [{path, [<<"type">>], <<"admin">>}])),
+
+    %% Test comparison condition
+    ?assert(barrel_query:matches(Doc, [{compare, [<<"age">>], '>', 18}])),
+    ?assertNot(barrel_query:matches(Doc, [{compare, [<<"age">>], '>', 40}])),
+
+    %% Test multiple conditions (AND)
+    ?assert(barrel_query:matches(Doc, [
+        {path, [<<"type">>], <<"user">>},
+        {compare, [<<"age">>], '>=', 30}
+    ])),
+
+    %% Test empty conditions (always matches)
+    ?assert(barrel_query:matches(Doc, [])),
+
     ok.
 
 %%====================================================================
