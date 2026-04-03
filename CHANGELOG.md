@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-04-04
+
+### Added
+- **Views with Map/Reduce**: Secondary indexes with map/reduce support
+  - Module-based views with `map/1` and optional `reduce/3` callbacks
+  - Query-based views with declarative key/value extraction
+  - Built-in reduce functions: `_count`, `_sum`, `_stats`
+  - Rereduce support for merging results from sharded queries via `merge_reduced_results/2`
+  - Manual and automatic refresh modes
+- **OpenAPI 3.0 Specification**: Full API documentation with Swagger UI at `/api-docs`
+- `barrel_docdb:fold_docs/4` with options support (limit, skip, start_key, end_key)
+- `barrel_query:matches/2` for simple condition matching outside of queries
+
+### Changed
+- Migrated from legacy `{Epoch, Counter}` sequence format to HLC timestamps throughout
+- Removed `barrel_sequence` module (functionality consolidated in `barrel_hlc`)
+- Upgraded hlc to 3.0.3 and match_trie to 1.0.0
+- Removed unused bitmap dependency
+
+### Fixed
+- Multiple dialyzer warnings across modules
+- Dead code removal in fold_range functions
+- Unmatched return values in shard rebalancing
+
 ## [0.4.1] - 2026-03-08
 
 ### Fixed
