@@ -83,8 +83,7 @@ teardown_replication(VdbName) when is_binary(VdbName) ->
                 PolicyName = shard_policy_name(VdbName, ShardId),
                 case barrel_rep_policy:get(PolicyName) of
                     {ok, _} ->
-                        barrel_rep_policy:disable(PolicyName),
-                        barrel_rep_policy:delete(PolicyName);
+                        disable_and_delete_policy(PolicyName);
                     {error, not_found} ->
                         ok
                 end
@@ -242,15 +241,7 @@ setup_single_shard_replication(VdbName, ShardId, Placement, Auth) ->
             end,
 
             %% Create or update policy
-            case barrel_rep_policy:get(PolicyName) of
-                {ok, _} ->
-                    %% Policy exists - delete and recreate
-                    barrel_rep_policy:disable(PolicyName),
-                    barrel_rep_policy:delete(PolicyName),
-                    create_and_enable_policy(PolicyName, PolicyConfig2);
-                {error, not_found} ->
-                    create_and_enable_policy(PolicyName, PolicyConfig2)
-            end,
+            _ = create_or_update_policy(PolicyName, PolicyConfig2),
 
             %% Update shard assignment
             #{primary := Primary} = PlacementResult,
@@ -260,9 +251,14 @@ setup_single_shard_replication(VdbName, ShardId, Placement, Auth) ->
                 replicas => Replicas,
                 status => active
             },
-            barrel_shard_map:set_assignment(VdbName, ShardId, Assignment),
+            _ = barrel_shard_map:set_assignment(VdbName, ShardId, Assignment),
             ok
     end.
+
+%% @private Disable and delete a privacy policy
+disable_and_delete_policy(PolicyName) ->
+    _ = barrel_rep_policy:disable(PolicyName),
+    barrel_rep_policy:delete(PolicyName). 
 
 %% @private Create and enable a replication policy
 create_and_enable_policy(PolicyName, PolicyConfig) ->
@@ -272,6 +268,17 @@ create_and_enable_policy(PolicyName, PolicyConfig) ->
         {error, _} = Err ->
             Err
     end.
+
+%% @private Create or update policy
+create_or_update_policy(PolicyName, PolicyConfig) ->
+  case barrel_rep_policy:get(PolicyName) of
+    {ok, _} ->
+      %% Policy exists - delete and recreate
+      _ = disable_and_delete_policy(PolicyName),
+      create_and_enable_policy(PolicyName, PolicyConfig);
+    {error, not_found} ->
+      create_and_enable_policy(PolicyName, PolicyConfig)
+  end.
 
 %% @private Get replication status for a single shard
 get_shard_replication_status(VdbName, ShardId) ->

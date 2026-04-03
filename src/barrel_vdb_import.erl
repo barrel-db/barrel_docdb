@@ -169,15 +169,11 @@ do_import(SourceDb, TargetVdb, Opts) ->
         end
     end,
 
-    case barrel_docdb:fold_docs(SourceDb, FoldFun, Stats0, #{batch_size => BatchSize}) of
-        {ok, FinalStats} ->
-            {ok, FinalStats#{
-                finished_at => erlang:system_time(millisecond),
-                status => completed
-            }};
-        {error, Reason} ->
-            {error, Reason}
-    end.
+    {ok, FinalStats} = barrel_docdb:fold_docs(SourceDb, FoldFun, Stats0, #{batch_size => BatchSize}),
+    {ok, FinalStats#{
+          finished_at => erlang:system_time(millisecond),
+          status => completed
+        }}.
 
 %% @private Check if document matches filter
 should_include(_Doc, undefined) ->
@@ -196,17 +192,8 @@ prepare_doc_for_import(Doc, _OnConflict) ->
 %% @private Worker for async import
 import_worker(TaskId, SourceDb, TargetVdb, Opts) ->
     try
-        Result = do_import(SourceDb, TargetVdb, Opts),
-        case Result of
-            {ok, Stats} ->
-                store_task_result(TaskId, Stats);
-            {error, Reason} ->
-                store_task_result(TaskId, #{
-                    status => failed,
-                    error => Reason,
-                    finished_at => erlang:system_time(millisecond)
-                })
-        end
+        {ok, Stats} = do_import(SourceDb, TargetVdb, Opts),
+        store_task_result(TaskId, Stats)
     catch
         exit:cancelled ->
             store_task_result(TaskId, #{

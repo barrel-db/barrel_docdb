@@ -116,12 +116,9 @@ update_doc_entries(StoreRef, DbName, ViewId, DocId, NewEntries) ->
             [{put, ByDocIdKey, term_to_binary(NewKeys)}]
     end,
 
-    %% Execute batch
+    %% Execute batch - AllOps always contains at least DeleteByDocIdOp
     AllOps = DeleteOps ++ [DeleteByDocIdOp] ++ InsertOps ++ ByDocIdOp,
-    case AllOps of
-        [] -> ok;
-        _ -> barrel_store_rocksdb:write_batch(StoreRef, AllOps)
-    end.
+    barrel_store_rocksdb:write_batch(StoreRef, AllOps).
 
 %% @doc Delete all view entries for a document
 -spec delete_doc_entries(barrel_store_rocksdb:db_ref(), db_name(), binary(), docid()) -> ok.

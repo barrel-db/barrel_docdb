@@ -164,11 +164,10 @@ handle_info(sync_tick, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
+terminate(_Reason, #state{sync_timer = undefined}) ->
+    ok;
 terminate(_Reason, #state{sync_timer = TimerRef}) ->
-    case TimerRef of
-        undefined -> ok;
-        _ -> erlang:cancel_timer(TimerRef)
-    end,
+    _ = erlang:cancel_timer(TimerRef),
     ok.
 
 %%====================================================================
@@ -220,8 +219,8 @@ update_meta_replication() ->
             case barrel_rep_policy:get(PolicyName) of
                 {ok, _} ->
                     %% Policy exists - update if members changed
-                    barrel_rep_policy:disable(PolicyName),
-                    barrel_rep_policy:delete(PolicyName),
+                    _ = barrel_rep_policy:disable(PolicyName),
+                    _ = barrel_rep_policy:delete(PolicyName),
                     create_meta_policy(PolicyName, PolicyConfig);
                 {error, not_found} ->
                     create_meta_policy(PolicyName, PolicyConfig)
@@ -231,7 +230,7 @@ update_meta_replication() ->
 create_meta_policy(PolicyName, PolicyConfig) ->
     case barrel_rep_policy:create(PolicyName, PolicyConfig) of
         ok ->
-            barrel_rep_policy:enable(PolicyName),
+            _ = barrel_rep_policy:enable(PolicyName),
             logger:info("VDB meta replication policy enabled with ~p members",
                        [length(maps:get(members, PolicyConfig))]);
         {error, Reason} ->
@@ -451,9 +450,7 @@ import_config_from_meta(VdbName, MetaConfig) ->
 
             barrel_shard_map:get_config(VdbName);
         {error, already_exists} ->
-            barrel_shard_map:get_config(VdbName);
-        {error, _} = Err ->
-            Err
+            barrel_shard_map:get_config(VdbName)
     end.
 
 %% @private Import config from HTTP response format

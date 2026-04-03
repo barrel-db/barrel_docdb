@@ -152,15 +152,15 @@ delete(LogicalDb) when is_binary(LogicalDb) ->
         true ->
             %% Delete config
             ConfigDocId = config_doc_id(LogicalDb),
-            barrel_docdb:delete_system_doc(ConfigDocId),
+            _ = barrel_docdb:delete_system_doc(ConfigDocId),
 
             %% Delete ranges
             RangesDocId = ranges_doc_id(LogicalDb),
-            barrel_docdb:delete_system_doc(RangesDocId),
+            _ = barrel_docdb:delete_system_doc(RangesDocId),
 
             %% Delete assignments
             AssignDocId = assignments_doc_id(LogicalDb),
-            barrel_docdb:delete_system_doc(AssignDocId),
+            _ = barrel_docdb:delete_system_doc(AssignDocId),
 
             ok
     end.

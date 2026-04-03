@@ -144,23 +144,19 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% @private Load existing VDBs from shard map at startup
 load_existing_vdbs() ->
-    case barrel_shard_map:list() of
-        {ok, VdbNames} ->
-            lists:foreach(
-                fun(VdbName) ->
-                    case barrel_shard_map:get_config(VdbName) of
-                        {ok, Config} ->
-                            Info = #{
-                                config => Config,
-                                registered_at => erlang:system_time(millisecond)
-                            },
-                            ets:insert(?TABLE, {VdbName, Info});
-                        {error, _} ->
-                            ok
-                    end
-                end,
-                VdbNames
-            );
-        {error, _} ->
-            ok
-    end.
+    {ok, VdbNames} = barrel_shard_map:list(),
+    lists:foreach(
+      fun(VdbName) ->
+          case barrel_shard_map:get_config(VdbName) of
+            {ok, Config} ->
+              Info = #{
+                       config => Config,
+                       registered_at => erlang:system_time(millisecond)
+                      },
+              ets:insert(?TABLE, {VdbName, Info});
+            {error, _} ->
+              ok
+          end
+      end,
+      VdbNames
+     ).

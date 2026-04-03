@@ -30,8 +30,9 @@
     value => view_value_spec()
 }.
 -type refresh_mode() :: on_change | manual.
+-type reduce_fun() :: {builtin, atom()} | {module, module()} | undefined.
 
--export_type([view_query_spec/0, refresh_mode/0]).
+-export_type([view_query_spec/0, refresh_mode/0, reduce_fun/0]).
 
 %% API - View management
 -export([
@@ -44,7 +45,8 @@
 -export([
     query/3,
     refresh/2,
-    refresh/3
+    refresh/3,
+    merge_reduced_results/2
 ]).
 
 %% API - Subscriptions
@@ -153,24 +155,20 @@ subscribe(DbServer, ViewId) ->
     end.
 
 %% @doc Unsubscribe from view change notifications
--spec unsubscribe(pid(), reference()) -> ok | {error, term()}.
+-spec unsubscribe(pid(), reference()) -> ok.
 unsubscribe(DbServer, SubRef) ->
     %% We need to find the view that has this subscription
     %% For simplicity, broadcast to all views managed by this db server
-    case barrel_db_server:list_views(DbServer) of
-        {ok, Views} ->
-            lists:foreach(fun(#{id := ViewId}) ->
-                case barrel_db_server:get_view_pid(DbServer, ViewId) of
-                    {ok, Pid} ->
-                        gen_statem:cast(Pid, {unsubscribe, SubRef});
-                    _ ->
-                        ok
+    {ok, Views} =  barrel_db_server:list_views(DbServer),
+    lists:foreach(fun(#{id := ViewId}) ->
+            case barrel_db_server:get_view_pid(DbServer, ViewId) of
+                {ok, Pid} ->
+                    gen_statem:cast(Pid, {unsubscribe, SubRef});
+                _ ->
+                    ok
                 end
             end, Views),
-            ok;
-        _ ->
-            ok
-    end.
+    ok.
 
 %%====================================================================
 %% API - Process management
@@ -511,6 +509,7 @@ handle_pipeline_exit(Reason, #{waiters := Waiters, pipeline := Pipeline} = State
 %% Pipeline: Reader Process
 %%====================================================================
 
+-spec reader_loop(map()) -> no_return().
 reader_loop(#{store_ref := StoreRef, db_name := DbName, snapshot := Snapshot,
               since := Since, mapper := Mapper}) ->
     %% Fold changes using snapshot
@@ -881,6 +880,33 @@ apply_reduce(Entries, ReduceFun, true, GroupLevel) ->
         end,
         Grouped
     ).
+
+%% @doc Merge reduced results from multiple shards using rereduce
+%% This function is used for scatter-gather queries across sharded databases.
+%% Results should be grouped by key before merging.
+-spec merge_reduced_results(reduce_fun(), [[map()]]) -> [map()].
+merge_reduced_results(ReduceFun, ShardResults) when ReduceFun =/= undefined ->
+    %% Flatten and group by key
+    AllResults = lists:flatten(ShardResults),
+    Grouped = lists:foldl(
+        fun(#{key := Key, value := Value}, Acc) ->
+            maps:update_with(Key, fun(Vs) -> [Value | Vs] end, [Value], Acc)
+        end,
+        #{},
+        AllResults
+    ),
+    %% Rereduce each group
+    maps:fold(
+        fun(Key, Values, Acc) ->
+            MergedValue = call_reduce(ReduceFun, null, Values, true),
+            [#{key => Key, value => MergedValue} | Acc]
+        end,
+        [],
+        Grouped
+    );
+merge_reduced_results(undefined, ShardResults) ->
+    %% No reduce function - just flatten
+    lists:flatten(ShardResults).
 
 group_entries(Entries, GroupLevel) ->
     %% Group entries by key (or key prefix)

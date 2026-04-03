@@ -87,7 +87,7 @@ create(VdbName, Opts) when is_binary(VdbName), is_map(Opts) ->
                     ok;
                 {error, _} = Err ->
                     %% Rollback shard map on failure
-                    barrel_shard_map:delete(VdbName),
+                    _ = barrel_shard_map:delete(VdbName),
                     Err
             end;
         {error, _} = Err ->
@@ -103,7 +103,7 @@ delete(VdbName) when is_binary(VdbName) ->
             {error, not_found};
         true ->
             %% Teardown replication first
-            barrel_vdb_replication:teardown_replication(VdbName),
+            _ = barrel_vdb_replication:teardown_replication(VdbName),
             %% Delete all physical shard databases
             {ok, ShardDbs} = barrel_shard_map:all_physical_dbs(VdbName),
             lists:foreach(fun(DbName) ->
@@ -153,11 +153,8 @@ info_internal(VdbName) ->
                 case barrel_docdb:db_info(DbName) of
                     {ok, DbInfo} ->
                         %% Get actual doc count via fold_docs (excludes deleted docs)
-                        DocCount = case barrel_docdb:fold_docs(DbName,
-                                fun(_Doc, Acc) -> {ok, Acc + 1} end, 0) of
-                            {ok, Count} -> Count;
-                            {error, _} -> 0
-                        end,
+                        {ok, DocCount} = barrel_docdb:fold_docs(DbName,
+                                fun(_Doc, Acc) -> {ok, Acc + 1} end, 0),
                         #{
                             db => DbName,
                             doc_count => DocCount,
@@ -329,12 +326,8 @@ get_changes(VdbName, Since, Opts) when is_binary(VdbName) ->
             ShardOpts = maps:remove(limit, Opts),
             AllChanges = barrel_parallel:pmap(
                 fun(ShardDb) ->
-                    case barrel_docdb:get_changes(ShardDb, Since, ShardOpts) of
-                        {ok, Changes, LastSeq} ->
-                            #{changes => Changes, last_seq => LastSeq};
-                        {error, _} ->
-                            #{changes => [], last_seq => 0}
-                    end
+                    {ok, Changes, LastSeq} = barrel_docdb:get_changes(ShardDb, Since, ShardOpts),
+                    #{changes => Changes, last_seq => LastSeq}
                 end,
                 ShardDbs
             ),
@@ -353,10 +346,8 @@ fold_docs(VdbName, Fun, Acc0, _Opts) when is_binary(VdbName), is_function(Fun, 2
             %% Fold over each shard sequentially
             FinalAcc = lists:foldl(
                 fun(ShardDb, Acc) ->
-                    case barrel_docdb:fold_docs(ShardDb, Fun, Acc) of
-                        {ok, NewAcc} -> NewAcc;
-                        {error, _} -> Acc
-                    end
+                    {ok, NewAcc} = barrel_docdb:fold_docs(ShardDb, Fun, Acc),
+                    NewAcc
                 end,
                 Acc0,
                 ShardDbs
@@ -422,9 +413,7 @@ route_to_shard(VdbName, DocId) ->
                     end;
                 {error, _} = Err ->
                     Err
-            end;
-        {error, _} = Err ->
-            Err
+            end
     end.
 
 %% @private Group documents by their target shard
