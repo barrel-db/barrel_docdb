@@ -257,13 +257,8 @@ fold_range(#{ref := Ref}, StartKey, EndKey, Fun, Acc) ->
 %% Currently all profiles use defaults; infrastructure for future tuning.
 -spec fold_range(db_ref(), binary(), binary(), fun(), term(), read_profile()) -> term().
 fold_range(DbRef, StartKey, EndKey, Fun, Acc, Profile) ->
-    case read_profile_opts(Profile) of
-        [] ->
-            %% Fast path: no extra options, use 5-arity directly
-            fold_range(DbRef, StartKey, EndKey, Fun, Acc);
-        ExtraOpts ->
-            fold_range_with_opts(DbRef, StartKey, EndKey, Fun, Acc, ExtraOpts)
-    end.
+    ExtraOpts = read_profile_opts(Profile),
+    fold_range_with_opts(DbRef, StartKey, EndKey, Fun, Acc, ExtraOpts).
 
 %% @doc Fold over a key range in reverse order with default options
 %% Useful for building sorted lists with prepend: [Item | Acc]
@@ -284,13 +279,8 @@ fold_range_reverse(#{ref := Ref}, StartKey, EndKey, Fun, Acc) ->
 %% @doc Fold over a key range in reverse order with explicit read profile
 -spec fold_range_reverse(db_ref(), binary(), binary(), fun(), term(), read_profile()) -> term().
 fold_range_reverse(DbRef, StartKey, EndKey, Fun, Acc, Profile) ->
-    case read_profile_opts(Profile) of
-        [] ->
-            %% Fast path: no extra options, use 5-arity directly
-            fold_range_reverse(DbRef, StartKey, EndKey, Fun, Acc);
-        ExtraOpts ->
-            fold_range_reverse_with_opts(DbRef, StartKey, EndKey, Fun, Acc, ExtraOpts)
-    end.
+    ExtraOpts = read_profile_opts(Profile),
+    fold_range_reverse_with_opts(DbRef, StartKey, EndKey, Fun, Acc, ExtraOpts).
 
 %% @doc Fold over a key range with explicit extra options (internal)
 -spec fold_range_with_opts(db_ref(), binary(), binary(), fun(), term(), list()) -> term().
