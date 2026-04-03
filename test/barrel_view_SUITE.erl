@@ -36,6 +36,11 @@
     reduce_group/1,
     reduce_group_level/1,
 
+    %% Rereduce (merge shard results)
+    rereduce_count/1,
+    rereduce_sum/1,
+    rereduce_stats/1,
+
     %% Query-based views
     query_view_register/1,
     query_view_index/1,
@@ -69,7 +74,7 @@ reduce(_Keys, Values, _Rereduce) ->
 %%====================================================================
 
 all() ->
-    [{group, registration}, {group, indexing}, {group, query}, {group, reduce}, {group, query_views}].
+    [{group, registration}, {group, indexing}, {group, query}, {group, reduce}, {group, rereduce}, {group, query_views}].
 
 groups() ->
     [
@@ -93,6 +98,11 @@ groups() ->
             reduce_sum,
             reduce_group,
             reduce_group_level
+        ]},
+        {rereduce, [sequence], [
+            rereduce_count,
+            rereduce_sum,
+            rereduce_stats
         ]},
         {query_views, [sequence], [
             query_view_register,
@@ -473,6 +483,79 @@ reduce_group_level(Config) ->
     }),
     ?assertEqual(2, length(Results)),
 
+    ok.
+
+%%====================================================================
+%% Rereduce Tests (merge results from multiple shards)
+%%====================================================================
+
+rereduce_count(_Config) ->
+    %% Test merging _count results from multiple shards
+    ReduceFun = {builtin, '_count'},
+
+    %% Simulate results from 3 shards
+    Shard1Results = [#{key => <<"users">>, value => 10}],
+    Shard2Results = [#{key => <<"users">>, value => 15}, #{key => <<"posts">>, value => 5}],
+    Shard3Results = [#{key => <<"users">>, value => 7}, #{key => <<"posts">>, value => 8}],
+
+    Merged = barrel_view:merge_reduced_results(ReduceFun, [Shard1Results, Shard2Results, Shard3Results]),
+
+    %% Sort results by key for consistent comparison
+    Sorted = lists:sort(fun(A, B) -> maps:get(key, A) =< maps:get(key, B) end, Merged),
+
+    ?assertEqual(2, length(Sorted)),
+    [Posts, Users] = Sorted,
+    ?assertEqual(#{key => <<"posts">>, value => 13}, Posts),
+    ?assertEqual(#{key => <<"users">>, value => 32}, Users),
+    ok.
+
+rereduce_sum(_Config) ->
+    %% Test merging _sum results from multiple shards
+    ReduceFun = {builtin, '_sum'},
+
+    %% Simulate sum results from shards
+    Shard1Results = [#{key => null, value => 100}],
+    Shard2Results = [#{key => null, value => 250}],
+    Shard3Results = [#{key => null, value => 75}],
+
+    Merged = barrel_view:merge_reduced_results(ReduceFun, [Shard1Results, Shard2Results, Shard3Results]),
+
+    ?assertEqual(1, length(Merged)),
+    [Result] = Merged,
+    ?assertEqual(#{key => null, value => 425}, Result),
+    ok.
+
+rereduce_stats(_Config) ->
+    %% Test merging _stats results from multiple shards
+    ReduceFun = {builtin, '_stats'},
+
+    %% Simulate stats results from 2 shards
+    Shard1Results = [#{key => <<"orders">>, value => #{
+        sum => 100,
+        count => 5,
+        min => 10,
+        max => 30,
+        sumsqr => 2500
+    }}],
+    Shard2Results = [#{key => <<"orders">>, value => #{
+        sum => 200,
+        count => 10,
+        min => 5,
+        max => 50,
+        sumsqr => 6000
+    }}],
+
+    Merged = barrel_view:merge_reduced_results(ReduceFun, [Shard1Results, Shard2Results]),
+
+    ?assertEqual(1, length(Merged)),
+    [Result] = Merged,
+    ?assertEqual(<<"orders">>, maps:get(key, Result)),
+    Value = maps:get(value, Result),
+    ?assertEqual(300, maps:get(sum, Value)),   %% 100 + 200
+    ?assertEqual(15, maps:get(count, Value)),  %% 5 + 10
+    ?assertEqual(5, maps:get(min, Value)),     %% min(10, 5)
+    ?assertEqual(50, maps:get(max, Value)),    %% max(30, 50)
+    ?assertEqual(8500, maps:get(sumsqr, Value)), %% 2500 + 6000
     ok.
 
 %%====================================================================

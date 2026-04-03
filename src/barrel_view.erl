@@ -932,8 +932,11 @@ get_group_key(Key, Level) when is_list(Key) ->
 get_group_key(Key, _Level) ->
     Key.
 
-call_reduce({builtin, '_count'}, _Keys, Values, _Rereduce) ->
+call_reduce({builtin, '_count'}, _Keys, Values, false) ->
     length(Values);
+call_reduce({builtin, '_count'}, _Keys, Values, true) ->
+    %% Rereduce: sum the existing counts
+    lists:sum(Values);
 call_reduce({builtin, '_sum'}, _Keys, Values, _Rereduce) ->
     lists:sum(Values);
 call_reduce({builtin, '_stats'}, _Keys, Values, false) ->
