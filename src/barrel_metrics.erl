@@ -309,7 +309,7 @@ observe_federation_latency(Federation, DurationMs) ->
 %%====================================================================
 
 %% @doc Export all metrics in Prometheus text format
--spec export() -> iolist().
+-spec export() -> binary().
 export() ->
     prometheus_text_format:format().
 

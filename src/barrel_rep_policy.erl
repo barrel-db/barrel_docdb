@@ -673,8 +673,6 @@ load_policies() ->
                 PolicyList
             );
         {error, not_found} ->
-            #{};
-        {error, _Reason} ->
             #{}
     end.
 

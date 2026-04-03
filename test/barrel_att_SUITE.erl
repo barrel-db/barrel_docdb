@@ -477,7 +477,7 @@ chunked_get_info(Config) ->
     ?assert(maps:get(chunk_count, LargeInfo) > 1),
 
     %% Get info for non-existent
-    not_found = barrel_att_store:get_info(AttRef, DbName, DocId, <<"nope">>),
+    {error, not_found} = barrel_att_store:get_info(AttRef, DbName, DocId, <<"nope">>),
 
     ok = barrel_att_store:close(AttRef),
     ok.

@@ -98,11 +98,41 @@ fold_changes_long_scan(StoreRef, DbName, Since, Fun, Acc) ->
 %% @doc Fold over changes with compact tuple format for efficiency.
 %% Callback receives {DocId, Hlc, Rev, Deleted, NumConflicts} tuples.
 %% Use for internal iteration; convert to maps at API boundary.
+%% Always uses long_scan mode for optimal sequential read performance.
 -spec fold_changes_compact(barrel_store_rocksdb:db_ref(), db_name(),
                            barrel_hlc:timestamp() | first, compact_fold_fun(), term()) ->
     {ok, term(), barrel_hlc:timestamp()}.
 fold_changes_compact(StoreRef, DbName, Since, Fun, Acc) ->
-    fold_changes_compact_internal(StoreRef, DbName, Since, Fun, Acc, long_scan).
+    {StartHlc, StartKey} = case Since of
+        first ->
+            Min = barrel_hlc:min(),
+            {Min, barrel_store_keys:doc_hlc(DbName, Min)};
+        SinceHlc ->
+            {SinceHlc, barrel_store_keys:doc_hlc(DbName, SinceHlc)}
+    end,
+    EndKey = barrel_store_keys:doc_hlc_end(DbName),
+
+    FoldFun = fun(Key, Value, {CurrentHlc, AccIn}) ->
+        ChangeHlc = barrel_store_keys:decode_hlc_key(DbName, Key),
+        case Since =/= first andalso barrel_hlc:equal(ChangeHlc, Since) of
+            true ->
+                {ok, {CurrentHlc, AccIn}};
+            false ->
+                CompactChange = decode_change_compact(Value, ChangeHlc),
+                case Fun(CompactChange, AccIn) of
+                    {ok, AccOut} ->
+                        {ok, {ChangeHlc, AccOut}};
+                    {stop, AccOut} ->
+                        {stop, {ChangeHlc, AccOut}};
+                    stop ->
+                        {stop, {CurrentHlc, AccIn}}
+                end
+        end
+    end,
+
+    {LastHlc, FinalAcc} = barrel_store_rocksdb:fold_range_long_scan(
+        StoreRef, StartKey, EndKey, FoldFun, {StartHlc, Acc}),
+    {ok, FinalAcc, LastHlc}.
 
 %% @private Internal fold with scan mode selection
 fold_changes_internal(StoreRef, DbName, Since, Fun, Acc, ScanMode) ->
@@ -126,45 +156,6 @@ fold_changes_internal(StoreRef, DbName, Since, Fun, Acc, ScanMode) ->
             false ->
                 Change = decode_change(Value, ChangeHlc),
                 case Fun(Change, AccIn) of
-                    {ok, AccOut} ->
-                        {ok, {ChangeHlc, AccOut}};
-                    {stop, AccOut} ->
-                        {stop, {ChangeHlc, AccOut}};
-                    stop ->
-                        {stop, {CurrentHlc, AccIn}}
-                end
-        end
-    end,
-
-    {LastHlc, FinalAcc} = case ScanMode of
-        long_scan ->
-            barrel_store_rocksdb:fold_range_long_scan(
-                StoreRef, StartKey, EndKey, FoldFun, {StartHlc, Acc});
-        normal ->
-            barrel_store_rocksdb:fold_range(
-                StoreRef, StartKey, EndKey, FoldFun, {StartHlc, Acc})
-    end,
-    {ok, FinalAcc, LastHlc}.
-
-%% @private Internal fold with compact tuple format
-fold_changes_compact_internal(StoreRef, DbName, Since, Fun, Acc, ScanMode) ->
-    {StartHlc, StartKey} = case Since of
-        first ->
-            Min = barrel_hlc:min(),
-            {Min, barrel_store_keys:doc_hlc(DbName, Min)};
-        SinceHlc ->
-            {SinceHlc, barrel_store_keys:doc_hlc(DbName, SinceHlc)}
-    end,
-    EndKey = barrel_store_keys:doc_hlc_end(DbName),
-
-    FoldFun = fun(Key, Value, {CurrentHlc, AccIn}) ->
-        ChangeHlc = barrel_store_keys:decode_hlc_key(DbName, Key),
-        case Since =/= first andalso barrel_hlc:equal(ChangeHlc, Since) of
-            true ->
-                {ok, {CurrentHlc, AccIn}};
-            false ->
-                CompactChange = decode_change_compact(Value, ChangeHlc),
-                case Fun(CompactChange, AccIn) of
                     {ok, AccOut} ->
                         {ok, {ChangeHlc, AccOut}};
                     {stop, AccOut} ->
@@ -332,10 +323,8 @@ get_changes_with_multiple_paths(StoreRef, DbName, Paths, Since, Opts, QuerySpec)
     %% Get changes from each path index - no fallback to full scan
     AllChanges = lists:flatmap(
         fun(PathPattern) ->
-            case get_changes_by_path(StoreRef, DbName, PathPattern, Since, #{}) of
-                {ok, Changes, _} -> Changes;
-                _ -> []
-            end
+            {ok, Changes, _} = get_changes_by_path(StoreRef, DbName, PathPattern, Since, #{}),
+            Changes
         end,
         Paths
     ),
@@ -905,7 +894,8 @@ write_change(StoreRef, DbName, Hlc, DocInfo) ->
 %% Use this to combine with other operations in a single write_batch.
 %% Also updates the last_hlc metadata for efficient get_last_seq lookups.
 %% Note: Does NOT update change buckets - call write_change/4 for full update.
--spec write_change_ops(db_name(), barrel_hlc:timestamp(), doc_info()) ->
+-spec write_change_ops(db_name(), barrel_hlc:timestamp(),
+                       #{id := binary(), rev := binary(), deleted := boolean(), _ => _}) ->
     [{put, binary(), binary()}].
 write_change_ops(DbName, Hlc, DocInfo) ->
     Key = barrel_store_keys:doc_hlc(DbName, Hlc),
@@ -959,7 +949,7 @@ delete_old_change(StoreRef, DbName, OldHlc, _DocId) ->
 %% @doc Encode change to compact binary format.
 %% Format: `&lt;&lt;DocIdLen:16, DocId/binary, RevLen:16, Rev/binary, Deleted:8, NumConflicts:16, HasDoc:8, [DocCbor/binary]&gt;&gt;'
 %% Stores conflict count for quick check; optionally includes doc body for filtering.
--spec encode_change(doc_info()) -> binary().
+-spec encode_change(#{id := binary(), rev := binary(), deleted => boolean(), _ => _}) -> binary().
 encode_change(DocInfo) ->
     DocId = maps:get(id, DocInfo),
     Rev = maps:get(rev, DocInfo),
@@ -1026,7 +1016,8 @@ decode_change(<<DocIdLen:16, DocId:DocIdLen/binary,
 %% @doc Generate operations to index a change by all its paths.
 %% Creates entries under path_hlc/{db}/{topic}/{hlc} for exact matches,
 %% and prefix_changes/{db}/{prefix}/{bucket} posting lists for wildcard queries.
--spec write_path_index_ops(db_name(), barrel_hlc:timestamp(), doc_info()) ->
+-spec write_path_index_ops(db_name(), barrel_hlc:timestamp(),
+                           #{id := binary(), rev := binary(), deleted := boolean(), _ => _}) ->
     [{put, binary(), binary()} | {posting_append, binary(), binary()}].
 write_path_index_ops(DbName, Hlc, DocInfo) ->
     #{id := DocId, rev := Rev, deleted := Deleted} = DocInfo,
@@ -1071,7 +1062,8 @@ write_path_index_ops(DbName, Hlc, DocInfo) ->
 
 %% @doc Generate operations to update path index (remove old entries + add new).
 %% Used when a document is updated to maintain a current path index without stale entries.
--spec update_path_index_ops(db_name(), barrel_hlc:timestamp(), doc_info(),
+-spec update_path_index_ops(db_name(), barrel_hlc:timestamp(),
+                            #{id := binary(), rev := binary(), deleted := boolean(), _ => _},
                             barrel_hlc:timestamp() | undefined, map() | undefined) ->
     [tuple()].
 update_path_index_ops(DbName, NewHlc, NewDocInfo, OldHlc, OldDoc) ->

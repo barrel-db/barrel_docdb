@@ -93,15 +93,10 @@ build_block_opts_no_cache(Options) ->
 init([]) ->
     CacheSize = application:get_env(barrel_docdb, block_cache_size, 512 * 1024 * 1024),
     CacheType = application:get_env(barrel_docdb, block_cache_type, clock),
-    case rocksdb:new_cache(CacheType, CacheSize) of
-        {ok, Cache} ->
-            logger:info("barrel_cache: initialized ~p MB ~p cache",
+    {ok, Cache} = rocksdb:new_cache(CacheType, CacheSize),
+    logger:info("barrel_cache: initialized ~p MB ~p cache",
                        [CacheSize div (1024 * 1024), CacheType]),
-            {ok, #state{cache = Cache}};
-        {error, Reason} ->
-            logger:error("barrel_cache: failed to create ~p cache: ~p", [CacheType, Reason]),
-            {ok, #state{cache = undefined}}
-    end.
+    {ok, #state{cache = Cache}}.
 
 handle_call(get_cache, _From, #state{cache = Cache} = State) ->
     case Cache of

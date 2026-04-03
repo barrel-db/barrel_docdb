@@ -177,7 +177,7 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
-    dets:close(?TABLE),
+    _ = dets:close(?TABLE),
     ok.
 
 %%====================================================================
@@ -228,7 +228,7 @@ maybe_bootstrap_admin_key(_State) ->
                         last_used = undefined
                     },
                     ok = dets:insert(?TABLE, Record),
-                    dets:sync(?TABLE),
+                    ok = dets:sync(?TABLE),
                     logger:info("Admin key configured from environment variable"),
                     ok;
                 [_] ->
@@ -254,7 +254,7 @@ do_validate_key(Key) ->
         [Record] ->
             %% Update last_used timestamp
             UpdatedRecord = Record#api_key{last_used = erlang:system_time(millisecond)},
-            dets:insert(?TABLE, UpdatedRecord),
+            ok = dets:insert(?TABLE, UpdatedRecord),
             {ok, record_to_map(Record)}
     end.
 
@@ -269,7 +269,7 @@ do_validate_key(Key, DbName) ->
                 true ->
                     %% Update last_used timestamp
                     UpdatedRecord = Record#api_key{last_used = erlang:system_time(millisecond)},
-                    dets:insert(?TABLE, UpdatedRecord),
+                    ok = dets:insert(?TABLE, UpdatedRecord),
                     {ok, record_to_map(Record)};
                 false ->
                     {error, access_denied}
@@ -313,7 +313,7 @@ do_create_key(Opts) ->
 
     case dets:insert(?TABLE, Record) of
         ok ->
-            dets:sync(?TABLE),
+            _ = dets:sync(?TABLE),
             {ok, Key, record_to_map(Record)};
         {error, Reason} ->
             {error, Reason}
@@ -329,13 +329,13 @@ do_delete_key(KeyPrefix) ->
                 AdminCount =< 1 ->
                     {error, cannot_delete_last_admin_key};
                 true ->
-                    dets:delete(?TABLE, Record#api_key.key_hash),
-                    dets:sync(?TABLE),
+                    ok = dets:delete(?TABLE, Record#api_key.key_hash),
+                    ok = dets:sync(?TABLE),
                     ok
             end;
         {ok, Record} ->
-            dets:delete(?TABLE, Record#api_key.key_hash),
-            dets:sync(?TABLE),
+            ok = dets:delete(?TABLE, Record#api_key.key_hash),
+            ok = dets:sync(?TABLE),
             ok;
         {error, not_found} ->
             {error, not_found}
@@ -369,7 +369,7 @@ do_generate_admin_key() ->
 
     case dets:insert(?TABLE, Record) of
         ok ->
-            dets:sync(?TABLE),
+            ok = dets:sync(?TABLE),
             {ok, Key};
         {error, Reason} ->
             {error, Reason}

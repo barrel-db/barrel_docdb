@@ -96,7 +96,7 @@
 
 -type shard_assignment() :: #{
     shard_id := non_neg_integer(),
-    primary := node_ref(),
+    primary := node_ref() | undefined,  %% undefined until assigned to a node
     replicas := [node_ref()],
     status := shard_status()
 }.
@@ -435,6 +435,7 @@ encode_range(#{shard_id := ShardId, start_hash := Start, end_hash := End}) ->
     }.
 
 %% @private Decode range from storage
+-spec decode_ranges(map()) -> [shard_range()].
 decode_ranges(RangesMap) ->
     maps:fold(
         fun(_K, V, Acc) ->
@@ -459,6 +460,7 @@ encode_assignment(#{shard_id := ShardId, primary := Primary, replicas := Replica
     }.
 
 %% @private Decode assignment from storage
+-spec decode_assignment(map()) -> shard_assignment().
 decode_assignment(Map) ->
     #{
         shard_id => maps:get(<<"shard_id">>, Map),

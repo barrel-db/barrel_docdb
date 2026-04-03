@@ -416,7 +416,7 @@ fold_loop({error, _Reason}, _Itr, _Prefix, _Fun, Acc) ->
 
 %% @doc Get attachment info/metadata without reading the data
 -spec get_info(att_ref(), db_name(), docid(), binary()) ->
-    {ok, att_info()} | not_found | {error, term()}.
+    {ok, att_info()} | {error, term()}.
 get_info(#{ref := Ref}, DbName, DocId, AttName) ->
     Key = make_key(DbName, DocId, AttName),
     case rocksdb:get(Ref, Key, []) of
@@ -445,7 +445,7 @@ get_info(#{ref := Ref}, DbName, DocId, AttName) ->
                     }}
             end;
         not_found ->
-            not_found;
+          {error, not_found};
         {error, _} = Error ->
             Error
     end.
@@ -582,7 +582,7 @@ abort_stream(_) ->
 
 %% @doc Open a stream for reading an attachment
 -spec get_stream(att_ref(), db_name(), docid(), binary()) ->
-    {ok, att_stream()} | not_found | {error, term()}.
+    {ok, att_stream()} | {error, term()}.
 get_stream(AttRef, DbName, DocId, AttName) ->
     case get_info(AttRef, DbName, DocId, AttName) of
         {ok, #{chunked := true, chunk_count := ChunkCount} = Info} ->
@@ -609,8 +609,6 @@ get_stream(AttRef, DbName, DocId, AttName) ->
                 chunk_count => 1,
                 single_value => true
             }};
-        not_found ->
-            not_found;
         {error, _} = Error ->
             Error
     end.

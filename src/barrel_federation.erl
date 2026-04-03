@@ -199,14 +199,12 @@ get(Name) ->
 -spec list() -> {ok, [federation()]}.
 list() ->
     %% Fold over system docs with federation prefix
-    case barrel_docdb:fold_system_docs(
+    {ok, Federations}  = barrel_docdb:fold_system_docs(
         <<"federation:">>,
         fun(_DocId, Federation, Acc) -> [Federation | Acc] end,
         []
-    ) of
-        {ok, Federations} -> {ok, lists:reverse(Federations)};
-        {error, _} -> {ok, []}
-    end.
+    ),
+    {ok, lists:reverse(Federations)}.
 
 %% @doc Get federation for API response (auth stripped)
 -spec get_safe(federation_name()) -> {ok, federation()} | {error, not_found}.
@@ -221,12 +219,8 @@ get_safe(Name) ->
 %% @doc List federations for API response (auth stripped)
 -spec list_safe() -> {ok, [federation()]}.
 list_safe() ->
-    case list() of
-        {ok, Federations} ->
-            {ok, [maps:remove(auth, F) || F <- Federations]};
-        Error ->
-            Error
-    end.
+    {ok, Federations} = list(),
+    {ok, [maps:remove(auth, F) || F <- Federations]}.
 
 %% @doc Add a member to an existing federation
 -spec add_member(federation_name(), member()) -> ok | {error, term()}.

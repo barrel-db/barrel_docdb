@@ -326,7 +326,7 @@ spawn_pool_worker() ->
 pool_worker_loop(Pool) ->
     receive
         {work, Caller, Ref, Index, Fun, Item} ->
-            try
+            _ = try
                 Result = Fun(Item),
                 Caller ! {Ref, Index, {ok, Result}}
             catch

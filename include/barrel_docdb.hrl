@@ -63,13 +63,16 @@
     name := binary(),
     content_type := binary(),
     length := non_neg_integer(),
-    digest := binary()
+    digest := binary(),
+    chunked => boolean(),
+    chunk_size => pos_integer(),
+    chunk_count => pos_integer()
 }.
-%% Attachment metadata.
+%% Attachment metadata. Chunked attachments include optional chunked/chunk_size/chunk_count fields.
 
 %% Sequence types
--type seq() :: {non_neg_integer(), non_neg_integer()}.
-%% Sequence number as {Epoch, Counter} tuple.
+-type seq() :: {timestamp, non_neg_integer(), non_neg_integer()}.
+%% Sequence number as HLC timestamp record {timestamp, WallTime, Logical}.
 
 -type seq_string() :: binary().
 %% Sequence number as a string for external use.

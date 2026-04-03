@@ -250,12 +250,11 @@ handle_call({sign_request, _Method, _Path, _Body, _Timestamp}, _From,
             #state{private_key = undefined} = State) ->
     {reply, {error, not_initialized}, State};
 handle_call({sign_request, Method, Path, Body, Timestamp}, _From,
-            #state{private_key = PrivKey, public_key = PubKey, peer_id = PeerId} = State) ->
+            #state{private_key = PrivKey, peer_id = PeerId} = State) ->
     %% Ensure Body is binary (json:encode returns iolist)
     BodyBin = iolist_to_binary(Body),
     CanonicalString = build_canonical_string(Timestamp, PeerId, Method, Path, BodyBin),
-    %% Ed25519 signing requires both public and private key in OTP 27+
-    Signature = public_key:sign(CanonicalString, none, {ed_pri, ed25519, PubKey, PrivKey}),
+    Signature = crypto:sign(eddsa, none, CanonicalString, [PrivKey, ed25519]),
     {reply, {ok, base64:encode(Signature)}, State};
 
 handle_call(_Request, _From, State) ->
@@ -404,8 +403,8 @@ do_verify_request(PeerPublicKey, Method, Path, Body, Headers) ->
                     BodyBin = iolist_to_binary(Body),
                     CanonicalString = build_canonical_string(Timestamp, PeerId, Method, Path, BodyBin),
 
-                    case public_key:verify(CanonicalString, none, Signature,
-                                          {ed_pub, ed25519, PeerPublicKey}) of
+                    case crypto:verify(eddsa, none, CanonicalString, Signature,
+                                       [PeerPublicKey, ed25519]) of
                         true -> ok;
                         false -> {error, invalid_signature}
                     end;
@@ -441,18 +440,8 @@ get_data_path() ->
 %% @doc Get local peer ID.
 %% Uses node_id from barrel_discovery if available.
 get_local_peer_id() ->
-    case barrel_discovery:node_id() of
-        {ok, NodeId} ->
-            NodeId;
-        _ ->
-            %% Fall back to hostname-based peer ID
-            case inet:gethostname() of
-                {ok, Hostname} ->
-                    list_to_binary(Hostname);
-                _ ->
-                    <<"unknown">>
-            end
-    end.
+  {ok, NodeId} = barrel_discovery:node_id(),
+  NodeId.
 
 %% @doc Truncate key for logging (show first 16 chars + "...").
 truncate_key(Key) when byte_size(Key) > 16 ->

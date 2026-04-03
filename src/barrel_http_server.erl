@@ -365,5 +365,5 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
-    cowboy:stop_listener(barrel_http_listener),
+    _ = cowboy:stop_listener(barrel_http_listener),
     ok.

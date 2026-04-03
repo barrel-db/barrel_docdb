@@ -286,7 +286,7 @@ delete_db(Name) when is_binary(Name) ->
             DbPath = maps:get(db_path, Info),
             barrel_db_server:stop(Pid),
             %% Remove data directory
-            os:cmd("rm -rf " ++ DbPath),
+            _ = (catch os:cmd("rm -rf " ++ DbPath)),
             ok;
         {error, not_found} ->
             ok
@@ -555,9 +555,9 @@ get_doc(Db, DocId) ->
 %%
 %% @param Db Database name or pid
 %% @param DocId Document ID
-%% @param Opts Options map
-%% @returns `{ok, Document}' or `{error, not_found}'
--spec get_doc(binary() | pid(), binary(), map()) -> {ok, map()} | {error, term()}.
+%% @param Opts Options map. When `raw_body => true', returns `{ok, CborBin, Meta}'
+%% @returns `{ok, Document}' or `{ok, CborBin, Meta}' or `{error, not_found}'
+-spec get_doc(binary() | pid(), binary(), map()) -> {ok, map()} | {ok, binary(), map()} | {error, term()}.
 get_doc(Db, DocId, Opts) ->
     DbName = db_name(Db),
     Start = erlang:monotonic_time(millisecond),

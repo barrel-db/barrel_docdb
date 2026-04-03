@@ -48,8 +48,6 @@ get_db_usage(DbName) when is_binary(DbName) ->
                 {error, Reason} ->
                     {error, Reason}
             end;
-        {error, not_found} ->
-            {error, not_found};
         {error, Reason} ->
             {error, Reason}
     end.
@@ -138,6 +136,4 @@ safe_to_integer(Bin) when is_binary(Bin) ->
         binary_to_integer(Bin)
     catch
         _:_ -> 0
-    end;
-safe_to_integer(_) ->
-    0.
+    end.

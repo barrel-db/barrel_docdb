@@ -370,7 +370,7 @@ handle_call({add_peer, Url}, _From, State) ->
     {reply, Result, State};
 
 handle_call({remove_peer, Url}, _From, State) ->
-    do_remove_peer(Url),
+    _ = do_remove_peer(Url),
     {reply, ok, State};
 
 handle_call(list_peers, _From, State) ->
@@ -453,11 +453,10 @@ handle_info(refresh_peers, #state{refresh_interval = Interval} = State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
+terminate(_Reason, #state{refresh_timer = undefined}) ->
+    ok;
 terminate(_Reason, #state{refresh_timer = TimerRef}) ->
-    case TimerRef of
-        undefined -> ok;
-        _ -> erlang:cancel_timer(TimerRef)
-    end,
+    _ = erlang:cancel_timer(TimerRef),
     ok.
 
 %%====================================================================
@@ -480,12 +479,9 @@ get_or_create_node_id() ->
 %% @private Generate a unique node ID
 generate_node_id() ->
     %% Use hostname + random bytes
-    Hostname = case inet:gethostname() of
-        {ok, H} -> list_to_binary(H);
-        _ -> <<"unknown">>
-    end,
+    {ok, Hostname} = inet:gethostname(),
     Random = base64:encode(crypto:strong_rand_bytes(8)),
-    <<Hostname/binary, "-", Random/binary>>.
+    << (list_to_binary(Hostname))/binary, "-", Random/binary >>.
 
 %% @private Build node info map
 build_node_info(NodeId, Zone) ->
@@ -494,10 +490,7 @@ build_node_info(NodeId, Zone) ->
     Databases = [Db || Db <- AllDbs, not is_system_db(Db)],
 
     %% Get list of VDBs (virtual databases / sharded)
-    Vdbs = case barrel_shard_map:list() of
-        {ok, VdbList} -> VdbList;
-        _ -> []
-    end,
+    {ok, Vdbs} = barrel_shard_map:list(),
 
     %% Get list of federations
     {ok, Federations} = barrel_federation:list(),
@@ -695,8 +688,7 @@ do_refresh_peers() ->
                         status => active
                     },
                     DocId = peer_doc_id(Url),
-                    barrel_docdb:put_system_doc(DocId, UpdatedInfo),
-
+                    _ = barrel_docdb:put_system_doc(DocId, UpdatedInfo),
                     %% Learn about new peers
                     case maps:get(<<"known_peers">>, Info, []) of
                         KnownPeers when is_list(KnownPeers) ->
@@ -951,9 +943,9 @@ do_add_dns_domain(Domain) ->
             ok;  % Already registered
         false ->
             NewDomains = [Domain | Domains],
-            barrel_docdb:put_system_doc(DocId, #{<<"domains">> => NewDomains}),
+            _ = barrel_docdb:put_system_doc(DocId, #{<<"domains">> => NewDomains}),
             %% Trigger immediate discovery for new domain
-            spawn(fun() -> do_discover_from_dns(Domain) end),
+            spawn(fun() -> _ = do_discover_from_dns(Domain) end),
             ok
     end.
 
@@ -979,12 +971,12 @@ do_list_dns_domains() ->
 %% @private Refresh all configured DNS domains
 do_refresh_dns_domains() ->
     case do_list_dns_domains() of
+        {ok, []} ->
+            ok;
         {ok, Domains} ->
             lists:foreach(fun(Domain) ->
                 spawn(fun() -> do_discover_from_dns(Domain) end)
-            end, Domains);
-        _ ->
-            ok
+            end, Domains)
     end.
 
 %% @private Decode public key from base64 in peer info.

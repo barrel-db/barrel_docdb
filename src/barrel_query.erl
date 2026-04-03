@@ -241,7 +241,7 @@ execute(StoreRef, DbName, #query_plan{} = Plan) ->
 %% @private Execute unbounded include_docs query with automatic pagination
 %% Collects results in chunks to avoid memory pressure from large MultiGet
 execute_with_auto_pagination(StoreRef, DbName, Plan) ->
-    execute_auto_paginated_loop(StoreRef, DbName, Plan, undefined, []).
+    collect_all_chunks(StoreRef, DbName, Plan, undefined, []).
 
 %% @private Direct execution bypassing auto-pagination
 %% Used when chunked execution falls back to non-chunked for needs_body queries
@@ -253,20 +253,29 @@ execute_direct(StoreRef, DbName, Plan) ->
         barrel_store_rocksdb:release_snapshot(Snapshot)
     end.
 
-%% @private Auto-pagination loop for unbounded include_docs queries
-execute_auto_paginated_loop(StoreRef, DbName, Plan, Continuation, AccResults) ->
-    Opts = case Continuation of
-        undefined -> #{chunk_size => ?MAX_UNBOUNDED_RESULTS};
-        Token -> #{chunk_size => ?MAX_UNBOUNDED_RESULTS, continuation => Token}
-    end,
-    case execute(StoreRef, DbName, Plan, Opts) of
-        {ok, ChunkResults, #{has_more := false, last_seq := LastSeq}} ->
-            %% Final chunk - combine all results
-            AllResults = AccResults ++ ChunkResults,
-            {ok, AllResults, LastSeq};
-        {ok, ChunkResults, #{has_more := true, continuation := NextToken}} ->
-            %% More results available - continue loop
-            execute_auto_paginated_loop(StoreRef, DbName, Plan, NextToken, AccResults ++ ChunkResults);
+%% @private Collect all chunks from paginated query
+-spec collect_all_chunks(barrel_store_rocksdb:db_ref(), db_name(), query_plan(),
+                         binary() | undefined, [map()]) ->
+    {ok, [map()], seq()} | {error, term()}.
+collect_all_chunks(StoreRef, DbName, Plan, undefined, AccResults) ->
+    %% Initial call - no continuation token
+    %% execute_chunked_fresh always succeeds (no cursor lookup)
+    Opts = #{chunk_size => ?MAX_UNBOUNDED_RESULTS},
+    {ok, Results, Meta} = execute_chunked_fresh(StoreRef, DbName, Plan, Opts),
+    case Meta of
+        #{has_more := false, last_seq := LastSeq} ->
+            {ok, AccResults ++ Results, LastSeq};
+        #{has_more := true, continuation := NextToken} ->
+            collect_all_chunks(StoreRef, DbName, Plan, NextToken, AccResults ++ Results)
+    end;
+collect_all_chunks(StoreRef, DbName, Plan, Token, AccResults) when is_binary(Token) ->
+    %% Continuation call - cursor lookup may fail
+    Opts = #{chunk_size => ?MAX_UNBOUNDED_RESULTS},
+    case execute_chunked_resume(StoreRef, DbName, Plan, Token, Opts) of
+        {ok, Results, #{has_more := false, last_seq := LastSeq}} ->
+            {ok, AccResults ++ Results, LastSeq};
+        {ok, Results, #{has_more := true, continuation := NextToken}} ->
+            collect_all_chunks(StoreRef, DbName, Plan, NextToken, AccResults ++ Results);
         {error, _} = Error ->
             Error
     end.
@@ -339,13 +348,9 @@ execute_chunked_resume(StoreRef, DbName, Plan, Token, Opts) ->
             ChunkSize = maps:get(chunk_size, Opts, 1000),
 
             %% Validate cursor matches current query
-            case validate_cursor_for_plan(QueryType, Plan) of
-                ok ->
-                    execute_chunked_with_snapshot(StoreRef, DbName, Plan, ChunkSize, LastKey, Snapshot);
-                {error, _} = Error ->
-                    barrel_query_cursor:release(Token),
-                    Error
-            end;
+            %% Currently validate_cursor_for_plan always returns ok
+            ok = validate_cursor_for_plan(QueryType, Plan),
+            execute_chunked_with_snapshot(StoreRef, DbName, Plan, ChunkSize, LastKey, Snapshot);
         {error, expired} ->
             {error, cursor_expired};
         {error, not_found} ->
@@ -381,7 +386,7 @@ execute_chunked_with_snapshot(StoreRef, DbName, Plan, ChunkSize, StartKey, Snaps
 
 %% @private Execute chunked pure equality query
 execute_pure_equality_chunked(StoreRef, DbName, Path, Value, Plan, ChunkSize, StartKey, Snapshot) ->
-    #query_plan{offset = Offset} = Plan,
+    #query_plan{offset = Offset, include_docs = IncludeDocs, decoder_fun = DecoderFun} = Plan,
 
     %% Determine start key for iteration
     ActualStartKey = case StartKey of
@@ -406,16 +411,16 @@ execute_pure_equality_chunked(StoreRef, DbName, Path, Value, Plan, ChunkSize, St
                 {stop, {Count, ChunkLastK, Acc}};
             NewCount =:= ChunkSize ->
                 %% This is the ChunkSize-th result - save its key for cursor
-                {ok, {NewCount, Key, [#{<<"id">> => DocId} | Acc]}};
+                {ok, {NewCount, Key, [DocId | Acc]}};
             NewCount > ChunkSize ->
                 %% Extra result to detect has_more - don't update ChunkLastK
-                {ok, {NewCount, ChunkLastK, [#{<<"id">> => DocId} | Acc]}};
+                {ok, {NewCount, ChunkLastK, [DocId | Acc]}};
             true ->
-                {ok, {NewCount, ChunkLastK, [#{<<"id">> => DocId} | Acc]}}
+                {ok, {NewCount, ChunkLastK, [DocId | Acc]}}
         end
     end,
 
-    {CollectedCount, ChunkLastKey, Results} =
+    {CollectedCount, ChunkLastKey, DocIds} =
         case Snapshot of
             undefined ->
                 barrel_store_rocksdb:fold_range(
@@ -428,12 +433,15 @@ execute_pure_equality_chunked(StoreRef, DbName, Path, Value, Plan, ChunkSize, St
     %% Check if we have more results
     HasMore = CollectedCount > ChunkSize,
 
-    %% Take only ChunkSize results (drop the extra one if present)
-    FinalResults0 = case HasMore of
-        true -> tl(Results);  %% Drop the extra one (results are reversed)
-        false -> Results
+    %% Take only ChunkSize doc IDs (drop the extra one if present)
+    FinalDocIds0 = case HasMore of
+        true -> tl(DocIds);  %% Drop the extra one (results are reversed)
+        false -> DocIds
     end,
-    FinalResults = apply_offset_limit(lists:reverse(FinalResults0), Offset, ChunkSize),
+    FinalDocIds = apply_offset_limit(lists:reverse(FinalDocIds0), Offset, ChunkSize),
+
+    %% Fetch docs if include_docs is true, otherwise just return IDs
+    FinalResults = maybe_fetch_docs_chunked(DbName, FinalDocIds, IncludeDocs, DecoderFun),
 
     LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
 
@@ -451,7 +459,7 @@ execute_pure_equality_chunked(StoreRef, DbName, Path, Value, Plan, ChunkSize, St
 
 %% @private Execute chunked pure exists query
 execute_pure_exists_chunked(StoreRef, DbName, Path, Plan, ChunkSize, StartKey, Snapshot) ->
-    #query_plan{offset = Offset} = Plan,
+    #query_plan{offset = Offset, include_docs = IncludeDocs, decoder_fun = DecoderFun} = Plan,
 
     %% Determine start key for iteration
     ActualStartKey = case StartKey of
@@ -475,21 +483,24 @@ execute_pure_exists_chunked(StoreRef, DbName, Path, Plan, ChunkSize, StartKey, S
     %% Fold over posting lists
     FoldResult = barrel_store_rocksdb:fold_range_posting_with_snapshot(
         StoreRef, ActualStartKey, EndKey,
-        fun(Key, DocIds, {Seen, Count, LastK, Acc}) ->
-            process_exists_docids_chunked(DocIds, Key, Seen, Count, LastK, Acc, MaxCollect)
+        fun(Key, DocIds0, {Seen, Count, LastK, Acc}) ->
+            process_exists_docids_chunked(DocIds0, Key, Seen, Count, LastK, Acc, MaxCollect)
         end,
         {#{}, 0, undefined, []},
         ActualSnapshot
     ),
 
-    {_, CollectedCount, LastCollectedKey, Results} = FoldResult,
+    {_, CollectedCount, LastCollectedKey, DocIds} = FoldResult,
 
     HasMore = CollectedCount > ChunkSize,
-    FinalResults0 = case HasMore of
-        true -> tl(Results);
-        false -> Results
+    FinalDocIds0 = case HasMore of
+        true -> tl(DocIds);
+        false -> DocIds
     end,
-    FinalResults = apply_offset_limit(lists:reverse(FinalResults0), Offset, ChunkSize),
+    FinalDocIds = apply_offset_limit(lists:reverse(FinalDocIds0), Offset, ChunkSize),
+
+    %% Fetch docs if include_docs is true
+    FinalResults = maybe_fetch_docs_chunked(DbName, FinalDocIds, IncludeDocs, DecoderFun),
 
     LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
 
@@ -505,7 +516,7 @@ execute_pure_exists_chunked(StoreRef, DbName, Path, Plan, ChunkSize, StartKey, S
 
 %% @private Execute chunked pure prefix query
 execute_pure_prefix_chunked(StoreRef, DbName, Path, Prefix, Plan, ChunkSize, StartKey, Snapshot) ->
-    #query_plan{offset = Offset} = Plan,
+    #query_plan{offset = Offset, include_docs = IncludeDocs, decoder_fun = DecoderFun} = Plan,
 
     %% Build prefix range
     FullPath = Path ++ [Prefix],
@@ -530,21 +541,24 @@ execute_pure_prefix_chunked(StoreRef, DbName, Path, Prefix, Plan, ChunkSize, Sta
     end,
     FoldResult = barrel_store_rocksdb:fold_range_posting_with_snapshot(
         StoreRef, ActualStartKey, EndKey,
-        fun(Key, DocIds, {Seen, Count, LastK, Acc}) ->
-            process_prefix_docids_chunked(DocIds, Key, Seen, Count, LastK, Acc, MaxCollect)
+        fun(Key, DocIds0, {Seen, Count, LastK, Acc}) ->
+            process_prefix_docids_chunked(DocIds0, Key, Seen, Count, LastK, Acc, MaxCollect)
         end,
         {#{}, 0, undefined, []},
         ActualSnapshot
     ),
 
-    {_, CollectedCount, LastCollectedKey, Results} = FoldResult,
+    {_, CollectedCount, LastCollectedKey, DocIds} = FoldResult,
 
     HasMore = CollectedCount > ChunkSize,
-    FinalResults0 = case HasMore of
-        true -> tl(Results);
-        false -> Results
+    FinalDocIds0 = case HasMore of
+        true -> tl(DocIds);
+        false -> DocIds
     end,
-    FinalResults = apply_offset_limit(lists:reverse(FinalResults0), Offset, ChunkSize),
+    FinalDocIds = apply_offset_limit(lists:reverse(FinalDocIds0), Offset, ChunkSize),
+
+    %% Fetch docs if include_docs is true
+    FinalResults = maybe_fetch_docs_chunked(DbName, FinalDocIds, IncludeDocs, DecoderFun),
 
     LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
 
@@ -568,7 +582,7 @@ process_exists_docids_chunked([DocId | Rest], Key, Seen, Count, _LastKey, Acc, M
         false ->
             NewSeen = Seen#{DocId => true},
             NewCount = Count + 1,
-            NewAcc = [#{<<"id">> => DocId} | Acc],
+            NewAcc = [DocId | Acc],
             case NewCount >= MaxCollect of
                 true ->
                     {stop, {NewSeen, NewCount, Key, NewAcc}};
@@ -587,7 +601,7 @@ process_prefix_docids_chunked([DocId | Rest], Key, Seen, Count, _LastKey, Acc, M
         false ->
             NewSeen = Seen#{DocId => true},
             NewCount = Count + 1,
-            NewAcc = [#{<<"id">> => DocId} | Acc],
+            NewAcc = [DocId | Acc],
             case NewCount >= MaxCollect of
                 true ->
                     {stop, {NewSeen, NewCount, Key, NewAcc}};
@@ -598,7 +612,7 @@ process_prefix_docids_chunked([DocId | Rest], Key, Seen, Count, _LastKey, Acc, M
 
 %% @private Execute chunked pure compare query (range scan)
 execute_pure_compare_chunked(StoreRef, DbName, Path, Op, Value, Plan, ChunkSize, StartKey, Snapshot) ->
-    #query_plan{offset = Offset} = Plan,
+    #query_plan{offset = Offset, include_docs = IncludeDocs, decoder_fun = DecoderFun} = Plan,
 
     %% Compute start/end keys for the range based on operator
     {RangeStart, RangeEnd} = compare_range_keys(DbName, Path, Op, Value),
@@ -621,21 +635,24 @@ execute_pure_compare_chunked(StoreRef, DbName, Path, Op, Value, Plan, ChunkSize,
 
     FoldResult = barrel_store_rocksdb:fold_range_posting_with_snapshot(
         StoreRef, ActualStartKey, RangeEnd,
-        fun(Key, DocIds, {Seen, Count, LastK, Acc}) ->
-            process_compare_docids_chunked(DocIds, Key, Seen, Count, LastK, Acc, MaxCollect)
+        fun(Key, DocIds0, {Seen, Count, LastK, Acc}) ->
+            process_compare_docids_chunked(DocIds0, Key, Seen, Count, LastK, Acc, MaxCollect)
         end,
         {#{}, 0, undefined, []},
         ActualSnapshot
     ),
 
-    {_, CollectedCount, LastCollectedKey, Results} = FoldResult,
+    {_, CollectedCount, LastCollectedKey, DocIds} = FoldResult,
 
     HasMore = CollectedCount > ChunkSize,
-    FinalResults0 = case HasMore of
-        true -> tl(Results);
-        false -> Results
+    FinalDocIds0 = case HasMore of
+        true -> tl(DocIds);
+        false -> DocIds
     end,
-    FinalResults = apply_offset_limit(lists:reverse(FinalResults0), Offset, ChunkSize),
+    FinalDocIds = apply_offset_limit(lists:reverse(FinalDocIds0), Offset, ChunkSize),
+
+    %% Fetch docs if include_docs is true
+    FinalResults = maybe_fetch_docs_chunked(DbName, FinalDocIds, IncludeDocs, DecoderFun),
 
     LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
 
@@ -681,7 +698,7 @@ process_compare_docids_chunked([DocId | Rest], Key, Seen, Count, _LastKey, Acc, 
         false ->
             NewSeen = Seen#{DocId => true},
             NewCount = Count + 1,
-            NewAcc = [#{<<"id">> => DocId} | Acc],
+            NewAcc = [DocId | Acc],
             case NewCount >= MaxCollect of
                 true ->
                     {stop, {NewSeen, NewCount, Key, NewAcc}};
@@ -692,7 +709,7 @@ process_compare_docids_chunked([DocId | Rest], Key, Seen, Count, _LastKey, Acc, 
 
 %% @private Execute chunked multi-index query (intersection of posting lists)
 execute_multi_index_chunked(StoreRef, DbName, Conditions, Plan, ChunkSize, StartKey, Snapshot) ->
-    #query_plan{offset = Offset} = Plan,
+    #query_plan{offset = Offset, include_docs = IncludeDocs, decoder_fun = DecoderFun} = Plan,
 
     %% Get snapshot if not already present
     ActualSnapshot = case Snapshot of
@@ -734,12 +751,14 @@ execute_multi_index_chunked(StoreRef, DbName, Conditions, Plan, ChunkSize, Start
     end,
 
     %% Build results
-    Results0 = [#{<<"id">> => DocId} || DocId <- CollectedDocIds],
-    FinalResults0 = case HasMore of
-        true -> lists:droplast(Results0);
-        false -> Results0
+    FinalDocIds0 = case HasMore of
+        true -> lists:droplast(CollectedDocIds);
+        false -> CollectedDocIds
     end,
-    FinalResults = apply_offset_limit(FinalResults0, Offset, ChunkSize),
+    FinalDocIds = apply_offset_limit(FinalDocIds0, Offset, ChunkSize),
+
+    %% Fetch docs if include_docs is true
+    FinalResults = maybe_fetch_docs_chunked(DbName, FinalDocIds, IncludeDocs, DecoderFun),
 
     LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
 
@@ -755,55 +774,19 @@ execute_multi_index_chunked(StoreRef, DbName, Conditions, Plan, ChunkSize, Start
     end.
 
 %% @private Collect DocIds for a single condition using index
-collect_condition_docids(StoreRef, DbName, Cond) ->
-    collect_condition_docids(StoreRef, DbName, Cond, infinity).
-
-collect_condition_docids(StoreRef, DbName, {path, Path, Value}, infinity) ->
+collect_condition_docids(StoreRef, DbName, {path, Path, Value}) ->
     FullPath = Path ++ [Value],
     barrel_ars_index:get_posting_list(StoreRef, DbName, FullPath);
-collect_condition_docids(StoreRef, DbName, {path, Path, Value}, MaxCount) when is_integer(MaxCount) ->
-    FullPath = Path ++ [Value],
-    AllDocIds = barrel_ars_index:get_posting_list(StoreRef, DbName, FullPath),
-    lists:sublist(AllDocIds, MaxCount);
-collect_condition_docids(StoreRef, DbName, {exists, Path}, infinity) ->
+collect_condition_docids(StoreRef, DbName, {exists, Path}) ->
     %% Collect all DocIds that have this path
     barrel_ars_index:fold_path(StoreRef, DbName, Path,
         fun({_P, DocId}, Acc) -> {ok, [DocId | Acc]} end, [], short_range);
-collect_condition_docids(StoreRef, DbName, {exists, Path}, MaxCount) when is_integer(MaxCount) ->
-    Profile = select_read_profile(MaxCount),
-    {_, DocIds} = barrel_ars_index:fold_path(StoreRef, DbName, Path,
-        fun({_P, DocId}, {Count, Acc}) ->
-            case Count >= MaxCount of
-                true -> {stop, {Count, Acc}};
-                false -> {ok, {Count + 1, [DocId | Acc]}}
-            end
-        end, {0, []}, Profile),
-    DocIds;
-collect_condition_docids(StoreRef, DbName, {prefix, Path, Prefix}, infinity) ->
+collect_condition_docids(StoreRef, DbName, {prefix, Path, Prefix}) ->
     barrel_ars_index:fold_prefix(StoreRef, DbName, Path, Prefix,
         fun({_P, DocId}, Acc) -> {ok, [DocId | Acc]} end, [], short_range);
-collect_condition_docids(StoreRef, DbName, {prefix, Path, Prefix}, MaxCount) when is_integer(MaxCount) ->
-    Profile = select_read_profile(MaxCount),
-    {_, DocIds} = barrel_ars_index:fold_prefix(StoreRef, DbName, Path, Prefix,
-        fun({_P, DocId}, {Count, Acc}) ->
-            case Count >= MaxCount of
-                true -> {stop, {Count, Acc}};
-                false -> {ok, {Count + 1, [DocId | Acc]}}
-            end
-        end, {0, []}, Profile),
-    DocIds;
-collect_condition_docids(StoreRef, DbName, {compare, Path, Op, Value}, infinity) ->
+collect_condition_docids(StoreRef, DbName, {compare, Path, Op, Value}) ->
     barrel_ars_index:fold_path_values_compare(StoreRef, DbName, Path, Op, Value,
-        fun({_P, DocId}, Acc) -> {ok, [DocId | Acc]} end, []);
-collect_condition_docids(StoreRef, DbName, {compare, Path, Op, Value}, MaxCount) when is_integer(MaxCount) ->
-    {_, DocIds} = barrel_ars_index:fold_path_values_compare(StoreRef, DbName, Path, Op, Value,
-        fun({_P, DocId}, {Count, Acc}) ->
-            case Count >= MaxCount of
-                true -> {stop, {Count, Acc}};
-                false -> {ok, {Count + 1, [DocId | Acc]}}
-            end
-        end, {0, []}),
-    DocIds.
+        fun({_P, DocId}, Acc) -> {ok, [DocId | Acc]} end, []).
 
 %% @private Intersect multiple DocId sets using optimized intersection
 %% First collects from most selective condition, then filters against others
@@ -1999,9 +1982,12 @@ execute_index_scan(StoreRef, DbName, Plan, Snapshot) ->
     {multi_index, [condition()]} |
     needs_body.
 classify_scan_query(Conditions, Plan) ->
-    #query_plan{include_docs = IncludeDocs, projections = Projections} = Plan,
-    NeedsBody = IncludeDocs orelse needs_body_for_projection(Projections),
-    case {Conditions, NeedsBody} of
+    #query_plan{projections = Projections} = Plan,
+    %% Note: include_docs doesn't affect classification - we can still use
+    %% pure index scans and fetch docs afterward. Only projections that
+    %% reference paths require body fetch during query.
+    NeedsBodyForQuery = needs_body_for_projection(Projections),
+    case {Conditions, NeedsBodyForQuery} of
         {[{path, Path, Value}], false} ->
             %% Pure equality - only if value is concrete (not a logic var)
             case is_logic_var(Value) of
@@ -2068,9 +2054,11 @@ needs_body_for_projection(Projections) ->
     {multi_index, [condition()]} |
     needs_body.
 classify_scan_query_adaptive(StoreRef, DbName, Conditions, Plan) ->
-    #query_plan{include_docs = IncludeDocs, projections = Projections} = Plan,
-    NeedsBody = IncludeDocs orelse needs_body_for_projection(Projections),
-    case {Conditions, NeedsBody} of
+    #query_plan{projections = Projections} = Plan,
+    %% Note: include_docs doesn't affect classification - we can still use
+    %% pure index scans and fetch docs afterward.
+    NeedsBodyForQuery = needs_body_for_projection(Projections),
+    case {Conditions, NeedsBodyForQuery} of
         {[{path, Path, Value}], false} ->
             case is_logic_var(Value) of
                 true ->
@@ -2249,21 +2237,10 @@ execute_pure_compare(StoreRef, DbName, Path, Op, Value, Plan, Snapshot) ->
         end
     end,
 
-    %% Use provided snapshot or create a temporary one for consistency
-    {ActualSnapshot, CreatedSnapshot} = case Snapshot of
-        undefined ->
-            {ok, S} = barrel_store_rocksdb:snapshot(StoreRef),
-            {S, true};
-        S -> {S, false}
-    end,
+    %% Use provided snapshot for consistency
     {_, _, Results} = barrel_ars_index:fold_compare_docids_with_snapshot(
-        StoreRef, DbName, Path, Op, Value, FoldFun, {#{}, 0, []}, ActualSnapshot
+        StoreRef, DbName, Path, Op, Value, FoldFun, {#{}, 0, []}, Snapshot
     ),
-    %% Only release if we created the snapshot
-    case CreatedSnapshot of
-        true -> maybe_release_snapshot(ActualSnapshot);
-        false -> ok
-    end,
 
     %% Apply offset and limit (results are in reverse order)
     Results1 = lists:reverse(Results),
@@ -3075,13 +3052,10 @@ fetch_and_filter_batch_streaming(DbName, DocIds, Conds, Bindings, Projs,
             {[], 0};
         _ ->
             %% Use snapshot-aware fetch with read profile
-            DocBodyResults = case Snapshot of
-                undefined ->
-                    barrel_doc_body_store:multi_get_current_bodies(DbName, DocIds, Profile);
-                _ ->
-                    barrel_doc_body_store:multi_get_current_bodies_with_snapshot(
-                        DbName, DocIds, Snapshot, Profile)
-            end,
+            %% Snapshot is always valid in this code path (created by execute/3)
+            DocBodyResults = barrel_doc_body_store:multi_get_current_bodies_with_snapshot(
+                DbName, DocIds, Snapshot, Profile
+            ),
 
             %% Process each doc
             Pairs = lists:zip(DocIds, DocBodyResults),
@@ -3143,6 +3117,34 @@ safe_split(N, List) when length(List) =< N ->
     {List, []};
 safe_split(N, List) ->
     lists:split(N, List).
+
+%% @doc Fetch documents for chunked query results when include_docs is true.
+%% Takes a list of doc IDs and returns results with doc bodies included.
+maybe_fetch_docs_chunked(_DbName, DocIds, false, _DecoderFun) ->
+    %% No include_docs - just return ID-only results
+    [#{<<"id">> => DocId} || DocId <- DocIds];
+maybe_fetch_docs_chunked(DbName, DocIds, true, DecoderFun) ->
+    case DocIds of
+        [] -> [];
+        _ ->
+            %% Fetch document bodies
+            DocBodyResults = barrel_doc_body_store:multi_get_current_bodies(DbName, DocIds),
+            Pairs = lists:zip(DocIds, DocBodyResults),
+            lists:filtermap(
+                fun({DocId, {ok, CborBin}}) ->
+                    Doc = case DecoderFun of
+                        undefined -> barrel_docdb_codec_cbor:decode_any(CborBin);
+                        Fun -> Fun(CborBin)
+                    end,
+                    {true, #{<<"id">> => DocId, <<"doc">> => Doc}};
+                   ({DocId, not_found}) ->
+                    %% Doc deleted - return ID only with deleted flag
+                    {true, #{<<"id">> => DocId, <<"deleted">> => true}};
+                   ({_DocId, {error, _}}) ->
+                    false
+                end,
+                Pairs)
+    end.
 
 %% @doc Batch fetch documents using direct body fetch (no entity lookup needed).
 %% With current body stored without revision key, we can skip the entity fetch entirely
@@ -3663,14 +3665,10 @@ fetch_batch_for_pipeline(DbName, DocIds, Conditions, Bindings,
                          Projections, IncludeDocs, DecoderFun, Snapshot) ->
     Profile = select_body_read_profile(length(DocIds)),
 
-    %% Fetch bodies
-    DocBodyResults = case Snapshot of
-        undefined ->
-            barrel_doc_body_store:multi_get_current_bodies(DbName, DocIds, Profile);
-        _ ->
-            barrel_doc_body_store:multi_get_current_bodies_with_snapshot(
-                DbName, DocIds, Snapshot, Profile)
-    end,
+    %% Fetch bodies with snapshot (always valid in this code path)
+    DocBodyResults = barrel_doc_body_store:multi_get_current_bodies_with_snapshot(
+        DbName, DocIds, Snapshot, Profile
+    ),
 
     %% Process each doc
     Pairs = lists:zip(DocIds, DocBodyResults),

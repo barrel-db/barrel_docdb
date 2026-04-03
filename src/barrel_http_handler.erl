@@ -209,13 +209,9 @@ handle_action(metrics, <<"GET">>, Req) ->
 
 %% Node info (discovery endpoint)
 handle_action(node_info, <<"GET">>, Req) ->
-    case barrel_discovery:node_info() of
-        {ok, Info} ->
-            Body = encode_response(Info, Req),
-            {200, response_headers(Req), Body, Req};
-        {error, Reason} ->
-            throw({error, 500, format_error(Reason)})
-    end;
+  {ok, Info} =  barrel_discovery:node_info(),
+  Body = encode_response(Info, Req),
+  {200, response_headers(Req), Body, Req};
 
 %% Peer management: list all peers
 handle_action(peers, <<"GET">>, Req) ->
@@ -329,9 +325,7 @@ handle_action(federation_find, <<"GET">>, Req) ->
             Body = encode_response(Response, Req),
             {200, response_headers(Req), Body, Req};
         {error, {federation_not_found, _}} ->
-            throw({error, 404, <<"Federation not found">>});
-        {error, Reason} ->
-            throw({error, 400, format_error(Reason)})
+            throw({error, 404, <<"Federation not found">>})
     end;
 handle_action(federation_find, <<"POST">>, Req) ->
     handle_federation_find(Req);
@@ -373,9 +367,9 @@ handle_action(policy, <<"PUT">>, Req) ->
             case barrel_rep_policy:create(Name, Config) of
                 ok ->
                     %% Re-enable if it was enabled
-                    case WasEnabled of
-                        true -> barrel_rep_policy:enable(Name);
-                        false -> ok
+                _ = case WasEnabled of
+                      true ->  barrel_rep_policy:enable(Name);
+                      false -> ok
                     end,
                     Body = encode_response(#{<<"ok">> => true}, Req1),
                     {200, response_headers(Req1), Body, Req1};
@@ -444,7 +438,8 @@ handle_action(tier_config, <<"POST">>, Req) ->
             Body = encode_response(#{<<"ok">> => true}, Req1),
             {200, response_headers(Req1), Body, Req1};
         {error, {missing_config, Field, Msg}} ->
-            throw({error, 400, <<"Missing config: ", Field/binary, " - ", Msg/binary>>});
+            FieldBin = atom_to_binary(Field, utf8),
+            throw({error, 400, <<"Missing config: ", FieldBin/binary, " - ", Msg/binary>>});
         {error, Reason} ->
             throw({error, 400, format_error(Reason)})
     end;
@@ -614,15 +609,9 @@ handle_action(db_info, <<"PUT">>, Req) ->
     end;
 handle_action(db_info, <<"DELETE">>, Req) ->
     DbName = cowboy_req:binding(db, Req),
-    case barrel_docdb:delete_db(DbName) of
-        ok ->
-            Body = encode_response(#{ok => true}, Req),
-            {200, response_headers(Req), Body, Req};
-        {error, not_found} ->
-            throw({error, 404, <<"Database not found">>});
-        {error, Reason} ->
-            throw({error, 500, format_error(Reason)})
-    end;
+    ok = barrel_docdb:delete_db(DbName),
+    Body = encode_response(#{ok => true}, Req),
+    {200, response_headers(Req), Body, Req};
 handle_action(db_info, <<"POST">>, Req) ->
     handle_post_doc(Req);
 
@@ -827,19 +816,15 @@ handle_get_changes(Req0) ->
 
 %% Normal poll - return changes immediately
 handle_normal_changes(DbName, Since, FilterFun, Opts, Req0) ->
-    case barrel_docdb:get_changes(DbName, Since, Opts) of
-        {ok, Changes, LastHlc} ->
-            FilteredChanges = filter_changes(Changes, FilterFun),
-            FormattedChanges = lists:map(fun format_change/1, FilteredChanges),
-            Response = #{
-                <<"results">> => FormattedChanges,
-                <<"last_seq">> => format_hlc(LastHlc)
-            },
-            Body = encode_response(Response, Req0),
-            {200, response_headers(Req0), Body, Req0};
-        {error, Reason} ->
-            throw({error, 500, format_error(Reason)})
-    end.
+  {ok, Changes, LastHlc}  =  barrel_docdb:get_changes(DbName, Since, Opts),
+  FilteredChanges = filter_changes(Changes, FilterFun),
+  FormattedChanges = lists:map(fun format_change/1, FilteredChanges),
+  Response = #{
+               <<"results">> => FormattedChanges,
+               <<"last_seq">> => format_hlc(LastHlc)
+              },
+  Body = encode_response(Response, Req0),
+  {200, response_headers(Req0), Body, Req0}.
 
 %% Long poll - wait for changes or timeout
 handle_longpoll_changes(DbName, Since, FilterFun, Opts, Timeout, Req0) ->
@@ -883,10 +868,7 @@ longpoll_loop(DbName, Since, FilterFun, Opts, Timeout, StartTime, Req0) ->
                             },
                             Body = encode_response(Response, Req0),
                             {200, response_headers(Req0), Body, Req0}
-                    end;
-
-                {error, Reason} ->
-                    throw({error, 500, format_error(Reason)})
+                    end
             end
     end.
 
@@ -1014,9 +996,7 @@ handle_vdb_delete(Req) ->
             Body = encode_response(#{<<"ok">> => true}, Req),
             {200, response_headers(Req), Body, Req};
         {error, not_found} ->
-            throw({error, 404, <<"VDB not found">>});
-        {error, Reason} ->
-            throw({error, 500, format_error(Reason)})
+            throw({error, 404, <<"VDB not found">>})
     end.
 
 %% Get VDB shard assignments
@@ -1089,9 +1069,7 @@ handle_vdb_bulk_docs(Req0) ->
             Body = encode_response(Results, Req1),
             {201, response_headers(Req1), Body, Req1};
         {error, not_found} ->
-            throw({error, 404, <<"VDB not found">>});
-        {error, Reason} ->
-            throw({error, 500, format_error(Reason)})
+            throw({error, 404, <<"VDB not found">>})
     end.
 
 %% VDB find (scatter-gather query)
@@ -1111,9 +1089,7 @@ handle_vdb_find(Req0) ->
             Body = encode_response(Response, Req1),
             {200, response_headers(Req1), Body, Req1};
         {error, not_found} ->
-            throw({error, 404, <<"VDB not found">>});
-        {error, Reason} ->
-            throw({error, 500, format_error(Reason)})
+            throw({error, 404, <<"VDB not found">>})
     end.
 
 %% Get VDB document (routed to correct shard)
@@ -1178,34 +1154,28 @@ handle_vdb_delete_doc(Req) ->
 handle_vdb_import(Req0) ->
     VdbName = cowboy_req:binding(vdb, Req0),
     {ok, Body, Req} = cowboy_req:read_body(Req0),
-    case decode_request_body(Body, Req) of
-        {ok, Data} ->
-            SourceDb = maps:get(<<"source_db">>, Data, undefined),
-            case SourceDb of
-                undefined ->
-                    throw({error, 400, <<"source_db is required">>});
-                _ ->
-                    Opts = convert_import_opts(Data),
-                    case barrel_vdb_import:import(SourceDb, VdbName, Opts) of
-                        {ok, Stats} ->
-                            %% Convert atom keys to binary for JSON
-                            SafeStats = maps:fold(
-                                fun(K, V, Acc) -> Acc#{atom_to_binary(K) => V} end,
-                                #{},
-                                Stats
-                            ),
-                            RespBody = encode_response(SafeStats, Req),
-                            {200, response_headers(Req), RespBody, Req};
-                        {error, {source_not_found, _}} ->
-                            throw({error, 404, <<"Source database not found">>});
-                        {error, {vdb_not_found, _}} ->
-                            throw({error, 404, <<"VDB not found">>});
-                        {error, Reason} ->
-                            throw({error, 500, format_error(Reason)})
-                    end
-            end;
-        {error, _} ->
-            throw({error, 400, <<"Invalid JSON">>})
+    Data = decode_request_body(Body, Req),
+    SourceDb = maps:get(<<"source_db">>, Data, undefined),
+    case SourceDb of
+      undefined ->
+        throw({error, 400, <<"source_db is required">>});
+      _ ->
+        Opts = convert_import_opts(Data),
+        case barrel_vdb_import:import(SourceDb, VdbName, Opts) of
+          {ok, Stats} ->
+            %% Convert atom keys to binary for JSON
+            SafeStats = maps:fold(
+                          fun(K, V, Acc) -> Acc#{atom_to_binary(K) => V} end,
+                          #{},
+                          Stats
+                         ),
+            RespBody = encode_response(SafeStats, Req),
+            {200, response_headers(Req), RespBody, Req};
+          {error, {source_not_found, _}} ->
+            throw({error, 404, <<"Source database not found">>});
+          {error, {vdb_not_found, _}} ->
+            throw({error, 404, <<"VDB not found">>})
+        end
     end.
 
 %% Split a shard into two shards
@@ -1217,12 +1187,8 @@ handle_vdb_shard_split(Req0) ->
     Opts = case cowboy_req:has_body(Req0) of
         true ->
             {ok, Body, _} = cowboy_req:read_body(Req0),
-            case decode_request_body(Body, Req0) of
-                {ok, Data} ->
-                    convert_rebalance_opts(Data);
-                {error, _} ->
-                    #{}
-            end;
+            Data = decode_request_body(Body, Req0),
+            convert_rebalance_opts(Data);
         false ->
             #{}
     end,
@@ -1255,43 +1221,40 @@ handle_vdb_shard_merge(Req0) ->
     ShardBin = cowboy_req:binding(shard, Req0),
     ShardId = binary_to_integer(ShardBin),
     {ok, Body, Req} = cowboy_req:read_body(Req0),
-    case decode_request_body(Body, Req) of
-        {ok, Data} ->
-            TargetShard = maps:get(<<"target_shard">>, Data, undefined),
-            case TargetShard of
-                undefined ->
-                    throw({error, 400, <<"target_shard is required">>});
-                _ ->
-                    TargetShardId = if
+    Data = decode_request_body(Body, Req),
+    TargetShard = maps:get(<<"target_shard">>, Data, undefined),
+    case TargetShard of
+      undefined ->
+        throw({error, 400, <<"target_shard is required">>});
+      _ ->
+        TargetShardId = if
                         is_integer(TargetShard) -> TargetShard;
                         is_binary(TargetShard) -> binary_to_integer(TargetShard);
                         true -> throw({error, 400, <<"target_shard must be an integer">>})
                     end,
-                    Opts = convert_rebalance_opts(Data),
-                    case barrel_shard_rebalance:merge_shards(VdbName, ShardId, TargetShardId, Opts) of
-                        ok ->
-                            Response = #{
-                                <<"ok">> => true,
-                                <<"message">> => iolist_to_binary([
+        Opts = convert_rebalance_opts(Data),
+        case barrel_shard_rebalance:merge_shards(VdbName, ShardId, TargetShardId, Opts) of
+          ok ->
+            Response = #{
+                         <<"ok">> => true,
+                         <<"message">> => iolist_to_binary([
                                     <<"Shard ">>, integer_to_binary(ShardId),
                                     <<" merged into shard ">>, integer_to_binary(TargetShardId)
                                 ])
-                            },
-                            RespBody = encode_response(Response, Req),
-                            {200, response_headers(Req), RespBody, Req};
-                        {error, shards_not_adjacent} ->
-                            throw({error, 409, <<"Shards are not adjacent in hash space">>});
-                        {error, {shard_not_active, ShId, Status}} ->
-                            throw({error, 409, iolist_to_binary([
-                                <<"Shard ">>, integer_to_binary(ShId),
-                                <<" is not active, status: ">>, atom_to_binary(Status)
-                            ])});
-                        {error, Reason} ->
-                            throw({error, 500, format_error(Reason)})
-                    end
-            end;
-        {error, _} ->
-            throw({error, 400, <<"Invalid JSON">>})
+                        },
+            RespBody = encode_response(Response, Req),
+            {200, response_headers(Req), RespBody, Req};
+          {error, shards_not_adjacent} ->
+            throw({error, 409, <<"Shards are not adjacent in hash space">>});
+          {error, {shard_not_active, ShId, Status}} ->
+            throw({error, 409, iolist_to_binary([
+                                                 <<"Shard ">>, integer_to_binary(ShId),
+                                                 <<" is not active, status: ">>, atom_to_binary(Status)
+                                                ])});
+          {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+        end
+
     end.
 
 %% Convert import options from binary keys to atoms
@@ -1636,9 +1599,8 @@ handle_federation_find(Req0) ->
             FormattedMeta = format_federation_meta(Meta),
             case response_content_type(Req1) of
                 ?CT_CBOR ->
-                    ConvertedResults = [doc_to_map(Doc) || Doc <- Results],
                     Response = #{
-                        <<"results">> => ConvertedResults,
+                        <<"results">> => Results,
                         <<"meta">> => FormattedMeta
                     },
                     Body = barrel_docdb_codec_cbor:encode_cbor(Response),
@@ -1658,9 +1620,7 @@ handle_federation_find(Req0) ->
                     {200, response_headers(Req1), Body, Req1}
             end;
         {error, {federation_not_found, _}} ->
-            throw({error, 404, <<"Federation not found">>});
-        {error, Reason} ->
-            throw({error, 400, format_error(Reason)})
+            throw({error, 404, <<"Federation not found">>})
     end.
 
 %% Format federation query metadata for JSON/CBOR
@@ -1846,26 +1806,15 @@ handle_find(Req0) ->
     {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
     QuerySpec0 = decode_request_body(ReqBody, Req1),
     %% Convert binary keys to atoms for internal API
-    QuerySpec1 = convert_query_spec(QuerySpec0),
-    %% For CBOR responses with include_docs, use doc_format => binary for efficiency
-    IsCbor = response_content_type(Req1) =:= ?CT_CBOR,
-    IncludeDocs = maps:get(include_docs, QuerySpec1, false),
-    QuerySpec = case IsCbor andalso IncludeDocs of
-        true -> QuerySpec1#{doc_format => binary};
-        false -> QuerySpec1
-    end,
+    QuerySpec = convert_query_spec(QuerySpec0),
     case barrel_docdb:find(DbName, QuerySpec) of
         {ok, Results, Meta} ->
-            %% Format metadata for JSON/CBOR
             FormattedMeta = format_query_meta(Meta),
-            %% Convert documents based on response type
-            case IsCbor of
-                true ->
-                    %% For CBOR with doc_format=binary, results are raw CBOR binaries
-                    %% Use encode_cbor_with_raw_docs to embed them directly
+            case response_content_type(Req1) of
+                ?CT_CBOR ->
                     Body = encode_cbor_with_raw_docs(Results, FormattedMeta),
                     {200, response_headers(Req1), Body, Req1};
-                false ->
+                ?CT_JSON ->
                     %% For JSON, encode each document properly
                     JsonDocsStr = iolist_to_binary([
                         <<"[">>,
@@ -1886,14 +1835,8 @@ handle_find(Req0) ->
 
 %% Convert document to JSON, handling both maps and indexed binary format
 doc_to_json(Doc) when is_map(Doc) ->
-    iolist_to_binary(json:encode(Doc));
-doc_to_json(Doc) when is_binary(Doc) ->
-    barrel_doc:to_json(Doc).
+    iolist_to_binary(json:encode(Doc)).
 
-%% Convert document to map for CBOR encoding
-doc_to_map(Doc) when is_map(Doc) -> Doc;
-doc_to_map(Doc) when is_binary(Doc) ->
-    barrel_doc:to_map(Doc).
 
 %%====================================================================
 %% Materialized Views Handlers
@@ -2293,9 +2236,7 @@ format_rep_result(Result) when is_map(Result) ->
         end,
         #{},
         Result
-    );
-format_rep_result(_) ->
-    #{<<"ok">> => true}.
+    ).
 
 %% Format seq for replication result (convert tuples to strings)
 format_seq_for_rep({timestamp, Ts, Counter}) ->
@@ -2332,13 +2273,9 @@ handle_revsdiff(Req0) ->
             end;
         #{<<"revs">> := RevsMap} when is_map(RevsMap) ->
             %% Batch format: map of DocId => [RevIds]
-            case barrel_docdb:revsdiff_batch(DbName, RevsMap) of
-                {ok, Results} ->
-                    Body = encode_response(Results, Req1),
-                    {200, response_headers(Req1), Body, Req1};
-                {error, Reason} ->
-                    throw({error, 500, format_error(Reason)})
-            end;
+            {ok, Results} = barrel_docdb:revsdiff_batch(DbName, RevsMap),
+            Body = encode_response(Results, Req1),
+            {200, response_headers(Req1), Body, Req1};
         _ ->
             throw({error, 400, <<"Invalid revsdiff request format">>})
     end.
@@ -2383,9 +2320,7 @@ handle_get_local_doc(Req) ->
             Body = encode_response(Doc, Req),
             {200, response_headers(Req), Body, Req};
         {error, not_found} ->
-            throw({error, 404, <<"Local document not found">>});
-        {error, Reason} ->
-            throw({error, 500, format_error(Reason)})
+            throw({error, 404, <<"Local document not found">>})
     end.
 
 handle_put_local_doc(Req0) ->
@@ -2411,9 +2346,7 @@ handle_delete_local_doc(Req) ->
             Body = encode_response(Response, Req),
             {200, response_headers(Req), Body, Req};
         {error, not_found} ->
-            throw({error, 404, <<"Local document not found">>});
-        {error, Reason} ->
-            throw({error, 500, format_error(Reason)})
+            throw({error, 404, <<"Local document not found">>})
     end.
 
 %%====================================================================
@@ -2452,12 +2385,8 @@ handle_get_attachment(Req) ->
                 {error, Reason} ->
                     throw({error, 500, format_error(Reason)})
             end;
-        not_found ->
-            throw({error, 404, <<"Attachment not found">>});
         {error, not_found} ->
-            throw({error, 404, <<"Attachment not found">>});
-        {error, Reason} ->
-            throw({error, 500, format_error(Reason)})
+            throw({error, 404, <<"Attachment not found">>})
     end.
 
 %% @private Stream attachment chunks to HTTP response
@@ -2526,10 +2455,6 @@ handle_put_attachment_stream(DbName, DocId, AttName, ContentType, Req0) ->
                     end;
                 {error, Reason, FailedWriter} ->
                     barrel_docdb:abort_attachment_writer(FailedWriter),
-                    throw({error, 500, format_error(Reason)});
-                {error, Reason} ->
-                    %% Writer state unknown - best effort cleanup
-                    barrel_docdb:abort_attachment_writer(Writer),
                     throw({error, 500, format_error(Reason)})
             end;
         {error, Reason} ->
@@ -2659,24 +2584,13 @@ encode_doc_with_raw_body(CborBin, Meta) ->
     %% Merge metadata with raw body using efficient CBOR merge
     barrel_docdb_codec_cbor:merge_into_cbor(CborBin, MetaMap3).
 
-%% Encode CBOR response with raw document bodies (for query results)
-%% Documents may be raw CBOR binaries (doc_format=binary) or maps
+%% Encode CBOR response for query results
 encode_cbor_with_raw_docs(Results, Meta) ->
-    %% Convert results - raw CBOR docs stay as-is, maps need decoding
-    DecodedResults = [decode_doc_for_cbor(Doc) || Doc <- Results],
     Response = #{
-        <<"results">> => DecodedResults,
+        <<"results">> => Results,
         <<"meta">> => Meta
     },
     barrel_docdb_codec_cbor:encode_cbor(Response).
-
-%% Decode document for CBOR response encoding
-%% Raw CBOR binary -> decode to map for inclusion in response
-%% Map -> use as-is
-decode_doc_for_cbor(Doc) when is_binary(Doc) ->
-    barrel_docdb_codec_cbor:decode_any(Doc);
-decode_doc_for_cbor(Doc) when is_map(Doc) ->
-    Doc.
 
 %% Decode request body based on Content-Type
 decode_request_body(Body, Req) ->
@@ -2859,17 +2773,13 @@ handle_delete_key(Req) ->
 
 %% @doc Get usage statistics for all databases
 handle_admin_usage(Req) ->
-    case barrel_docdb_usage:get_all_usage() of
-        {ok, Stats} ->
-            Response = #{
-                <<"databases">> => Stats,
-                <<"total_databases">> => length(Stats)
-            },
-            Body = encode_response(Response, Req),
-            {200, response_headers(Req), Body, Req};
-        {error, Reason} ->
-            throw({error, 500, format_error(Reason)})
-    end.
+  {ok, Stats} = barrel_docdb_usage:get_all_usage(),
+  Response = #{
+               <<"databases">> => Stats,
+               <<"total_databases">> => length(Stats)
+              },
+  Body = encode_response(Response, Req),
+  {200, response_headers(Req), Body, Req}.
 
 %% @doc Get usage statistics for a specific database
 handle_admin_db_usage(Req) ->
@@ -3056,20 +2966,12 @@ collect_single_db_health(DbName) ->
 
 %% @private Collect peer health status
 collect_peer_health() ->
-    case barrel_discovery:list_peers() of
-        {ok, Peers} ->
-            TotalPeers = length(Peers),
-            ActivePeers = length([P || P <- Peers,
-                                       maps:get(status, P, unknown) =:= active]),
-            #{
-                <<"total">> => TotalPeers,
-                <<"active">> => ActivePeers,
-                <<"inactive">> => TotalPeers - ActivePeers
-            };
-        {error, _} ->
-            #{
-                <<"total">> => 0,
-                <<"active">> => 0,
-                <<"inactive">> => 0
-            }
-    end.
+  {ok, Peers} = barrel_discovery:list_peers(),
+  TotalPeers = length(Peers),
+  ActivePeers = length([P || P <- Peers,
+                             maps:get(status, P, unknown) =:= active]),
+  #{
+    <<"total">> => TotalPeers,
+    <<"active">> => ActivePeers,
+    <<"inactive">> => TotalPeers - ActivePeers
+   }.

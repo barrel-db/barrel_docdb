@@ -108,12 +108,12 @@ reset() ->
 init([]) ->
     %% Create ETS tables for caching
     %% Path -> ID cache (high read concurrency)
-    ets:new(?ETS_CACHE, [
+    _ = ets:new(?ETS_CACHE, [
         named_table, public, set,
         {read_concurrency, true}
     ]),
     %% ID -> Path reverse cache
-    ets:new(?ETS_REVERSE, [
+    _ = ets:new(?ETS_REVERSE, [
         named_table, public, set,
         {read_concurrency, true}
     ]),

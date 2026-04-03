@@ -119,7 +119,8 @@ put_docs(Pid, Docs, Opts) ->
     gen_server:call(Pid, {put_docs, Docs, Opts}).
 
 %% @doc Get a document
--spec get_doc(pid(), binary(), map()) -> {ok, map()} | {error, not_found} | {error, term()}.
+%% When raw_body => true in Opts, returns {ok, CborBin, Meta} for zero-copy responses
+-spec get_doc(pid(), binary(), map()) -> {ok, map()} | {ok, binary(), map()} | {error, not_found} | {error, term()}.
 get_doc(Pid, DocId, Opts) ->
     gen_server:call(Pid, {get_doc, DocId, Opts}).
 
@@ -527,31 +528,36 @@ handle_info(_Info, State) ->
 terminate(_Reason, #state{name = Name, store_ref = StoreRef, att_ref = AttRef,
                           view_sup = ViewSup, filter_pid = FilterPid,
                           compaction_timer = CompactionTimer}) ->
-    %% Cancel compaction timer
-    case CompactionTimer of
-        undefined -> ok;
-        _ -> erlang:cancel_timer(CompactionTimer)
-    end,
+    %% Cancel compaction timer 
+    _ = 
+      case CompactionTimer of
+          undefined -> ok;
+          _ -> erlang:cancel_timer(CompactionTimer)
+      end,
     %% Stop view supervisor (will stop all views)
-    case ViewSup of
-        undefined -> ok;
-        _ -> catch exit(ViewSup, shutdown)
-    end,
+    _ = 
+      case ViewSup of
+          undefined -> ok;
+          _ -> catch exit(ViewSup, shutdown)
+      end,
     %% Stop compaction filter handler
-    case FilterPid of
-        undefined -> ok;
-        _ -> catch exit(FilterPid, shutdown)
-    end,
+    _ = 
+      case FilterPid of
+          undefined -> ok;
+          _ -> catch exit(FilterPid, shutdown)
+      end,
     %% Close attachment store
-    case AttRef of
-        undefined -> ok;
-        _ -> barrel_att_store:close(AttRef)
-    end,
+    _ = 
+      case AttRef of
+          undefined -> ok;
+          _ -> barrel_att_store:close(AttRef)
+      end,
     %% Close document store (includes body CF)
-    case StoreRef of
-        undefined -> ok;
-        _ -> barrel_store_rocksdb:close(StoreRef)
-    end,
+    _ = 
+      case StoreRef of
+          undefined -> ok;
+          _ -> barrel_store_rocksdb:close(StoreRef)
+      end,
     %% Unregister
     persistent_term:erase({barrel_db, Name}),
     persistent_term:erase({barrel_store, Name}),
@@ -649,20 +655,21 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
 
     %% Check for existing document (wide column entity)
     DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
-    {OldHlc, OldRev, OldRevTree, OldDocBody} = case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
+    {OldHlc, OldRev, OldRevTree, OldDocBody, OldDocBodyCbor} = case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
         {ok, Columns} ->
             ExistingRev = proplists:get_value(?COL_REV, Columns),
             ExistingHlc = barrel_hlc:decode(proplists:get_value(?COL_HLC, Columns)),
             OldTree = decode_revtree(proplists:get_value(?COL_REVTREE, Columns)),
             %% Get old doc body for path index diff from body CF (current body, no rev in key)
-            OldBody = case barrel_store_rocksdb:body_get(StoreRef,
+            %% Keep both raw CBOR (for archiving) and decoded map (for path indexing)
+            {OldBody, OldBodyCbor} = case barrel_store_rocksdb:body_get(StoreRef,
                             barrel_store_keys:doc_body(DbName, DocId)) of
-                {ok, OldCborBin} -> OldCborBin;
-                not_found -> undefined
+                {ok, OldCborBin} -> {barrel_docdb_codec_cbor:decode_any(OldCborBin), OldCborBin};
+                not_found -> {undefined, undefined}
             end,
-            {ExistingHlc, ExistingRev, OldTree, OldBody};
+            {ExistingHlc, ExistingRev, OldTree, OldBody, OldBodyCbor};
         not_found ->
-            {undefined, undefined, #{}, undefined}
+            {undefined, undefined, #{}, undefined, undefined}
     end,
 
     %% Build revision tree (merge with existing)
@@ -763,7 +770,7 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
     CborBody = barrel_docdb_codec_cbor:encode_cbor(DocBody),
 
     %% Archive old body to revision-keyed location if updating
-    ArchiveOps = case {OldRev, OldDocBody} of
+    ArchiveOps = case {OldRev, OldDocBodyCbor} of
         {undefined, _} -> [];  %% New document, no archive needed
         {_, undefined} -> [];  %% No old body to archive
         {_, OldCbor} ->
@@ -1104,10 +1111,8 @@ do_delete_doc(StoreRef, DbName, DocId, Opts) ->
             ],
             DocOps = [{entity_put, DocEntityKey, DocColumns}],
 
-            HlcDeleteOps = case OldHlc of
-                undefined -> [];
-                _ -> [{delete, barrel_store_keys:doc_hlc(DbName, OldHlc)}]
-            end,
+            %% Delete old HLC index entry (HLC always exists for valid documents)
+            HlcDeleteOps = [{delete, barrel_store_keys:doc_hlc(DbName, OldHlc)}],
 
             %% Path index removal operations
             PathIndexOps = case barrel_ars_index:get_doc_paths(StoreRef, DbName, DocId) of
@@ -1375,19 +1380,11 @@ do_revsdiff(StoreRef, DbName, DocId, RevIds) ->
 do_revsdiff_batch(StoreRef, DbName, RevsMap) ->
     Result = maps:fold(
         fun(DocId, RevIds, Acc) ->
-            case do_revsdiff(StoreRef, DbName, DocId, RevIds) of
-                {ok, Missing, PossibleAncestors} ->
-                    maps:put(DocId, #{
-                        missing => Missing,
-                        possible_ancestors => PossibleAncestors
-                    }, Acc);
-                {error, _Reason} ->
-                    %% On error, treat all revisions as missing
-                    maps:put(DocId, #{
-                        missing => RevIds,
-                        possible_ancestors => []
-                    }, Acc)
-            end
+            {ok, Missing, PossibleAncestors} =  do_revsdiff(StoreRef, DbName, DocId, RevIds),
+            maps:put(DocId, #{
+                    missing => Missing,
+                    possible_ancestors => PossibleAncestors
+            }, Acc)
         end,
         #{},
         RevsMap
@@ -1479,7 +1476,7 @@ notify_subscribers(DbName, DocId, Rev, Hlc, Deleted, DocBody) ->
     }},
 
     %% Send to each path subscriber
-    [Pid ! Notification || Pid <- Pids],
+    _ = [Pid ! Notification || Pid <- Pids],
 
     %% Notify query subscribers (only for non-deleted docs)
     case Deleted of
@@ -1839,45 +1836,41 @@ do_classify_by_age(StoreRef, DbName, HotCutoff, WarmCutoff) ->
     Stats = #{classified => 0, errors => 0},
 
     FoldFun = fun(Key, Value, AccStats) ->
-        case barrel_store_rocksdb:decode_entity(Value) of
-            Columns when is_list(Columns) ->
-                CreatedAtBin = proplists:get_value(?COL_CREATED_AT, Columns, <<>>),
-                %% decode_entity returns tier as atom (hot, warm, cold)
-                CurrentTier = proplists:get_value(?COL_TIER, Columns, hot),
+        Columns = barrel_store_rocksdb:decode_entity(Value),
+        CreatedAtBin = proplists:get_value(?COL_CREATED_AT, Columns, <<>>),
+        %% decode_entity returns tier as atom (hot, warm, cold)
+        CurrentTier = proplists:get_value(?COL_TIER, Columns, hot),
 
-                %% Decode created_at HLC to get timestamp (wall_time in ms)
-                CreatedMs = case CreatedAtBin of
-                    <<>> -> 0;
-                    _ ->
+        %% Decode created_at HLC to get timestamp (wall_time in ms)
+        CreatedMs = case CreatedAtBin of
+                      <<>> -> 0;
+                      _ ->
                         CreatedHlc = barrel_hlc:decode(CreatedAtBin),
                         barrel_hlc:wall_time(CreatedHlc)
-                end,
+                    end,
 
-                %% Determine new tier based on age (use atoms)
-                NewTier = if
+        %% Determine new tier based on age (use atoms)
+        NewTier = if
                     CreatedMs >= HotCutoff -> hot;
                     CreatedMs >= WarmCutoff -> warm;
                     true -> cold
-                end,
+                  end,
 
-                %% Update if tier changed
-                case NewTier =/= CurrentTier of
-                    true ->
-                        %% Store as byte value for encoding
-                        NewTierByte = barrel_tier:tier_to_byte(NewTier),
-                        UpdatedColumns = lists:keyreplace(?COL_TIER, 1, Columns, {?COL_TIER, NewTierByte}),
-                        case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, Key, UpdatedColumns}]) of
-                            ok ->
-                                {ok, AccStats#{classified := maps:get(classified, AccStats) + 1}};
-                            _ ->
-                                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
-                        end;
-                    false ->
-                        {ok, AccStats}
-                end;
-            _ ->
+        %% Update if tier changed
+        case NewTier =/= CurrentTier of
+          true ->
+            %% Store as byte value for encoding
+            NewTierByte = barrel_tier:tier_to_byte(NewTier),
+            UpdatedColumns = lists:keyreplace(?COL_TIER, 1, Columns, {?COL_TIER, NewTierByte}),
+            case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, Key, UpdatedColumns}]) of
+              ok ->
+                {ok, AccStats#{classified := maps:get(classified, AccStats) + 1}};
+              _ ->
                 {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
-        end
+            end;
+          false ->
+            {ok, AccStats}
+        end    
     end,
 
     FinalStats = barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, Stats),
@@ -1893,25 +1886,20 @@ do_migrate_expired(StoreRef, DbName) ->
     Stats = #{deleted => 0, errors => 0},
 
     FoldFun = fun(Key, Value, AccStats) ->
-        case barrel_store_rocksdb:decode_entity(Value) of
-            Columns when is_list(Columns) ->
-                ExpiresAt = proplists:get_value(?COL_EXPIRES_AT, Columns, 0),
-
-                case ExpiresAt > 0 andalso Now >= ExpiresAt of
-                    true ->
-                        %% Document has expired - mark as deleted
-                        UpdatedColumns = lists:keyreplace(?COL_DELETED, 1, Columns, {?COL_DELETED, <<"true">>}),
-                        case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, Key, UpdatedColumns}]) of
-                            ok ->
-                                {ok, AccStats#{deleted := maps:get(deleted, AccStats) + 1}};
-                            _ ->
-                                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
-                        end;
-                    false ->
-                        {ok, AccStats}
-                end;
-            _ ->
-                {ok, AccStats}
+        Columns = barrel_store_rocksdb:decode_entity(Value),
+        ExpiresAt = proplists:get_value(?COL_EXPIRES_AT, Columns, 0),
+        case ExpiresAt > 0 andalso Now >= ExpiresAt of
+          true ->
+            %% Document has expired - mark as deleted
+            UpdatedColumns = lists:keyreplace(?COL_DELETED, 1, Columns, {?COL_DELETED, <<"true">>}),
+            case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, Key, UpdatedColumns}]) of
+              ok ->
+                {ok, AccStats#{deleted := maps:get(deleted, AccStats) + 1}};
+              _ ->
+                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
+            end;
+          false ->
+            {ok, AccStats}
         end
     end,
 
@@ -2008,11 +1996,9 @@ do_physical_migrate_doc(StoreRef, SourceDb, DocId, TargetDb) ->
                         {ok, _, _} ->
                             %% Delete from source - mark as deleted
                             DeleteOpts = #{rev => Rev},
-                            case do_delete_doc(StoreRef, SourceDb, DocId, DeleteOpts) of
-                                {ok, _, _} -> ok;
-                                %% Ignore delete errors, doc is already copied
-                                _ -> ok
-                            end;
+                            %% Ignore delete errors, doc is already copied
+                            _ = do_delete_doc(StoreRef, SourceDb, DocId, DeleteOpts),
+                            ok;
                         {error, Reason} ->
                             {error, {target_put_failed, Reason}}
                     end;
@@ -2041,47 +2027,43 @@ do_migrate_to_tier_bulk(StoreRef, DbName, TargetTier, TargetDbName,
     Stats = #{migrated => 0, skipped => 0, errors => 0},
 
     FoldFun = fun(Key, Value, AccStats) ->
-        case barrel_store_rocksdb:decode_entity(Value) of
-            Columns when is_list(Columns) ->
-                CurrentTier = proplists:get_value(?COL_TIER, Columns, hot),
-                CreatedAtBin = proplists:get_value(?COL_CREATED_AT, Columns, <<>>),
+        Columns = barrel_store_rocksdb:decode_entity(Value),
+        CurrentTier = proplists:get_value(?COL_TIER, Columns, hot),
+        CreatedAtBin = proplists:get_value(?COL_CREATED_AT, Columns, <<>>),
 
-                TierMatch = (SourceTier =:= undefined) orelse (CurrentTier =:= SourceTier),
+        TierMatch = (SourceTier =:= undefined) orelse (CurrentTier =:= SourceTier),
 
-                AgeMs = case CreatedAtBin of
-                    <<>> -> 0;
-                    _ ->
-                        CreatedHlc = barrel_hlc:decode(CreatedAtBin),
-                        Now - barrel_hlc:wall_time(CreatedHlc)
+        AgeMs = case CreatedAtBin of
+                  <<>> -> 0;
+                  _ ->
+                    CreatedHlc = barrel_hlc:decode(CreatedAtBin),
+                    Now - barrel_hlc:wall_time(CreatedHlc)
                 end,
-                AgeMatch = AgeMs >= MinAge,
+        AgeMatch = AgeMs >= MinAge,
 
-                case TierMatch andalso AgeMatch andalso CurrentTier =/= TargetTier of
-                    true when PhysicalMigration ->
-                        %% Physical migration - extract DocId from key and migrate
-                        <<_Prefix:PrefixSize/binary, DocId/binary>> = Key,
-                        case do_physical_migrate_doc(StoreRef, DbName, DocId, TargetDbName) of
-                            ok ->
-                                {ok, AccStats#{migrated := maps:get(migrated, AccStats) + 1}};
-                            _ ->
-                                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
-                        end;
-                    true ->
-                        %% Metadata-only migration
-                        UpdatedColumns = lists:keyreplace(?COL_TIER, 1, Columns,
-                                                          {?COL_TIER, TargetTierByte}),
-                        case barrel_store_rocksdb:write_batch(StoreRef,
-                                [{entity_put, Key, UpdatedColumns}]) of
-                            ok ->
-                                {ok, AccStats#{migrated := maps:get(migrated, AccStats) + 1}};
-                            _ ->
-                                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
-                        end;
-                    false ->
-                        {ok, AccStats#{skipped := maps:get(skipped, AccStats) + 1}}
-                end;
-            _ ->
+        case TierMatch andalso AgeMatch andalso CurrentTier =/= TargetTier of
+          true when PhysicalMigration ->
+            %% Physical migration - extract DocId from key and migrate
+            <<_Prefix:PrefixSize/binary, DocId/binary>> = Key,
+            case do_physical_migrate_doc(StoreRef, DbName, DocId, TargetDbName) of
+              ok ->
+                {ok, AccStats#{migrated := maps:get(migrated, AccStats) + 1}};
+              _ ->
                 {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
+            end;
+          true ->
+            %% Metadata-only migration
+            UpdatedColumns = lists:keyreplace(?COL_TIER, 1, Columns,
+                                              {?COL_TIER, TargetTierByte}),
+            case barrel_store_rocksdb:write_batch(StoreRef,
+                                                  [{entity_put, Key, UpdatedColumns}]) of
+              ok ->
+                {ok, AccStats#{migrated := maps:get(migrated, AccStats) + 1}};
+              _ ->
+                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
+            end;
+          false ->
+            {ok, AccStats#{skipped := maps:get(skipped, AccStats) + 1}}
         end
     end,
 

@@ -73,7 +73,8 @@
     execute_multi_index_intersection/1,
     execute_multi_index_zero_cardinality/1,
     execute_multi_index_with_limit/1,
-    execute_chunked_query/1
+    execute_chunked_query/1,
+    execute_chunked_with_include_docs/1
 ]).
 
 %%====================================================================
@@ -137,7 +138,8 @@ groups() ->
             execute_multi_index_intersection,
             execute_multi_index_zero_cardinality,
             execute_multi_index_with_limit,
-            execute_chunked_query
+            execute_chunked_query,
+            execute_chunked_with_include_docs
         ]}
     ].
 
@@ -877,5 +879,49 @@ execute_chunked_query(Config) ->
     ?assert(lists:member(<<"user1">>, AllDocIds)),
     ?assert(lists:member(<<"user2">>, AllDocIds)),
     ?assert(lists:member(<<"user3">>, AllDocIds)),
+
+    ok.
+
+execute_chunked_with_include_docs(Config) ->
+    DbName = proplists:get_value(db_name, Config),
+    StoreRef = proplists:get_value(store_ref, Config),
+
+    %% Pure equality query with include_docs and small chunk size
+    Spec = #{
+        where => [{path, [<<"type">>], <<"user">>}],
+        include_docs => true
+    },
+    {ok, Plan} = barrel_query:compile(Spec),
+
+    %% First chunk with size 2 (we have 3 users)
+    {ok, Results1, Meta1} = barrel_query:execute(StoreRef, DbName, Plan, #{chunk_size => 2}),
+
+    ?assertEqual(2, length(Results1)),
+    ?assertEqual(true, maps:get(has_more, Meta1)),
+    ?assert(maps:is_key(continuation, Meta1)),
+
+    %% Verify docs are included in results
+    [R1, R2] = Results1,
+    ?assert(maps:is_key(<<"doc">>, R1)),
+    ?assert(maps:is_key(<<"doc">>, R2)),
+    Doc1 = maps:get(<<"doc">>, R1),
+    ?assertEqual(<<"user">>, maps:get(<<"type">>, Doc1)),
+
+    %% Get continuation token
+    Token = maps:get(continuation, Meta1),
+
+    %% Second chunk should get remaining doc with include_docs
+    {ok, Results2, Meta2} = barrel_query:execute(StoreRef, DbName, Plan, #{continuation => Token}),
+
+    ?assertEqual(1, length(Results2)),
+    ?assertEqual(false, maps:get(has_more, Meta2)),
+
+    %% Verify doc is included
+    [R3] = Results2,
+    ?assert(maps:is_key(<<"doc">>, R3)),
+
+    %% Verify all users were returned across chunks
+    AllDocIds = [maps:get(<<"id">>, R) || R <- Results1 ++ Results2],
+    ?assertEqual(3, length(AllDocIds)),
 
     ok.

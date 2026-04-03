@@ -50,7 +50,7 @@
     basic_auth => {binary(), binary()}, % {Username, Password} for Basic auth
     peer_auth => boolean(),             % Use Ed25519 peer authentication (default: true)
     %% SSL/TLS options
-    ssl_options => [ssl:tls_client_option()], % Custom SSL options
+    ssl_options => [term()], % Custom SSL/TLS options
     insecure => boolean()               % Skip certificate verification (NOT recommended)
 }.
 
@@ -365,9 +365,7 @@ ssl_options(#{url := Url} = Endpoint, BaseOpts) ->
             [{ssl_options, DefaultSslOpts} | BaseOpts];
         _ ->
             BaseOpts
-    end;
-ssl_options(_, BaseOpts) ->
-    BaseOpts.
+    end.
 
 %% Default SSL options - verify peer by default
 default_ssl_options(#{insecure := true}) ->

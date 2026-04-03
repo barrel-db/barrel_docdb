@@ -194,7 +194,7 @@ push(info, send_changes, #{store_ref := StoreRef,
     Changes = lists:reverse(RevChanges),
 
     ReqId = make_ref(),
-    case Owner of
+    _ = case Owner of
         undefined -> ok;
         Pid when is_pid(Pid) -> Pid ! {changes, ReqId, Changes}
     end,
@@ -215,6 +215,8 @@ push(cast, stop, State) ->
 
 push(_EventType, _Event, State) ->
     {keep_state, State}.
+
+
 
 %%====================================================================
 %% State: wait_pending (waiting for acks)

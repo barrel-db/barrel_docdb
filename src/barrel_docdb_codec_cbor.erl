@@ -1071,10 +1071,8 @@ get(RecordBin, Path) ->
 get(RecordBin, Path, Default) ->
     case find_path(RecordBin, Path) of
         {ok, {_Type, VRef}} ->
-            case decode_value(RecordBin, VRef) of
-                {ok, Value} -> Value;
-                {error, _} -> Default
-            end;
+            {ok, Value} = decode_value(RecordBin, VRef),
+            Value;
         not_found ->
             Default;
         {error, _} ->

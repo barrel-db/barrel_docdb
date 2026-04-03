@@ -217,16 +217,16 @@ handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
 handle_cast({task_complete, TaskId}, State) ->
-    update_task_status(TaskId, completed),
+    _ = update_task_status(TaskId, completed),
     NewRunning = maps:remove(TaskId, State#state.running),
     {noreply, State#state{running = NewRunning}};
 
 handle_cast({task_progress, TaskId, LastSeq}, State) ->
-    update_task_seq(TaskId, LastSeq),
+    _ = update_task_seq(TaskId, LastSeq),
     {noreply, State};
 
 handle_cast({task_error, TaskId, Reason}, State) ->
-    update_task_status(TaskId, failed, #{error => format_reason(Reason)}),
+    _ = update_task_status(TaskId, failed, #{error => format_reason(Reason)}),
     NewRunning = maps:remove(TaskId, State#state.running),
     {noreply, State#state{running = NewRunning}};
 
@@ -281,12 +281,8 @@ do_start_task(Config, State) ->
             case save_task(Task) of
                 ok ->
                     %% Start the task
-                    case start_task_process(Task, State) of
-                        {ok, NewState} ->
-                            {ok, TaskId, NewState};
-                        {error, _} = Error ->
-                            Error
-                    end;
+                    {ok, NewState} = start_task_process(Task, State),
+                    {ok, TaskId, NewState};
                 {error, _} = Error ->
                     Error
             end;
@@ -300,7 +296,7 @@ do_stop_task(TaskId, State) ->
             %% Stop the process
             exit(Pid, shutdown),
             %% Update status
-            update_task_status(TaskId, paused),
+            _ = update_task_status(TaskId, paused),
             NewRunning = maps:remove(TaskId, State#state.running),
             {ok, State#state{running = NewRunning}};
         error ->
@@ -390,7 +386,7 @@ start_task_process(#{id := TaskId, config := Config} = Task, State) ->
     erlang:monitor(process, Pid),
 
     %% Update status
-    update_task_status(TaskId, running),
+    _ = update_task_status(TaskId, running),
 
     NewRunning = maps:put(TaskId, Pid, State#state.running),
     {ok, State#state{running = NewRunning}}.
@@ -451,23 +447,18 @@ run_task_loop(Parent, TaskId, Source, Target, SourceTransport, TargetTransport,
 
         {ok, Changes, LastSeq} ->
             %% Replicate batch
-            case barrel_rep_alg:replicate(Source, Target, SourceTransport, TargetTransport, Changes) of
-                {ok, _Stats} ->
-                    %% If wait_for is specified, verify docs reached downstream
-                    case wait_for_downstream(Changes, WaitFor) of
-                        ok ->
-                            %% Update checkpoint
-                            gen_server:cast(Parent, {task_progress, TaskId, LastSeq}),
-                            %% Continue
-                            run_task_loop(Parent, TaskId, Source, Target, SourceTransport, TargetTransport,
-                                          LastSeq, BatchSize, Filter, Mode, WaitFor);
-                        {error, Reason} ->
-                            gen_server:cast(Parent, {task_error, TaskId, Reason})
-                    end;
-                {error, Reason} ->
-                    gen_server:cast(Parent, {task_error, TaskId, Reason})
+            {ok, _Stats} = barrel_rep_alg:replicate(Source, Target, SourceTransport, TargetTransport, Changes),
+            %% If wait_for is specified, verify docs reached downstream
+            case wait_for_downstream(Changes, WaitFor) of
+              ok ->
+                %% Update checkpoint
+                gen_server:cast(Parent, {task_progress, TaskId, LastSeq}),
+                %% Continue
+                run_task_loop(Parent, TaskId, Source, Target, SourceTransport, TargetTransport,
+                              LastSeq, BatchSize, Filter, Mode, WaitFor);
+              {error, Reason} ->
+                gen_server:cast(Parent, {task_error, TaskId, Reason})
             end;
-
         {error, Reason} ->
             gen_server:cast(Parent, {task_error, TaskId, Reason})
     end.
@@ -543,7 +534,7 @@ handle_task_down(Pid, Reason, State) ->
                 shutdown -> paused;
                 _ -> failed
             end,
-            update_task_status(TaskId, Status, #{error => format_reason(Reason)}),
+            _ = update_task_status(TaskId, Status, #{error => format_reason(Reason)}),
             NewRunning = maps:remove(TaskId, State#state.running),
             State#state{running = NewRunning};
         error ->
@@ -567,10 +558,8 @@ check_running_tasks(State) ->
                             AccState;
                         false ->
                             %% Task should be running but isn't - restart it
-                            case start_task_process(Task, AccState) of
-                                {ok, NewState} -> NewState;
-                                {error, _} -> AccState
-                            end
+                            {ok, NewState} = start_task_process(Task, AccState),
+                            NewState
                     end
                 end,
                 State,
@@ -599,10 +588,8 @@ restore_tasks(State) ->
         {ok, Tasks} ->
             lists:foldl(
                 fun(Task, AccState) ->
-                    case start_task_process(Task, AccState) of
-                        {ok, NewState} -> NewState;
-                        {error, _} -> AccState
-                    end
+                    {ok, NewState} = start_task_process(Task, AccState),
+                     NewState
                 end,
                 State,
                 Tasks

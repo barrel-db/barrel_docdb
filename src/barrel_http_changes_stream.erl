@@ -118,30 +118,32 @@ info(poll_changes, Req, #state{db_name = DbName,
     end,
     Opts = maps:merge(FilterOpts, BaseOpts),
 
-    case barrel_docdb:get_changes(DbName, Since, Opts) of
+    try 
+      case barrel_docdb:get_changes(DbName, Since, Opts) of
         {ok, [], _LastHlc} ->
-            %% No changes, reschedule poll
-            PollRef = erlang:send_after(?POLL_INTERVAL_MS, self(), poll_changes),
-            {ok, Req, State#state{poll_ref = PollRef}};
+          %% No changes, reschedule poll
+          PollRef = erlang:send_after(?POLL_INTERVAL_MS, self(), poll_changes),
+          {ok, Req, State#state{poll_ref = PollRef}};
 
         {ok, Changes, LastHlc} ->
-            %% Filter and send changes
-            FilteredChanges = filter_changes(Changes, FilterFun),
-            lists:foreach(
-                fun(Change) ->
-                    send_change_event(Req, Change)
-                end,
-                FilteredChanges
-            ),
+          %% Filter and send changes
+          FilteredChanges = filter_changes(Changes, FilterFun),
+          lists:foreach(
+            fun(Change) ->
+                send_change_event(Req, Change)
+            end,
+            FilteredChanges
+           ),
 
-            %% Schedule next poll
-            PollRef = erlang:send_after(?POLL_INTERVAL_MS, self(), poll_changes),
-            {ok, Req, State#state{since = LastHlc, poll_ref = PollRef}};
-
-        {error, _Reason} ->
-            %% Database error - close stream
-            send_error_event(Req, <<"Database error">>),
-            {stop, Req, State}
+          %% Schedule next poll
+          PollRef = erlang:send_after(?POLL_INTERVAL_MS, self(), poll_changes),
+          {ok, Req, State#state{since = LastHlc, poll_ref = PollRef}}
+      end
+    catch
+      _:_ ->
+        %% Database error - close stream
+        send_error_event(Req, <<"Database error">>),
+        {stop, Req, State}
     end;
 
 info(heartbeat, Req, #state{heartbeat_ms = HeartbeatMs} = State) ->
@@ -155,8 +157,8 @@ info(_Info, Req, State) ->
 
 terminate(_Reason, _Req, #state{heartbeat_ref = HbRef, poll_ref = PollRef}) ->
     %% Cancel timers
-    cancel_timer(HbRef),
-    cancel_timer(PollRef),
+    _ = cancel_timer(HbRef),
+    _ = cancel_timer(PollRef),
     ok;
 terminate(_Reason, _Req, _State) ->
     ok.
