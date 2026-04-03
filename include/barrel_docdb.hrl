@@ -71,8 +71,8 @@
 %% Attachment metadata. Chunked attachments include optional chunked/chunk_size/chunk_count fields.
 
 %% Sequence types
--type seq() :: {timestamp, non_neg_integer(), non_neg_integer()}.
-%% Sequence number as HLC timestamp record {timestamp, WallTime, Logical}.
+-type seq() :: barrel_hlc:timestamp().
+%% Sequence number as HLC timestamp.
 
 -type seq_string() :: binary().
 %% Sequence number as a string for external use.

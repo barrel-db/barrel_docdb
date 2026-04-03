@@ -15,7 +15,6 @@
 %% Document keys (legacy)
 -export([doc_info/2, doc_info_prefix/1, doc_info_end/1]).
 -export([doc_rev/3, doc_rev_prefix/2]).
--export([doc_seq/2, doc_seq_prefix/1, doc_seq_end/1]).
 -export([doc_hlc/2, doc_hlc_prefix/1, doc_hlc_end/1]).
 
 %% Column-wide document keys (CBOR codec)
@@ -82,14 +81,12 @@
 %% Attachment keys
 -export([att_data/3, att_data_prefix/2]).
 
-%% Sequence encoding/decoding
--export([encode_seq/1, decode_seq/1]).
 
 %% HLC encoding/decoding
 -export([encode_hlc/1, decode_hlc/1, decode_hlc_key/2]).
 
 %% Key decoding
--export([decode_doc_id/2, decode_seq_key/2, decode_doc_info_key/2]).
+-export([decode_doc_id/2, decode_doc_info_key/2]).
 
 %%====================================================================
 %% Key Prefixes - single byte for efficiency
@@ -99,7 +96,6 @@
 -define(PREFIX_DB_META, 16#01).
 -define(PREFIX_DOC_INFO, 16#02).
 -define(PREFIX_DOC_REV, 16#03).
--define(PREFIX_DOC_SEQ, 16#04).
 -define(PREFIX_LOCAL_DOC, 16#05).
 -define(PREFIX_VIEW_META, 16#06).
 -define(PREFIX_VIEW_SEQ, 16#07).
@@ -201,22 +197,6 @@ doc_rev(DbName, DocId, RevId) ->
 -spec doc_rev_prefix(db_name(), docid()) -> binary().
 doc_rev_prefix(DbName, DocId) ->
     <<?PREFIX_DOC_REV, (encode_name(DbName))/binary, DocId/binary, $:>>.
-
-%% @doc Document sequence key (for changes feed)
--spec doc_seq(db_name(), seq()) -> binary().
-doc_seq(DbName, Seq) ->
-    <<?PREFIX_DOC_SEQ, (encode_name(DbName))/binary, (encode_seq(Seq))/binary>>.
-
-%% @doc Prefix for all sequence keys
--spec doc_seq_prefix(db_name()) -> binary().
-doc_seq_prefix(DbName) ->
-    <<?PREFIX_DOC_SEQ, (encode_name(DbName))/binary>>.
-
-%% @doc End marker for sequence range scan
--spec doc_seq_end(db_name()) -> binary().
-doc_seq_end(DbName) ->
-    <<?PREFIX_DOC_SEQ, (encode_name(DbName))/binary, 16#FF, 16#FF, 16#FF, 16#FF,
-      16#FF, 16#FF, 16#FF, 16#FF>>.
 
 %% @doc Document HLC key (for changes feed with HLC ordering)
 %% HLC timestamps are 12 bytes (8 wall_time + 4 logical)
@@ -544,16 +524,6 @@ encode_name(Name) when is_binary(Name) ->
     Len = byte_size(Name),
     <<Len:16, Name/binary>>.
 
-%% @doc Encode sequence number (epoch:32, counter:32 big-endian for sort order)
--spec encode_seq(seq()) -> binary().
-encode_seq({Epoch, Counter}) when is_integer(Epoch), is_integer(Counter) ->
-    <<Epoch:32/big-unsigned, Counter:32/big-unsigned>>.
-
-%% @doc Decode sequence number
--spec decode_seq(binary()) -> seq().
-decode_seq(<<Epoch:32/big-unsigned, Counter:32/big-unsigned>>) ->
-    {Epoch, Counter}.
-
 %% @doc Encode HLC timestamp to binary (big-endian for sort order)
 %% Uses barrel_hlc:encode/1 which produces 12 bytes
 -spec encode_hlc(barrel_hlc:timestamp()) -> binary().
@@ -572,14 +542,6 @@ decode_doc_id(DbName, Key) ->
     PrefixLen = byte_size(Prefix),
     <<Prefix:PrefixLen/binary, DocId/binary>> = Key,
     DocId.
-
-%% @doc Extract sequence from a seq key
--spec decode_seq_key(db_name(), binary()) -> seq().
-decode_seq_key(DbName, Key) ->
-    Prefix = doc_seq_prefix(DbName),
-    PrefixLen = byte_size(Prefix),
-    <<Prefix:PrefixLen/binary, SeqBin/binary>> = Key,
-    decode_seq(SeqBin).
 
 %% @doc Extract HLC from a doc_hlc key
 -spec decode_hlc_key(db_name(), binary()) -> barrel_hlc:timestamp().

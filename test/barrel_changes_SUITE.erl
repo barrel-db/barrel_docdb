@@ -15,15 +15,6 @@
          init_per_group/2, end_per_group/2,
          init_per_testcase/2, end_per_testcase/2]).
 
-%% Test cases - barrel_sequence (legacy, kept for internal use)
--export([
-    seq_new/1,
-    seq_inc/1,
-    seq_compare/1,
-    seq_encode_decode/1,
-    seq_to_from_string/1
-]).
-
 %% Test cases - barrel_changes
 -export([
     changes_write_read/1,
@@ -56,17 +47,10 @@
 %%====================================================================
 
 all() ->
-    [{group, sequence}, {group, changes}, {group, stream}].
+    [{group, changes}, {group, stream}].
 
 groups() ->
     [
-        {sequence, [sequence], [
-            seq_new,
-            seq_inc,
-            seq_compare,
-            seq_encode_decode,
-            seq_to_from_string
-        ]},
         {changes, [sequence], [
             changes_write_read,
             changes_fold,
@@ -113,70 +97,6 @@ init_per_testcase(_TestCase, Config) ->
     Config.
 
 end_per_testcase(_TestCase, _Config) ->
-    ok.
-
-%%====================================================================
-%% Test Cases - barrel_sequence (legacy internal module)
-%%====================================================================
-
-seq_new(_Config) ->
-    ?assertEqual({0, 0}, barrel_sequence:new()),
-    ?assertEqual({5, 0}, barrel_sequence:new(5)),
-    ok.
-
-seq_inc(_Config) ->
-    Seq0 = barrel_sequence:new(),
-    Seq1 = barrel_sequence:inc(Seq0),
-    Seq2 = barrel_sequence:inc(Seq1),
-
-    ?assertEqual({0, 0}, Seq0),
-    ?assertEqual({0, 1}, Seq1),
-    ?assertEqual({0, 2}, Seq2),
-    ok.
-
-seq_compare(_Config) ->
-    %% Same sequence
-    ?assertEqual(0, barrel_sequence:compare({0, 0}, {0, 0})),
-    ?assertEqual(0, barrel_sequence:compare({1, 5}, {1, 5})),
-
-    %% Different epochs
-    ?assertEqual(-1, barrel_sequence:compare({0, 100}, {1, 0})),
-    ?assertEqual(1, barrel_sequence:compare({2, 0}, {1, 100})),
-
-    %% Same epoch, different counters
-    ?assertEqual(-1, barrel_sequence:compare({1, 5}, {1, 10})),
-    ?assertEqual(1, barrel_sequence:compare({1, 10}, {1, 5})),
-    ok.
-
-seq_encode_decode(_Config) ->
-    Seqs = [{0, 0}, {0, 1}, {1, 0}, {1, 100}, {16#FFFFFFFF, 16#FFFFFFFF}],
-    lists:foreach(
-        fun(Seq) ->
-            Encoded = barrel_sequence:encode(Seq),
-            ?assert(is_binary(Encoded)),
-            ?assertEqual(8, byte_size(Encoded)),
-            Decoded = barrel_sequence:decode(Encoded),
-            ?assertEqual(Seq, Decoded)
-        end,
-        Seqs
-    ),
-    ok.
-
-seq_to_from_string(_Config) ->
-    Seqs = [{0, 0}, {0, 1}, {1, 0}, {1, 100}, {999, 12345}],
-    lists:foreach(
-        fun(Seq) ->
-            Str = barrel_sequence:to_string(Seq),
-            ?assert(is_binary(Str)),
-            Parsed = barrel_sequence:from_string(Str),
-            ?assertEqual(Seq, Parsed)
-        end,
-        Seqs
-    ),
-
-    %% Test invalid strings
-    ?assertEqual({error, invalid_sequence}, barrel_sequence:from_string(<<"invalid">>)),
-    ?assertEqual({error, invalid_sequence}, barrel_sequence:from_string(<<"not-a-number">>)),
     ok.
 
 %%====================================================================

@@ -8,6 +8,7 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("hlc/include/hlc.hrl").
 
 %% CT callbacks
 -export([all/0, groups/0, init_per_suite/1, end_per_suite/1,
@@ -19,7 +20,6 @@
     %% Key encoding tests
     key_db_meta/1,
     key_doc_info/1,
-    key_doc_seq/1,
     key_encoding_order/1,
 
     %% Path index key tests
@@ -53,7 +53,6 @@ groups() ->
         {keys, [sequence], [
             key_db_meta,
             key_doc_info,
-            key_doc_seq,
             key_encoding_order
         ]},
         {path_keys, [parallel], [
@@ -150,33 +149,6 @@ key_doc_info(_Config) ->
 
     ok.
 
-key_doc_seq(_Config) ->
-    DbName = <<"testdb">>,
-
-    %% Test sequence encoding with {Epoch, Counter} tuples
-    Seq1 = {0, 1},
-    Seq2 = {0, 100},
-    Seq3 = {1, 0},  %% New epoch
-
-    SeqKey1 = barrel_store_keys:doc_seq(DbName, Seq1),
-    SeqKey2 = barrel_store_keys:doc_seq(DbName, Seq2),
-    SeqKey3 = barrel_store_keys:doc_seq(DbName, Seq3),
-
-    %% Keys should be in order (for proper iteration)
-    ?assert(SeqKey1 < SeqKey2),
-    ?assert(SeqKey2 < SeqKey3),
-
-    %% Test decode
-    DecodedSeq1 = barrel_store_keys:decode_seq_key(DbName, SeqKey1),
-    DecodedSeq2 = barrel_store_keys:decode_seq_key(DbName, SeqKey2),
-    DecodedSeq3 = barrel_store_keys:decode_seq_key(DbName, SeqKey3),
-
-    ?assertEqual(Seq1, DecodedSeq1),
-    ?assertEqual(Seq2, DecodedSeq2),
-    ?assertEqual(Seq3, DecodedSeq3),
-
-    ok.
-
 key_encoding_order(_Config) ->
     DbName = <<"testdb">>,
 
@@ -184,8 +156,8 @@ key_encoding_order(_Config) ->
     MetaKey = barrel_store_keys:db_uid(DbName),
     DocInfoKey = barrel_store_keys:doc_info(DbName, <<"doc1">>),
     DocRevKey = barrel_store_keys:doc_rev(DbName, <<"doc1">>, <<"1-abc">>),
-    DocSeqKey = barrel_store_keys:doc_seq(DbName, {0, 1}),
     LocalKey = barrel_store_keys:local_doc(DbName, <<"_local/test">>),
+    DocHlcKey = barrel_store_keys:doc_hlc(DbName, #timestamp{wall_time = 1000, logical = 1}),
 
     %% Meta keys should come first (prefix 0x01)
     ?assert(MetaKey < DocInfoKey),
@@ -193,11 +165,11 @@ key_encoding_order(_Config) ->
     %% Doc info before rev (prefix 0x02 < 0x03)
     ?assert(DocInfoKey < DocRevKey),
 
-    %% Rev before seq (prefix 0x03 < 0x04)
-    ?assert(DocRevKey < DocSeqKey),
+    %% Rev before local (prefix 0x03 < 0x05)
+    ?assert(DocRevKey < LocalKey),
 
-    %% Seq before local (prefix 0x04 < 0x05)
-    ?assert(DocSeqKey < LocalKey),
+    %% Local before HLC (prefix 0x05 < 0x0D)
+    ?assert(LocalKey < DocHlcKey),
 
     ok.
 

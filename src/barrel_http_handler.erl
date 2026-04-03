@@ -2045,17 +2045,11 @@ format_query_meta(Meta) ->
     ).
 
 %% Format sequence number for JSON - convert to base64 string
-%% The sequence is an opaque CBOR-encoded binary from barrel_hlc:encode/1
+%% The sequence is an HLC timestamp from barrel_hlc
 format_seq(Seq) when is_binary(Seq) ->
-    %% Convert binary to base64 for safe JSON transport
     base64:encode(Seq);
-format_seq({Epoch, Counter}) when is_integer(Epoch), is_integer(Counter) ->
-    iolist_to_binary(io_lib:format("~p:~p", [Epoch, Counter]));
-format_seq(Seq) when is_tuple(Seq) ->
-    %% Handle other tuple formats
-    iolist_to_binary(io_lib:format("~p", [Seq]));
-format_seq(Other) ->
-    Other.
+format_seq(Hlc) when is_tuple(Hlc), element(1, Hlc) =:= timestamp ->
+    base64:encode(barrel_hlc:encode(Hlc)).
 
 %% Format meta values that may contain non-JSON-serializable data
 format_meta_value(V) when is_tuple(V) ->
