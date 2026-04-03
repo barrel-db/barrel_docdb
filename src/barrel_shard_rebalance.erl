@@ -142,14 +142,9 @@ can_merge(VdbName, ShardId1, ShardId2) ->
 estimate_migration(VdbName, FromShardId, _ToShardId) ->
     FromDb = barrel_shard_map:physical_db_name(VdbName, FromShardId),
     %% Count docs via fold since db_info may not have doc_count
-    case barrel_docdb:fold_docs(FromDb,
-            fun(_Doc, Acc) -> {ok, Acc + 1} end,
-            0) of
-        {ok, Count} ->
-            {ok, Count};
-        {error, _} = Err ->
-            Err
-    end.
+    barrel_docdb:fold_docs(FromDb,
+                           fun(_Doc, Acc) -> {ok, Acc + 1} end,
+                           0).
 
 %%====================================================================
 %% Internal Functions - Split
@@ -230,7 +225,7 @@ do_split_shard(VdbName, ShardId, Opts) ->
                     catch
                         throw:Reason ->
                             %% Rollback: restore original status
-                            barrel_shard_map:set_status(VdbName, ShardId, active),
+                            _ = barrel_shard_map:set_status(VdbName, ShardId, active),
                             {error, Reason}
                     end;
                 undefined ->
@@ -370,8 +365,8 @@ do_merge_shards(VdbName, ShardId1, ShardId2, Opts) ->
                     catch
                         throw:Reason ->
                             %% Rollback: restore statuses
-                            barrel_shard_map:set_status(VdbName, ShardId1, active),
-                            barrel_shard_map:set_status(VdbName, ShardId2, active),
+                            _ = barrel_shard_map:set_status(VdbName, ShardId1, active),
+                            _ = barrel_shard_map:set_status(VdbName, ShardId2, active),
                             {error, Reason}
                     end;
                 _ ->
@@ -431,7 +426,7 @@ update_shard_count(VdbName, Delta) ->
 remove_shard_metadata(VdbName, ShardId) ->
     %% Remove from ranges document
     RangesDocId = <<"vdb:ranges:", VdbName/binary>>,
-    case barrel_docdb:get_system_doc(RangesDocId) of
+    _ = case barrel_docdb:get_system_doc(RangesDocId) of
         {ok, RangesDoc} ->
             Ranges = maps:get(<<"ranges">>, RangesDoc, #{}),
             Key = integer_to_binary(ShardId),
@@ -443,7 +438,7 @@ remove_shard_metadata(VdbName, ShardId) ->
 
     %% Remove from assignments document
     AssignDocId = <<"vdb:assign:", VdbName/binary>>,
-    case barrel_docdb:get_system_doc(AssignDocId) of
+    _ = case barrel_docdb:get_system_doc(AssignDocId) of
         {ok, AssignDoc} ->
             Assignments = maps:get(<<"assignments">>, AssignDoc, #{}),
             Key2 = integer_to_binary(ShardId),
