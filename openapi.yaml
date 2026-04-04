@@ -16,7 +16,7 @@ info:
     The API supports:
     - `application/json` (default)
     - `application/cbor` (binary, more efficient)
-  version: 0.4.2
+  version: 0.5.0
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -873,6 +873,333 @@ paths:
         '200':
           description: Policy disabled
 
+  /vdb:
+    get:
+      tags: [VDB]
+      summary: List VDBs
+      description: List all virtual databases
+      operationId: listVdbs
+      responses:
+        '200':
+          description: List of VDBs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VdbList'
+    post:
+      tags: [VDB]
+      summary: Create VDB
+      description: Create a new virtual database with sharding
+      operationId: createVdb
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VdbDefinition'
+      responses:
+        '201':
+          description: VDB created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VdbCreateResult'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /vdb/{vdb}:
+    parameters:
+      - $ref: '#/components/parameters/VdbName'
+    get:
+      tags: [VDB]
+      summary: Get VDB info
+      description: Get information about a virtual database
+      operationId: getVdbInfo
+      responses:
+        '200':
+          description: VDB information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VdbInfo'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [VDB]
+      summary: Delete VDB
+      description: Delete a virtual database and all its shards
+      operationId: deleteVdb
+      responses:
+        '200':
+          description: VDB deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResult'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /vdb/{vdb}/_shards:
+    parameters:
+      - $ref: '#/components/parameters/VdbName'
+    get:
+      tags: [VDB]
+      summary: Get VDB shards
+      description: Get shard assignments and status for a VDB
+      operationId: getVdbShards
+      responses:
+        '200':
+          description: Shard information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VdbShards'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /vdb/{vdb}/_replication:
+    parameters:
+      - $ref: '#/components/parameters/VdbName'
+    get:
+      tags: [VDB]
+      summary: Get VDB replication status
+      description: Get replication status for all shards in a VDB
+      operationId: getVdbReplicationStatus
+      responses:
+        '200':
+          description: Replication status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VdbReplicationStatus'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /vdb/{vdb}/_changes:
+    parameters:
+      - $ref: '#/components/parameters/VdbName'
+    get:
+      tags: [VDB]
+      summary: Get VDB changes
+      description: Get merged changes feed from all shards
+      operationId: getVdbChanges
+      parameters:
+        - name: since
+          in: query
+          description: Start sequence (use 'first' for beginning)
+          schema:
+            type: string
+        - name: limit
+          in: query
+          description: Maximum changes to return
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Changes feed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangesResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /vdb/{vdb}/_bulk_docs:
+    parameters:
+      - $ref: '#/components/parameters/VdbName'
+    post:
+      tags: [VDB]
+      summary: VDB bulk operations
+      description: Perform bulk document operations across shards
+      operationId: vdbBulkDocs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BulkDocsRequest'
+      responses:
+        '200':
+          description: Bulk operation results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BulkDocsResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /vdb/{vdb}/_find:
+    parameters:
+      - $ref: '#/components/parameters/VdbName'
+    post:
+      tags: [VDB]
+      summary: Query VDB
+      description: Query across all shards with scatter-gather
+      operationId: vdbFind
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuerySpec'
+      responses:
+        '200':
+          description: Query results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResult'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /vdb/{vdb}/_import:
+    parameters:
+      - $ref: '#/components/parameters/VdbName'
+    post:
+      tags: [VDB]
+      summary: Import into VDB
+      description: Import documents from a regular database into the VDB
+      operationId: vdbImport
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VdbImportSpec'
+      responses:
+        '200':
+          description: Import results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VdbImportResult'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /vdb/{vdb}/_shards/{shard}/_split:
+    parameters:
+      - $ref: '#/components/parameters/VdbName'
+      - $ref: '#/components/parameters/ShardId'
+    post:
+      tags: [VDB]
+      summary: Split shard
+      description: Split a shard into two shards
+      operationId: vdbSplitShard
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                batch_size:
+                  type: integer
+                  description: Documents per migration batch
+      responses:
+        '200':
+          description: Shard split result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VdbShardSplitResult'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /vdb/{vdb}/_shards/{shard}/_merge:
+    parameters:
+      - $ref: '#/components/parameters/VdbName'
+      - $ref: '#/components/parameters/ShardId'
+    post:
+      tags: [VDB]
+      summary: Merge shards
+      description: Merge this shard into an adjacent target shard
+      operationId: vdbMergeShards
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                target_shard:
+                  type: integer
+                  description: Target shard ID to merge into
+                batch_size:
+                  type: integer
+                  description: Documents per migration batch
+              required: [target_shard]
+      responses:
+        '200':
+          description: Shard merge result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VdbShardMergeResult'
+        '400':
+          description: Shards not adjacent
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /vdb/{vdb}/{docId}:
+    parameters:
+      - $ref: '#/components/parameters/VdbName'
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      tags: [VDB]
+      summary: Get VDB document
+      description: Get document from VDB (routed to correct shard)
+      operationId: getVdbDocument
+      responses:
+        '200':
+          description: Document found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [VDB]
+      summary: Put VDB document
+      description: Create or update document in VDB (routed to correct shard)
+      operationId: putVdbDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Document'
+      responses:
+        '200':
+          description: Document updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentResult'
+        '201':
+          description: Document created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentResult'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags: [VDB]
+      summary: Delete VDB document
+      description: Delete document from VDB (routed to correct shard)
+      operationId: deleteVdbDocument
+      responses:
+        '200':
+          description: Document deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentResult'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /admin/usage:
     get:
       tags: [Admin]
@@ -923,6 +1250,20 @@ components:
       description: Document ID
       schema:
         type: string
+    VdbName:
+      name: vdb
+      in: path
+      required: true
+      description: Virtual database name
+      schema:
+        type: string
+    ShardId:
+      name: shard
+      in: path
+      required: true
+      description: Shard ID
+      schema:
+        type: integer
 
   responses:
     NotFound:
@@ -1243,6 +1584,205 @@ components:
           type: integer
         last_updated:
           type: integer
+
+    VdbList:
+      type: object
+      properties:
+        vdbs:
+          type: array
+          items:
+            type: string
+
+    VdbDefinition:
+      type: object
+      properties:
+        name:
+          type: string
+          description: VDB name
+        shard_count:
+          type: integer
+          description: Number of shards
+          default: 4
+        hash_function:
+          type: string
+          description: Hash function (only "phash2" supported)
+          default: phash2
+        placement:
+          type: object
+          properties:
+            replica_factor:
+              type: integer
+              description: Number of replicas per shard
+              default: 1
+            zones:
+              type: array
+              items:
+                type: string
+              description: Preferred zones for placement
+      required: [name]
+
+    VdbCreateResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        name:
+          type: string
+        shard_count:
+          type: integer
+
+    VdbInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        shard_count:
+          type: integer
+        total_docs:
+          type: integer
+        total_disk_size:
+          type: integer
+        shards:
+          type: array
+          items:
+            $ref: '#/components/schemas/VdbShardInfo'
+
+    VdbShardInfo:
+      type: object
+      properties:
+        db:
+          type: string
+          description: Physical database name
+        doc_count:
+          type: integer
+        disk_size:
+          type: integer
+
+    VdbShards:
+      type: object
+      properties:
+        shards:
+          type: array
+          items:
+            type: object
+            properties:
+              shard_id:
+                type: integer
+              primary:
+                type: string
+              replicas:
+                type: array
+                items:
+                  type: string
+              status:
+                type: string
+                enum: [active, splitting, merging]
+        ranges:
+          type: array
+          items:
+            type: object
+            properties:
+              shard_id:
+                type: integer
+              start_hash:
+                type: integer
+              end_hash:
+                type: integer
+
+    VdbReplicationStatus:
+      type: object
+      properties:
+        vdb_name:
+          type: string
+        replica_factor:
+          type: integer
+        shard_count:
+          type: integer
+        policies:
+          type: object
+          properties:
+            enabled:
+              type: integer
+            disabled:
+              type: integer
+            not_created:
+              type: integer
+        shards:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              policy_found:
+                type: boolean
+              policy_name:
+                type: string
+              policy_enabled:
+                type: boolean
+              task_count:
+                type: integer
+              primary:
+                type: string
+              replicas:
+                type: array
+                items:
+                  type: string
+              shard_status:
+                type: string
+
+    VdbImportSpec:
+      type: object
+      properties:
+        source_db:
+          type: string
+          description: Source database name
+        filter:
+          $ref: '#/components/schemas/QuerySpec'
+        batch_size:
+          type: integer
+          description: Documents per batch
+          default: 100
+        on_conflict:
+          type: string
+          enum: [skip, overwrite, merge]
+          default: skip
+      required: [source_db]
+
+    VdbImportResult:
+      type: object
+      properties:
+        docs_read:
+          type: integer
+        docs_written:
+          type: integer
+        docs_skipped:
+          type: integer
+        errors:
+          type: integer
+        started_at:
+          type: integer
+        finished_at:
+          type: integer
+        status:
+          type: string
+          enum: [completed, failed, partial]
+
+    VdbShardSplitResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        new_shard_id:
+          type: integer
+        message:
+          type: string
+
+    VdbShardMergeResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
 
 security:
   - bearerAuth: []

@@ -194,7 +194,7 @@ curl -X POST "http://localhost:8080/vdb" \
 |--------|------|---------|-------------|
 | `name` | string | (required) | VDB name |
 | `shard_count` | integer | 4 | Number of shards |
-| `hash_function` | string | "phash2" | Hash function ("phash2" or "xxhash") |
+| `hash_function` | string | "phash2" | Hash function (only "phash2" supported) |
 | `placement.replica_factor` | integer | 1 | Number of replicas per shard |
 | `placement.zones` | array | [] | Preferred zones for placement |
 
@@ -265,8 +265,6 @@ Response:
 | `active` | Normal operation |
 | `splitting` | Shard is being split |
 | `merging` | Shard is being merged |
-| `migrating` | Data is being moved |
-| `readonly` | Read-only mode |
 
 ---
 
@@ -326,6 +324,8 @@ Response:
   "last_seq": 2
 }
 ```
+
+**Note:** Changes are ordered using Hybrid Logical Clocks (HLC) to ensure causal consistency across shards. The `last_seq` value is an HLC timestamp that can be used to resume the changes feed.
 
 ---
 
@@ -501,6 +501,18 @@ Docs = [
     #{<<"id">> => <<"doc2">>, <<"value">> => 2}
 ],
 {ok, Results} = barrel_vdb:bulk_docs(VdbName, Docs).
+```
+
+### Cluster-Wide Operations
+
+```erlang
+%% List all VDBs known across the cluster (local + discovered from peers)
+{ok, VDBs} = barrel_vdb_sync:list_cluster_vdbs().
+%% VDBs = [<<"users">>, <<"orders">>, <<"products">>]
+
+%% Get list of peer URLs that have a specific VDB
+{ok, Nodes} = barrel_vdb_sync:get_vdb_nodes(<<"users">>).
+%% Nodes = [<<"http://node1:8080">>, <<"http://node2:8080">>]
 ```
 
 ---
