@@ -12,7 +12,7 @@
         match_trie,
         cowboy,
         hackney,
-        prometheus
+        instrument
     ]},
     {env, [
         {data_dir, "data/barrel_docdb"},

@@ -1,7 +1,7 @@
 %%%-------------------------------------------------------------------
-%%% @doc Prometheus metrics for barrel_docdb
+%%% @doc OpenTelemetry metrics for barrel_docdb
 %%%
-%%% Provides comprehensive metrics for monitoring:
+%%% Provides metrics for monitoring:
 %%% - Document operations (put, get, delete)
 %%% - Query performance
 %%% - Replication status and throughput
@@ -65,6 +65,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(SERVER, ?MODULE).
+-define(METER_NAME, barrel_docdb).
 
 %%====================================================================
 %% Metric definitions
@@ -72,97 +73,79 @@
 
 -define(METRICS, [
     %% Document operation counters
-    {counter, barrel_doc_operations_total,
-     "Total number of document operations",
-     [db, operation]},
+    {counter, barrel_doc_operations,
+     <<"Total number of document operations">>},
 
     %% Document operation latency histogram
     {histogram, barrel_doc_operation_duration_seconds,
-     "Document operation duration in seconds",
-     [db, operation],
+     <<"Document operation duration in seconds">>,
      [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]},
 
     %% Query counters
-    {counter, barrel_query_operations_total,
-     "Total number of query operations",
-     [db]},
+    {counter, barrel_query_operations,
+     <<"Total number of query operations">>},
 
     %% Query latency histogram
     {histogram, barrel_query_duration_seconds,
-     "Query duration in seconds",
-     [db],
+     <<"Query duration in seconds">>,
      [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]},
 
     %% Query result count histogram
     {histogram, barrel_query_results_count,
-     "Number of results returned per query",
-     [db],
+     <<"Number of results returned per query">>,
      [1, 10, 50, 100, 500, 1000, 5000]},
 
     %% Replication document counter
-    {counter, barrel_replication_docs_total,
-     "Total documents replicated",
-     [direction]},
+    {counter, barrel_replication_docs,
+     <<"Total documents replicated">>},
 
     %% Replication error counter
-    {counter, barrel_replication_errors_total,
-     "Total replication errors",
-     [task_id]},
+    {counter, barrel_replication_errors,
+     <<"Total replication errors">>},
 
     %% Replication lag gauge
     {gauge, barrel_replication_lag_seconds,
-     "Replication lag in seconds",
-     [task_id]},
+     <<"Replication lag in seconds">>},
 
     %% Active replications gauge
     {gauge, barrel_replication_active,
-     "Whether replication is active (1) or not (0)",
-     [task_id]},
+     <<"Whether replication is active (1) or not (0)">>},
 
     %% Database document count gauge
     {gauge, barrel_db_documents_total,
-     "Total number of documents in database",
-     [db]},
+     <<"Total number of documents in database">>},
 
     %% Database size gauge
     {gauge, barrel_db_size_bytes,
-     "Database size in bytes",
-     [db]},
+     <<"Database size in bytes">>},
 
     %% Database attachment count gauge
     {gauge, barrel_db_attachments_total,
-     "Total number of attachments in database",
-     [db]},
+     <<"Total number of attachments in database">>},
 
     %% HTTP request counter
-    {counter, barrel_http_requests_total,
-     "Total HTTP requests",
-     [method, path, status]},
+    {counter, barrel_http_requests,
+     <<"Total HTTP requests">>},
 
     %% HTTP latency histogram
     {histogram, barrel_http_request_duration_seconds,
-     "HTTP request duration in seconds",
-     [method, path],
+     <<"HTTP request duration in seconds">>,
      [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]},
 
     %% Peer count gauges
     {gauge, barrel_peers_total,
-     "Total number of known peers",
-     []},
+     <<"Total number of known peers">>},
 
     {gauge, barrel_peers_active,
-     "Number of active/reachable peers",
-     []},
+     <<"Number of active/reachable peers">>},
 
     %% Federation query counter
-    {counter, barrel_federation_queries_total,
-     "Total federation queries",
-     [federation]},
+    {counter, barrel_federation_queries,
+     <<"Total federation queries">>},
 
     %% Federation latency histogram
     {histogram, barrel_federation_query_duration_seconds,
-     "Federation query duration in seconds",
-     [federation],
+     <<"Federation query duration in seconds">>,
      [0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]}
 ]).
 
@@ -175,7 +158,9 @@ start_link() ->
 
 %% @doc Setup all metrics - call this during application startup
 setup() ->
-    lists:foreach(fun declare_metric/1, ?METRICS).
+    Meter = instrument_meter:get_meter(?METER_NAME),
+    lists:foreach(fun(Metric) -> declare_metric(Meter, Metric) end, ?METRICS),
+    ok.
 
 %%====================================================================
 %% Document Operations
@@ -188,13 +173,22 @@ inc_doc_ops(Db, Op) ->
 
 -spec inc_doc_ops(binary(), atom(), pos_integer()) -> ok.
 inc_doc_ops(Db, Op, Count) ->
-    prometheus_counter:inc(barrel_doc_operations_total, [Db, Op], Count).
+    Attrs = #{db => Db, operation => Op},
+    case instrument_meter:get_instrument(barrel_doc_operations) of
+        undefined -> ok;
+        Instrument -> instrument_meter:add(Instrument, Count, Attrs)
+    end,
+    ok.
 
 %% @doc Record document operation latency
 -spec observe_doc_latency(binary(), atom(), number()) -> ok.
 observe_doc_latency(Db, Op, DurationMs) ->
-    prometheus_histogram:observe(barrel_doc_operation_duration_seconds,
-                                  [Db, Op], DurationMs / 1000).
+    Attrs = #{db => Db, operation => Op},
+    case instrument_meter:get_instrument(barrel_doc_operation_duration_seconds) of
+        undefined -> ok;
+        Instrument -> instrument_meter:record(Instrument, DurationMs / 1000, Attrs)
+    end,
+    ok.
 
 %%====================================================================
 %% Query Operations
@@ -203,18 +197,32 @@ observe_doc_latency(Db, Op, DurationMs) ->
 %% @doc Increment query operation counter
 -spec inc_query_ops(binary()) -> ok.
 inc_query_ops(Db) ->
-    prometheus_counter:inc(barrel_query_operations_total, [Db]).
+    Attrs = #{db => Db},
+    case instrument_meter:get_instrument(barrel_query_operations) of
+        undefined -> ok;
+        Instrument -> instrument_meter:add(Instrument, 1, Attrs)
+    end,
+    ok.
 
 %% @doc Record query latency
 -spec observe_query_latency(binary(), number()) -> ok.
 observe_query_latency(Db, DurationMs) ->
-    prometheus_histogram:observe(barrel_query_duration_seconds,
-                                  [Db], DurationMs / 1000).
+    Attrs = #{db => Db},
+    case instrument_meter:get_instrument(barrel_query_duration_seconds) of
+        undefined -> ok;
+        Instrument -> instrument_meter:record(Instrument, DurationMs / 1000, Attrs)
+    end,
+    ok.
 
 %% @doc Record query result count
 -spec observe_query_results(binary(), non_neg_integer()) -> ok.
 observe_query_results(Db, Count) ->
-    prometheus_histogram:observe(barrel_query_results_count, [Db], Count).
+    Attrs = #{db => Db},
+    case instrument_meter:get_instrument(barrel_query_results_count) of
+        undefined -> ok;
+        Instrument -> instrument_meter:record(Instrument, Count, Attrs)
+    end,
+    ok.
 
 %%====================================================================
 %% Replication
@@ -223,23 +231,43 @@ observe_query_results(Db, Count) ->
 %% @doc Increment replicated document counter
 -spec inc_rep_docs(push | pull, pos_integer()) -> ok.
 inc_rep_docs(Direction, Count) ->
-    prometheus_counter:inc(barrel_replication_docs_total, [Direction], Count).
+    Attrs = #{direction => Direction},
+    case instrument_meter:get_instrument(barrel_replication_docs) of
+        undefined -> ok;
+        Instrument -> instrument_meter:add(Instrument, Count, Attrs)
+    end,
+    ok.
 
 %% @doc Increment replication error counter
 -spec inc_rep_errors(binary()) -> ok.
 inc_rep_errors(TaskId) ->
-    prometheus_counter:inc(barrel_replication_errors_total, [TaskId]).
+    Attrs = #{task_id => TaskId},
+    case instrument_meter:get_instrument(barrel_replication_errors) of
+        undefined -> ok;
+        Instrument -> instrument_meter:add(Instrument, 1, Attrs)
+    end,
+    ok.
 
 %% @doc Set replication lag
 -spec set_rep_lag(binary(), number()) -> ok.
 set_rep_lag(TaskId, LagSeconds) ->
-    prometheus_gauge:set(barrel_replication_lag_seconds, [TaskId], LagSeconds).
+    Attrs = #{task_id => TaskId},
+    case instrument_meter:get_instrument(barrel_replication_lag_seconds) of
+        undefined -> ok;
+        Instrument -> instrument_meter:set(Instrument, LagSeconds, Attrs)
+    end,
+    ok.
 
 %% @doc Set replication active status
 -spec set_rep_active(binary(), boolean()) -> ok.
 set_rep_active(TaskId, Active) ->
     Value = case Active of true -> 1; false -> 0 end,
-    prometheus_gauge:set(barrel_replication_active, [TaskId], Value).
+    Attrs = #{task_id => TaskId},
+    case instrument_meter:get_instrument(barrel_replication_active) of
+        undefined -> ok;
+        Instrument -> instrument_meter:set(Instrument, Value, Attrs)
+    end,
+    ok.
 
 %%====================================================================
 %% Storage
@@ -248,17 +276,32 @@ set_rep_active(TaskId, Active) ->
 %% @doc Set database document count
 -spec set_db_docs(binary(), non_neg_integer()) -> ok.
 set_db_docs(Db, Count) ->
-    prometheus_gauge:set(barrel_db_documents_total, [Db], Count).
+    Attrs = #{db => Db},
+    case instrument_meter:get_instrument(barrel_db_documents_total) of
+        undefined -> ok;
+        Instrument -> instrument_meter:set(Instrument, Count, Attrs)
+    end,
+    ok.
 
 %% @doc Set database size in bytes
 -spec set_db_size(binary(), non_neg_integer()) -> ok.
 set_db_size(Db, SizeBytes) ->
-    prometheus_gauge:set(barrel_db_size_bytes, [Db], SizeBytes).
+    Attrs = #{db => Db},
+    case instrument_meter:get_instrument(barrel_db_size_bytes) of
+        undefined -> ok;
+        Instrument -> instrument_meter:set(Instrument, SizeBytes, Attrs)
+    end,
+    ok.
 
 %% @doc Set database attachment count
 -spec set_db_attachments(binary(), non_neg_integer()) -> ok.
 set_db_attachments(Db, Count) ->
-    prometheus_gauge:set(barrel_db_attachments_total, [Db], Count).
+    Attrs = #{db => Db},
+    case instrument_meter:get_instrument(barrel_db_attachments_total) of
+        undefined -> ok;
+        Instrument -> instrument_meter:set(Instrument, Count, Attrs)
+    end,
+    ok.
 
 %%====================================================================
 %% HTTP
@@ -267,13 +310,22 @@ set_db_attachments(Db, Count) ->
 %% @doc Increment HTTP request counter
 -spec inc_http_requests(binary(), binary(), integer()) -> ok.
 inc_http_requests(Method, Path, Status) ->
-    prometheus_counter:inc(barrel_http_requests_total, [Method, Path, Status]).
+    Attrs = #{method => Method, path => Path, status => Status},
+    case instrument_meter:get_instrument(barrel_http_requests) of
+        undefined -> ok;
+        Instrument -> instrument_meter:add(Instrument, 1, Attrs)
+    end,
+    ok.
 
 %% @doc Record HTTP request latency
 -spec observe_http_latency(binary(), binary(), number()) -> ok.
 observe_http_latency(Method, Path, DurationMs) ->
-    prometheus_histogram:observe(barrel_http_request_duration_seconds,
-                                  [Method, Path], DurationMs / 1000).
+    Attrs = #{method => Method, path => Path},
+    case instrument_meter:get_instrument(barrel_http_request_duration_seconds) of
+        undefined -> ok;
+        Instrument -> instrument_meter:record(Instrument, DurationMs / 1000, Attrs)
+    end,
+    ok.
 
 %%====================================================================
 %% Peers
@@ -282,12 +334,20 @@ observe_http_latency(Method, Path, DurationMs) ->
 %% @doc Set total peer count
 -spec set_peers_total(non_neg_integer()) -> ok.
 set_peers_total(Count) ->
-    prometheus_gauge:set(barrel_peers_total, [], Count).
+    case instrument_meter:get_instrument(barrel_peers_total) of
+        undefined -> ok;
+        Instrument -> instrument_meter:set(Instrument, Count, #{})
+    end,
+    ok.
 
 %% @doc Set active peer count
 -spec set_peers_active(non_neg_integer()) -> ok.
 set_peers_active(Count) ->
-    prometheus_gauge:set(barrel_peers_active, [], Count).
+    case instrument_meter:get_instrument(barrel_peers_active) of
+        undefined -> ok;
+        Instrument -> instrument_meter:set(Instrument, Count, #{})
+    end,
+    ok.
 
 %%====================================================================
 %% Federation
@@ -296,13 +356,22 @@ set_peers_active(Count) ->
 %% @doc Increment federation query counter
 -spec inc_federation_queries(binary()) -> ok.
 inc_federation_queries(Federation) ->
-    prometheus_counter:inc(barrel_federation_queries_total, [Federation]).
+    Attrs = #{federation => Federation},
+    case instrument_meter:get_instrument(barrel_federation_queries) of
+        undefined -> ok;
+        Instrument -> instrument_meter:add(Instrument, 1, Attrs)
+    end,
+    ok.
 
 %% @doc Record federation query latency
 -spec observe_federation_latency(binary(), number()) -> ok.
 observe_federation_latency(Federation, DurationMs) ->
-    prometheus_histogram:observe(barrel_federation_query_duration_seconds,
-                                  [Federation], DurationMs / 1000).
+    Attrs = #{federation => Federation},
+    case instrument_meter:get_instrument(barrel_federation_query_duration_seconds) of
+        undefined -> ok;
+        Instrument -> instrument_meter:record(Instrument, DurationMs / 1000, Attrs)
+    end,
+    ok.
 
 %%====================================================================
 %% Export
@@ -311,7 +380,7 @@ observe_federation_latency(Federation, DurationMs) ->
 %% @doc Export all metrics in Prometheus text format
 -spec export() -> binary().
 export() ->
-    prometheus_text_format:format().
+    instrument_prometheus:format().
 
 %% @doc Export all metrics as a binary string
 -spec export_text() -> binary().
@@ -323,8 +392,8 @@ export_text() ->
 %%====================================================================
 
 init([]) ->
-    %% Ensure prometheus application is started (creates ETS tables)
-    _ = application:ensure_all_started(prometheus),
+    %% Ensure instrument application is started
+    _ = application:ensure_all_started(instrument),
     setup(),
     {ok, #{}}.
 
@@ -344,22 +413,10 @@ terminate(_Reason, _State) ->
 %% Internal functions
 %%====================================================================
 
-declare_metric({counter, Name, Help, Labels}) ->
-    prometheus_counter:declare([
-        {name, Name},
-        {help, Help},
-        {labels, Labels}
-    ]);
-declare_metric({gauge, Name, Help, Labels}) ->
-    prometheus_gauge:declare([
-        {name, Name},
-        {help, Help},
-        {labels, Labels}
-    ]);
-declare_metric({histogram, Name, Help, Labels, Buckets}) ->
-    prometheus_histogram:declare([
-        {name, Name},
-        {help, Help},
-        {labels, Labels},
-        {buckets, Buckets}
-    ]).
+declare_metric(Meter, {counter, Name, Description}) ->
+    instrument_meter:create_counter(Meter, Name, #{description => Description});
+declare_metric(Meter, {gauge, Name, Description}) ->
+    instrument_meter:create_gauge(Meter, Name, #{description => Description});
+declare_metric(Meter, {histogram, Name, Description, Boundaries}) ->
+    instrument_meter:create_histogram(Meter, Name,
+        #{description => Description, boundaries => Boundaries}).
