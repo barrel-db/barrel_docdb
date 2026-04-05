@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Migrated from legacy `{Epoch, Counter}` sequence format to HLC timestamps throughout
 - Removed `barrel_sequence` module (functionality consolidated in `barrel_hlc`)
 - Upgraded hlc to 3.0.3 and match_trie to 1.0.0
+- Upgraded rocksdb to 2.6.2
 - Removed unused bitmap dependency
 
 ### Fixed
