@@ -20,8 +20,10 @@
 start(_StartType, _StartArgs) ->
     %% Install instrument logger filter for trace context enrichment
     ok = instrument_logger:install(),
-    %% Configure tracing
+    %% Configure observability exporters
     ok = configure_tracing(),
+    ok = configure_metrics(),
+    ok = configure_logging(),
     logger:info("Starting barrel_docdb application"),
     %% Configure jose JSON module (use OTP json)
     jose:json_module(json),
@@ -33,8 +35,10 @@ start(_StartType, _StartArgs) ->
 -spec stop(term()) -> ok.
 stop(_State) ->
     logger:info("Stopping barrel_docdb application"),
-    %% Shutdown span exporter
-    ok = instrument_exporter:shutdown(),
+    %% Shutdown all exporters
+    _ = instrument_exporter:shutdown(),
+    _ = instrument_metrics_exporter:shutdown(),
+    _ = instrument_log_exporter:shutdown(),
     %% Uninstall instrument logger filter
     instrument_logger:uninstall(),
     ok.
@@ -96,5 +100,86 @@ configure_exporter(TracingConfig) ->
             ok;
         _ ->
             logger:warning("Unknown tracing exporter configuration: ~p", [Exporter]),
+            ok
+    end.
+
+%% @doc Configure metrics exporter based on application environment.
+%%
+%% Configuration options:
+%% - {metrics, exporter} - none | console | otlp (default: none)
+%% - {metrics, otlp_endpoint} - OTLP endpoint URL
+%% - {metrics, otlp_headers} - Additional HTTP headers
+%% - {metrics, otlp_compression} - none | gzip
+%% - {metrics, export_interval} - Export interval in ms (default: 60000)
+-spec configure_metrics() -> ok.
+configure_metrics() ->
+    MetricsConfig = application:get_env(barrel_docdb, metrics, []),
+    Exporter = proplists:get_value(exporter, MetricsConfig, none),
+    case Exporter of
+        none ->
+            ok;
+        console ->
+            _ = instrument_metrics_exporter:register(
+                instrument_metrics_exporter_console:new(#{})),
+            logger:info("Metrics exporter enabled: console"),
+            ok;
+        otlp ->
+            Endpoint = proplists:get_value(otlp_endpoint, MetricsConfig, "http://localhost:4318"),
+            Headers = proplists:get_value(otlp_headers, MetricsConfig, #{}),
+            Compression = proplists:get_value(otlp_compression, MetricsConfig, none),
+            _ = instrument_metrics_exporter:register(
+                instrument_metrics_exporter_otlp:new(#{
+                    endpoint => Endpoint,
+                    headers => Headers,
+                    compression => Compression
+                })),
+            logger:info("Metrics exporter enabled: OTLP (~s)", [Endpoint]),
+            ok;
+        {Module, Config} when is_atom(Module), is_map(Config) ->
+            _ = instrument_metrics_exporter:register(#{module => Module, config => Config}),
+            logger:info("Metrics exporter enabled: ~p", [Module]),
+            ok;
+        _ ->
+            logger:warning("Unknown metrics exporter configuration: ~p", [Exporter]),
+            ok
+    end.
+
+%% @doc Configure logging exporter based on application environment.
+%%
+%% Configuration options:
+%% - {logging, exporter} - none | console | otlp (default: none)
+%% - {logging, otlp_endpoint} - OTLP endpoint URL
+%% - {logging, otlp_headers} - Additional HTTP headers
+%% - {logging, otlp_compression} - none | gzip
+-spec configure_logging() -> ok.
+configure_logging() ->
+    LoggingConfig = application:get_env(barrel_docdb, logging, []),
+    Exporter = proplists:get_value(exporter, LoggingConfig, none),
+    case Exporter of
+        none ->
+            ok;
+        console ->
+            _ = instrument_log_exporter:register(
+                instrument_log_exporter_console:new(#{})),
+            logger:info("Log exporter enabled: console"),
+            ok;
+        otlp ->
+            Endpoint = proplists:get_value(otlp_endpoint, LoggingConfig, "http://localhost:4318"),
+            Headers = proplists:get_value(otlp_headers, LoggingConfig, #{}),
+            Compression = proplists:get_value(otlp_compression, LoggingConfig, none),
+            _ = instrument_log_exporter:register(
+                instrument_log_exporter_otlp:new(#{
+                    endpoint => Endpoint,
+                    headers => Headers,
+                    compression => Compression
+                })),
+            logger:info("Log exporter enabled: OTLP (~s)", [Endpoint]),
+            ok;
+        {Module, Config} when is_atom(Module), is_map(Config) ->
+            _ = instrument_log_exporter:register(#{module => Module, config => Config}),
+            logger:info("Log exporter enabled: ~p", [Module]),
+            ok;
+        _ ->
+            logger:warning("Unknown logging exporter configuration: ~p", [Exporter]),
             ok
     end.

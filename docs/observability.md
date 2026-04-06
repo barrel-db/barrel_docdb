@@ -22,20 +22,32 @@ All three signals are automatically correlated via trace context, enabling end-t
 ]}
 ```
 
-### Enable OTLP Export (Production)
+### Enable OTLP Export for All Signals (Production)
 
 ```erlang
 %% In sys.config
 {barrel_docdb, [
+    %% Tracing - spans to OTLP
     {tracing, [
         {enabled, true},
+        {exporter, otlp},
+        {otlp_endpoint, "http://localhost:4318"}
+    ]},
+    %% Metrics - push to OTLP (in addition to /metrics endpoint)
+    {metrics, [
+        {exporter, otlp},
+        {otlp_endpoint, "http://localhost:4318"},
+        {export_interval, 60000}  %% ms, default 60s
+    ]},
+    %% Logging - push to OTLP
+    {logging, [
         {exporter, otlp},
         {otlp_endpoint, "http://localhost:4318"}
     ]}
 ]}
 ```
 
-### Scrape Metrics
+### Scrape Metrics (Pull Model)
 
 ```bash
 curl http://localhost:8080/metrics
@@ -187,9 +199,27 @@ Barrel DocDB follows [OpenTelemetry Database Semantic Conventions](https://opent
 
 ## Metrics
 
-Barrel DocDB exposes Prometheus-compatible metrics via the `/metrics` endpoint.
+Barrel DocDB supports two modes for metrics export:
+- **Pull model** - Prometheus scrapes the `/metrics` endpoint
+- **Push model** - Metrics are pushed to an OTLP collector
 
-### Endpoint
+### Configuration
+
+```erlang
+{barrel_docdb, [
+    {metrics, [
+        {exporter, none},              %% none | otlp | console
+        {otlp_endpoint, "http://localhost:4318"},
+        {export_interval, 60000},      %% Push interval in ms (default: 60s)
+        {otlp_headers, #{}},           %% Optional auth headers
+        {otlp_compression, none}       %% none | gzip
+    ]}
+]}
+```
+
+### Pull Model (Prometheus Scraping)
+
+Metrics are always available at the `/metrics` endpoint regardless of push configuration:
 
 ```bash
 curl http://localhost:8080/metrics
@@ -258,7 +288,7 @@ barrel_doc_operation_duration_seconds_bucket{db="mydb",operation="get",le="0.01"
 | `barrel_federation_queries` | Counter | federation | Federation queries |
 | `barrel_federation_query_duration_seconds` | Histogram | federation | Query latency |
 
-### Prometheus Configuration
+### Prometheus Configuration (Pull)
 
 ```yaml
 # prometheus.yml
@@ -268,6 +298,58 @@ scrape_configs:
       - targets: ['localhost:8080']
     metrics_path: /metrics
     scrape_interval: 15s
+```
+
+### Push Model (OTLP)
+
+To push metrics directly to an OpenTelemetry Collector:
+
+```erlang
+{barrel_docdb, [
+    {metrics, [
+        {exporter, otlp},
+        {otlp_endpoint, "http://otel-collector:4318"}
+    ]}
+]}
+```
+
+**With authentication:**
+
+```erlang
+{barrel_docdb, [
+    {metrics, [
+        {exporter, otlp},
+        {otlp_endpoint, "https://otlp.vendor.com:4318"},
+        {otlp_headers, #{
+            <<"Authorization">> => <<"Bearer your-api-key">>
+        }},
+        {otlp_compression, gzip}
+    ]}
+]}
+```
+
+**OpenTelemetry Collector configuration for metrics:**
+
+```yaml
+# otel-collector-config.yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+  # Or send to a metrics backend
+  otlphttp:
+    endpoint: "https://metrics-backend.example.com"
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [prometheus]
 ```
 
 ### Grafana Dashboard Queries
@@ -338,9 +420,24 @@ groups:
 
 ## Logging
 
-Barrel DocDB uses Erlang's built-in `logger` module with automatic trace context enrichment.
+Barrel DocDB uses Erlang's built-in `logger` module with automatic trace context enrichment. Logs can be:
+- Written to stdout/files (default)
+- Pushed to an OTLP collector for centralized logging
 
 ### Configuration
+
+```erlang
+{barrel_docdb, [
+    {logging, [
+        {exporter, none},              %% none | otlp | console
+        {otlp_endpoint, "http://localhost:4318"},
+        {otlp_headers, #{}},           %% Optional auth headers
+        {otlp_compression, none}       %% none | gzip
+    ]}
+]}
+```
+
+### Standard Output (Default)
 
 Configure logging in `sys.config`:
 
@@ -407,6 +504,58 @@ For structured logging (recommended for production):
 | `alert` | Action must be taken immediately |
 | `emergency` | System is unusable |
 
+### Push Model (OTLP)
+
+To push logs directly to an OpenTelemetry Collector:
+
+```erlang
+{barrel_docdb, [
+    {logging, [
+        {exporter, otlp},
+        {otlp_endpoint, "http://otel-collector:4318"}
+    ]}
+]}
+```
+
+**With authentication:**
+
+```erlang
+{barrel_docdb, [
+    {logging, [
+        {exporter, otlp},
+        {otlp_endpoint, "https://logs.vendor.com:4318"},
+        {otlp_headers, #{
+            <<"Authorization">> => <<"Bearer your-api-key">>
+        }},
+        {otlp_compression, gzip}
+    ]}
+]}
+```
+
+**OpenTelemetry Collector configuration for logs:**
+
+```yaml
+# otel-collector-config.yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  loki:
+    endpoint: "http://loki:3100/loki/api/v1/push"
+  # Or send to another backend
+  elasticsearch:
+    endpoints: ["http://elasticsearch:9200"]
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [loki]
+```
+
 ### Correlating Logs with Traces
 
 Use the trace ID from logs to find the corresponding trace in your tracing backend:
@@ -434,15 +583,12 @@ services:
     image: barrel/barrel_docdb
     ports:
       - "8080:8080"
-    environment:
-      - BARREL_TRACING_ENABLED=true
-      - BARREL_TRACING_EXPORTER=otlp
-      - BARREL_OTLP_ENDPOINT=http://otel-collector:4318
     volumes:
       - barrel-data:/data
+      - ./sys.config:/etc/barrel/sys.config
 
   otel-collector:
-    image: otel/opentelemetry-collector:latest
+    image: otel/opentelemetry-collector-contrib:latest
     command: ["--config=/etc/otel-collector-config.yaml"]
     volumes:
       - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
@@ -461,6 +607,11 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
 
+  loki:
+    image: grafana/loki:latest
+    ports:
+      - "3100:3100"
+
   grafana:
     image: grafana/grafana:latest
     ports:
@@ -470,6 +621,41 @@ services:
 
 volumes:
   barrel-data:
+```
+
+### Barrel Configuration (sys.config)
+
+```erlang
+%% sys.config - Full OTLP export for all signals
+[
+    {barrel_docdb, [
+        {data_dir, "/data/barrel"},
+        {http_port, 8080},
+
+        %% Tracing - push spans to OTLP
+        {tracing, [
+            {enabled, true},
+            {exporter, otlp},
+            {otlp_endpoint, "http://otel-collector:4318"}
+        ]},
+
+        %% Metrics - push to OTLP (also available via /metrics)
+        {metrics, [
+            {exporter, otlp},
+            {otlp_endpoint, "http://otel-collector:4318"},
+            {export_interval, 30000}
+        ]},
+
+        %% Logging - push to OTLP
+        {logging, [
+            {exporter, otlp},
+            {otlp_endpoint, "http://otel-collector:4318"}
+        ]}
+    ]},
+    {kernel, [
+        {logger_level, info}
+    ]}
+].
 ```
 
 ### OpenTelemetry Collector Configuration
@@ -488,10 +674,19 @@ processors:
     send_batch_size: 1024
 
 exporters:
+  # Traces to Jaeger
   jaeger:
     endpoint: jaeger:14250
     tls:
       insecure: true
+
+  # Metrics to Prometheus
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+
+  # Logs to Loki
+  loki:
+    endpoint: "http://loki:3100/loki/api/v1/push"
 
 service:
   pipelines:
@@ -499,6 +694,14 @@ service:
       receivers: [otlp]
       processors: [batch]
       exporters: [jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [loki]
 ```
 
 ### Prometheus Configuration
@@ -509,10 +712,16 @@ global:
   scrape_interval: 15s
 
 scrape_configs:
+  # Scrape barrel directly (pull model)
   - job_name: 'barrel_docdb'
     static_configs:
       - targets: ['barrel:8080']
     metrics_path: /metrics
+
+  # Or scrape from OTEL collector (if using push model)
+  - job_name: 'otel-collector'
+    static_configs:
+      - targets: ['otel-collector:8889']
 ```
 
 ---
