@@ -421,7 +421,8 @@ groups:
 ## Logging
 
 Barrel DocDB uses Erlang's built-in `logger` module with automatic trace context enrichment. Logs can be:
-- Written to stdout/files (default)
+- Written to stdout (default Erlang logger)
+- Written to files with rotation
 - Pushed to an OTLP collector for centralized logging
 
 ### Configuration
@@ -429,7 +430,16 @@ Barrel DocDB uses Erlang's built-in `logger` module with automatic trace context
 ```erlang
 {barrel_docdb, [
     {logging, [
-        {exporter, none},              %% none | otlp | console
+        {exporter, none},              %% none | console | file | otlp
+
+        %% File exporter options
+        {file_path, "/var/log/barrel.log"},
+        {file_format, text},           %% text | json
+        {file_max_size, 10485760},     %% 10MB, 0 = unlimited
+        {file_max_files, 5},           %% Number of rotated files
+        {file_compress, false},        %% Compress rotated files
+
+        %% OTLP exporter options
         {otlp_endpoint, "http://localhost:4318"},
         {otlp_headers, #{}},           %% Optional auth headers
         {otlp_compression, none}       %% none | gzip
@@ -503,6 +513,38 @@ For structured logging (recommended for production):
 | `critical` | Critical conditions |
 | `alert` | Action must be taken immediately |
 | `emergency` | System is unusable |
+
+### File Exporter
+
+Write logs to files with automatic rotation:
+
+```erlang
+{barrel_docdb, [
+    {logging, [
+        {exporter, file},
+        {file_path, "/var/log/barrel/app.log"},
+        {file_format, json},           %% text | json
+        {file_max_size, 52428800},     %% 50MB
+        {file_max_files, 10},          %% Keep 10 rotated files
+        {file_compress, true}          %% Compress rotated files (.gz)
+    ]}
+]}
+```
+
+**File rotation behavior:**
+- When `file_max_size` is reached, files rotate: `app.log` -> `app.log.1` -> `app.log.2` -> ...
+- If `file_compress` is true, rotated files become `app.log.1.gz`, etc.
+- Set `file_max_size` to 0 to disable rotation
+
+**JSON format output:**
+```json
+{"timeUnixNano":"1705312245123456000","severityText":"INFO","body":{"stringValue":"Processing document doc123"},"traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"b7ad6b7169203331"}
+```
+
+**Text format output:**
+```
+[2024-01-15T10:30:45.123456Z] INFO [trace_id=0af7651916cd43dd span_id=b7ad6b7169203331] Processing document doc123
+```
 
 ### Push Model (OTLP)
 

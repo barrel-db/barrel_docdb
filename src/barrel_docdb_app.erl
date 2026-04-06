@@ -147,7 +147,12 @@ configure_metrics() ->
 %% @doc Configure logging exporter based on application environment.
 %%
 %% Configuration options:
-%% - {logging, exporter} - none | console | otlp (default: none)
+%% - {logging, exporter} - none | console | file | otlp (default: none)
+%% - {logging, file_path} - Log file path (for file exporter)
+%% - {logging, file_format} - text | json (default: text)
+%% - {logging, file_max_size} - Max file size in bytes (default: 10MB, 0 = unlimited)
+%% - {logging, file_max_files} - Number of rotated files (default: 5)
+%% - {logging, file_compress} - Compress rotated files (default: false)
 %% - {logging, otlp_endpoint} - OTLP endpoint URL
 %% - {logging, otlp_headers} - Additional HTTP headers
 %% - {logging, otlp_compression} - none | gzip
@@ -162,6 +167,22 @@ configure_logging() ->
             _ = instrument_log_exporter:register(
                 instrument_log_exporter_console:new(#{})),
             logger:info("Log exporter enabled: console"),
+            ok;
+        file ->
+            Path = proplists:get_value(file_path, LoggingConfig, "/var/log/barrel.log"),
+            Format = proplists:get_value(file_format, LoggingConfig, text),
+            MaxSize = proplists:get_value(file_max_size, LoggingConfig, 10485760),
+            MaxFiles = proplists:get_value(file_max_files, LoggingConfig, 5),
+            Compress = proplists:get_value(file_compress, LoggingConfig, false),
+            _ = instrument_log_exporter:register(
+                instrument_log_exporter_file:new(#{
+                    path => Path,
+                    format => Format,
+                    max_size => MaxSize,
+                    max_files => MaxFiles,
+                    compress => Compress
+                })),
+            logger:info("Log exporter enabled: file (~s)", [Path]),
             ok;
         otlp ->
             Endpoint = proplists:get_value(otlp_endpoint, LoggingConfig, "http://localhost:4318"),
