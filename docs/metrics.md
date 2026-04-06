@@ -1,5 +1,8 @@
 # Prometheus Metrics
 
+!!! note "See also: Observability Guide"
+    For a complete guide covering tracing, metrics, and logging with exporters, see the [Observability Guide](observability.md).
+
 Barrel DocDB exposes metrics in Prometheus format for monitoring and alerting.
 
 ## Endpoint

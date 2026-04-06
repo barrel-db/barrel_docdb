@@ -62,6 +62,14 @@ Sync anywhere. Query anything. Your data, wherever you need it.
 
     [:octicons-arrow-right-24: Sharding Guide](sharding.md)
 
+-   :chart_with_upwards_trend: __Observability__
+
+    ---
+
+    Distributed tracing, metrics, and logging with OpenTelemetry support
+
+    [:octicons-arrow-right-24: Observability Guide](observability.md)
+
 </div>
 
 ## What is Barrel DocDB?
