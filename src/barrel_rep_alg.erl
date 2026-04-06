@@ -23,17 +23,24 @@
 -spec replicate(term(), term(), module(), module(), [map()]) ->
     {ok, map()}.
 replicate(Source, Target, SourceTransport, TargetTransport, Changes) ->
-    Stats = new_stats(),
-    {ok, Stats2} = lists:foldl(
-        fun(Change, {ok, Acc}) ->
-            %% Sync HLC from change to target (for distributed ordering)
-            _ = maybe_sync_hlc(Target, TargetTransport, Change),
-            sync_change(Source, Target, SourceTransport, TargetTransport, Change, Acc)
-        end,
-        {ok, Stats},
-        Changes
-    ),
-    {ok, Stats2}.
+    ExtraAttrs = #{
+        <<"replication.changes_count">> => length(Changes),
+        <<"replication.source_transport">> => atom_to_binary(SourceTransport, utf8),
+        <<"replication.target_transport">> => atom_to_binary(TargetTransport, utf8)
+    },
+    barrel_trace:with_db_span(replication, undefined, ExtraAttrs, fun() ->
+        Stats = new_stats(),
+        {ok, Stats2} = lists:foldl(
+            fun(Change, {ok, Acc}) ->
+                %% Sync HLC from change to target (for distributed ordering)
+                _ = maybe_sync_hlc(Target, TargetTransport, Change),
+                sync_change(Source, Target, SourceTransport, TargetTransport, Change, Acc)
+            end,
+            {ok, Stats},
+            Changes
+        ),
+        {ok, Stats2}
+    end).
 
 %% @doc Replicate changes in batches with checkpoint callback
 -spec replicate_batch(term(), term(), module(), module(), map()) ->

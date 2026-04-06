@@ -194,12 +194,15 @@
 %% Returns {ok, QueryPlan} or {error, Reason}.
 -spec compile(query_spec()) -> {ok, query_plan()} | {error, term()}.
 compile(Spec) when is_map(Spec) ->
-    case validate_spec(Spec) of
-        ok ->
-            do_compile(Spec);
-        {error, _} = Error ->
-            Error
-    end;
+    barrel_trace:with_db_span(query_compile, undefined, fun() ->
+        case validate_spec(Spec) of
+            ok ->
+                do_compile(Spec);
+            {error, _} = Error ->
+                barrel_trace:record_error(Error),
+                Error
+        end
+    end);
 compile(_) ->
     {error, {invalid_spec, not_a_map}}.
 
@@ -228,15 +231,19 @@ validate_spec(_) ->
     {ok, [map()], seq()} | {error, term()}.
 execute(StoreRef, DbName, #query_plan{include_docs = true, limit = undefined} = Plan) ->
     %% Unbounded include_docs query - auto-paginate to avoid memory issues
-    execute_with_auto_pagination(StoreRef, DbName, Plan);
+    barrel_trace:with_db_span(query_execute, DbName, fun() ->
+        execute_with_auto_pagination(StoreRef, DbName, Plan)
+    end);
 execute(StoreRef, DbName, #query_plan{} = Plan) ->
     %% Bounded query or pure index query - execute directly
-    {ok, Snapshot} = barrel_store_rocksdb:snapshot(StoreRef),
-    try
-        execute_with_snapshot(StoreRef, DbName, Plan, Snapshot)
-    after
-        barrel_store_rocksdb:release_snapshot(Snapshot)
-    end.
+    barrel_trace:with_db_span(query_execute, DbName, fun() ->
+        {ok, Snapshot} = barrel_store_rocksdb:snapshot(StoreRef),
+        try
+            execute_with_snapshot(StoreRef, DbName, Plan, Snapshot)
+        after
+            barrel_store_rocksdb:release_snapshot(Snapshot)
+        end
+    end).
 
 %% @private Execute unbounded include_docs query with automatic pagination
 %% Collects results in chunks to avoid memory pressure from large MultiGet
@@ -304,14 +311,16 @@ collect_all_chunks(StoreRef, DbName, Plan, Token, AccResults) when is_binary(Tok
 -spec execute(barrel_store_rocksdb:db_ref(), db_name(), query_plan(), chunk_opts()) ->
     {ok, [map()], result_meta()} | {error, term()}.
 execute(StoreRef, DbName, #query_plan{} = Plan, Opts) when is_map(Opts) ->
-    case maps:get(continuation, Opts, undefined) of
-        undefined ->
-            %% Fresh query - create new snapshot
-            execute_chunked_fresh(StoreRef, DbName, Plan, Opts);
-        Token ->
-            %% Resume from cursor
-            execute_chunked_resume(StoreRef, DbName, Plan, Token, Opts)
-    end.
+    barrel_trace:with_db_span(query_execute, DbName, fun() ->
+        case maps:get(continuation, Opts, undefined) of
+            undefined ->
+                %% Fresh query - create new snapshot
+                execute_chunked_fresh(StoreRef, DbName, Plan, Opts);
+            Token ->
+                %% Resume from cursor
+                execute_chunked_resume(StoreRef, DbName, Plan, Token, Opts)
+        end
+    end).
 
 %%====================================================================
 %% Chunked Execution Implementation

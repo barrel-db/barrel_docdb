@@ -203,12 +203,16 @@ put_doc(VdbName, Doc) ->
 -spec put_doc(binary(), map(), map()) -> {ok, map()} | {error, term()}.
 put_doc(VdbName, Doc, Opts) when is_binary(VdbName), is_map(Doc), is_map(Opts) ->
     DocId = get_doc_id(Doc),
-    case route_to_shard(VdbName, DocId) of
-        {ok, ShardDb} ->
-            barrel_docdb:put_doc(ShardDb, Doc, Opts);
-        {error, _} = Err ->
-            Err
-    end.
+    barrel_trace:with_db_span(vdb_put, VdbName, fun() ->
+        case route_to_shard(VdbName, DocId) of
+            {ok, ShardDb} ->
+                barrel_trace:set_attribute(<<"vdb.shard">>, ShardDb),
+                barrel_docdb:put_doc(ShardDb, Doc, Opts);
+            {error, _} = Err ->
+                barrel_trace:record_error(Err),
+                Err
+        end
+    end).
 
 %% @doc Get a document (routed to correct shard)
 -spec get_doc(binary(), binary()) -> {ok, map()} | {error, term()}.
@@ -217,12 +221,16 @@ get_doc(VdbName, DocId) ->
 
 -spec get_doc(binary(), binary(), map()) -> {ok, map()} | {error, term()}.
 get_doc(VdbName, DocId, Opts) when is_binary(VdbName), is_binary(DocId) ->
-    case route_to_shard(VdbName, DocId) of
-        {ok, ShardDb} ->
-            barrel_docdb:get_doc(ShardDb, DocId, Opts);
-        {error, _} = Err ->
-            Err
-    end.
+    barrel_trace:with_db_span(vdb_get, VdbName, fun() ->
+        case route_to_shard(VdbName, DocId) of
+            {ok, ShardDb} ->
+                barrel_trace:set_attribute(<<"vdb.shard">>, ShardDb),
+                barrel_docdb:get_doc(ShardDb, DocId, Opts);
+            {error, _} = Err ->
+                barrel_trace:record_error(Err),
+                Err
+        end
+    end).
 
 %% @doc Delete a document (routed to correct shard)
 -spec delete_doc(binary(), binary()) -> {ok, map()} | {error, term()}.
@@ -231,12 +239,16 @@ delete_doc(VdbName, DocId) ->
 
 -spec delete_doc(binary(), binary(), map()) -> {ok, map()} | {error, term()}.
 delete_doc(VdbName, DocId, Opts) when is_binary(VdbName), is_binary(DocId), is_map(Opts) ->
-    case route_to_shard(VdbName, DocId) of
-        {ok, ShardDb} ->
-            barrel_docdb:delete_doc(ShardDb, DocId, Opts);
-        {error, _} = Err ->
-            Err
-    end.
+    barrel_trace:with_db_span(vdb_delete, VdbName, fun() ->
+        case route_to_shard(VdbName, DocId) of
+            {ok, ShardDb} ->
+                barrel_trace:set_attribute(<<"vdb.shard">>, ShardDb),
+                barrel_docdb:delete_doc(ShardDb, DocId, Opts);
+            {error, _} = Err ->
+                barrel_trace:record_error(Err),
+                Err
+        end
+    end).
 
 %%====================================================================
 %% Bulk Operations
@@ -287,30 +299,35 @@ find(VdbName, Query) ->
 
 -spec find(binary(), map(), map()) -> {ok, [map()]} | {error, term()}.
 find(VdbName, Query, Opts) when is_binary(VdbName), is_map(Query) ->
-    case barrel_shard_map:all_physical_dbs(VdbName) of
-        {ok, ShardDbs} ->
-            %% Normalize query - ensure where clause exists
-            NormalizedQuery = normalize_query(Query),
-            %% Remove pagination opts from shard query - we apply at VDB level after merge
-            ShardOpts = maps:without([limit, offset, <<"limit">>, <<"offset">>], Opts),
-            %% Scatter: query all shards in parallel
-            Results = barrel_parallel:pmap(
-                fun(ShardDb) ->
-                    case barrel_docdb:find(ShardDb, NormalizedQuery, ShardOpts) of
-                        {ok, Docs, _Meta} ->
-                            %% Extract actual doc from result format
-                            [extract_doc(D) || D <- Docs];
-                        {error, _} -> []
-                    end
-                end,
-                ShardDbs
-            ),
-            %% Gather: merge results with VDB-level pagination
-            MergedResults = merge_query_results(lists:flatten(Results), Query, Opts),
-            {ok, MergedResults};
-        {error, _} = Err ->
-            Err
-    end.
+    barrel_trace:with_db_span(vdb_query, VdbName, fun() ->
+        case barrel_shard_map:all_physical_dbs(VdbName) of
+            {ok, ShardDbs} ->
+                barrel_trace:set_attribute(<<"vdb.shard_count">>, length(ShardDbs)),
+                %% Normalize query - ensure where clause exists
+                NormalizedQuery = normalize_query(Query),
+                %% Remove pagination opts from shard query - we apply at VDB level after merge
+                ShardOpts = maps:without([limit, offset, <<"limit">>, <<"offset">>], Opts),
+                %% Scatter: query all shards in parallel
+                Results = barrel_parallel:pmap(
+                    fun(ShardDb) ->
+                        case barrel_docdb:find(ShardDb, NormalizedQuery, ShardOpts) of
+                            {ok, Docs, _Meta} ->
+                                %% Extract actual doc from result format
+                                [extract_doc(D) || D <- Docs];
+                            {error, _} -> []
+                        end
+                    end,
+                    ShardDbs
+                ),
+                %% Gather: merge results with VDB-level pagination
+                MergedResults = merge_query_results(lists:flatten(Results), Query, Opts),
+                barrel_trace:set_attribute(<<"db.response.returned_rows">>, length(MergedResults)),
+                {ok, MergedResults};
+            {error, _} = Err ->
+                barrel_trace:record_error(Err),
+                Err
+        end
+    end).
 
 %% @doc Get changes across all shards
 -spec get_changes(binary(), map()) -> {ok, map()} | {error, term()}.

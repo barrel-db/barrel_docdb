@@ -300,7 +300,8 @@ request_headers(Endpoint, Method, Path, Body) ->
     ContentTypeHeaders = content_type_headers(Endpoint),
     AuthHeaders = auth_headers(Endpoint),
     PeerAuthHeaders = peer_auth_headers(Endpoint, Method, Path, Body),
-    ContentTypeHeaders ++ AuthHeaders ++ PeerAuthHeaders.
+    TraceHeaders = barrel_trace:inject_headers([]),
+    ContentTypeHeaders ++ AuthHeaders ++ PeerAuthHeaders ++ TraceHeaders.
 
 content_type_headers(#{content_type := cbor}) ->
     [{<<"Content-Type">>, ?CT_CBOR}, {<<"Accept">>, ?CT_CBOR}];

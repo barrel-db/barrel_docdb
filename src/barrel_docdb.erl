@@ -410,28 +410,40 @@ put_doc(Db, Doc) ->
 -spec put_doc(binary() | pid(), map(), map()) -> {ok, map()} | {error, term()}.
 put_doc(Db, Doc, Opts) ->
     DbName = db_name(Db),
-    Start = erlang:monotonic_time(millisecond),
-    %% Write document locally first
-    Result = with_db(Db, fun(Pid) ->
-        barrel_db_server:put_doc(Pid, Doc, Opts)
-    end),
-    %% Record metrics
-    Duration = erlang:monotonic_time(millisecond) - Start,
-    barrel_metrics:inc_doc_ops(DbName, put),
-    barrel_metrics:observe_doc_latency(DbName, put, Duration),
-    %% Handle sync replication if requested
-    case {Result, maps:get(replicate, Opts, async)} of
-        {{ok, WriteResult}, sync} ->
-            WaitFor = maps:get(wait_for, Opts, []),
-            DocId = maps:get(<<"id">>, WriteResult),
-            Rev = maps:get(<<"rev">>, WriteResult),
-            case wait_for_sync_replication(DocId, Rev, WaitFor) of
-                ok -> Result;
-                {error, Reason} -> {error, {sync_replication_failed, Reason}}
-            end;
-        _ ->
-            Result
-    end.
+    DocId = maps:get(<<"id">>, Doc, undefined),
+    ExtraAttrs = case DocId of
+        undefined -> #{};
+        _ -> #{<<"db.document.id">> => DocId}
+    end,
+    barrel_trace:with_db_span(put, DbName, ExtraAttrs, fun() ->
+        Start = erlang:monotonic_time(millisecond),
+        %% Write document locally first
+        Result = with_db(Db, fun(Pid) ->
+            barrel_db_server:put_doc(Pid, Doc, Opts)
+        end),
+        %% Record metrics
+        Duration = erlang:monotonic_time(millisecond) - Start,
+        barrel_metrics:inc_doc_ops(DbName, put),
+        barrel_metrics:observe_doc_latency(DbName, put, Duration),
+        %% Record error on span if failed
+        case Result of
+            {error, Reason} -> barrel_trace:record_error(Reason);
+            _ -> ok
+        end,
+        %% Handle sync replication if requested
+        case {Result, maps:get(replicate, Opts, async)} of
+            {{ok, WriteResult}, sync} ->
+                WaitFor = maps:get(wait_for, Opts, []),
+                ResultDocId = maps:get(<<"id">>, WriteResult),
+                Rev = maps:get(<<"rev">>, WriteResult),
+                case wait_for_sync_replication(ResultDocId, Rev, WaitFor) of
+                    ok -> Result;
+                    {error, SyncReason} -> {error, {sync_replication_failed, SyncReason}}
+                end;
+            _ ->
+                Result
+        end
+    end).
 
 %% @doc Wait for a document revision to reach all specified targets
 -spec wait_for_sync_replication(binary(), binary(), [binary() | map()]) ->
@@ -512,8 +524,12 @@ put_docs(Db, Docs) ->
 %% @returns List of `{ok, Result}' or `{error, Reason}' in same order as input
 -spec put_docs(binary() | pid(), [map()], map()) -> [{ok, map()} | {error, term()}].
 put_docs(Db, Docs, Opts) ->
-    with_db(Db, fun(Pid) ->
-        barrel_db_server:put_docs(Pid, Docs, Opts)
+    DbName = db_name(Db),
+    ExtraAttrs = #{<<"db.batch_size">> => length(Docs)},
+    barrel_trace:with_db_span(put_batch, DbName, ExtraAttrs, fun() ->
+        with_db(Db, fun(Pid) ->
+            barrel_db_server:put_docs(Pid, Docs, Opts)
+        end)
     end).
 
 %% @doc Get a document by ID.
@@ -560,14 +576,22 @@ get_doc(Db, DocId) ->
 -spec get_doc(binary() | pid(), binary(), map()) -> {ok, map()} | {ok, binary(), map()} | {error, term()}.
 get_doc(Db, DocId, Opts) ->
     DbName = db_name(Db),
-    Start = erlang:monotonic_time(millisecond),
-    Result = with_db(Db, fun(Pid) ->
-        barrel_db_server:get_doc(Pid, DocId, Opts)
-    end),
-    Duration = erlang:monotonic_time(millisecond) - Start,
-    barrel_metrics:inc_doc_ops(DbName, get),
-    barrel_metrics:observe_doc_latency(DbName, get, Duration),
-    Result.
+    ExtraAttrs = #{<<"db.document.id">> => DocId},
+    barrel_trace:with_db_span(get, DbName, ExtraAttrs, fun() ->
+        Start = erlang:monotonic_time(millisecond),
+        Result = with_db(Db, fun(Pid) ->
+            barrel_db_server:get_doc(Pid, DocId, Opts)
+        end),
+        Duration = erlang:monotonic_time(millisecond) - Start,
+        barrel_metrics:inc_doc_ops(DbName, get),
+        barrel_metrics:observe_doc_latency(DbName, get, Duration),
+        %% Record error on span if failed
+        case Result of
+            {error, Reason} -> barrel_trace:record_error(Reason);
+            _ -> ok
+        end,
+        Result
+    end).
 
 %% @doc Get multiple documents by ID (batch read).
 %%
@@ -601,8 +625,12 @@ get_docs(Db, DocIds) ->
 %% @returns List of `{ok, Document}' or `{error, not_found}' in same order as input
 -spec get_docs(binary() | pid(), [binary()], map()) -> [{ok, map()} | {error, term()}].
 get_docs(Db, DocIds, Opts) ->
-    with_db(Db, fun(Pid) ->
-        barrel_db_server:get_docs(Pid, DocIds, Opts)
+    DbName = db_name(Db),
+    ExtraAttrs = #{<<"db.batch_size">> => length(DocIds)},
+    barrel_trace:with_db_span(get_batch, DbName, ExtraAttrs, fun() ->
+        with_db(Db, fun(Pid) ->
+            barrel_db_server:get_docs(Pid, DocIds, Opts)
+        end)
     end).
 
 %% @doc Delete a document.
@@ -637,14 +665,22 @@ delete_doc(Db, DocId) ->
 -spec delete_doc(binary() | pid(), binary(), map()) -> {ok, map()} | {error, term()}.
 delete_doc(Db, DocId, Opts) ->
     DbName = db_name(Db),
-    Start = erlang:monotonic_time(millisecond),
-    Result = with_db(Db, fun(Pid) ->
-        barrel_db_server:delete_doc(Pid, DocId, Opts)
-    end),
-    Duration = erlang:monotonic_time(millisecond) - Start,
-    barrel_metrics:inc_doc_ops(DbName, delete),
-    barrel_metrics:observe_doc_latency(DbName, delete, Duration),
-    Result.
+    ExtraAttrs = #{<<"db.document.id">> => DocId},
+    barrel_trace:with_db_span(delete, DbName, ExtraAttrs, fun() ->
+        Start = erlang:monotonic_time(millisecond),
+        Result = with_db(Db, fun(Pid) ->
+            barrel_db_server:delete_doc(Pid, DocId, Opts)
+        end),
+        Duration = erlang:monotonic_time(millisecond) - Start,
+        barrel_metrics:inc_doc_ops(DbName, delete),
+        barrel_metrics:observe_doc_latency(DbName, delete, Duration),
+        %% Record error on span if failed
+        case Result of
+            {error, Reason} -> barrel_trace:record_error(Reason);
+            _ -> ok
+        end,
+        Result
+    end).
 
 %% @doc Fold over all documents in the database.
 %%
@@ -674,8 +710,11 @@ delete_doc(Db, DocId, Opts) ->
 -spec fold_docs(binary() | pid(), fun((map(), term()) -> {ok, term()} | {stop, term()} | stop), term()) ->
     {ok, term()}.
 fold_docs(Db, Fun, Acc) ->
-    with_db(Db, fun(Pid) ->
-        barrel_db_server:fold_docs(Pid, Fun, Acc)
+    DbName = db_name(Db),
+    barrel_trace:with_db_span(fold, DbName, fun() ->
+        with_db(Db, fun(Pid) ->
+            barrel_db_server:fold_docs(Pid, Fun, Acc)
+        end)
     end).
 
 %% @doc Fold over all documents with options.
@@ -693,8 +732,11 @@ fold_docs(Db, Fun, Acc) ->
 -spec fold_docs(binary() | pid(), fun((map(), term()) -> {ok, term()} | {stop, term()} | stop), term(), map()) ->
     {ok, term()}.
 fold_docs(Db, Fun, Acc, Opts) when is_map(Opts) ->
-    with_db(Db, fun(Pid) ->
-        barrel_db_server:fold_docs(Pid, Fun, Acc, Opts)
+    DbName = db_name(Db),
+    barrel_trace:with_db_span(fold, DbName, fun() ->
+        with_db(Db, fun(Pid) ->
+            barrel_db_server:fold_docs(Pid, Fun, Acc, Opts)
+        end)
     end).
 
 %% @doc Get list of conflicting revisions for a document.
@@ -1083,8 +1125,12 @@ unregister_view(Db, ViewId) ->
 %% @returns `{ok, [Result]}' where each result is a map with key, value, id
 -spec query_view(binary() | pid(), binary(), map()) -> {ok, [map()]} | {error, term()}.
 query_view(Db, ViewId, Opts) ->
-    with_db(Db, fun(Pid) ->
-        barrel_view:query(Pid, ViewId, Opts)
+    DbName = db_name(Db),
+    ExtraAttrs = #{<<"db.view.name">> => ViewId},
+    barrel_trace:with_db_span(view_query, DbName, ExtraAttrs, fun() ->
+        with_db(Db, fun(Pid) ->
+            barrel_view:query(Pid, ViewId, Opts)
+        end)
     end).
 
 %% @doc List all registered views.
@@ -1109,8 +1155,12 @@ list_views(Db) ->
 %% @returns `{ok, HlcTimestamp}' or `{error, Reason}'
 -spec refresh_view(binary() | pid(), binary()) -> {ok, barrel_hlc:timestamp()} | {error, term()}.
 refresh_view(Db, ViewId) ->
-    with_db(Db, fun(Pid) ->
-        barrel_view:refresh(Pid, ViewId)
+    DbName = db_name(Db),
+    ExtraAttrs = #{<<"db.view.name">> => ViewId},
+    barrel_trace:with_db_span(view_refresh, DbName, ExtraAttrs, fun() ->
+        with_db(Db, fun(Pid) ->
+            barrel_view:refresh(Pid, ViewId)
+        end)
     end).
 
 %%====================================================================
@@ -1199,44 +1249,49 @@ find(Db, QuerySpec) ->
 -spec find(binary() | pid(), map(), map()) -> {ok, [map()], map()} | {error, term()}.
 find(Db, QuerySpec, Opts) ->
     MetricsDbName = db_name(Db),
-    Start = erlang:monotonic_time(millisecond),
-    Result = with_db(Db, fun(Pid) ->
-        {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
-        {ok, Info} = barrel_db_server:info(Pid),
-        DbName = maps:get(name, Info),
-        %% Default include_docs to true for find API
-        DefaultOpts = #{include_docs => true},
-        MergedSpec = maps:merge(maps:merge(DefaultOpts, QuerySpec), Opts),
-        case barrel_query:compile(MergedSpec) of
-            {ok, Plan} ->
-                %% Use chunked execution with configurable chunk_size
-                %% If query has a limit, use min(limit, chunk_size) to respect it
-                DefaultChunkSize = maps:get(chunk_size, Opts, 1000),
-                EffectiveChunkSize = case maps:get(limit, MergedSpec, undefined) of
-                    undefined -> DefaultChunkSize;
-                    Limit when Limit < DefaultChunkSize -> Limit;
-                    _ -> DefaultChunkSize
-                end,
-                ChunkOpts = case maps:get(continuation, Opts, undefined) of
-                    undefined -> #{chunk_size => EffectiveChunkSize};
-                    Token -> #{chunk_size => EffectiveChunkSize, continuation => Token}
-                end,
-                barrel_query:execute(StoreRef, DbName, Plan, ChunkOpts);
-            {error, _} = Error ->
-                Error
-        end
-    end),
-    %% Record query metrics
-    Duration = erlang:monotonic_time(millisecond) - Start,
-    barrel_metrics:inc_query_ops(MetricsDbName),
-    barrel_metrics:observe_query_latency(MetricsDbName, Duration),
-    case Result of
-        {ok, Results, _Meta} ->
-            barrel_metrics:observe_query_results(MetricsDbName, length(Results));
-        _ ->
-            ok
-    end,
-    Result.
+    barrel_trace:with_db_span(query, MetricsDbName, fun() ->
+        Start = erlang:monotonic_time(millisecond),
+        Result = with_db(Db, fun(Pid) ->
+            {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
+            {ok, Info} = barrel_db_server:info(Pid),
+            DbName = maps:get(name, Info),
+            %% Default include_docs to true for find API
+            DefaultOpts = #{include_docs => true},
+            MergedSpec = maps:merge(maps:merge(DefaultOpts, QuerySpec), Opts),
+            case barrel_query:compile(MergedSpec) of
+                {ok, Plan} ->
+                    %% Use chunked execution with configurable chunk_size
+                    %% If query has a limit, use min(limit, chunk_size) to respect it
+                    DefaultChunkSize = maps:get(chunk_size, Opts, 1000),
+                    EffectiveChunkSize = case maps:get(limit, MergedSpec, undefined) of
+                        undefined -> DefaultChunkSize;
+                        Limit when Limit < DefaultChunkSize -> Limit;
+                        _ -> DefaultChunkSize
+                    end,
+                    ChunkOpts = case maps:get(continuation, Opts, undefined) of
+                        undefined -> #{chunk_size => EffectiveChunkSize};
+                        Token -> #{chunk_size => EffectiveChunkSize, continuation => Token}
+                    end,
+                    barrel_query:execute(StoreRef, DbName, Plan, ChunkOpts);
+                {error, _} = Error ->
+                    Error
+            end
+        end),
+        %% Record query metrics
+        Duration = erlang:monotonic_time(millisecond) - Start,
+        barrel_metrics:inc_query_ops(MetricsDbName),
+        barrel_metrics:observe_query_latency(MetricsDbName, Duration),
+        case Result of
+            {ok, Results, _Meta} ->
+                barrel_metrics:observe_query_results(MetricsDbName, length(Results)),
+                barrel_trace:set_attribute(<<"db.response.returned_rows">>, length(Results));
+            {error, Reason} ->
+                barrel_trace:record_error(Reason);
+            _ ->
+                ok
+        end,
+        Result
+    end).
 
 %% @doc Explain a query execution plan.
 %%
@@ -1257,13 +1312,17 @@ find(Db, QuerySpec, Opts) ->
 %% @param QuerySpec Query specification map
 %% @returns `{ok, ExplanationMap}' or `{error, Reason}'
 -spec explain(binary() | pid(), map()) -> {ok, map()} | {error, term()}.
-explain(_Db, QuerySpec) ->
-    case barrel_query:compile(QuerySpec) of
-        {ok, Plan} ->
-            {ok, barrel_query:explain(Plan)};
-        {error, _} = Error ->
-            Error
-    end.
+explain(Db, QuerySpec) ->
+    DbName = db_name(Db),
+    barrel_trace:with_db_span(explain, DbName, fun() ->
+        case barrel_query:compile(QuerySpec) of
+            {ok, Plan} ->
+                {ok, barrel_query:explain(Plan)};
+            {error, _} = Error ->
+                barrel_trace:record_error(Error),
+                Error
+        end
+    end).
 
 %%====================================================================
 %% Changes
@@ -1309,11 +1368,14 @@ get_changes(Db, Since) ->
 -spec get_changes(binary() | pid(), barrel_hlc:timestamp() | first, map()) ->
     {ok, [map()], barrel_hlc:timestamp()}.
 get_changes(Db, Since, Opts) ->
-    with_db(Db, fun(Pid) ->
-        {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
-        {ok, Info} = barrel_db_server:info(Pid),
-        DbName = maps:get(name, Info),
-        barrel_changes:get_changes(StoreRef, DbName, Since, Opts)
+    DbName = db_name(Db),
+    barrel_trace:with_db_span(changes, DbName, fun() ->
+        with_db(Db, fun(Pid) ->
+            {ok, StoreRef} = barrel_db_server:get_store_ref(Pid),
+            {ok, Info} = barrel_db_server:info(Pid),
+            DbNameInner = maps:get(name, Info),
+            barrel_changes:get_changes(StoreRef, DbNameInner, Since, Opts)
+        end)
     end).
 
 %% @doc Subscribe to a changes stream.

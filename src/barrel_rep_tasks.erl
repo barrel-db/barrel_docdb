@@ -400,29 +400,37 @@ run_task(Parent, TaskId, Config, SourceTransport, TargetTransport, StartSeq) ->
     Filter = maps:get(filter, Config, #{}),
     WaitFor = maps:get(wait_for, Config, []),
 
-    %% Run replication based on direction
-    case Direction of
-        push ->
-            %% Source -> Target (read from source, write to target)
-            run_task_loop(Parent, TaskId, Source, Target, SourceTransport, TargetTransport,
-                          StartSeq, BatchSize, Filter, Mode, WaitFor);
-        pull ->
-            %% Target -> Source (read from target, write to source)
-            %% Swap the read/write roles
-            run_task_loop(Parent, TaskId, Target, Source, TargetTransport, SourceTransport,
-                          StartSeq, BatchSize, Filter, Mode, WaitFor);
-        both ->
-            %% Bidirectional: run both push and pull concurrently
-            %% This is simplified - for production we'd want separate checkpoints
-            Self = self(),
-            spawn_link(fun() ->
-                run_task_loop(Self, TaskId, Source, Target, SourceTransport, TargetTransport,
+    ExtraAttrs = #{
+        <<"replication.task_id">> => TaskId,
+        <<"replication.direction">> => atom_to_binary(Direction, utf8),
+        <<"replication.mode">> => atom_to_binary(Mode, utf8)
+    },
+
+    barrel_trace:with_db_span(rep_task, undefined, ExtraAttrs, fun() ->
+        %% Run replication based on direction
+        case Direction of
+            push ->
+                %% Source -> Target (read from source, write to target)
+                run_task_loop(Parent, TaskId, Source, Target, SourceTransport, TargetTransport,
+                              StartSeq, BatchSize, Filter, Mode, WaitFor);
+            pull ->
+                %% Target -> Source (read from target, write to source)
+                %% Swap the read/write roles
+                run_task_loop(Parent, TaskId, Target, Source, TargetTransport, SourceTransport,
+                              StartSeq, BatchSize, Filter, Mode, WaitFor);
+            both ->
+                %% Bidirectional: run both push and pull concurrently
+                %% This is simplified - for production we'd want separate checkpoints
+                Self = self(),
+                spawn_link(fun() ->
+                    run_task_loop(Self, TaskId, Source, Target, SourceTransport, TargetTransport,
+                                  StartSeq, BatchSize, Filter, Mode, WaitFor)
+                end),
+                %% Run pull in this process
+                run_task_loop(Parent, TaskId, Target, Source, TargetTransport, SourceTransport,
                               StartSeq, BatchSize, Filter, Mode, WaitFor)
-            end),
-            %% Run pull in this process
-            run_task_loop(Parent, TaskId, Target, Source, TargetTransport, SourceTransport,
-                          StartSeq, BatchSize, Filter, Mode, WaitFor)
-    end.
+        end
+    end).
 
 run_task_loop(Parent, TaskId, Source, Target, SourceTransport, TargetTransport,
               Since, BatchSize, Filter, Mode, WaitFor) ->

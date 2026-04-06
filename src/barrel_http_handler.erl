@@ -25,33 +25,51 @@
 init(Req0, State) ->
     #{action := Action} = State,
     Method = cowboy_req:method(Req0),
-    try
-        %% Authenticate request (unless it's a health check)
-        ok = maybe_authenticate(Action, Req0),
-        case handle_action(Action, Method, Req0) of
-            {Status, Headers, Body, Req1} ->
-                %% Normal response
-                Req2 = cowboy_req:reply(Status, Headers, Body, Req1),
-                {ok, Req2, State};
-            {stream, Status, Headers, StreamFun, Req1} ->
-                %% Streaming response - StreamFun sends the body
-                Req2 = cowboy_req:stream_reply(Status, Headers, Req1),
-                StreamFun(Req2),
-                {ok, Req2, State}
+    Path = cowboy_req:path(Req0),
+
+    %% Extract trace context from incoming request headers
+    ReqHeaders = cowboy_req:headers(Req0),
+    HeadersList = maps:to_list(ReqHeaders),
+    barrel_trace:extract_headers(HeadersList),
+
+    %% Wrap request handling in an HTTP span
+    barrel_trace:with_http_span(Method, Path, fun() ->
+        try
+            %% Authenticate request (unless it's a health check)
+            ok = maybe_authenticate(Action, Req0),
+            case handle_action(Action, Method, Req0) of
+                {Status, Headers, Body, Req1} ->
+                    %% Set response status on span
+                    barrel_trace:set_attribute(<<"http.response.status_code">>, Status),
+                    %% Normal response
+                    Req2 = cowboy_req:reply(Status, Headers, Body, Req1),
+                    {ok, Req2, State};
+                {stream, Status, Headers, StreamFun, Req1} ->
+                    %% Set response status on span
+                    barrel_trace:set_attribute(<<"http.response.status_code">>, Status),
+                    %% Streaming response - StreamFun sends the body
+                    Req2 = cowboy_req:stream_reply(Status, Headers, Req1),
+                    StreamFun(Req2),
+                    {ok, Req2, State}
+            end
+        catch
+            throw:{error, ErrStatus, Message} ->
+                barrel_trace:set_attribute(<<"http.response.status_code">>, ErrStatus),
+                barrel_trace:record_error(Message),
+                ErrorBody = encode_error(Message, Req0),
+                ErrHeaders = response_headers(Req0),
+                ErrReq = cowboy_req:reply(ErrStatus, ErrHeaders, ErrorBody, Req0),
+                {ok, ErrReq, State};
+            Class:Reason:Stack ->
+                logger:error("HTTP handler error: ~p:~p~n~p", [Class, Reason, Stack]),
+                barrel_trace:set_attribute(<<"http.response.status_code">>, 500),
+                barrel_trace:record_error(Reason, #{stacktrace => Stack}),
+                ErrorBody = encode_error(<<"Internal server error">>, Req0),
+                ErrHeaders = response_headers(Req0),
+                ErrReq = cowboy_req:reply(500, ErrHeaders, ErrorBody, Req0),
+                {ok, ErrReq, State}
         end
-    catch
-        throw:{error, ErrStatus, Message} ->
-            ErrorBody = encode_error(Message, Req0),
-            ErrHeaders = response_headers(Req0),
-            ErrReq = cowboy_req:reply(ErrStatus, ErrHeaders, ErrorBody, Req0),
-            {ok, ErrReq, State};
-        Class:Reason:Stack ->
-            logger:error("HTTP handler error: ~p:~p~n~p", [Class, Reason, Stack]),
-            ErrorBody = encode_error(<<"Internal server error">>, Req0),
-            ErrHeaders = response_headers(Req0),
-            ErrReq = cowboy_req:reply(500, ErrHeaders, ErrorBody, Req0),
-            {ok, ErrReq, State}
-    end.
+    end).
 
 %%====================================================================
 %% Authentication
@@ -2532,12 +2550,17 @@ request_content_type(Req) ->
         _ -> json
     end.
 
-%% Response headers with content type and HLC for clock sync
+%% Response headers with content type, HLC for clock sync, and trace context
 response_headers(Req) ->
     Hlc = barrel_hlc:get_hlc(),
     HlcBin = barrel_hlc:encode(Hlc),
-    #{<<"content-type">> => response_content_type(Req),
-      <<"x-barrel-hlc">> => base64:encode(HlcBin)}.
+    BaseHeaders = #{
+        <<"content-type">> => response_content_type(Req),
+        <<"x-barrel-hlc">> => base64:encode(HlcBin)
+    },
+    %% Add trace context headers for distributed tracing
+    TraceHeaders = barrel_trace:inject_headers([]),
+    lists:foldl(fun({K, V}, Acc) -> maps:put(K, V, Acc) end, BaseHeaders, TraceHeaders).
 
 %%====================================================================
 %% Encoding/Decoding
