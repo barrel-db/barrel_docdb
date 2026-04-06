@@ -71,6 +71,9 @@ configure_tracing() ->
         true ->
             configure_exporter(TracingConfig);
         false ->
+            %% Disable tracing globally for zero overhead
+            instrument_config:set_tracing_enabled(false),
+            logger:info("Tracing disabled globally"),
             ok
     end.
 

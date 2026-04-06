@@ -27,48 +27,49 @@ init(Req0, State) ->
     Method = cowboy_req:method(Req0),
     Path = cowboy_req:path(Req0),
 
-    %% Extract trace context from incoming request headers
+    %% Extract trace context from incoming request headers (properly scoped)
     ReqHeaders = cowboy_req:headers(Req0),
     HeadersList = maps:to_list(ReqHeaders),
-    barrel_trace:extract_headers(HeadersList),
 
-    %% Wrap request handling in an HTTP span
-    barrel_trace:with_http_span(Method, Path, fun() ->
-        try
-            %% Authenticate request (unless it's a health check)
-            ok = maybe_authenticate(Action, Req0),
-            case handle_action(Action, Method, Req0) of
-                {Status, Headers, Body, Req1} ->
-                    %% Set response status on span
-                    barrel_trace:set_attribute(<<"http.response.status_code">>, Status),
-                    %% Normal response
-                    Req2 = cowboy_req:reply(Status, Headers, Body, Req1),
-                    {ok, Req2, State};
-                {stream, Status, Headers, StreamFun, Req1} ->
-                    %% Set response status on span
-                    barrel_trace:set_attribute(<<"http.response.status_code">>, Status),
-                    %% Streaming response - StreamFun sends the body
-                    Req2 = cowboy_req:stream_reply(Status, Headers, Req1),
-                    StreamFun(Req2),
-                    {ok, Req2, State}
+    barrel_trace:with_extracted_context(HeadersList, fun() ->
+        %% Wrap request handling in an HTTP span
+        barrel_trace:with_http_span(Method, Path, fun() ->
+            try
+                %% Authenticate request (unless it's a health check)
+                ok = maybe_authenticate(Action, Req0),
+                case handle_action(Action, Method, Req0) of
+                    {Status, Headers, Body, Req1} ->
+                        %% Set response status on span
+                        barrel_trace:set_attribute(<<"http.response.status_code">>, Status),
+                        %% Normal response
+                        Req2 = cowboy_req:reply(Status, Headers, Body, Req1),
+                        {ok, Req2, State};
+                    {stream, Status, Headers, StreamFun, Req1} ->
+                        %% Set response status on span
+                        barrel_trace:set_attribute(<<"http.response.status_code">>, Status),
+                        %% Streaming response - StreamFun sends the body
+                        Req2 = cowboy_req:stream_reply(Status, Headers, Req1),
+                        StreamFun(Req2),
+                        {ok, Req2, State}
+                end
+            catch
+                throw:{error, ErrStatus, Message} ->
+                    barrel_trace:set_attribute(<<"http.response.status_code">>, ErrStatus),
+                    barrel_trace:record_error(Message),
+                    ErrorBody = encode_error(Message, Req0),
+                    ErrHeaders = response_headers(Req0),
+                    ErrReq = cowboy_req:reply(ErrStatus, ErrHeaders, ErrorBody, Req0),
+                    {ok, ErrReq, State};
+                Class:Reason:Stack ->
+                    logger:error("HTTP handler error: ~p:~p~n~p", [Class, Reason, Stack]),
+                    barrel_trace:set_attribute(<<"http.response.status_code">>, 500),
+                    barrel_trace:record_error(Reason, #{stacktrace => Stack}),
+                    ErrorBody = encode_error(<<"Internal server error">>, Req0),
+                    ErrHeaders = response_headers(Req0),
+                    ErrReq = cowboy_req:reply(500, ErrHeaders, ErrorBody, Req0),
+                    {ok, ErrReq, State}
             end
-        catch
-            throw:{error, ErrStatus, Message} ->
-                barrel_trace:set_attribute(<<"http.response.status_code">>, ErrStatus),
-                barrel_trace:record_error(Message),
-                ErrorBody = encode_error(Message, Req0),
-                ErrHeaders = response_headers(Req0),
-                ErrReq = cowboy_req:reply(ErrStatus, ErrHeaders, ErrorBody, Req0),
-                {ok, ErrReq, State};
-            Class:Reason:Stack ->
-                logger:error("HTTP handler error: ~p:~p~n~p", [Class, Reason, Stack]),
-                barrel_trace:set_attribute(<<"http.response.status_code">>, 500),
-                barrel_trace:record_error(Reason, #{stacktrace => Stack}),
-                ErrorBody = encode_error(<<"Internal server error">>, Req0),
-                ErrHeaders = response_headers(Req0),
-                ErrReq = cowboy_req:reply(500, ErrHeaders, ErrorBody, Req0),
-                {ok, ErrReq, State}
-        end
+        end)
     end).
 
 %%====================================================================

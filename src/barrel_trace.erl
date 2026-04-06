@@ -37,7 +37,13 @@
 -export([
     inject_headers/1,
     extract_headers/1,
-    attach_context/1
+    attach_context/1,
+    with_extracted_context/2
+]).
+
+%% Recording check for expensive operations
+-export([
+    is_recording/0
 ]).
 
 %% Error recording
@@ -158,6 +164,7 @@ inject_headers(Headers) when is_list(Headers) ->
 
 %% @doc Extract trace context from HTTP headers.
 %% Returns the extracted context (attached to current process).
+%% @deprecated Use with_extracted_context/2 for proper context cleanup.
 -spec extract_headers(list()) -> ok.
 extract_headers(Headers) when is_list(Headers) ->
     Ctx = instrument_propagation:extract_headers(Headers),
@@ -165,10 +172,30 @@ extract_headers(Headers) when is_list(Headers) ->
     ok.
 
 %% @doc Attach an extracted context to the current process.
+%% @deprecated Use with_extracted_context/2 for proper context cleanup.
 -spec attach_context(map()) -> ok.
 attach_context(Ctx) when is_map(Ctx) ->
     instrument_context:attach(Ctx),
     ok.
+
+%% @doc Execute function with trace context extracted from HTTP headers.
+%% This properly scopes the context and ensures cleanup via detach.
+-spec with_extracted_context(list(), fun(() -> Result)) -> Result
+    when Result :: term().
+with_extracted_context(Headers, Fun) when is_list(Headers), is_function(Fun, 0) ->
+    Ctx = instrument_propagation:extract_headers(Headers),
+    Token = instrument_context:attach(Ctx),
+    try
+        Fun()
+    after
+        instrument_context:detach(Token)
+    end.
+
+%% @doc Check if the current span is recording.
+%% Use this to guard expensive attribute computation.
+-spec is_recording() -> boolean().
+is_recording() ->
+    instrument_tracer:is_recording().
 
 %%====================================================================
 %% Error Recording
