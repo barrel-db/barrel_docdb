@@ -39,7 +39,8 @@
 %% Test cases - barrel_changes_stream
 -export([
     stream_iterate_mode/1,
-    stream_push_mode/1
+    stream_push_mode/1,
+    push_mode_idle_no_stall/1
 ]).
 
 %%====================================================================
@@ -72,7 +73,8 @@ groups() ->
         ]},
         {stream, [sequence], [
             stream_iterate_mode,
-            stream_push_mode
+            stream_push_mode,
+            push_mode_idle_no_stall
         ]}
     ].
 
@@ -912,5 +914,48 @@ stream_push_mode(Config) ->
     %% Stop
     ok = barrel_changes_stream:stop(Stream),
 
+    barrel_store_rocksdb:close(StoreRef),
+    ok.
+
+%% @doc Test push mode does not stall when stream is idle for multiple poll cycles
+%% This verifies the fix for push mode idle handling where empty batches were not
+%% correctly scheduling the next poll, causing the stream to stall
+push_mode_idle_no_stall(Config) ->
+    TestDir = proplists:get_value(test_dir, Config),
+    DbPath = TestDir ++ "/push_idle_db",
+
+    {ok, StoreRef} = barrel_store_rocksdb:open(DbPath, #{}),
+    DbName = <<"push_idle_test">>,
+
+    %% Start push stream with short interval
+    {ok, StreamPid} = barrel_changes_stream:start_link(
+        StoreRef, DbName,
+        #{mode => push, owner => self(), interval => 50, since => first, batch_size => 10}
+    ),
+
+    %% Wait for several poll cycles without any documents (empty batches)
+    timer:sleep(500),  %% 10 poll cycles with no data
+
+    %% Stream should still be alive
+    true = is_process_alive(StreamPid),
+
+    %% Now insert a document
+    Hlc = make_test_hlc(1000, 0),
+    barrel_changes:write_change(StoreRef, DbName, Hlc, #{
+        id => <<"test_doc">>,
+        rev => <<"1-abc">>,
+        deleted => false
+    }),
+
+    %% Should receive the change (not stalled)
+    receive
+        {changes, _ReqId, Changes} ->
+            1 = length(Changes),
+            [#{id := <<"test_doc">>}] = Changes
+    after 1000 ->
+        ct:fail(stream_stalled)
+    end,
+
+    barrel_changes_stream:stop(StreamPid),
     barrel_store_rocksdb:close(StoreRef),
     ok.

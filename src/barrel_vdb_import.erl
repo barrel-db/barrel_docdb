@@ -77,6 +77,9 @@ import(SourceDb, TargetVdb, Opts) when is_binary(SourceDb), is_binary(TargetVdb)
     end.
 
 %% @doc Import documents asynchronously, returns task ID
+%% Uses spawn + monitor instead of spawn_link so:
+%% - Caller exit doesn't kill the import
+%% - Worker crash doesn't kill the caller
 -spec import_async(binary(), binary(), import_opts()) -> {ok, binary()} | {error, term()}.
 import_async(SourceDb, TargetVdb, Opts) when is_binary(SourceDb), is_binary(TargetVdb) ->
     %% Validate source exists
@@ -90,8 +93,11 @@ import_async(SourceDb, TargetVdb, Opts) when is_binary(SourceDb), is_binary(Targ
                     {error, {vdb_not_found, TargetVdb}};
                 true ->
                     TaskId = generate_task_id(),
-                    Pid = spawn_link(?MODULE, import_worker, [TaskId, SourceDb, TargetVdb, Opts]),
-                    register_task(TaskId, Pid),
+                    %% Use spawn (not spawn_link) for isolation
+                    Pid = spawn(?MODULE, import_worker, [TaskId, SourceDb, TargetVdb, Opts]),
+                    %% Monitor for crash detection
+                    MonRef = erlang:monitor(process, Pid),
+                    register_task(TaskId, Pid, MonRef),
                     {ok, TaskId}
             end
     end.
@@ -107,12 +113,21 @@ get_status(TaskId) ->
 %% @doc Cancel an async import task
 -spec cancel(binary()) -> ok | {error, not_found}.
 cancel(TaskId) ->
-    case get_task_pid(TaskId) of
-        {ok, Pid} ->
+    case get_task(TaskId) of
+        {ok, #{pid := Pid, mon_ref := MonRef}} ->
+            erlang:demonitor(MonRef, [flush]),
             exit(Pid, cancelled),
             update_task_status(TaskId, cancelled),
+            %% Schedule cleanup
+            schedule_cleanup(TaskId, 300000),
             ok;
-        error ->
+        {ok, #{pid := Pid}} ->
+            %% Old format without mon_ref
+            exit(Pid, cancelled),
+            update_task_status(TaskId, cancelled),
+            schedule_cleanup(TaskId, 300000),
+            ok;
+        _ ->
             {error, not_found}
     end.
 
@@ -193,19 +208,23 @@ prepare_doc_for_import(Doc, _OnConflict) ->
 import_worker(TaskId, SourceDb, TargetVdb, Opts) ->
     try
         {ok, Stats} = do_import(SourceDb, TargetVdb, Opts),
-        store_task_result(TaskId, Stats)
+        store_task_result(TaskId, Stats),
+        %% Schedule cleanup after a delay (keep result available for 1 hour)
+        schedule_cleanup(TaskId, 3600000)
     catch
         exit:cancelled ->
             store_task_result(TaskId, #{
                 status => cancelled,
                 finished_at => erlang:system_time(millisecond)
-            });
+            }),
+            schedule_cleanup(TaskId, 300000);  %% 5 minutes for cancelled
         _:Error ->
             store_task_result(TaskId, #{
                 status => failed,
                 error => Error,
                 finished_at => erlang:system_time(millisecond)
-            })
+            }),
+            schedule_cleanup(TaskId, 300000)  %% 5 minutes for failed
     end.
 
 %% @private Generate unique task ID
@@ -213,10 +232,15 @@ generate_task_id() ->
     Rand = crypto:strong_rand_bytes(8),
     base64:encode(Rand, #{mode => urlsafe, padding => false}).
 
-%% @private Task storage (using process dictionary for simplicity)
-%% In production, use ETS or a proper task manager
-register_task(TaskId, Pid) ->
-    persistent_term:put({vdb_import_task, TaskId}, #{pid => Pid, status => running}).
+%% @private Task storage (using persistent_term for simplicity)
+%% Tasks are automatically cleaned up after completion/cancellation/failure
+register_task(TaskId, Pid, MonRef) ->
+    persistent_term:put({vdb_import_task, TaskId}, #{
+        pid => Pid,
+        mon_ref => MonRef,
+        status => running,
+        started_at => erlang:system_time(millisecond)
+    }).
 
 get_task(TaskId) ->
     try
@@ -225,12 +249,6 @@ get_task(TaskId) ->
         Stats -> {ok, Stats}
     catch
         error:badarg -> error
-    end.
-
-get_task_pid(TaskId) ->
-    case get_task(TaskId) of
-        {ok, #{pid := Pid}} -> {ok, Pid};
-        _ -> error
     end.
 
 update_task_status(TaskId, Status) ->
@@ -242,4 +260,31 @@ update_task_status(TaskId, Status) ->
     end.
 
 store_task_result(TaskId, Stats) ->
-    persistent_term:put({vdb_import_task, TaskId}, Stats).
+    %% Preserve pid and mon_ref from original registration
+    case get_task(TaskId) of
+        {ok, #{pid := Pid, mon_ref := MonRef}} ->
+            persistent_term:put({vdb_import_task, TaskId},
+                                Stats#{pid => Pid, mon_ref => MonRef});
+        _ ->
+            persistent_term:put({vdb_import_task, TaskId}, Stats)
+    end.
+
+%% @private Schedule cleanup of task data
+schedule_cleanup(TaskId, DelayMs) ->
+    spawn(fun() ->
+        timer:sleep(DelayMs),
+        cleanup_task(TaskId)
+    end).
+
+%% @private Clean up task data from persistent_term
+cleanup_task(TaskId) ->
+    case get_task(TaskId) of
+        {ok, #{mon_ref := MonRef}} ->
+            %% Demonitor if still valid
+            erlang:demonitor(MonRef, [flush]);
+        _ ->
+            ok
+    end,
+    %% Erase the task
+    catch persistent_term:erase({vdb_import_task, TaskId}),
+    ok.

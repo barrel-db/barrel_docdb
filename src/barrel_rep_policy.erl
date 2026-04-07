@@ -60,7 +60,8 @@
 
 -record(state, {
     policies = #{} :: #{binary() => policy()},
-    tasks = #{} :: #{binary() => [pid()]}  % policy_name => replication task pids
+    %% policy_name => [{TaskId, Pid, MonRef}, ...]
+    tasks = #{} :: #{binary() => [{binary(), pid(), reference()}]}
 }).
 
 -type pattern() :: chain | tiered | group | fanout.
@@ -229,11 +230,13 @@ handle_call({enable, Name}, _From, State) ->
         {ok, Policy} ->
             Policy2 = Policy#{enabled => true},
             case apply_policy(Policy2) of
-                {ok, TaskPids} ->
+                {ok, TaskIds} ->
                     ok = save_policy(Policy2),
+                    %% Monitor each task and track {TaskId, Pid, MonRef}
+                    TaskInfos = monitor_tasks(TaskIds),
                     NewState = State#state{
                         policies = maps:put(Name, Policy2, State#state.policies),
-                        tasks = maps:put(Name, TaskPids, State#state.tasks)
+                        tasks = maps:put(Name, TaskInfos, State#state.tasks)
                     },
                     {reply, ok, NewState};
                 {error, _} = Error ->
@@ -260,13 +263,13 @@ handle_call({disable, Name}, _From, State) ->
 handle_call({status, Name}, _From, State) ->
     case maps:find(Name, State#state.policies) of
         {ok, Policy} ->
-            TaskPids = maps:get(Name, State#state.tasks, []),
+            TaskInfos = maps:get(Name, State#state.tasks, []),
             Status = #{
                 name => Name,
                 pattern => maps:get(pattern, Policy),
                 enabled => maps:get(enabled, Policy),
-                task_count => length(TaskPids),
-                tasks => [task_status(Pid) || Pid <- TaskPids]
+                task_count => length(TaskInfos),
+                tasks => [task_status(TaskId) || {TaskId, _Pid, _MonRef} <- TaskInfos]
             },
             {reply, {ok, Status}, State};
         error ->
@@ -286,9 +289,10 @@ handle_info(auto_enable, State) ->
             case maps:get(enabled, Policy, false) of
                 true ->
                     case apply_policy(Policy) of
-                        {ok, TaskPids} ->
+                        {ok, TaskIds} ->
+                            TaskInfos = monitor_tasks(TaskIds),
                             AccState#state{
-                                tasks = maps:put(Name, TaskPids, AccState#state.tasks)
+                                tasks = maps:put(Name, TaskInfos, AccState#state.tasks)
                             };
                         {error, Reason} ->
                             logger:warning("Failed to enable policy ~s: ~p", [Name, Reason]),
@@ -303,16 +307,26 @@ handle_info(auto_enable, State) ->
     ),
     {noreply, NewState};
 
-handle_info({'DOWN', _Ref, process, Pid, _Reason}, State) ->
-    %% A replication task died - remove from tracking
-    %% In production, we might want to restart it
-    NewTasks = maps:map(
-        fun(_Name, Pids) ->
-            lists:delete(Pid, Pids)
-        end,
-        State#state.tasks
-    ),
-    {noreply, State#state{tasks = NewTasks}};
+handle_info({'DOWN', MonRef, process, Pid, Reason}, State) ->
+    %% A replication task died - find it and restart if policy is enabled
+    case find_task_by_pid(Pid, State) of
+        {ok, PolicyName, TaskId} ->
+            logger:warning("Replication task ~s for policy ~s died: ~p",
+                          [TaskId, PolicyName, Reason]),
+            %% Remove the dead task from tracking
+            NewState = remove_task(PolicyName, Pid, MonRef, State),
+            %% Restart if policy is still enabled
+            case maps:find(PolicyName, NewState#state.policies) of
+                {ok, #{enabled := true} = Policy} ->
+                    logger:info("Restarting replication task for policy ~s", [PolicyName]),
+                    FinalState = restart_policy_tasks(PolicyName, Policy, NewState),
+                    {noreply, FinalState};
+                _ ->
+                    {noreply, NewState}
+            end;
+        not_found ->
+            {noreply, State}
+    end;
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -632,16 +646,76 @@ collect_task_results(Results) ->
 %% @private Stop all replication tasks for a policy
 stop_policy_tasks(Name, State) ->
     case maps:find(Name, State#state.tasks) of
-        {ok, TaskIds} ->
+        {ok, TaskInfos} ->
             lists:foreach(
-                fun(TaskId) when is_binary(TaskId) ->
+                fun({TaskId, _Pid, MonRef}) when is_binary(TaskId) ->
+                    erlang:demonitor(MonRef, [flush]),
                     barrel_rep_tasks:stop_task(TaskId);
                    (_) -> ok
                 end,
-                TaskIds
+                TaskInfos
             ),
             State#state{tasks = maps:remove(Name, State#state.tasks)};
         error ->
+            State
+    end.
+
+%% @private Monitor tasks and return list of {TaskId, Pid, MonRef}
+monitor_tasks(TaskIds) ->
+    lists:filtermap(
+        fun(TaskId) when is_binary(TaskId) ->
+            case barrel_rep_tasks:get_task_pid(TaskId) of
+                {ok, Pid} ->
+                    MonRef = erlang:monitor(process, Pid),
+                    {true, {TaskId, Pid, MonRef}};
+                {error, _} ->
+                    false
+            end;
+           (undefined) ->
+            false
+        end,
+        TaskIds
+    ).
+
+%% @private Find task info by pid
+find_task_by_pid(Pid, State) ->
+    find_task_by_pid_in_list(Pid, maps:to_list(State#state.tasks)).
+
+find_task_by_pid_in_list(_Pid, []) ->
+    not_found;
+find_task_by_pid_in_list(Pid, [{PolicyName, TaskInfos} | Rest]) ->
+    case lists:keyfind(Pid, 2, TaskInfos) of
+        {TaskId, Pid, _MonRef} ->
+            {ok, PolicyName, TaskId};
+        false ->
+            find_task_by_pid_in_list(Pid, Rest)
+    end.
+
+%% @private Remove a task from tracking
+remove_task(PolicyName, Pid, MonRef, State) ->
+    erlang:demonitor(MonRef, [flush]),
+    case maps:find(PolicyName, State#state.tasks) of
+        {ok, TaskInfos} ->
+            NewTaskInfos = lists:filter(
+                fun({_TaskId, P, _MonRef}) -> P =/= Pid end,
+                TaskInfos
+            ),
+            State#state{tasks = maps:put(PolicyName, NewTaskInfos, State#state.tasks)};
+        error ->
+            State
+    end.
+
+%% @private Restart all tasks for a policy
+restart_policy_tasks(PolicyName, Policy, State) ->
+    case apply_policy(Policy) of
+        {ok, TaskIds} ->
+            TaskInfos = monitor_tasks(TaskIds),
+            %% Merge with existing tasks (in case not all died)
+            ExistingInfos = maps:get(PolicyName, State#state.tasks, []),
+            AllInfos = ExistingInfos ++ TaskInfos,
+            State#state{tasks = maps:put(PolicyName, AllInfos, State#state.tasks)};
+        {error, Reason} ->
+            logger:error("Failed to restart policy ~s: ~p", [PolicyName, Reason]),
             State
     end.
 

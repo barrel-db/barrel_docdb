@@ -27,6 +27,7 @@
     get_changes_with_doc_ids/1,
     get_changes_with_query/1,
     get_changes_longpoll_timeout/1,
+    since_now_returns_future_changes_only/1,
     changes_stream_basic/1,
     changes_stream_since_now/1,
     changes_stream_heartbeat/1,
@@ -84,6 +85,7 @@ groups() ->
             get_changes_with_doc_ids,
             get_changes_with_query,
             get_changes_longpoll_timeout,
+            since_now_returns_future_changes_only,
             changes_stream_basic,
             changes_stream_since_now,
             changes_stream_heartbeat,
@@ -533,6 +535,36 @@ get_changes_longpoll_timeout(Config) ->
     %% Should return empty results after timeout
     #{<<"results">> := Results} = json:decode(Body),
     0 = length(Results),
+    ok.
+
+%% @doc Test that since=now returns only changes that occur after the request
+%% This verifies the fix for since=now handling in normal changes feed
+since_now_returns_future_changes_only(Config) ->
+    Auth = auth_header(Config),
+    %% Insert first document
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, #{<<"id">> => <<"before_now">>, <<"val">> => 1}),
+
+    %% Get changes with since=now - should return empty (no docs after "now")
+    {ok, 200, _, Body1} = hackney:get(
+        ?BASE_URL ++ "/db/testdb/_changes?since=now",
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>, []
+    ),
+    #{<<"results">> := Results1, <<"last_seq">> := LastSeq} = json:decode(Body1),
+    %% Should not contain the document inserted before since=now
+    false = lists:any(fun(R) -> maps:get(<<"id">>, R) =:= <<"before_now">> end, Results1),
+
+    %% Insert second document after since=now request
+    {ok, _} = barrel_docdb:put_doc(<<"testdb">>, #{<<"id">> => <<"after_now">>, <<"val">> => 2}),
+
+    %% Get changes with since from first response - should see new doc
+    {ok, 200, _, Body2} = hackney:get(
+        ?BASE_URL ++ "/db/testdb/_changes?since=" ++ binary_to_list(LastSeq),
+        [Auth, {<<"Accept">>, <<"application/json">>}],
+        <<>>, []
+    ),
+    #{<<"results">> := Results2} = json:decode(Body2),
+    true = lists:any(fun(R) -> maps:get(<<"id">>, R) =:= <<"after_now">> end, Results2),
     ok.
 
 %% @doc Test SSE changes stream

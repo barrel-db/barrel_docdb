@@ -63,21 +63,38 @@ init(Req0, _State) ->
             {ok, Req, undefined};
         {ok, _Info} ->
             %% Parse options from query string
-            Since = parse_since(proplists:get_value(<<"since">>, Qs, <<"first">>)),
+            Since0 = parse_since(proplists:get_value(<<"since">>, Qs, <<"first">>)),
+            %% Resolve 'now' to current HLC
+            Since = resolve_since(DbName, Since0),
             IncludeDocs = proplists:get_value(<<"include_docs">>, Qs, <<"false">>) =:= <<"true">>,
             HeartbeatMs = parse_heartbeat(proplists:get_value(<<"heartbeat">>, Qs)),
-            FilterFun = parse_filter(DbName, proplists:get_value(<<"filter">>, Qs)),
 
             %% Parse filter options from query string
             FilterOpts0 = parse_filter_opts_from_qs(Qs),
+
+            %% Handle filter pattern:
+            %% - Patterns with + wildcards need client-side filtering
+            %% - Patterns with only # wildcards can use backend paths option
+            FilterPattern = proplists:get_value(<<"filter">>, Qs),
+            {FilterOpts1, FilterFun} = case FilterPattern of
+                undefined ->
+                    {FilterOpts0, undefined};
+                Pattern ->
+                    case needs_client_side_filter(Pattern) of
+                        true ->
+                            {FilterOpts0, create_filter_fun(Pattern)};
+                        false ->
+                            {FilterOpts0#{paths => [Pattern]}, undefined}
+                    end
+            end,
 
             %% Read POST body for doc_ids and query filters
             {FilterOpts, Req1} = case cowboy_req:method(Req0) of
                 <<"POST">> ->
                     {ok, Body, ReqWithBody} = cowboy_req:read_body(Req0),
-                    {merge_body_filter_opts(Body, FilterOpts0), ReqWithBody};
+                    {merge_body_filter_opts(Body, FilterOpts1), ReqWithBody};
                 _ ->
-                    {FilterOpts0, Req0}
+                    {FilterOpts1, Req0}
             end,
 
             %% Start SSE response
@@ -118,7 +135,7 @@ info(poll_changes, Req, #state{db_name = DbName,
     end,
     Opts = maps:merge(FilterOpts, BaseOpts),
 
-    try 
+    try
       case barrel_docdb:get_changes(DbName, Since, Opts) of
         {ok, [], _LastHlc} ->
           %% No changes, reschedule poll
@@ -193,11 +210,7 @@ send_error_event(Req, Message) ->
 
 parse_since(<<"0">>) -> first;
 parse_since(<<"first">>) -> first;
-parse_since(<<"now">>) ->
-    %% "now" means start from current position - get the latest HLC
-    %% Note: This returns 'first' as fallback; the caller should handle
-    %% this by fetching the latest sequence before starting the stream
-    first;
+parse_since(<<"now">>) -> now;  %% Signal to resolve to current HLC
 parse_since(HlcBin) when is_binary(HlcBin) ->
     %% Try to parse as base64-encoded binary (our standard format)
     try base64:decode(HlcBin) of
@@ -222,43 +235,6 @@ parse_heartbeat(Bin) when is_binary(Bin) ->
         _:_ -> ?DEFAULT_HEARTBEAT_MS
     end.
 
-parse_filter(_DbName, undefined) -> undefined;
-parse_filter(_DbName, Pattern) when is_binary(Pattern) ->
-    %% Validate pattern
-    case match_trie:validate({filter, Pattern}) of
-        true ->
-            %% Pre-compute pattern words for efficiency
-            PatternWords = pattern_to_words(Pattern),
-            fun(Change) ->
-                DocId = maps:get(<<"id">>, Change, maps:get(id, Change, <<>>)),
-                DocWords = binary:split(DocId, <<"/">>, [global]),
-                match_mqtt_pattern(PatternWords, DocWords)
-            end;
-        false ->
-            undefined
-    end.
-
-%% Convert pattern to words, converting + and # to atoms
-pattern_to_words(Pattern) ->
-    [pattern_word(W) || W <- binary:split(Pattern, <<"/">>, [global])].
-
-pattern_word(<<"+">>) -> '+';
-pattern_word(<<"#">>) -> '#';
-pattern_word(W) -> W.
-
-%% Match document path against MQTT pattern words
-match_mqtt_pattern([], []) -> true;
-match_mqtt_pattern(['#'], _) -> true;  %% # at end matches anything
-match_mqtt_pattern(['+' | PRest], [_ | DRest]) ->
-    match_mqtt_pattern(PRest, DRest);
-match_mqtt_pattern([P | PRest], [P | DRest]) ->
-    match_mqtt_pattern(PRest, DRest);
-match_mqtt_pattern(_, _) -> false.
-
-filter_changes(Changes, undefined) -> Changes;
-filter_changes(Changes, FilterFun) ->
-    lists:filter(FilterFun, Changes).
-
 format_change_json(Change) when is_map(Change) ->
     %% Format HLC for JSON
     FormattedChange = maps:map(
@@ -279,6 +255,60 @@ format_hlc(Other) ->
 
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref).
+
+%% @doc Resolve 'now' to the current HLC for the database
+resolve_since(DbName, now) ->
+    case barrel_docdb:db_pid(DbName) of
+        {ok, Pid} ->
+            case barrel_db_server:get_store_ref(Pid) of
+                {ok, StoreRef} ->
+                    barrel_changes:get_last_hlc(StoreRef, DbName);
+                {error, _} ->
+                    first
+            end;
+        {error, _} ->
+            first
+    end;
+resolve_since(_DbName, Other) ->
+    Other.
+
+%% Check if a filter pattern needs client-side filtering
+needs_client_side_filter(Pattern) when is_binary(Pattern) ->
+    binary:match(Pattern, <<"+">>) =/= nomatch.
+
+%% Create filter function from MQTT-style pattern
+create_filter_fun(undefined) -> undefined;
+create_filter_fun(Pattern) when is_binary(Pattern) ->
+    case match_trie:validate({filter, Pattern}) of
+        true ->
+            PatternWords = pattern_to_words(Pattern),
+            fun(Change) ->
+                DocId = maps:get(<<"id">>, Change, maps:get(id, Change, <<>>)),
+                DocWords = binary:split(DocId, <<"/">>, [global]),
+                match_mqtt_pattern(PatternWords, DocWords)
+            end;
+        false ->
+            undefined
+    end.
+
+pattern_to_words(Pattern) ->
+    [pattern_word(W) || W <- binary:split(Pattern, <<"/">>, [global])].
+
+pattern_word(<<"+">>) -> '+';
+pattern_word(<<"#">>) -> '#';
+pattern_word(W) -> W.
+
+match_mqtt_pattern([], []) -> true;
+match_mqtt_pattern(['#'], _) -> true;
+match_mqtt_pattern(['+' | PRest], [_ | DRest]) ->
+    match_mqtt_pattern(PRest, DRest);
+match_mqtt_pattern([P | PRest], [P | DRest]) ->
+    match_mqtt_pattern(PRest, DRest);
+match_mqtt_pattern(_, _) -> false.
+
+filter_changes(Changes, undefined) -> Changes;
+filter_changes(Changes, FilterFun) ->
+    lists:filter(FilterFun, Changes).
 
 %% @doc Parse filter options from query string (path, doc_ids)
 parse_filter_opts_from_qs(Qs) ->

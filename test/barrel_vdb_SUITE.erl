@@ -20,7 +20,8 @@ all() ->
         {group, lifecycle},
         {group, document_ops},
         {group, bulk_ops},
-        {group, query_ops}
+        {group, query_ops},
+        {group, import_ops}
     ].
 
 groups() ->
@@ -54,6 +55,9 @@ groups() ->
             find_with_sort,
             get_changes_basic,
             fold_docs
+        ]},
+        {import_ops, [], [
+            import_async_caller_exit_survives
         ]}
     ].
 
@@ -345,3 +349,66 @@ fold_docs(_Config) ->
     %% Fold to count docs - callback must return {ok, Acc}
     {ok, Count} = barrel_vdb:fold_docs(VdbName, fun(_, Acc) -> {ok, Acc + 1} end, 0, #{}),
     ?assertEqual(10, Count).
+
+%%====================================================================
+%% Test Cases - Import Operations
+%%====================================================================
+
+%% @doc Test that async import survives caller process exit
+%% This verifies the fix that uses spawn instead of spawn_link for isolation
+import_async_caller_exit_survives(_Config) ->
+    %% Create source and target
+    SourceDb = <<"test_import_source">>,
+    TargetVdb = <<"test_import_target">>,
+    {ok, _} = barrel_docdb:create_db(SourceDb),
+    ok = barrel_vdb:create(TargetVdb, #{shard_count => 2}),
+
+    %% Add some docs to source
+    lists:foreach(fun(I) ->
+        Id = iolist_to_binary(["doc_", integer_to_list(I)]),
+        {ok, _} = barrel_docdb:put_doc(SourceDb, #{<<"id">> => Id, <<"val">> => I})
+    end, lists:seq(1, 100)),
+
+    %% Start async import from a spawned process that will exit
+    Self = self(),
+    CallerPid = spawn(fun() ->
+        {ok, TaskId} = barrel_vdb_import:import_async(SourceDb, TargetVdb, #{}),
+        Self ! {task_started, TaskId},
+        %% Exit immediately
+        exit(normal)
+    end),
+
+    %% Get the task ID
+    TaskId = receive
+        {task_started, TId} -> TId
+    after 1000 -> ct:fail(task_not_started)
+    end,
+
+    %% Caller should be dead
+    false = is_process_alive(CallerPid),
+
+    %% Wait for import to complete (should continue despite caller exit)
+    wait_for_import_complete(TaskId, 10000),
+
+    %% Verify all docs imported
+    {ok, Info} = barrel_vdb:info(TargetVdb),
+    100 = maps:get(total_docs, Info),
+
+    %% Cleanup
+    barrel_docdb:delete_db(SourceDb),
+    barrel_vdb:delete(TargetVdb),
+    ok.
+
+%% @private Wait for import task to complete
+wait_for_import_complete(TaskId, Timeout) when Timeout =< 0 ->
+    ct:fail({import_timeout, TaskId});
+wait_for_import_complete(TaskId, Timeout) ->
+    case barrel_vdb_import:get_status(TaskId) of
+        {ok, #{status := completed}} -> ok;
+        {ok, #{status := running}} ->
+            timer:sleep(100),
+            wait_for_import_complete(TaskId, Timeout - 100);
+        {error, not_found} ->
+            %% Task may have been cleaned up after completion
+            ok
+    end.

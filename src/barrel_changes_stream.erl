@@ -193,21 +193,30 @@ push(info, send_changes, #{store_ref := StoreRef,
     {ok, RevChanges, NewSeq} = barrel_changes:fold_changes(StoreRef, DbName, Since, FoldFun, []),
     Changes = lists:reverse(RevChanges),
 
-    ReqId = make_ref(),
-    _ = case Owner of
-        undefined -> ok;
-        Pid when is_pid(Pid) -> Pid ! {changes, ReqId, Changes}
-    end,
-
-    NewPending = [ReqId | Pending],
-    NewState = State#{since => NewSeq, pending => NewPending},
-
-    case length(NewPending) < ?MAX_PENDING of
-        true ->
+    %% Only track non-empty batches to prevent stall during idle periods
+    case Changes of
+        [] ->
+            %% No changes - don't add to pending, just schedule next poll
             erlang:send_after(Interval, self(), send_changes),
-            {keep_state, NewState};
-        false ->
-            {next_state, wait_pending, NewState}
+            {keep_state, State#{since => NewSeq}};
+        _ ->
+            %% Have changes - send and track
+            ReqId = make_ref(),
+            _ = case Owner of
+                undefined -> ok;
+                Pid when is_pid(Pid) -> Pid ! {changes, ReqId, Changes}
+            end,
+
+            NewPending = [ReqId | Pending],
+            NewState = State#{since => NewSeq, pending => NewPending},
+
+            case length(NewPending) < ?MAX_PENDING of
+                true ->
+                    erlang:send_after(Interval, self(), send_changes),
+                    {keep_state, NewState};
+                false ->
+                    {next_state, wait_pending, NewState}
+            end
     end;
 
 push(cast, stop, State) ->

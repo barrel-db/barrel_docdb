@@ -43,6 +43,7 @@
     resume_task/1,
     delete_task/1,
     get_task/1,
+    get_task_pid/1,
     list_tasks/0,
     list_tasks/1
 ]).
@@ -154,6 +155,12 @@ list_tasks() ->
 list_tasks(Filter) ->
     gen_server:call(?SERVER, {list_tasks, Filter}).
 
+%% @doc Get the pid for a running task
+%% Returns {ok, Pid} if the task is running, {error, not_running} otherwise.
+-spec get_task_pid(task_id()) -> {ok, pid()} | {error, not_running | not_found}.
+get_task_pid(TaskId) ->
+    gen_server:call(?SERVER, {get_task_pid, TaskId}).
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -212,6 +219,13 @@ handle_call({get_task, TaskId}, _From, State) ->
 
 handle_call({list_tasks, Filter}, _From, State) ->
     {reply, do_list_tasks(Filter, State), State};
+
+handle_call({get_task_pid, TaskId}, _From, State) ->
+    Reply = case maps:find(TaskId, State#state.running) of
+        {ok, Pid} -> {ok, Pid};
+        error -> {error, not_running}
+    end,
+    {reply, Reply, State};
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.

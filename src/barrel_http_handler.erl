@@ -811,11 +811,11 @@ handle_delete_doc(Req) ->
 
 handle_get_changes(Req0) ->
     DbName = cowboy_req:binding(db, Req0),
-    {Since, Feed, FilterPattern, Opts0} = parse_changes_opts(Req0),
+    {Since0, Feed, FilterPattern, Opts0} = parse_changes_opts(Req0),
     Timeout = maps:get(timeout, Opts0, 60000),
 
     %% Read POST body for doc_ids and query filters
-    {Opts, Req1} = case cowboy_req:method(Req0) of
+    {Opts1, Req1} = case cowboy_req:method(Req0) of
         <<"POST">> ->
             {ok, Body, Req} = cowboy_req:read_body(Req0),
             {merge_body_opts(Body, Opts0), Req};
@@ -823,8 +823,26 @@ handle_get_changes(Req0) ->
             {Opts0, Req0}
     end,
 
-    %% Create filter function if pattern provided
-    FilterFun = create_filter_fun(FilterPattern),
+    %% Resolve 'now' to current HLC for this database
+    Since = resolve_since(DbName, Since0),
+
+    %% Handle filter pattern:
+    %% - Patterns with + wildcards need client-side filtering (path index doesn't support +)
+    %% - Patterns with only # wildcards can use backend paths option
+    %% - Exact patterns can use backend paths option
+    {Opts, FilterFun} = case FilterPattern of
+        undefined ->
+            {Opts1, undefined};
+        Pattern ->
+            case needs_client_side_filter(Pattern) of
+                true ->
+                    %% Contains + wildcard - use client-side filtering
+                    {Opts1, create_filter_fun(Pattern)};
+                false ->
+                    %% No + wildcard - use backend paths option
+                    {Opts1#{paths => [Pattern]}, undefined}
+            end
+    end,
 
     case Feed of
         longpoll ->
@@ -891,6 +909,22 @@ longpoll_loop(DbName, Since, FilterFun, Opts, Timeout, StartTime, Req0) ->
             end
     end.
 
+%% Format a change for JSON serialization
+format_change(Change) when is_map(Change) ->
+    maps:map(
+        fun(hlc, V) -> format_hlc(V);
+           (<<"hlc">>, V) -> format_hlc(V);
+           (_, V) -> V
+        end,
+        Change
+    ).
+
+%% Check if a filter pattern needs client-side filtering
+%% Patterns with + wildcards need client-side filtering because the path index
+%% only supports exact matches and # (multi-level) wildcards
+needs_client_side_filter(Pattern) when is_binary(Pattern) ->
+    binary:match(Pattern, <<"+">>) =/= nomatch.
+
 %% Create filter function from MQTT-style pattern
 %% Supports:
 %%   + : matches one segment
@@ -931,16 +965,6 @@ match_mqtt_pattern(_, _) -> false.
 filter_changes(Changes, undefined) -> Changes;
 filter_changes(Changes, FilterFun) ->
     lists:filter(FilterFun, Changes).
-
-%% Format a change for JSON serialization
-format_change(Change) when is_map(Change) ->
-    maps:map(
-        fun(hlc, V) -> format_hlc(V);
-           (<<"hlc">>, V) -> format_hlc(V);
-           (_, V) -> V
-        end,
-        Change
-    ).
 
 %%====================================================================
 %% Bulk Docs Handler
@@ -2647,6 +2671,7 @@ parse_changes_opts(Req) ->
     Since = case proplists:get_value(<<"since">>, Qs, <<"0">>) of
         <<"0">> -> first;
         <<"first">> -> first;
+        <<"now">> -> now;  %% Signal to fetch current HLC
         HlcBin -> parse_hlc(HlcBin)
     end,
     %% Parse feed type (normal or longpoll)
@@ -2654,10 +2679,8 @@ parse_changes_opts(Req) ->
         <<"longpoll">> -> longpoll;
         _ -> normal
     end,
-    %% Parse filter pattern (MQTT-style)
-    FilterPattern = proplists:get_value(<<"filter">>, Qs),
     %% Parse other options
-    Opts = lists:foldl(
+    Opts0 = lists:foldl(
         fun({<<"limit">>, LimitBin}, Acc) ->
                 Acc#{limit => binary_to_integer(LimitBin)};
            ({<<"include_docs">>, <<"true">>}, Acc) ->
@@ -2679,7 +2702,9 @@ parse_changes_opts(Req) ->
         #{},
         Qs
     ),
-    {Since, Feed, FilterPattern, Opts}.
+    %% Get filter parameter - will be handled separately
+    FilterPattern = proplists:get_value(<<"filter">>, Qs),
+    {Since, Feed, FilterPattern, Opts0}.
 
 %% @doc Merge doc_ids and query from POST body into options
 merge_body_opts(<<>>, Opts) -> Opts;
@@ -2722,6 +2747,24 @@ parse_hlc(HlcBin) when is_binary(HlcBin) ->
     catch
         _:_ -> first
     end.
+
+%% @doc Resolve 'now' to the current HLC for the database
+%% Returns the last sequence number so only future changes are returned.
+resolve_since(DbName, now) ->
+    %% Get the current last sequence for this database
+    case barrel_docdb:db_pid(DbName) of
+        {ok, Pid} ->
+            case barrel_db_server:get_store_ref(Pid) of
+                {ok, StoreRef} ->
+                    barrel_changes:get_last_hlc(StoreRef, DbName);
+                {error, _} ->
+                    first
+            end;
+        {error, _} ->
+            first
+    end;
+resolve_since(_DbName, Other) ->
+    Other.
 
 %%====================================================================
 %% API Key Management Handlers
