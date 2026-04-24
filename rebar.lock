@@ -7,7 +7,7 @@
  {<<"idna">>,{pkg,<<"idna">>,<<"7.1.0">>},1},
  {<<"instrument">>,
   {git,"https://github.com/benoitc/instrument.git",
-       {ref,"74ef0ea36685d9b95abcbd60dcd34aac583b1b1e"}},
+       {ref,"26a84271325a7d6d7b7fc467eb21db449468573b"}},
   0},
  {<<"jose">>,{pkg,<<"jose">>,<<"1.11.10">>},0},
  {<<"match_trie">>,{pkg,<<"match_trie">>,<<"1.0.0">>},0},
