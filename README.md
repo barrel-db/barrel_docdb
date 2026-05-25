@@ -24,10 +24,10 @@ barrel_docdb provides:
 - **Document CRUD** with MVCC revision trees and conflict resolution
 - **Declarative Queries** with automatic path indexing
 - **Real-time Subscriptions** via MQTT-style path patterns and queries
+- **Changes Feed** with long-poll and Server-Sent Events
+- **Attachments** with streaming for large binaries
 - **HTTP API** with REST endpoints for all operations
-- **Peer-to-Peer Replication** with configurable patterns (chain, group, fanout)
-- **Federated Queries** across multiple databases
-- **Tiered Storage** with automatic TTL/capacity-based migration
+- **Peer-to-Peer Replication** (one-shot or continuous) with pluggable transports
 - **Prometheus Metrics** for monitoring and alerting
 - **HLC Ordering** for distributed event coordination
 
@@ -35,9 +35,8 @@ barrel_docdb provides:
 
 - **Edge Computing**: Deploy nodes that sync to cloud when connected
 - **Multi-Region**: Replicate data across regions with conflict resolution
-- **Tiered Caching**: Hot/warm/cold data tiers with automatic migration
-- **Event Distribution**: Fan-out patterns for event streaming
 - **Offline-First Apps**: Full MVCC for seamless sync
+- **Application Backend**: Document storage with queries, changes feed, and attachments
 
 ## Quick Start
 
@@ -157,157 +156,6 @@ curl http://localhost:8080/db/mydb/doc1/_attachments/photo.jpg > photo.jpg
 }).
 ```
 
-### Replication Policies
-
-High-level patterns for common topologies:
-
-```erlang
-%% Chain replication: A -> B -> C
-barrel_rep_policy:create(<<"my_chain">>, #{
-    pattern => chain,
-    nodes => [<<"http://nodeA:8080">>, <<"http://nodeB:8080">>, <<"http://nodeC:8080">>],
-    database => <<"mydb">>,
-    mode => continuous
-}).
-barrel_rep_policy:enable(<<"my_chain">>).
-
-%% Group (multi-master): A <-> B <-> C
-barrel_rep_policy:create(<<"region_sync">>, #{
-    pattern => group,
-    members => [<<"db1">>, <<"http://nodeB:8080/db1">>, <<"http://nodeC:8080/db1">>],
-    mode => continuous
-}).
-
-%% Fanout: A -> B, C, D
-barrel_rep_policy:create(<<"events">>, #{
-    pattern => fanout,
-    source => <<"events">>,
-    targets => [<<"replica1">>, <<"replica2">>, <<"http://remote:8080/events">>]
-}).
-
-%% Check status
-{ok, Status} = barrel_rep_policy:status(<<"my_chain">>).
-%% #{name => <<"my_chain">>, pattern => chain, enabled => true, task_count => 2}
-```
-
-### HTTP API for Policies
-
-```bash
-# List all policies
-curl http://localhost:8080/_policies
-
-# Create a policy
-curl -X POST http://localhost:8080/_policies \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "my_fanout",
-    "pattern": "fanout",
-    "source": "events",
-    "targets": ["replica1", "replica2"],
-    "mode": "continuous"
-  }'
-
-# Get a policy
-curl http://localhost:8080/_policies/my_fanout
-
-# Enable a policy
-curl -X POST http://localhost:8080/_policies/my_fanout/_enable
-
-# Disable a policy
-curl -X POST http://localhost:8080/_policies/my_fanout/_disable
-
-# Get policy status
-curl http://localhost:8080/_policies/my_fanout/_status
-
-# Delete a policy
-curl -X DELETE http://localhost:8080/_policies/my_fanout
-```
-
-### Sync Writes (Chain Confirmation)
-
-```erlang
-%% Write to A, wait until C confirms
-{ok, _} = barrel_docdb:put_doc(<<"mydb">>, Doc, #{
-    replicate => sync,
-    wait_for => [<<"http://nodeC:8080/db/mydb">>]
-}).
-```
-
-## Federation (Cross-Database Queries)
-
-Query across multiple databases and merge results:
-
-```erlang
-%% Create a federation with a stored query
-barrel_federation:create(<<"all_users">>, [
-    <<"local_db">>,
-    <<"http://nodeB:8080/users">>,
-    <<"http://nodeC:8080/users">>
-], #{
-    query => #{where => [{path, [<<"active">>], true}]}
-}).
-
-%% Query using stored query
-{ok, Results, Meta} = barrel_federation:find(<<"all_users">>).
-
-%% Query with additional filters (merged with stored query)
-{ok, Results, Meta} = barrel_federation:find(<<"all_users">>, #{
-    where => [{path, [<<"role">>], <<"admin">>}]
-}).
-```
-
-### HTTP Federation
-
-```bash
-# Create federation
-curl -X POST http://localhost:8080/_federation \
-  -H "Content-Type: application/json" \
-  -d '{"name": "all_users", "members": ["users", "http://nodeB:8080/users"]}'
-
-# Query federation
-curl -X POST http://localhost:8080/_federation/all_users/_find \
-  -H "Content-Type: application/json" \
-  -d '{"where": [{"path": ["role"], "value": "admin"}]}'
-```
-
-## Tiered Storage
-
-Automatic data migration between hot/warm/cold tiers:
-
-```erlang
-%% Configure tiered storage
-barrel_tier:configure(<<"cache">>, #{
-    warm_db => <<"main">>,
-    cold_db => <<"archive">>,
-    ttl => 3600,           %% Move to warm after 1 hour
-    capacity => 10000000   %% Or when size exceeds 10MB
-}).
-
-%% Query spans all tiers transparently
-{ok, Results, Meta} = barrel_tier:find(<<"cache">>, #{
-    where => [{path, [<<"type">>], <<"event">>}]
-}).
-
-%% Manual migration
-barrel_tier:migrate_expired(<<"cache">>, #{force => true}).
-```
-
-## Peer Discovery
-
-Discover nodes via DNS SRV records or manual configuration:
-
-```erlang
-%% Add a peer manually
-barrel_discovery:add_peer(<<"http://nodeB:8080">>).
-
-%% Add DNS domain for SRV discovery
-barrel_discovery:add_dns_domain(<<"barrel.example.com">>).
-
-%% List discovered peers
-{ok, Peers} = barrel_discovery:list_peers().
-%% [#{id => <<"nodeB">>, url => <<"http://nodeB:8080">>, status => active}]
-```
-
 ## Conflict Resolution
 
 barrel_docdb uses revision trees (CRDT-style) for conflict handling:
@@ -342,9 +190,7 @@ Available metrics:
 | `barrel_query_duration_seconds` | Histogram | Query latency |
 | `barrel_replication_docs_total` | Counter | Documents replicated |
 | `barrel_replication_errors_total` | Counter | Replication errors |
-| `barrel_federation_queries_total` | Counter | Federation queries |
 | `barrel_http_requests_total` | Counter | HTTP requests by method/path/status |
-| `barrel_peers_active` | Gauge | Active peer connections |
 
 ## Configuration
 
@@ -385,8 +231,8 @@ barrel_docdb_sup
 ├── barrel_db_sup          (Database supervisor)
 │   └── barrel_db_server   (Per-database process)
 ├── barrel_rep_tasks       (Replication task manager)
-├── barrel_rep_policy      (Policy-based replication)
-└── barrel_discovery       (Peer discovery)
+├── barrel_http_api_keys   (HTTP API key management)
+└── barrel_peer_auth       (HTTP replication auth)
 ```
 
 ## API Reference
@@ -406,25 +252,15 @@ barrel_docdb_sup
 | Function | Description |
 |----------|-------------|
 | `barrel_rep:replicate/2,3` | One-shot replication |
-| `barrel_rep_policy:create/2` | Create replication policy |
-| `barrel_rep_policy:enable/1` | Enable policy |
-| `barrel_rep_tasks:start_task/1` | Start persistent task |
+| `barrel_rep_tasks:start_task/1` | Start/manage a continuous replication task |
 
-### Federation
+### Attachments & Changes
 
 | Function | Description |
 |----------|-------------|
-| `barrel_federation:create/2,3` | Create federation |
-| `barrel_federation:find/1,2,3` | Query federation |
-| `barrel_federation:set_query/2` | Set stored query |
-
-### Tier Management
-
-| Function | Description |
-|----------|-------------|
-| `barrel_tier:configure/2` | Configure tiers |
-| `barrel_tier:find/2,3` | Query across tiers |
-| `barrel_tier:migrate_expired/1,2` | Manual migration |
+| `put_attachment/4`, `get_attachment/3` | Store and read attachments |
+| `get_changes/3` | Read the changes feed |
+| `subscribe/2`, `subscribe_query/2` | Subscribe to changes |
 
 ## Support
 

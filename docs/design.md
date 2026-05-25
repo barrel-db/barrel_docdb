@@ -30,8 +30,8 @@ barrel_docdb is an embeddable document database for Erlang applications. It prov
     ┌──────────────┬───────────┼───────────┬──────────────┐
     ▼              ▼           ▼           ▼              ▼
 ┌────────┐  ┌────────────┐ ┌────────┐ ┌────────┐  ┌────────────┐
-│barrel  │  │barrel_view │ │barrel  │ │barrel  │  │barrel_     │
-│db_server│  │(per-view)  │ │_rep    │ │_sub    │  │query_sub   │
+│barrel  │  │barrel_query│ │barrel  │ │barrel  │  │barrel_     │
+│db_server│  │(find)      │ │_rep    │ │_sub    │  │query_sub   │
 └────────┘  └────────────┘ └────────┘ └────────┘  └────────────┘
     │              │           │           │              │
     │              │           │           └──────────────┘
@@ -399,28 +399,7 @@ prefix_changes/mydb/status/active/482345     → [<< hlc1, "doc1", ... >>]
 - Native RocksDB merge operator keeps entries sorted
 - No post-processing or deduplication needed
 
-### 9. Views (Secondary Indexes)
-
-Views are incremental map-reduce indexes:
-
-```
-┌─────────────┐      ┌─────────────┐      ┌─────────────┐
-│  Changes    │──────│  View       │──────│  Index      │
-│  Feed       │      │  gen_statem │      │  Storage    │
-└─────────────┘      └─────────────┘      └─────────────┘
-```
-
-**View Lifecycle:**
-1. Register view with module implementing `barrel_view` behaviour
-2. View process subscribes to changes feed
-3. For each change, call `Module:map(Doc)` to get key-value pairs
-4. Store/update index entries
-5. Track indexed sequence for incremental updates
-
-**Automatic Rebuild:**
-When `Module:version()` changes, the view clears and rebuilds from scratch.
-
-### 10. Replication
+### 9. Replication
 
 Replication follows the CouchDB protocol with HLC-based ordering:
 
@@ -477,7 +456,7 @@ Key: <<"replication-checkpoint-{rep_id}">>
 Value: #{<<"history">> => [#{<<"source_last_hlc">> => ...}]}
 ```
 
-### 11. Query Parallelization
+### 10. Query Parallelization
 
 Large queries (>100 documents) use parallel CBOR decode + condition matching via `barrel_parallel`:
 
@@ -511,7 +490,7 @@ Large queries (>100 documents) use parallel CBOR decode + condition matching via
 | 8 | ~50% slower | RocksDB contention, cache thrashing |
 | 2 | ~30% slower | Underutilizes CPU |
 
-### 12. Chunked Query Execution
+### 11. Chunked Query Execution
 
 Queries return results in chunks with continuation tokens for memory-efficient iteration:
 
@@ -592,24 +571,6 @@ put_doc(Db, Doc)
     └── Return {ok, #{id, rev, ok}}
 ```
 
-### Query View
-
-```
-query_view(Db, ViewId, Opts)
-    │
-    ├── Get view process
-    ├── Ensure view is up-to-date (refresh if needed)
-    │
-    ├── Build key range from start_key/end_key
-    │
-    ├── Iterate view_index entries:
-    │   ├── Decode key and value
-    │   ├── Apply limit
-    │   └── Optionally fetch full document
-    │
-    └── Return {ok, Results}
-```
-
 ### Replicate
 
 ```
@@ -646,9 +607,6 @@ barrel_docdb_sup (one_for_one)
 ├── barrel_parallel           # Worker pool for parallel queries
 └── barrel_db_sup (simple_one_for_one)
     ├── barrel_db_server (db1)
-    │   └── barrel_view_sup (simple_one_for_one)
-    │       ├── barrel_view (view1)
-    │       └── barrel_view (view2)
     ├── barrel_db_server (db2)
     │   └── ...
     └── ...
@@ -679,15 +637,19 @@ barrel_docdb_sup (one_for_one)
 ## Future Considerations
 
 ### Planned Features
-- Continuous replication
-- HTTP transport for replication
-- Reduce functions for views
 - Conflict resolution helpers
+- External tiering layer built on the changes feed, metrics, and the reserved `created_at`/`expires_at`/`tier` entity columns
+- External sharding and cluster coordination built on the replication engine and system documents
 
 ### Extension Points
+
+barrel_docdb is a document-database building block. Higher-level capabilities
+(sharding, tiering, clustering) are meant to be built on top of its public API
+rather than baked in:
+
 - Custom storage backends (via behaviour)
-- Custom replication transports
-- View behaviours for different index types
+- Custom replication transports (via the `barrel_rep_transport` behaviour)
+- Cluster/tiering substrate: changes feed, revision primitives (`put_rev`/`revsdiff`), HLC, system and local documents, and store/index introspection (`get_db_size`, range scans, snapshots)
 
 ## File Structure
 
@@ -712,7 +674,6 @@ src/
 ├── barrel_changes_stream.erl   # Streaming changes
 │
 ├── barrel_sub.erl              # Path subscriptions manager
-├── barrel_sub_sup.erl          # Subscription supervisor
 ├── barrel_query_sub.erl        # Query subscriptions manager
 │
 ├── barrel_query.erl            # Declarative query compiler & executor
@@ -723,10 +684,6 @@ src/
 │
 ├── barrel_parallel.erl         # Parallel map/filtermap with worker pool
 ├── barrel_doc_body_store.erl   # Batch document body operations
-│
-├── barrel_view.erl             # View gen_statem
-├── barrel_view_index.erl       # View index storage (HLC-tracked)
-├── barrel_view_sup.erl         # View supervisor
 │
 ├── barrel_cache.erl            # Shared RocksDB block cache
 ├── barrel_store_rocksdb.erl    # RocksDB storage (optimized)

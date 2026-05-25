@@ -62,13 +62,6 @@ barrel_replication_docs_total{source="mydb",target="http://remote:8080/mydb"} 10
 barrel_replication_errors_total{source="mydb",target="http://remote:8080/mydb"} 2
 ```
 
-### Federation
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `barrel_federation_queries_total` | Counter | federation | Federation queries |
-| `barrel_federation_errors_total` | Counter | federation, member | Member errors |
-
 ### HTTP Server
 
 | Metric | Type | Labels | Description |
@@ -81,13 +74,6 @@ barrel_replication_errors_total{source="mydb",target="http://remote:8080/mydb"} 
 barrel_http_requests_total{method="GET",path="/db/:db/:doc_id",status="200"} 5000
 barrel_http_requests_total{method="POST",path="/db/:db/_find",status="200"} 500
 ```
-
-### Peers
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `barrel_peers_active` | Gauge | - | Active peer connections |
-| `barrel_peers_discovered_total` | Counter | - | Total peers discovered |
 
 ## Grafana Dashboard
 

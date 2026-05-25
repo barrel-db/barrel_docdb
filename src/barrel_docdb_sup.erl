@@ -133,17 +133,6 @@ init([]) ->
         modules => [barrel_db_sup]
     },
 
-    %% VDB (Virtual Database) supervisor for sharded databases
-    %% Manages VDB registry and future shard-related processes
-    VdbSup = #{
-        id => barrel_vdb_sup,
-        start => {barrel_vdb_sup, start_link, []},
-        restart => permanent,
-        shutdown => infinity,
-        type => supervisor,
-        modules => [barrel_vdb_sup]
-    },
-
     %% Replication task manager for persistent replication tasks
     RepTasks = #{
         id => barrel_rep_tasks,
@@ -152,16 +141,6 @@ init([]) ->
         shutdown => 5000,
         type => worker,
         modules => [barrel_rep_tasks]
-    },
-
-    %% Replication policy manager for high-level replication patterns
-    RepPolicy = #{
-        id => barrel_rep_policy,
-        start => {barrel_rep_policy, start_link, []},
-        restart => permanent,
-        shutdown => 5000,
-        type => worker,
-        modules => [barrel_rep_policy]
     },
 
     %% API keys manager for HTTP authentication
@@ -184,17 +163,6 @@ init([]) ->
         modules => [barrel_peer_auth]
     },
 
-    %% Discovery service for peer-to-peer federation
-    %% Provides node info endpoint (/.well-known/barrel) and peer gossip
-    Discovery = #{
-        id => barrel_discovery,
-        start => {barrel_discovery, start_link, []},
-        restart => permanent,
-        shutdown => 5000,
-        type => worker,
-        modules => [barrel_discovery]
-    },
-
     %% HTTP server for REST API (optional, controlled by http_enabled config)
     HttpEnabled = application:get_env(barrel_docdb, http_enabled, false),
     HttpOpts = build_http_opts(),
@@ -208,7 +176,7 @@ init([]) ->
     },
 
     %% Base child specs (always started)
-    BaseSpecs = [Metrics, Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, VdbSup, RepTasks, RepPolicy, ApiKeys, PeerAuth, Discovery],
+    BaseSpecs = [Metrics, Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, ApiKeys, PeerAuth],
 
     %% Conditionally add HTTP server
     ChildSpecs = case HttpEnabled of

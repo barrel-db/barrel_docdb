@@ -239,19 +239,12 @@ Use a `<<"type">>` field to categorize documents:
 
 ### Querying by Type
 
-Create a view to query documents by type:
+Use a declarative query with automatic path indexing:
 
 ```erlang
--module(by_type_view).
--behaviour(barrel_view).
--export([version/0, map/1]).
-
-version() -> 1.
-
-map(#{<<"type">> := Type, <<"id">> := Id}) ->
-    [{Type, Id}];
-map(_) ->
-    [].
+{ok, Orders, _Meta} = barrel_docdb:find(<<"mydb">>, #{
+    where => [{path, [<<"type">>], <<"order">>}]
+}).
 ```
 
 ## Data Types

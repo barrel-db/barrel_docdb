@@ -153,13 +153,6 @@ build_dispatch() ->
             %% Prometheus metrics endpoint
             {"/metrics", barrel_http_handler, #{action => metrics}},
 
-            %% Discovery endpoint (Mastodon-like node info)
-            {"/.well-known/barrel", barrel_http_handler, #{action => node_info}},
-
-            %% Peer management
-            {"/_peers", barrel_http_handler, #{action => peers}},
-            {"/_peers/:peer_url", barrel_http_handler, #{action => peer}},
-
             %% API key management (admin only)
             {"/keys", barrel_http_handler, #{action => keys}},
             {"/keys/:key_prefix", barrel_http_handler, #{action => key}},
@@ -167,32 +160,6 @@ build_dispatch() ->
             %% Admin usage endpoints
             {"/admin/usage", barrel_http_handler, #{action => admin_usage}},
             {"/admin/databases/:db/usage", barrel_http_handler, #{action => admin_db_usage}},
-
-            %% Federation endpoints
-            {"/_federation", barrel_http_handler, #{action => federations}},
-            {"/_federation/:name", barrel_http_handler, #{action => federation}},
-            {"/_federation/:name/members/:member", barrel_http_handler, #{action => federation_member}},
-            {"/_federation/:name/_find", barrel_http_handler, #{action => federation_find}},
-
-            %% Replication policy endpoints
-            {"/_policies", barrel_http_handler, #{action => policies}},
-            {"/_policies/:name", barrel_http_handler, #{action => policy}},
-            {"/_policies/:name/_enable", barrel_http_handler, #{action => policy_enable}},
-            {"/_policies/:name/_disable", barrel_http_handler, #{action => policy_disable}},
-            {"/_policies/:name/_status", barrel_http_handler, #{action => policy_status}},
-
-            %% VDB (Virtual Database / Sharded Database) endpoints
-            {"/vdb", barrel_http_handler, #{action => vdb_list}},
-            {"/vdb/:vdb", barrel_http_handler, #{action => vdb_info}},
-            {"/vdb/:vdb/_shards", barrel_http_handler, #{action => vdb_shards}},
-            {"/vdb/:vdb/_replication", barrel_http_handler, #{action => vdb_replication}},
-            {"/vdb/:vdb/_changes", barrel_http_handler, #{action => vdb_changes}},
-            {"/vdb/:vdb/_bulk_docs", barrel_http_handler, #{action => vdb_bulk_docs}},
-            {"/vdb/:vdb/_find", barrel_http_handler, #{action => vdb_find}},
-            {"/vdb/:vdb/_import", barrel_http_handler, #{action => vdb_import}},
-            {"/vdb/:vdb/_shards/:shard/_split", barrel_http_handler, #{action => vdb_shard_split}},
-            {"/vdb/:vdb/_shards/:shard/_merge", barrel_http_handler, #{action => vdb_shard_merge}},
-            {"/vdb/:vdb/:doc_id", barrel_http_handler, #{action => vdb_doc}},
 
             %% Database operations
             {"/db/:db", barrel_http_handler, #{action => db_info}},
@@ -209,12 +176,6 @@ build_dispatch() ->
             %% Query endpoint
             {"/db/:db/_find", barrel_http_handler, #{action => find}},
 
-            %% Materialized views
-            {"/db/:db/_views", barrel_http_handler, #{action => views}},
-            {"/db/:db/_views/:view_id", barrel_http_handler, #{action => view}},
-            {"/db/:db/_views/:view_id/_query", barrel_http_handler, #{action => view_query}},
-            {"/db/:db/_views/:view_id/_refresh", barrel_http_handler, #{action => view_refresh}},
-
             %% Replication endpoints
             {"/db/:db/_replicate", barrel_http_handler, #{action => replicate}},
             {"/db/:db/_revsdiff", barrel_http_handler, #{action => revsdiff}},
@@ -227,14 +188,6 @@ build_dispatch() ->
             %% Attachments (before doc catch-all)
             {"/db/:db/:doc_id/_attachments", barrel_http_handler, #{action => attachments}},
             {"/db/:db/:doc_id/_attachments/:att_name", barrel_http_handler, #{action => attachment}},
-
-            %% Tier management endpoints
-            {"/db/:db/_tier/config", barrel_http_handler, #{action => tier_config}},
-            {"/db/:db/_tier/capacity", barrel_http_handler, #{action => tier_capacity}},
-            {"/db/:db/_tier/migrate", barrel_http_handler, #{action => tier_migrate}},
-            {"/db/:db/_tier/run_migration", barrel_http_handler, #{action => tier_run_migration}},
-            {"/db/:db/:doc_id/_tier/ttl", barrel_http_handler, #{action => doc_tier_ttl}},
-            {"/db/:db/:doc_id/_tier", barrel_http_handler, #{action => doc_tier}},
 
             %% Document operations (variable path - must be last)
             {"/db/:db/:doc_id", barrel_http_handler, #{action => doc}}

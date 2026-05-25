@@ -309,29 +309,9 @@ iterate_loop(StoreRef, DbName, Plan, Opts, Acc) ->
 | Pagination in HTTP API | `barrel_query:execute/4` | Natural page boundaries |
 | Background processing | `barrel_query:execute/4` | Process in batches |
 
-## Materialized Views from Queries
-
-For frequently-used queries, create a materialized view:
-
-```erlang
-%% Register a query-based view
-ok = barrel_docdb:register_view(<<"mydb">>, <<"active_users">>, #{
-    query => #{
-        where => [
-            {path, [<<"type">>], <<"user">>},
-            {path, [<<"active">>], true}
-        ]
-    }
-}).
-
-%% Query the materialized view (faster than ad-hoc query)
-{ok, Results} = barrel_docdb:query_view(<<"mydb">>, <<"active_users">>, #{}).
-```
-
 ## API Reference
 
 See the [Erlang API Reference](api/erlang.md) for complete function documentation.
 
 - `barrel_docdb:find/2,3` - Execute a query
 - `barrel_docdb:explain/2` - Explain query plan
-- `barrel_docdb:register_view/3` - Create materialized view

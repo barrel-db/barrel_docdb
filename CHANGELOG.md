@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+- **Virtual Database (VDB) and sharding**: removed `barrel_vdb*`, `barrel_shard_map`, and `barrel_shard_rebalance` with the `/vdb` HTTP endpoints
+- **Federation and peer discovery**: removed `barrel_federation` and `barrel_discovery` with the `/_federation`, `/_peers`, and `/.well-known/barrel` endpoints
+- **Replication policies**: removed `barrel_rep_policy` (chain/group/fanout/tiered patterns) and the `/_policies` endpoints; the replication engine (`barrel_rep`, `barrel_rep_tasks`, transports) is unchanged
+- **Tiered storage**: removed `barrel_tier` and the `/db/:db/_tier/*` endpoints; the `created_at`/`expires_at`/`tier` entity columns are kept as reserved fields so the on-disk format is unchanged
+- **Materialized views**: removed `barrel_view`, `barrel_view_index`, `barrel_view_sup`, the `register_view`/`unregister_view`/`query_view`/`list_views`/`refresh_view` API, and the `/db/:db/_views/*` endpoints
+
+### Changed
+- Reduced scope to a document-database core: CRUD with MVCC, declarative queries, changes feed, attachments, pub/sub, and the replication engine. Sharding, tiering, and clustering can be built on top via the public API (changes feed, revision primitives, HLC, system and local documents, store/index introspection, and metrics).
+- `barrel_peer_auth` is retained (used by the HTTP replication transport); its node id now persists in a `_node_id` system document.
+
 ## [0.5.0] - 2026-04-04
 
 ### Added

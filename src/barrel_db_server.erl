@@ -44,14 +44,6 @@
     fold_local_docs/4
 ]).
 
-%% View API
--export([
-    register_view/3,
-    unregister_view/2,
-    list_views/1,
-    get_view_pid/2
-]).
-
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -62,8 +54,6 @@
     db_path :: string(),
     store_ref :: barrel_store_rocksdb:db_ref() | undefined,
     att_ref :: barrel_att_store:att_ref() | undefined,
-    view_sup :: pid() | undefined,
-    views :: #{binary() => pid()},  %% ViewId => ViewPid
     filter_pid :: pid() | undefined,  %% Compaction filter handler for this database
     compaction_timer :: reference() | undefined,  %% Timer for periodic compaction checks
     compaction_interval :: pos_integer(),  %% Interval between checks in ms (default: 1 hour)
@@ -209,30 +199,6 @@ fold_local_docs(Pid, Prefix, Fun, Acc) ->
     gen_server:call(Pid, {fold_local_docs, Prefix, Fun, Acc}).
 
 %%====================================================================
-%% View API functions
-%%====================================================================
-
-%% @doc Register a new view
--spec register_view(pid(), binary(), map()) -> ok | {error, term()}.
-register_view(Pid, ViewId, Config) ->
-    gen_server:call(Pid, {register_view, ViewId, Config}).
-
-%% @doc Unregister a view
--spec unregister_view(pid(), binary()) -> ok | {error, term()}.
-unregister_view(Pid, ViewId) ->
-    gen_server:call(Pid, {unregister_view, ViewId}).
-
-%% @doc List all registered views
--spec list_views(pid()) -> {ok, [map()]}.
-list_views(Pid) ->
-    gen_server:call(Pid, list_views).
-
-%% @doc Get the pid of a view process
--spec get_view_pid(pid(), binary()) -> {ok, pid()} | {error, not_found}.
-get_view_pid(Pid, ViewId) ->
-    gen_server:call(Pid, {get_view_pid, ViewId}).
-
-%%====================================================================
 %% gen_server callbacks
 %%====================================================================
 
@@ -264,12 +230,6 @@ init([Name, Config]) ->
             AttOpts = maps:get(att_opts, Config, #{}),
             case barrel_att_store:open(AttStorePath, AttOpts) of
                 {ok, AttRef} ->
-                    %% Start view supervisor
-                    {ok, ViewSup} = barrel_view_sup:start_link(Name, StoreRef),
-
-                    %% Load and start registered views
-                    Views = start_registered_views(Name, StoreRef, ViewSup),
-
                     %% Register in persistent_term for lookup
                     %% barrel_store is used by barrel_doc_body_store for body CF access
                     %% and by compaction filter handler for body deletion
@@ -292,8 +252,6 @@ init([Name, Config]) ->
                         db_path = DbPath,
                         store_ref = StoreRef,
                         att_ref = AttRef,
-                        view_sup = ViewSup,
-                        views = Views,
                         filter_pid = FilterPid,
                         compaction_timer = TimerRef,
                         compaction_interval = CompactionInterval,
@@ -410,89 +368,6 @@ handle_call({fold_local_docs, Prefix, Fun, Acc}, _From,
     Result = do_fold_local_docs(StoreRef, DbName, Prefix, Fun, Acc),
     {reply, Result, State};
 
-%% View operations
-handle_call({register_view, ViewId, Config}, _From,
-            #state{view_sup = ViewSup, views = Views} = State) ->
-    case maps:is_key(ViewId, Views) of
-        true ->
-            {reply, {error, already_registered}, State};
-        false ->
-            ViewConfig = Config#{id => ViewId},
-            case barrel_view_sup:start_view(ViewSup, ViewConfig) of
-                {ok, Pid} ->
-                    NewViews = Views#{ViewId => Pid},
-                    {reply, ok, State#state{views = NewViews}};
-                {error, _} = Error ->
-                    {reply, Error, State}
-            end
-    end;
-
-handle_call({unregister_view, ViewId}, _From,
-            #state{name = Name, store_ref = StoreRef, view_sup = ViewSup, views = Views} = State) ->
-    case maps:get(ViewId, Views, undefined) of
-        undefined ->
-            {reply, {error, not_found}, State};
-        Pid ->
-            %% Stop the view process
-            ok = barrel_view_sup:stop_view(ViewSup, Pid),
-            %% Delete view metadata and index
-            ok = barrel_view_index:delete_view_meta(StoreRef, Name, ViewId),
-            ok = barrel_view_index:clear_all(StoreRef, Name, ViewId),
-            NewViews = maps:remove(ViewId, Views),
-            {reply, ok, State#state{views = NewViews}}
-    end;
-
-handle_call(list_views, _From, #state{name = Name, store_ref = StoreRef} = State) ->
-    Views = barrel_view_index:list_views(StoreRef, Name),
-    {reply, {ok, Views}, State};
-
-handle_call({get_view_pid, ViewId}, _From, #state{views = Views} = State) ->
-    case maps:get(ViewId, Views, undefined) of
-        undefined ->
-            {reply, {error, not_found}, State};
-        Pid ->
-            {reply, {ok, Pid}, State}
-    end;
-
-%%--------------------------------------------------------------------
-%% Tier/TTL Operations
-%%--------------------------------------------------------------------
-
-handle_call({set_doc_ttl, DocId, ExpiresAt, _Opts}, _From,
-            #state{name = DbName, store_ref = StoreRef} = State) ->
-    Result = do_set_doc_ttl(StoreRef, DbName, DocId, ExpiresAt),
-    {reply, Result, State};
-
-handle_call({get_doc_ttl, DocId, _Opts}, _From,
-            #state{name = DbName, store_ref = StoreRef} = State) ->
-    Result = do_get_doc_ttl(StoreRef, DbName, DocId),
-    {reply, Result, State};
-
-handle_call({get_doc_tier, DocId, _Opts}, _From,
-            #state{name = DbName, store_ref = StoreRef} = State) ->
-    Result = do_get_doc_tier(StoreRef, DbName, DocId),
-    {reply, Result, State};
-
-handle_call({set_doc_tier, DocId, Tier, _Opts}, _From,
-            #state{name = DbName, store_ref = StoreRef} = State) ->
-    Result = do_set_doc_tier(StoreRef, DbName, DocId, Tier),
-    {reply, Result, State};
-
-handle_call({classify_by_age, HotCutoff, WarmCutoff, _Opts}, _From,
-            #state{name = DbName, store_ref = StoreRef} = State) ->
-    Result = do_classify_by_age(StoreRef, DbName, HotCutoff, WarmCutoff),
-    {reply, Result, State};
-
-handle_call({migrate_expired, _Opts}, _From,
-            #state{name = DbName, store_ref = StoreRef} = State) ->
-    Result = do_migrate_expired(StoreRef, DbName),
-    {reply, Result, State};
-
-handle_call({migrate_to_tier, TargetTier, Filter, _Opts}, _From,
-            #state{name = DbName, store_ref = StoreRef} = State) ->
-    Result = do_migrate_to_tier(StoreRef, DbName, TargetTier, Filter),
-    {reply, Result, State};
-
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
@@ -510,35 +385,18 @@ handle_info(compaction_check, #state{store_ref = StoreRef,
     TimerRef = erlang:send_after(Interval, self(), compaction_check),
     {noreply, NewState#state{compaction_timer = TimerRef}};
 
-handle_info({'EXIT', Pid, Reason}, #state{views = Views} = State) ->
-    %% Check if it's a view process that exited
-    case find_view_by_pid(Pid, Views) of
-        {ok, ViewId} ->
-            logger:warning("View ~s exited: ~p", [ViewId, Reason]),
-            NewViews = maps:remove(ViewId, Views),
-            {noreply, State#state{views = NewViews}};
-        not_found ->
-            {noreply, State}
-    end;
-
 handle_info(_Info, State) ->
     {noreply, State}.
 
 %% @doc Clean up when terminating
 terminate(_Reason, #state{name = Name, store_ref = StoreRef, att_ref = AttRef,
-                          view_sup = ViewSup, filter_pid = FilterPid,
+                          filter_pid = FilterPid,
                           compaction_timer = CompactionTimer}) ->
     %% Cancel compaction timer 
     _ = 
       case CompactionTimer of
           undefined -> ok;
           _ -> erlang:cancel_timer(CompactionTimer)
-      end,
-    %% Stop view supervisor (will stop all views)
-    _ = 
-      case ViewSup of
-          undefined -> ok;
-          _ -> catch exit(ViewSup, shutdown)
       end,
     %% Stop compaction filter handler
     _ = 
@@ -567,40 +425,6 @@ terminate(_Reason, #state{name = Name, store_ref = StoreRef, att_ref = AttRef,
 %%====================================================================
 %% Internal functions
 %%====================================================================
-
-%% @doc Start all registered views on database startup
-start_registered_views(DbName, StoreRef, ViewSup) ->
-    ViewMetas = barrel_view_index:list_views(StoreRef, DbName),
-    lists:foldl(
-        fun(#{id := ViewId, module := Mod}, Acc) ->
-            ViewConfig = #{id => ViewId, module => Mod},
-            case barrel_view_sup:start_view(ViewSup, ViewConfig) of
-                {ok, Pid} ->
-                    Acc#{ViewId => Pid};
-                {error, Reason} ->
-                    logger:error("Failed to start view ~s: ~p", [ViewId, Reason]),
-                    Acc
-            end
-        end,
-        #{},
-        ViewMetas
-    ).
-
-%% @doc Find a view ID by its process pid
-find_view_by_pid(Pid, Views) ->
-    case maps:fold(
-        fun(ViewId, ViewPid, Acc) ->
-            case ViewPid of
-                Pid -> {found, ViewId};
-                _ -> Acc
-            end
-        end,
-        not_found,
-        Views
-    ) of
-        {found, ViewId} -> {ok, ViewId};
-        not_found -> not_found
-    end.
 
 %% @doc Check database size and trigger compaction if threshold exceeded
 %% Called periodically by the compaction_check timer.
@@ -636,7 +460,9 @@ do_check_compaction(StoreRef, Threshold, State) ->
 -define(COL_DELETED, <<"del">>).
 -define(COL_HLC, <<"hlc">>).
 -define(COL_REVTREE, <<"revtree">>).
-%% Tier/TTL columns (for tiered storage)
+%% Reserved entity columns (default 0, preserved across writes).
+%% The built-in tiering engine was removed; these are kept as on-disk
+%% format-stable seams for an external tiering layer to use.
 -define(COL_CREATED_AT, <<"created_at">>).
 -define(COL_EXPIRES_AT, <<"expires_at">>).
 -define(COL_TIER, <<"tier">>).
@@ -689,8 +515,9 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
     %% Generate new HLC timestamp for this change
     NextHlc = barrel_hlc:new_hlc(),
 
-    %% Prepare entity columns for wide-column storage
-    %% Always track created_at and tier metadata (tiered storage strategy is optional)
+    %% Prepare entity columns for wide-column storage.
+    %% created_at/expires_at/tier are reserved columns (preserved across
+    %% writes); the built-in tiering engine was removed.
     {CreatedAt, ExistingTier, ExistingExpires} = case OldHlc of
         undefined ->
             %% New document - set created_at to now, tier to hot (0)
@@ -1762,310 +1589,3 @@ do_apply_resolution(StoreRef, DbName, DocId, DocEntityKey, Columns,
             Err
     end.
 
-%%====================================================================
-%% Tier/TTL Operations
-%%====================================================================
-
-%% @doc Set TTL (expires_at timestamp) for a document
-do_set_doc_ttl(StoreRef, DbName, DocId, ExpiresAt) ->
-    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
-    case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
-        {ok, Columns} ->
-            %% Update only the expires_at column
-            UpdatedColumns = lists:keyreplace(?COL_EXPIRES_AT, 1, Columns, {?COL_EXPIRES_AT, ExpiresAt}),
-            case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, DocEntityKey, UpdatedColumns}]) of
-                ok -> ok;
-                Error -> Error
-            end;
-        not_found ->
-            {error, not_found}
-    end.
-
-%% @doc Get TTL info for a document
-do_get_doc_ttl(StoreRef, DbName, DocId) ->
-    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
-    case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
-        {ok, Columns} ->
-            ExpiresAt = proplists:get_value(?COL_EXPIRES_AT, Columns, 0),
-            case ExpiresAt of
-                0 ->
-                    {ok, undefined};
-                _ ->
-                    Now = erlang:system_time(millisecond),
-                    Remaining = max(0, (ExpiresAt - Now) div 1000),
-                    {ok, #{expires_at => ExpiresAt, remaining => Remaining}}
-            end;
-        not_found ->
-            {error, not_found}
-    end.
-
-%% @doc Get the current tier of a document
-do_get_doc_tier(StoreRef, DbName, DocId) ->
-    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
-    case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
-        {ok, Columns} ->
-            %% decode_entity already converts tier to atom (hot, warm, cold)
-            Tier = proplists:get_value(?COL_TIER, Columns, hot),
-            {ok, Tier};
-        not_found ->
-            {error, not_found}
-    end.
-
-%% @doc Set the tier for a document
-do_set_doc_tier(StoreRef, DbName, DocId, Tier) ->
-    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
-    case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
-        {ok, Columns} ->
-            TierByte = barrel_tier:tier_to_byte(Tier),
-            UpdatedColumns = lists:keyreplace(?COL_TIER, 1, Columns, {?COL_TIER, TierByte}),
-            case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, DocEntityKey, UpdatedColumns}]) of
-                ok -> ok;
-                Error -> Error
-            end;
-        not_found ->
-            {error, not_found}
-    end.
-
-%% @doc Classify documents by age into tiers
-%% Scans all documents and updates their tier based on created_at timestamp.
-do_classify_by_age(StoreRef, DbName, HotCutoff, WarmCutoff) ->
-    %% Get all document entities in this database
-    StartKey = barrel_store_keys:doc_entity(DbName, <<>>),
-    EndKey = barrel_store_keys:doc_entity_end(DbName),
-
-    Stats = #{classified => 0, errors => 0},
-
-    FoldFun = fun(Key, Value, AccStats) ->
-        Columns = barrel_store_rocksdb:decode_entity(Value),
-        CreatedAtBin = proplists:get_value(?COL_CREATED_AT, Columns, <<>>),
-        %% decode_entity returns tier as atom (hot, warm, cold)
-        CurrentTier = proplists:get_value(?COL_TIER, Columns, hot),
-
-        %% Decode created_at HLC to get timestamp (wall_time in ms)
-        CreatedMs = case CreatedAtBin of
-                      <<>> -> 0;
-                      _ ->
-                        CreatedHlc = barrel_hlc:decode(CreatedAtBin),
-                        barrel_hlc:wall_time(CreatedHlc)
-                    end,
-
-        %% Determine new tier based on age (use atoms)
-        NewTier = if
-                    CreatedMs >= HotCutoff -> hot;
-                    CreatedMs >= WarmCutoff -> warm;
-                    true -> cold
-                  end,
-
-        %% Update if tier changed
-        case NewTier =/= CurrentTier of
-          true ->
-            %% Store as byte value for encoding
-            NewTierByte = barrel_tier:tier_to_byte(NewTier),
-            UpdatedColumns = lists:keyreplace(?COL_TIER, 1, Columns, {?COL_TIER, NewTierByte}),
-            case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, Key, UpdatedColumns}]) of
-              ok ->
-                {ok, AccStats#{classified := maps:get(classified, AccStats) + 1}};
-              _ ->
-                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
-            end;
-          false ->
-            {ok, AccStats}
-        end    
-    end,
-
-    FinalStats = barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, Stats),
-    {ok, FinalStats}.
-
-%% @doc Migrate expired documents (delete or archive)
-do_migrate_expired(StoreRef, DbName) ->
-    Now = erlang:system_time(millisecond),
-
-    StartKey = barrel_store_keys:doc_entity(DbName, <<>>),
-    EndKey = barrel_store_keys:doc_entity_end(DbName),
-
-    Stats = #{deleted => 0, errors => 0},
-
-    FoldFun = fun(Key, Value, AccStats) ->
-        Columns = barrel_store_rocksdb:decode_entity(Value),
-        ExpiresAt = proplists:get_value(?COL_EXPIRES_AT, Columns, 0),
-        case ExpiresAt > 0 andalso Now >= ExpiresAt of
-          true ->
-            %% Document has expired - mark as deleted
-            UpdatedColumns = lists:keyreplace(?COL_DELETED, 1, Columns, {?COL_DELETED, <<"true">>}),
-            case barrel_store_rocksdb:write_batch(StoreRef, [{entity_put, Key, UpdatedColumns}]) of
-              ok ->
-                {ok, AccStats#{deleted := maps:get(deleted, AccStats) + 1}};
-              _ ->
-                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
-            end;
-          false ->
-            {ok, AccStats}
-        end
-    end,
-
-    FinalStats = barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, Stats),
-    {ok, FinalStats}.
-
-%% @doc Migrate documents matching filter to a target tier
-%% Filter options:
-%%   - min_age: minimum age in milliseconds
-%%   - tier: only documents in this tier
-%%   - doc_id: specific document to migrate
-%%
-%% If warm_db/cold_db are configured in tier config, performs physical migration
-%% (copies document to target DB and deletes from source). Otherwise, just
-%% updates the tier metadata byte.
-do_migrate_to_tier(StoreRef, DbName, TargetTier, Filter) ->
-    %% Get tier config to check for physical migration
-    Config = barrel_tier:get_config(DbName),
-    TargetDbName = get_target_db_name(TargetTier, Config, DbName),
-
-    %% Check if we're doing physical migration (different target DB)
-    PhysicalMigration = (TargetDbName =/= DbName),
-
-    %% Check if specific doc_id is provided
-    case maps:get(doc_id, Filter, undefined) of
-        undefined ->
-            %% Bulk migration
-            do_migrate_to_tier_bulk(StoreRef, DbName, TargetTier, TargetDbName,
-                                    PhysicalMigration, Filter);
-        DocId ->
-            %% Single document migration
-            do_migrate_single_doc(StoreRef, DbName, DocId, TargetTier,
-                                  TargetDbName, PhysicalMigration)
-    end.
-
-%% @private Get target database name based on tier and config
-get_target_db_name(warm, Config, DefaultDb) ->
-    maps:get(warm_db, Config, DefaultDb);
-get_target_db_name(cold, Config, DefaultDb) ->
-    maps:get(cold_db, Config, DefaultDb);
-get_target_db_name(hot, _Config, DefaultDb) ->
-    %% Hot tier is always the original database
-    DefaultDb.
-
-%% @private Migrate a single document to target tier
-do_migrate_single_doc(StoreRef, DbName, DocId, TargetTier, TargetDbName, PhysicalMigration) ->
-    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
-    case barrel_store_rocksdb:get_entity(StoreRef, DocEntityKey) of
-        {ok, Columns} ->
-            CurrentTier = proplists:get_value(?COL_TIER, Columns, hot),
-            case CurrentTier =:= TargetTier of
-                true ->
-                    %% Already in target tier
-                    {ok, #{migrated => 0, skipped => 1, errors => 0}};
-                false when PhysicalMigration ->
-                    %% Physical migration to different database
-                    case do_physical_migrate_doc(StoreRef, DbName, DocId, TargetDbName) of
-                        ok ->
-                            {ok, #{migrated => 1, skipped => 0, errors => 0}};
-                        {error, _Reason} ->
-                            {ok, #{migrated => 0, skipped => 0, errors => 1}}
-                    end;
-                false ->
-                    %% Metadata-only migration
-                    TargetTierByte = barrel_tier:tier_to_byte(TargetTier),
-                    UpdatedColumns = lists:keyreplace(?COL_TIER, 1, Columns,
-                                                      {?COL_TIER, TargetTierByte}),
-                    case barrel_store_rocksdb:write_batch(StoreRef,
-                            [{entity_put, DocEntityKey, UpdatedColumns}]) of
-                        ok ->
-                            {ok, #{migrated => 1, skipped => 0, errors => 0}};
-                        _ ->
-                            {ok, #{migrated => 0, skipped => 0, errors => 1}}
-                    end
-            end;
-        not_found ->
-            {error, not_found}
-    end.
-
-%% @private Physically migrate a document to a different database
-do_physical_migrate_doc(StoreRef, SourceDb, DocId, TargetDb) ->
-    %% Get full document from source
-    case do_get_doc(StoreRef, SourceDb, DocId, #{}) of
-        {ok, #{<<"_rev">> := Rev} = Doc} ->
-            %% Check if document is deleted
-            Deleted = maps:get(<<"_deleted">>, Doc, false),
-            %% Put document in target database
-            case barrel_docdb:db_pid(TargetDb) of
-                {ok, TargetPid} ->
-                    %% Use put_rev to preserve the revision
-                    %% The 4th arg is Deleted (boolean), not Opts
-                    History = [Rev],
-                    case gen_server:call(TargetPid, {put_rev, Doc, History, Deleted}, infinity) of
-                        {ok, _, _} ->
-                            %% Delete from source - mark as deleted
-                            DeleteOpts = #{rev => Rev},
-                            %% Ignore delete errors, doc is already copied
-                            _ = do_delete_doc(StoreRef, SourceDb, DocId, DeleteOpts),
-                            ok;
-                        {error, Reason} ->
-                            {error, {target_put_failed, Reason}}
-                    end;
-                {error, not_found} ->
-                    {error, {target_db_not_found, TargetDb}}
-            end;
-        {error, Reason} ->
-            {error, {source_get_failed, Reason}}
-    end.
-
-%% @private Bulk migration of documents matching filter
-do_migrate_to_tier_bulk(StoreRef, DbName, TargetTier, TargetDbName,
-                        PhysicalMigration, Filter) ->
-    Now = erlang:system_time(millisecond),
-    MinAge = maps:get(min_age, Filter, 0),
-    SourceTier = maps:get(tier, Filter, undefined),
-    TargetTierByte = barrel_tier:tier_to_byte(TargetTier),
-
-    StartKey = barrel_store_keys:doc_entity(DbName, <<>>),
-    EndKey = barrel_store_keys:doc_entity_end(DbName),
-
-    %% Calculate prefix size for DocId extraction:
-    %% 1 byte (prefix) + 2 bytes (length) + DbName bytes
-    PrefixSize = 1 + 2 + byte_size(DbName),
-
-    Stats = #{migrated => 0, skipped => 0, errors => 0},
-
-    FoldFun = fun(Key, Value, AccStats) ->
-        Columns = barrel_store_rocksdb:decode_entity(Value),
-        CurrentTier = proplists:get_value(?COL_TIER, Columns, hot),
-        CreatedAtBin = proplists:get_value(?COL_CREATED_AT, Columns, <<>>),
-
-        TierMatch = (SourceTier =:= undefined) orelse (CurrentTier =:= SourceTier),
-
-        AgeMs = case CreatedAtBin of
-                  <<>> -> 0;
-                  _ ->
-                    CreatedHlc = barrel_hlc:decode(CreatedAtBin),
-                    Now - barrel_hlc:wall_time(CreatedHlc)
-                end,
-        AgeMatch = AgeMs >= MinAge,
-
-        case TierMatch andalso AgeMatch andalso CurrentTier =/= TargetTier of
-          true when PhysicalMigration ->
-            %% Physical migration - extract DocId from key and migrate
-            <<_Prefix:PrefixSize/binary, DocId/binary>> = Key,
-            case do_physical_migrate_doc(StoreRef, DbName, DocId, TargetDbName) of
-              ok ->
-                {ok, AccStats#{migrated := maps:get(migrated, AccStats) + 1}};
-              _ ->
-                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
-            end;
-          true ->
-            %% Metadata-only migration
-            UpdatedColumns = lists:keyreplace(?COL_TIER, 1, Columns,
-                                              {?COL_TIER, TargetTierByte}),
-            case barrel_store_rocksdb:write_batch(StoreRef,
-                                                  [{entity_put, Key, UpdatedColumns}]) of
-              ok ->
-                {ok, AccStats#{migrated := maps:get(migrated, AccStats) + 1}};
-              _ ->
-                {ok, AccStats#{errors := maps:get(errors, AccStats) + 1}}
-            end;
-          false ->
-            {ok, AccStats#{skipped := maps:get(skipped, AccStats) + 1}}
-        end
-    end,
-
-    FinalStats = barrel_store_rocksdb:fold_range(StoreRef, StartKey, EndKey, FoldFun, Stats),
-    {ok, FinalStats}.

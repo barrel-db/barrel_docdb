@@ -35,29 +35,11 @@
     changes_stream_with_doc_ids/1,
     changes_stream_with_query/1,
     bulk_docs/1,
-    %% Policy tests
-    policy_create/1,
-    policy_get/1,
-    policy_list/1,
-    policy_enable_disable/1,
-    policy_status/1,
-    policy_delete/1,
-    %% Tier tests
-    tier_config_set/1,
-    tier_config_get/1,
-    tier_capacity/1,
-    tier_doc_get/1,
-    tier_doc_ttl/1,
-    tier_run_migration/1,
     %% Usage tests
     admin_usage_all/1,
     admin_usage_single_db/1,
     admin_usage_not_found/1,
-    admin_usage_requires_auth/1,
-    %% Federation tests
-    federation_create_with_bearer_auth/1,
-    federation_create_with_basic_auth/1,
-    federation_find_with_auth_override/1
+    admin_usage_requires_auth/1
 ]).
 
 -define(PORT, 18080).
@@ -68,7 +50,7 @@
 %%====================================================================
 
 all() ->
-    [{group, http_tests}, {group, policy_tests}, {group, tier_tests}, {group, usage_tests}, {group, federation_tests}].
+    [{group, http_tests}, {group, usage_tests}].
 
 groups() ->
     [
@@ -94,32 +76,11 @@ groups() ->
             changes_stream_with_query,
             bulk_docs
         ]},
-        {policy_tests, [sequence], [
-            policy_create,
-            policy_get,
-            policy_list,
-            policy_enable_disable,
-            policy_status,
-            policy_delete
-        ]},
-        {tier_tests, [sequence], [
-            tier_config_set,
-            tier_config_get,
-            tier_capacity,
-            tier_doc_get,
-            tier_doc_ttl,
-            tier_run_migration
-        ]},
         {usage_tests, [sequence], [
             admin_usage_all,
             admin_usage_single_db,
             admin_usage_not_found,
             admin_usage_requires_auth
-        ]},
-        {federation_tests, [sequence], [
-            federation_create_with_bearer_auth,
-            federation_create_with_basic_auth,
-            federation_find_with_auth_override
         ]}
     ].
 
@@ -147,28 +108,9 @@ init_per_group(http_tests, Config) ->
     %% Create test database
     {ok, _} = barrel_docdb:create_db(<<"testdb">>),
     Config;
-init_per_group(policy_tests, Config) ->
-    %% Clean up any existing test policies
-    case barrel_rep_policy:list() of
-        {ok, Policies} ->
-            lists:foreach(fun(#{name := Name}) ->
-                barrel_rep_policy:delete(Name)
-            end, Policies);
-        _ -> ok
-    end,
-    Config;
-init_per_group(tier_tests, Config) ->
-    %% Create test databases for tier tests
-    {ok, _} = barrel_docdb:create_db(<<"tier_test_db">>),
-    {ok, _} = barrel_docdb:create_db(<<"tier_warm_db">>),
-    Config;
 init_per_group(usage_tests, Config) ->
     %% Create test database for usage tests
     {ok, _} = barrel_docdb:create_db(<<"usage_http_test_db">>),
-    Config;
-init_per_group(federation_tests, Config) ->
-    %% Create test database for federation tests
-    {ok, _} = barrel_docdb:create_db(<<"fed_http_test_db">>),
     Config.
 
 %% Helper to get auth header
@@ -179,31 +121,9 @@ auth_header(Config) ->
 end_per_group(http_tests, _Config) ->
     barrel_docdb:delete_db(<<"testdb">>),
     ok;
-end_per_group(policy_tests, _Config) ->
-    %% Clean up test policies
-    case barrel_rep_policy:list() of
-        {ok, Policies} ->
-            lists:foreach(fun(#{name := Name}) ->
-                barrel_rep_policy:delete(Name)
-            end, Policies);
-        _ -> ok
-    end,
-    ok;
-end_per_group(tier_tests, _Config) ->
-    %% Clean up tier test databases
-    barrel_docdb:delete_db(<<"tier_test_db">>),
-    barrel_docdb:delete_db(<<"tier_warm_db">>),
-    ok;
 end_per_group(usage_tests, _Config) ->
     %% Clean up usage test database
     barrel_docdb:delete_db(<<"usage_http_test_db">>),
-    ok;
-end_per_group(federation_tests, _Config) ->
-    %% Clean up federation test database and federations
-    barrel_docdb:delete_db(<<"fed_http_test_db">>),
-    catch barrel_federation:delete(<<"http_bearer_fed">>),
-    catch barrel_federation:delete(<<"http_basic_fed">>),
-    catch barrel_federation:delete(<<"http_override_fed">>),
     ok.
 
 init_per_testcase(_TestCase, Config) ->
@@ -938,335 +858,6 @@ bulk_docs(Config) ->
     ok.
 
 %%====================================================================
-%% Policy HTTP API Tests
-%%====================================================================
-
-%% @doc Test creating a policy via HTTP
-policy_create(Config) ->
-    Auth = auth_header(Config),
-    PolicySpec = #{
-        <<"name">> => <<"test_fanout">>,
-        <<"pattern">> => <<"fanout">>,
-        <<"source">> => <<"source_db">>,
-        <<"targets">> => [<<"target1">>, <<"target2">>],
-        <<"mode">> => <<"one_shot">>
-    },
-    ReqBody = iolist_to_binary(json:encode(PolicySpec)),
-
-    {ok, 201, _Headers, Body} = hackney:post(
-        ?BASE_URL ++ "/_policies",
-        [Auth,
-         {<<"Content-Type">>, <<"application/json">>},
-         {<<"Accept">>, <<"application/json">>}],
-        ReqBody,
-        []
-    ),
-    #{<<"ok">> := true, <<"name">> := <<"test_fanout">>} = json:decode(Body),
-
-    %% Try to create duplicate
-    {ok, 409, _Headers2, _Body2} = hackney:post(
-        ?BASE_URL ++ "/_policies",
-        [Auth,
-         {<<"Content-Type">>, <<"application/json">>},
-         {<<"Accept">>, <<"application/json">>}],
-        ReqBody,
-        []
-    ),
-    ok.
-
-%% @doc Test getting a policy via HTTP
-policy_get(Config) ->
-    Auth = auth_header(Config),
-
-    %% Get existing policy
-    {ok, 200, _Headers, Body} = hackney:get(
-        ?BASE_URL ++ "/_policies/test_fanout",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    Policy = json:decode(Body),
-    <<"test_fanout">> = maps:get(<<"name">>, Policy),
-    <<"fanout">> = maps:get(<<"pattern">>, Policy),
-    <<"source_db">> = maps:get(<<"source">>, Policy),
-
-    %% Get non-existing policy
-    {ok, 404, _Headers2, _Body2} = hackney:get(
-        ?BASE_URL ++ "/_policies/nonexistent",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    ok.
-
-%% @doc Test listing policies via HTTP
-policy_list(Config) ->
-    Auth = auth_header(Config),
-
-    %% Create another policy
-    PolicySpec = #{
-        <<"name">> => <<"test_chain">>,
-        <<"pattern">> => <<"chain">>,
-        <<"nodes">> => [<<"node1">>, <<"node2">>],
-        <<"database">> => <<"mydb">>
-    },
-    ReqBody = iolist_to_binary(json:encode(PolicySpec)),
-    {ok, 201, _, _CreateBody} = hackney:post(
-        ?BASE_URL ++ "/_policies",
-        [Auth,
-         {<<"Content-Type">>, <<"application/json">>},
-         {<<"Accept">>, <<"application/json">>}],
-        ReqBody,
-        []
-    ),
-
-    %% List all policies
-    {ok, 200, _Headers, Body} = hackney:get(
-        ?BASE_URL ++ "/_policies",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    #{<<"policies">> := Policies} = json:decode(Body),
-    true = length(Policies) >= 2,
-
-    %% Verify we have our policies
-    Names = [maps:get(<<"name">>, P) || P <- Policies],
-    true = lists:member(<<"test_fanout">>, Names),
-    true = lists:member(<<"test_chain">>, Names),
-    ok.
-
-%% @doc Test enabling/disabling a policy via HTTP
-policy_enable_disable(Config) ->
-    Auth = auth_header(Config),
-
-    %% Check initial state (disabled by default)
-    {ok, 200, _Headers, Body} = hackney:get(
-        ?BASE_URL ++ "/_policies/test_fanout",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    #{<<"enabled">> := false} = json:decode(Body),
-
-    %% Enable policy (may fail to actually start tasks but API should work)
-    {ok, _Status1, _Headers2, _Body2} = hackney:post(
-        ?BASE_URL ++ "/_policies/test_fanout/_enable",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    %% Enable may succeed (200) or fail (400/500) if tasks can't be started
-    %% (e.g., databases don't exist). The important thing is the API works.
-
-    %% Disable policy
-    {ok, 200, _Headers3, Body3} = hackney:post(
-        ?BASE_URL ++ "/_policies/test_fanout/_disable",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    #{<<"ok">> := true} = json:decode(Body3),
-
-    %% Verify disabled
-    {ok, 200, _Headers4, Body4} = hackney:get(
-        ?BASE_URL ++ "/_policies/test_fanout",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    #{<<"enabled">> := false} = json:decode(Body4),
-    ok.
-
-%% @doc Test getting policy status via HTTP
-policy_status(Config) ->
-    Auth = auth_header(Config),
-
-    {ok, 200, _Headers, Body} = hackney:get(
-        ?BASE_URL ++ "/_policies/test_fanout/_status",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    Status = json:decode(Body),
-    <<"test_fanout">> = maps:get(<<"name">>, Status),
-    <<"fanout">> = maps:get(<<"pattern">>, Status),
-    _ = maps:get(<<"enabled">>, Status),
-    _ = maps:get(<<"task_count">>, Status),
-
-    %% Non-existing policy status
-    {ok, 404, _Headers2, _Body2} = hackney:get(
-        ?BASE_URL ++ "/_policies/nonexistent/_status",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    ok.
-
-%% @doc Test deleting a policy via HTTP
-policy_delete(Config) ->
-    Auth = auth_header(Config),
-
-    %% Delete test_fanout policy
-    {ok, 200, _Headers, Body} = hackney:delete(
-        ?BASE_URL ++ "/_policies/test_fanout",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    #{<<"ok">> := true} = json:decode(Body),
-
-    %% Verify deleted
-    {ok, 404, _Headers2, _Body2} = hackney:get(
-        ?BASE_URL ++ "/_policies/test_fanout",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-
-    %% Delete non-existing policy
-    {ok, 404, _Headers3, _Body3} = hackney:delete(
-        ?BASE_URL ++ "/_policies/nonexistent",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-
-    %% Delete test_chain too
-    {ok, 200, _Headers4, _Body4} = hackney:delete(
-        ?BASE_URL ++ "/_policies/test_chain",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    ok.
-
-%%====================================================================
-%% Tier HTTP API Tests
-%%====================================================================
-
-%% @doc Test setting tier configuration via HTTP
-tier_config_set(Config) ->
-    Auth = auth_header(Config),
-    TierConfig = #{
-        <<"enabled">> => true,
-        <<"warm_db">> => <<"tier_warm_db">>,
-        <<"hot_threshold">> => 3600,
-        <<"warm_threshold">> => 86400
-    },
-    ReqBody = iolist_to_binary(json:encode(TierConfig)),
-
-    {ok, 200, _Headers, Body} = hackney:post(
-        ?BASE_URL ++ "/db/tier_test_db/_tier/config",
-        [Auth,
-         {<<"Content-Type">>, <<"application/json">>},
-         {<<"Accept">>, <<"application/json">>}],
-        ReqBody,
-        []
-    ),
-    #{<<"ok">> := true} = json:decode(Body),
-    ok.
-
-%% @doc Test getting tier configuration via HTTP
-tier_config_get(Config) ->
-    Auth = auth_header(Config),
-
-    {ok, 200, _Headers, Body} = hackney:get(
-        ?BASE_URL ++ "/db/tier_test_db/_tier/config",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    TierConfig = json:decode(Body),
-    true = maps:get(<<"enabled">>, TierConfig),
-    <<"tier_warm_db">> = maps:get(<<"warm_db">>, TierConfig),
-    ok.
-
-%% @doc Test getting capacity info via HTTP
-tier_capacity(Config) ->
-    Auth = auth_header(Config),
-
-    {ok, 200, _Headers, Body} = hackney:get(
-        ?BASE_URL ++ "/db/tier_test_db/_tier/capacity",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    CapacityInfo = json:decode(Body),
-    %% Should have size_bytes or similar field
-    true = is_map(CapacityInfo),
-    ok.
-
-%% @doc Test getting document tier via HTTP
-tier_doc_get(Config) ->
-    Auth = auth_header(Config),
-
-    %% First create a document
-    Doc = #{<<"_id">> => <<"tier_test_doc">>, <<"value">> => <<"test">>},
-    DocBody = iolist_to_binary(json:encode(Doc)),
-    {ok, 201, _, _PutBody} = hackney:put(
-        ?BASE_URL ++ "/db/tier_test_db/tier_test_doc",
-        [Auth,
-         {<<"Content-Type">>, <<"application/json">>},
-         {<<"Accept">>, <<"application/json">>}],
-        DocBody,
-        []
-    ),
-
-    %% Get document tier
-    {ok, 200, _Headers, Body} = hackney:get(
-        ?BASE_URL ++ "/db/tier_test_db/tier_test_doc/_tier",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    TierInfo = json:decode(Body),
-    <<"tier_test_doc">> = maps:get(<<"doc_id">>, TierInfo),
-    ok.
-
-%% @doc Test setting and getting document TTL via HTTP
-tier_doc_ttl(Config) ->
-    Auth = auth_header(Config),
-
-    %% Set TTL
-    TTLSpec = #{<<"ttl">> => 3600},
-    TTLBody = iolist_to_binary(json:encode(TTLSpec)),
-    {ok, 200, _Headers, SetBody} = hackney:post(
-        ?BASE_URL ++ "/db/tier_test_db/tier_test_doc/_tier/ttl",
-        [Auth,
-         {<<"Content-Type">>, <<"application/json">>},
-         {<<"Accept">>, <<"application/json">>}],
-        TTLBody,
-        []
-    ),
-    #{<<"ok">> := true} = json:decode(SetBody),
-
-    %% Get TTL
-    {ok, 200, _Headers2, GetBody} = hackney:get(
-        ?BASE_URL ++ "/db/tier_test_db/tier_test_doc/_tier/ttl",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    TTLInfo = json:decode(GetBody),
-    true = is_map(TTLInfo),
-    ok.
-
-%% @doc Test running migration via HTTP
-tier_run_migration(Config) ->
-    Auth = auth_header(Config),
-
-    {ok, 200, _Headers, Body} = hackney:post(
-        ?BASE_URL ++ "/db/tier_test_db/_tier/run_migration",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    Result = json:decode(Body),
-    true = maps:get(<<"ok">>, Result),
-    ok.
-
-%%====================================================================
 %% Usage HTTP API Tests
 %%====================================================================
 
@@ -1367,137 +958,4 @@ admin_usage_requires_auth(_Config) ->
         <<>>,
         []
     ),
-    ok.
-
-%%====================================================================
-%% Federation Tests
-%%====================================================================
-
-%% @doc Test creating federation with bearer token auth via HTTP API
-federation_create_with_bearer_auth(Config) ->
-    Auth = auth_header(Config),
-
-    %% Create federation with bearer auth
-    FedSpec = #{
-        <<"name">> => <<"http_bearer_fed">>,
-        <<"members">> => [<<"fed_http_test_db">>],
-        <<"auth">> => #{
-            <<"bearer_token">> => <<"ak_test_bearer_token">>
-        }
-    },
-    SpecJson = iolist_to_binary(json:encode(FedSpec)),
-
-    {ok, 201, _Headers, Body} = hackney:post(
-        ?BASE_URL ++ "/_federation",
-        [Auth,
-         {<<"Content-Type">>, <<"application/json">>},
-         {<<"Accept">>, <<"application/json">>}],
-        SpecJson,
-        []
-    ),
-    #{<<"ok">> := true, <<"name">> := <<"http_bearer_fed">>} = json:decode(Body),
-
-    %% Verify federation was created with auth
-    {ok, Fed} = barrel_federation:get(<<"http_bearer_fed">>),
-    true = maps:is_key(auth, Fed),
-    #{bearer_token := <<"ak_test_bearer_token">>} = maps:get(auth, Fed),
-    ok.
-
-%% @doc Test creating federation with basic auth via HTTP API
-federation_create_with_basic_auth(Config) ->
-    Auth = auth_header(Config),
-
-    %% Create federation with basic auth
-    FedSpec = #{
-        <<"name">> => <<"http_basic_fed">>,
-        <<"members">> => [<<"fed_http_test_db">>],
-        <<"auth">> => #{
-            <<"basic_auth">> => #{
-                <<"username">> => <<"admin">>,
-                <<"password">> => <<"secret123">>
-            }
-        }
-    },
-    SpecJson = iolist_to_binary(json:encode(FedSpec)),
-
-    {ok, 201, _Headers, Body} = hackney:post(
-        ?BASE_URL ++ "/_federation",
-        [Auth,
-         {<<"Content-Type">>, <<"application/json">>},
-         {<<"Accept">>, <<"application/json">>}],
-        SpecJson,
-        []
-    ),
-    #{<<"ok">> := true, <<"name">> := <<"http_basic_fed">>} = json:decode(Body),
-
-    %% Verify federation was created with auth
-    {ok, Fed} = barrel_federation:get(<<"http_basic_fed">>),
-    true = maps:is_key(auth, Fed),
-    #{basic_auth := {<<"admin">>, <<"secret123">>}} = maps:get(auth, Fed),
-    ok.
-
-%% @doc Test querying federation with auth override via HTTP API
-federation_find_with_auth_override(Config) ->
-    Auth = auth_header(Config),
-
-    %% Create federation with default auth
-    FedSpec = #{
-        <<"name">> => <<"http_override_fed">>,
-        <<"members">> => [<<"fed_http_test_db">>],
-        <<"auth">> => #{
-            <<"bearer_token">> => <<"ak_default_token">>
-        }
-    },
-    SpecJson = iolist_to_binary(json:encode(FedSpec)),
-
-    {ok, 201, _Headers, _Body} = hackney:post(
-        ?BASE_URL ++ "/_federation",
-        [Auth,
-         {<<"Content-Type">>, <<"application/json">>},
-         {<<"Accept">>, <<"application/json">>}],
-        SpecJson,
-        []
-    ),
-
-    %% Add a test document
-    Doc = #{<<"id">> => <<"fed_test_doc">>, <<"type">> => <<"test">>},
-    DocJson = iolist_to_binary(json:encode(Doc)),
-    {ok, 201, _, _} = hackney:put(
-        ?BASE_URL ++ "/db/fed_http_test_db/fed_test_doc",
-        [Auth,
-         {<<"Content-Type">>, <<"application/json">>},
-         {<<"Accept">>, <<"application/json">>}],
-        DocJson,
-        []
-    ),
-
-    %% Query with auth override
-    QuerySpec = #{
-        <<"where">> => [#{
-            <<"path">> => [<<"type">>],
-            <<"op">> => <<"eq">>,
-            <<"value">> => <<"test">>
-        }],
-        <<"auth">> => #{
-            <<"bearer_token">> => <<"ak_override_token">>
-        }
-    },
-    QueryJson = iolist_to_binary(json:encode(QuerySpec)),
-
-    {ok, 200, _Headers2, Body2} = hackney:post(
-        ?BASE_URL ++ "/_federation/http_override_fed/_find",
-        [Auth,
-         {<<"Content-Type">>, <<"application/json">>},
-         {<<"Accept">>, <<"application/json">>}],
-        QueryJson,
-        []
-    ),
-
-    Response = json:decode(Body2),
-    Results = maps:get(<<"results">>, Response),
-    true = length(Results) >= 1,
-
-    %% Find our test document
-    DocIds = [maps:get(<<"id">>, R) || R <- Results],
-    true = lists:member(<<"fed_test_doc">>, DocIds),
     ok.

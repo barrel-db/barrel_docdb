@@ -38,7 +38,6 @@
     api_delete_doc/1,
     api_fold_docs/1,
     api_attachments/1,
-    api_views/1,
     api_changes/1
 ]).
 
@@ -90,7 +89,6 @@ groups() ->
             api_delete_doc,
             api_fold_docs,
             api_attachments,
-            api_views,
             api_changes
         ]},
         {path_indexing, [sequence], [
@@ -673,51 +671,6 @@ api_attachments(_Config) ->
 
     %% Attachment no longer accessible
     {error, not_found} = barrel_docdb:get_attachment(DbName, <<"doc1">>, <<"file.txt">>),
-
-    %% Cleanup
-    ok = barrel_docdb:delete_db(DbName),
-    os:cmd("rm -rf " ++ TestDir),
-    ok.
-
-%% @doc Test view API
-api_views(_Config) ->
-    {ok, _} = application:ensure_all_started(barrel_docdb),
-
-    DbName = <<"api_view_test">>,
-    TestDir = "/tmp/barrel_api_view_" ++ integer_to_list(erlang:system_time(millisecond)),
-    {ok, _} = barrel_docdb:create_db(DbName, #{data_dir => TestDir}),
-
-    %% Create documents
-    lists:foreach(
-        fun(N) ->
-            Type = case N rem 2 of 0 -> <<"even">>; 1 -> <<"odd">> end,
-            {ok, _} = barrel_docdb:put_doc(DbName, #{
-                <<"id">> => <<"doc", (integer_to_binary(N))/binary>>,
-                <<"_id">> => <<"doc", (integer_to_binary(N))/binary>>,
-                <<"type">> => Type,
-                <<"value">> => N
-            })
-        end,
-        lists:seq(1, 6)
-    ),
-
-    %% Register view
-    ok = barrel_docdb:register_view(DbName, <<"by_type">>, #{module => barrel_view_SUITE}),
-
-    %% Refresh view
-    {ok, _Seq} = barrel_docdb:refresh_view(DbName, <<"by_type">>),
-
-    %% Query view
-    {ok, Results} = barrel_docdb:query_view(DbName, <<"by_type">>, #{reduce => false}),
-    ?assertEqual(6, length(Results)),
-
-    %% List views
-    {ok, Views} = barrel_docdb:list_views(DbName),
-    ViewIds = [maps:get(id, V) || V <- Views],
-    ?assert(lists:member(<<"by_type">>, ViewIds)),
-
-    %% Unregister view
-    ok = barrel_docdb:unregister_view(DbName, <<"by_type">>),
 
     %% Cleanup
     ok = barrel_docdb:delete_db(DbName),

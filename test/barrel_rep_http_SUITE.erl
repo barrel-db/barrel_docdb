@@ -51,13 +51,7 @@
     %% Query tests
     query_find_basic/1,
     query_find_with_where/1,
-    query_find_with_pagination/1,
-
-    %% View tests
-    view_create/1,
-    view_list/1,
-    view_query/1,
-    view_delete/1
+    query_find_with_pagination/1
 ]).
 
 -define(HTTP_PORT, 18081).
@@ -74,8 +68,7 @@ all() ->
         {group, tasks},
         {group, keys},
         {group, attachments},
-        {group, query},
-        {group, views}
+        {group, query}
     ].
 
 groups() ->
@@ -117,12 +110,6 @@ groups() ->
             query_find_basic,
             query_find_with_where,
             query_find_with_pagination
-        ]},
-        {views, [sequence], [
-            view_create,
-            view_list,
-            view_query,
-            view_delete
         ]}
     ].
 
@@ -214,30 +201,6 @@ init_per_group(query, Config) ->
     ),
     Config;
 
-init_per_group(views, Config) ->
-    %% Ensure HTTP server is running
-    ensure_http_server(),
-    %% Create test database with sample documents
-    ensure_db(<<"views_test_db">>),
-    %% Insert test documents with types for the view
-    lists:foreach(
-        fun(N) ->
-            Type = case N rem 3 of
-                0 -> <<"user">>;
-                1 -> <<"order">>;
-                2 -> <<"product">>
-            end,
-            Doc = #{
-                <<"id">> => iolist_to_binary(["doc", integer_to_list(N)]),
-                <<"type">> => Type,
-                <<"name">> => iolist_to_binary(["Item ", integer_to_list(N)])
-            },
-            {ok, _} = barrel_docdb:put_doc(<<"views_test_db">>, Doc)
-        end,
-        lists:seq(1, 9)
-    ),
-    Config;
-
 init_per_group(_, Config) ->
     Config.
 
@@ -266,10 +229,6 @@ end_per_group(attachments, _Config) ->
 
 end_per_group(query, _Config) ->
     catch barrel_docdb:delete_db(<<"query_test_db">>),
-    ok;
-
-end_per_group(views, _Config) ->
-    catch barrel_docdb:delete_db(<<"views_test_db">>),
     ok;
 
 end_per_group(_, _Config) ->
@@ -898,62 +857,6 @@ query_find_with_pagination(Config) ->
             %% No more results - that's fine for a small result set
             ok
     end,
-
-    ok.
-
-%%====================================================================
-%% View Tests
-%%====================================================================
-
-view_create(Config) ->
-    %% View creation requires complex query spec with logic variables
-    %% This test just verifies the endpoint responds correctly
-    ApiKey = proplists:get_value(api_key, Config),
-    Url = <<?BASE_URL/binary, "/db/views_test_db/_views">>,
-    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>},
-               {<<"Content-Type">>, <<"application/json">>}],
-
-    %% Try to create an invalid view (missing required fields)
-    %% Should return 400
-    ReqBody = json:encode(#{
-        <<"id">> => <<"test_view">>,
-        <<"where">> => []  %% Empty where clause is invalid
-    }),
-
-    {ok, 400, _RespHeaders, _Body} = hackney:post(Url, Headers, ReqBody, []),
-    %% 400 is expected for invalid view spec
-    ok.
-
-view_list(Config) ->
-    ApiKey = proplists:get_value(api_key, Config),
-    Url = <<?BASE_URL/binary, "/db/views_test_db/_views">>,
-    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
-
-    {ok, 200, _RespHeaders, Body} = hackney:get(Url, Headers, <<>>, []),
-    Views = json:decode(Body),
-
-    %% Should return a list (even if empty)
-    true = is_list(Views),
-
-    ok.
-
-view_query(Config) ->
-    ApiKey = proplists:get_value(api_key, Config),
-    Url = <<?BASE_URL/binary, "/db/views_test_db/_views/nonexistent/_query">>,
-    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
-
-    %% Query a non-existent view should return 404
-    {ok, 404, _RespHeaders, _Body} = hackney:get(Url, Headers, <<>>, []),
-
-    ok.
-
-view_delete(Config) ->
-    ApiKey = proplists:get_value(api_key, Config),
-    Url = <<?BASE_URL/binary, "/db/views_test_db/_views/nonexistent">>,
-    Headers = [{<<"Authorization">>, <<"Bearer ", ApiKey/binary>>}],
-
-    %% Delete a non-existent view should return 404
-    {ok, 404, _RespHeaders, _Body} = hackney:delete(Url, Headers, <<>>, []),
 
     ok.
 
