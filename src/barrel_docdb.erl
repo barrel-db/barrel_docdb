@@ -140,7 +140,8 @@
     get_system_doc/1,
     delete_system_doc/1,
     fold_system_docs/3,
-    ensure_system_db/0
+    ensure_system_db/0,
+    node_id/0
 ]).
 
 %% HLC (Hybrid Logical Clock) for distributed time synchronization
@@ -1414,6 +1415,27 @@ put_system_doc(DocId, Doc) ->
 get_system_doc(DocId) ->
     ensure_system_db(),
     get_local_doc(?SYSTEM_DB, DocId).
+
+%% @doc Return this node's stable identity.
+%%
+%% The id is generated once (hostname plus a random suffix) and persisted in
+%% the `_node_id' system document. It has no dependency on discovery or
+%% federation; it is a building block an external cluster or discovery layer
+%% can use to identify this node.
+%%
+%% @returns the node id binary
+-spec node_id() -> binary().
+node_id() ->
+    case get_system_doc(<<"_node_id">>) of
+        {ok, #{<<"node_id">> := NodeId}} ->
+            NodeId;
+        {error, not_found} ->
+            {ok, Hostname} = inet:gethostname(),
+            Random = base64:encode(crypto:strong_rand_bytes(8)),
+            NodeId = <<(list_to_binary(Hostname))/binary, "-", Random/binary>>,
+            ok = put_system_doc(<<"_node_id">>, #{<<"node_id">> => NodeId}),
+            NodeId
+    end.
 
 %% @doc Delete a global system document.
 %%

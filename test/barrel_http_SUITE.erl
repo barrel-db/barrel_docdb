@@ -16,6 +16,7 @@
 %% Test cases
 -export([
     health_check/1,
+    node_info/1,
     get_doc_not_found/1,
     put_and_get_doc_json/1,
     put_and_get_doc_cbor/1,
@@ -56,6 +57,7 @@ groups() ->
     [
         {http_tests, [sequence], [
             health_check,
+            node_info,
             get_doc_not_found,
             put_and_get_doc_json,
             put_and_get_doc_cbor,
@@ -140,6 +142,14 @@ end_per_testcase(_TestCase, _Config) ->
 health_check(_Config) ->
     {ok, 200, _Headers, Body} = hackney:get(?BASE_URL ++ "/health", [], <<>>, []),
     #{<<"status">> := <<"ok">>} = json:decode(Body),
+    ok.
+
+%% @doc Test node identity endpoint (public, no auth)
+node_info(_Config) ->
+    {ok, 200, _Headers, Body} = hackney:get(?BASE_URL ++ "/.well-known/barrel", [], <<>>, []),
+    #{<<"node_id">> := NodeId, <<"version">> := Version} = json:decode(Body),
+    true = is_binary(NodeId) andalso byte_size(NodeId) > 0,
+    true = is_binary(Version),
     ok.
 
 %% @doc Test getting a non-existent document

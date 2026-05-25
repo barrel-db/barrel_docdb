@@ -91,8 +91,8 @@ test_start "Get deleted document"
 result=$(curl -sf "$BARREL1/db/test_api/doc1" -H "$AUTH_HEADER" 2>&1 || echo "not_found")
 assert_contains "$result" "not_found" "Deleted document returns not_found"
 
-# Test 15: Node info (discovery - no auth needed)
-test_start "Node info endpoint"
+# Test 15: Node identity (public - no auth needed)
+test_start "Node identity endpoint"
 result=$(curl -sf "$BARREL1/.well-known/barrel")
 assert_contains "$result" "node_id" "Node info returns node_id"
 assert_contains "$result" "version" "Node info returns version"
