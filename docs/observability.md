@@ -172,14 +172,8 @@ Barrel DocDB automatically propagates trace context using W3C Trace Context head
 | Query Compile | `query_compile` | internal | - |
 | Query Execute | `query_execute {db}` | internal | - |
 | Changes Feed | `changes {db}` | internal | - |
-| View Query | `view_query {db}` | internal | db.view.name |
-| View Refresh | `view_refresh {db}` | internal | db.view.name |
 | Replication | `replication` | internal | replication.changes_count, replication.source_transport, replication.target_transport |
 | Replication Task | `rep_task` | internal | replication.task_id, replication.direction, replication.mode |
-| VDB Put | `vdb_put {vdb}` | internal | vdb.shard |
-| VDB Get | `vdb_get {vdb}` | internal | vdb.shard |
-| VDB Delete | `vdb_delete {vdb}` | internal | vdb.shard |
-| VDB Query | `vdb_query {vdb}` | internal | vdb.shard_count, db.response.returned_rows |
 
 ### Semantic Conventions
 
@@ -273,20 +267,6 @@ barrel_doc_operation_duration_seconds_bucket{db="mydb",operation="get",le="0.01"
 |--------|------|--------|-------------|
 | `barrel_http_requests` | Counter | method, path, status | HTTP requests |
 | `barrel_http_request_duration_seconds` | Histogram | method, path | Request latency |
-
-#### Peers
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `barrel_peers_total` | Gauge | - | Total known peers |
-| `barrel_peers_active` | Gauge | - | Active peers |
-
-#### Federation
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `barrel_federation_queries` | Counter | federation | Federation queries |
-| `barrel_federation_query_duration_seconds` | Histogram | federation | Query latency |
 
 ### Prometheus Configuration (Pull)
 

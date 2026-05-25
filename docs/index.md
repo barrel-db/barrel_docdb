@@ -34,7 +34,7 @@ Sync anywhere. Query anything. Your data, wherever you need it.
 
     ---
 
-    Chain, group, and fanout replication patterns
+    One-shot or continuous replication with pluggable transports
 
     [:octicons-arrow-right-24: Replication](replication.md)
 
@@ -42,25 +42,9 @@ Sync anywhere. Query anything. Your data, wherever you need it.
 
     ---
 
-    Practical curl examples for replication, federation, and tiered storage
+    Practical curl examples for replication, attachments, and the changes feed
 
     [:octicons-arrow-right-24: Advanced Guide](advanced-features.md)
-
--   :bricks: __Virtual Databases (VDB)__
-
-    ---
-
-    Automatic sharding for horizontal scalability across multiple nodes
-
-    [:octicons-arrow-right-24: VDB Guide](vdb.md)
-
--   :globe_with_meridians: __Multi-Datacenter Sharding__
-
-    ---
-
-    Zone-aware deployment across regions with automatic replication
-
-    [:octicons-arrow-right-24: Sharding Guide](sharding.md)
 
 -   :chart_with_upwards_trend: __Observability__
 
@@ -79,11 +63,9 @@ Barrel DocDB is a production-ready document database built on Erlang/OTP that pr
 - **Document CRUD** with MVCC revision trees and automatic conflict resolution
 - **Declarative Queries** with automatic path indexing - no manual index creation needed
 - **Real-time Subscriptions** via MQTT-style path patterns and query subscriptions
-- **Peer-to-Peer Replication** with configurable patterns (chain, group, fanout)
-- **Federated Queries** across multiple databases with merged results
-- **Tiered Storage** with automatic TTL/capacity-based migration between hot/warm/cold tiers
-- **Virtual Databases (VDB)** for automatic sharding with scatter-gather queries
-- **Multi-Datacenter** deployment with zone-aware replication and shard placement
+- **Peer-to-Peer Replication** (one-shot or continuous) with pluggable transports
+- **Changes Feed** with long-poll and Server-Sent Events
+- **Attachments** with streaming for large binaries
 - **HTTP API** with REST endpoints, SSE streaming, and Prometheus metrics
 
 ## Why Barrel DocDB?
@@ -183,30 +165,6 @@ Query documents using path-based conditions with automatic indexing. No need to 
         ]}
     ],
     limit => 100
-}).
-```
-
-### :arrows_counterclockwise: Replication Policies
-
-High-level patterns for common topologies:
-
-- **Chain**: A → B → C (write to head, read from tail)
-- **Group**: A ↔ B ↔ C (multi-master sync)
-- **Fanout**: A → B, C, D (event distribution)
-
-### :globe_with_meridians: Federation
-
-Query across multiple databases and merge results transparently:
-
-```erlang
-barrel_federation:create(<<"all_users">>, [
-    <<"local_db">>,
-    <<"http://nodeB:8080/users">>,
-    <<"http://nodeC:8080/users">>
-]).
-
-{ok, Results, Meta} = barrel_federation:find(<<"all_users">>, #{
-    where => [{path, [<<"active">>], true}]
 }).
 ```
 

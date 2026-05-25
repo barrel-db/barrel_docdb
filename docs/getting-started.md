@@ -423,18 +423,6 @@ Now that you have Barrel DocDB running, explore these features:
 
     Sync data between nodes with filtering
 
--   :globe_with_meridians: **[Federation](federation.md)**
-
-    ---
-
-    Query across multiple databases
-
--   :file_folder: **[Tiered Storage](tiered-storage.md)**
-
-    ---
-
-    Hot/warm/cold data tiers with automatic migration
-
 -   :books: **[HTTP API Reference](api/http.md)**
 
     ---
