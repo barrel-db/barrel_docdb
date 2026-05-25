@@ -277,7 +277,7 @@ needs_client_side_filter(Pattern) when is_binary(Pattern) ->
     binary:match(Pattern, <<"+">>) =/= nomatch.
 
 %% Create filter function from MQTT-style pattern
-create_filter_fun(undefined) -> undefined;
+%% (callers handle the no-filter case before calling, so Pattern is always a binary)
 create_filter_fun(Pattern) when is_binary(Pattern) ->
     case match_trie:validate({filter, Pattern}) of
         true ->

@@ -526,7 +526,7 @@ needs_client_side_filter(Pattern) when is_binary(Pattern) ->
 %% Supports:
 %%   + : matches one segment
 %%   # : matches zero or more segments (must be last)
-create_filter_fun(undefined) -> undefined;
+%% Callers handle the no-filter case before calling, so Pattern is always a binary.
 create_filter_fun(Pattern) when is_binary(Pattern) ->
     case match_trie:validate({filter, Pattern}) of
         true ->
