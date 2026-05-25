@@ -134,6 +134,11 @@ start_link() ->
 
 %% @doc Setup all metrics - call this during application startup
 setup() ->
+    %% The instrument application keeps its metric registry across a
+    %% barrel_docdb stop/start, but the exemplar reservoir ETS table is
+    %% created lazily and owned by the first caller. Recreate it here so a
+    %% metric recorded right after a restart never hits a missing table.
+    ok = instrument_exemplar:init_table(),
     Meter = instrument_meter:get_meter(?METER_NAME),
     lists:foreach(fun(Metric) -> declare_metric(Meter, Metric) end, ?METRICS),
     ok.
