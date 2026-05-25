@@ -36,9 +36,9 @@ setup() ->
     ok = filelib:ensure_dir(filename:join(TestDataDir, "dummy")),
     application:set_env(barrel_docdb, data_dir, TestDataDir),
 
-    %% Mock barrel_discovery:node_id/0
-    meck:new(barrel_discovery, [passthrough, non_strict]),
-    meck:expect(barrel_discovery, node_id, fun() -> {ok, <<"test-node-123">>} end),
+    %% Mock node id (stored as a system doc by barrel_peer_auth:get_local_peer_id/0)
+    meck:new(barrel_docdb, [passthrough, non_strict]),
+    meck:expect(barrel_docdb, get_system_doc, fun(_) -> {ok, #{<<"node_id">> => <<"test-node-123">>}} end),
 
     %% Start peer auth
     {ok, Pid} = barrel_peer_auth:start_link(),
@@ -51,7 +51,7 @@ teardown(#{pid := Pid, data_dir := DataDir}) ->
     gen_server:stop(Pid),
 
     %% Clean up meck
-    meck:unload(barrel_discovery),
+    meck:unload(barrel_docdb),
 
     %% Clean up test data directory
     os:cmd("rm -rf " ++ DataDir),
@@ -226,8 +226,8 @@ canonical_string_test() ->
     ok = filelib:ensure_dir(filename:join(TestDataDir, "dummy")),
     application:set_env(barrel_docdb, data_dir, TestDataDir),
 
-    meck:new(barrel_discovery, [passthrough, non_strict]),
-    meck:expect(barrel_discovery, node_id, fun() -> {ok, <<"canonical-test-node">>} end),
+    meck:new(barrel_docdb, [passthrough, non_strict]),
+    meck:expect(barrel_docdb, get_system_doc, fun(_) -> {ok, #{<<"node_id">> => <<"canonical-test-node">>}} end),
 
     {ok, Pid} = barrel_peer_auth:start_link(),
     ok = barrel_peer_auth:init_keys(),
@@ -260,7 +260,7 @@ canonical_string_test() ->
         ?assertNotEqual(Sig1, Sig5)
     after
         gen_server:stop(Pid),
-        meck:unload(barrel_discovery),
+        meck:unload(barrel_docdb),
         os:cmd("rm -rf " ++ TestDataDir)
     end.
 
@@ -271,8 +271,8 @@ verify_with_lookup_fun_test() ->
     ok = filelib:ensure_dir(filename:join(TestDataDir, "dummy")),
     application:set_env(barrel_docdb, data_dir, TestDataDir),
 
-    meck:new(barrel_discovery, [passthrough, non_strict]),
-    meck:expect(barrel_discovery, node_id, fun() -> {ok, <<"lookup-test-node">>} end),
+    meck:new(barrel_docdb, [passthrough, non_strict]),
+    meck:expect(barrel_docdb, get_system_doc, fun(_) -> {ok, #{<<"node_id">> => <<"lookup-test-node">>}} end),
 
     {ok, Pid} = barrel_peer_auth:start_link(),
     ok = barrel_peer_auth:init_keys(),
@@ -309,7 +309,7 @@ verify_with_lookup_fun_test() ->
                      barrel_peer_auth:verify_request(LookupFail, Method, Path, Body, Headers, #{}))
     after
         gen_server:stop(Pid),
-        meck:unload(barrel_discovery),
+        meck:unload(barrel_docdb),
         os:cmd("rm -rf " ++ TestDataDir)
     end.
 
@@ -320,8 +320,8 @@ proplist_headers_test() ->
     ok = filelib:ensure_dir(filename:join(TestDataDir, "dummy")),
     application:set_env(barrel_docdb, data_dir, TestDataDir),
 
-    meck:new(barrel_discovery, [passthrough, non_strict]),
-    meck:expect(barrel_discovery, node_id, fun() -> {ok, <<"proplist-test-node">>} end),
+    meck:new(barrel_docdb, [passthrough, non_strict]),
+    meck:expect(barrel_docdb, get_system_doc, fun(_) -> {ok, #{<<"node_id">> => <<"proplist-test-node">>}} end),
 
     {ok, Pid} = barrel_peer_auth:start_link(),
     ok = barrel_peer_auth:init_keys(),
@@ -348,6 +348,6 @@ proplist_headers_test() ->
         ?assertEqual(ok, barrel_peer_auth:verify_request(PubKey, Method, Path, Body, Headers))
     after
         gen_server:stop(Pid),
-        meck:unload(barrel_discovery),
+        meck:unload(barrel_docdb),
         os:cmd("rm -rf " ++ TestDataDir)
     end.

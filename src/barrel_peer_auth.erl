@@ -437,11 +437,19 @@ normalize_headers(Headers) when is_list(Headers) ->
 get_data_path() ->
     application:get_env(barrel_docdb, data_dir, "data/barrel_docdb").
 
-%% @doc Get local peer ID.
-%% Uses node_id from barrel_discovery if available.
+%% @doc Get local peer ID (persistent, stored as a system doc).
 get_local_peer_id() ->
-  {ok, NodeId} = barrel_discovery:node_id(),
-  NodeId.
+  DocId = <<"_node_id">>,
+  case barrel_docdb:get_system_doc(DocId) of
+    {ok, #{<<"node_id">> := NodeId}} ->
+      NodeId;
+    {error, not_found} ->
+      {ok, Hostname} = inet:gethostname(),
+      Random = base64:encode(crypto:strong_rand_bytes(8)),
+      NodeId = << (list_to_binary(Hostname))/binary, "-", Random/binary >>,
+      ok = barrel_docdb:put_system_doc(DocId, #{<<"node_id">> => NodeId}),
+      NodeId
+  end.
 
 %% @doc Truncate key for logging (show first 16 chars + "...").
 truncate_key(Key) when byte_size(Key) > 16 ->

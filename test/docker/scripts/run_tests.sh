@@ -31,10 +31,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --no-build    Skip Docker build"
             echo "  --cleanup     Remove containers and volumes after tests"
-            echo "  --test NAME   Run specific test (http_api, replication, federation, policies, tiered)"
-            echo ""
-            echo "Note: VDB multi-region tests use a separate cluster. Run them with:"
-            echo "  ./run_vdb_tests.sh"
+            echo "  --test NAME   Run specific test (http_api, replication, tiered)"
             exit 0
             ;;
         *)
@@ -76,8 +73,6 @@ run_test() {
 
 run_test "http_api" "test_http_api.sh"
 run_test "replication" "test_replication.sh"
-run_test "federation" "test_federation.sh"
-run_test "policies" "test_policies.sh"
 run_test "tiered" "test_tiered.sh"
 
 echo "=========================================="

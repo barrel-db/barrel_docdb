@@ -47,15 +47,7 @@
 
     %% HTTP
     inc_http_requests/3,
-    observe_http_latency/3,
-
-    %% Peers
-    set_peers_total/1,
-    set_peers_active/1,
-
-    %% Federation
-    inc_federation_queries/1,
-    observe_federation_latency/2
+    observe_http_latency/3
 ]).
 
 %% Export function
@@ -130,23 +122,7 @@
     %% HTTP latency histogram
     {histogram, barrel_http_request_duration_seconds,
      <<"HTTP request duration in seconds">>,
-     [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]},
-
-    %% Peer count gauges
-    {gauge, barrel_peers_total,
-     <<"Total number of known peers">>},
-
-    {gauge, barrel_peers_active,
-     <<"Number of active/reachable peers">>},
-
-    %% Federation query counter
-    {counter, barrel_federation_queries,
-     <<"Total federation queries">>},
-
-    %% Federation latency histogram
-    {histogram, barrel_federation_query_duration_seconds,
-     <<"Federation query duration in seconds">>,
-     [0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]}
+     [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]}
 ]).
 
 %%====================================================================
@@ -322,52 +298,6 @@ inc_http_requests(Method, Path, Status) ->
 observe_http_latency(Method, Path, DurationMs) ->
     Attrs = #{method => Method, path => Path},
     case instrument_meter:get_instrument(barrel_http_request_duration_seconds) of
-        undefined -> ok;
-        Instrument -> instrument_meter:record(Instrument, DurationMs / 1000, Attrs)
-    end,
-    ok.
-
-%%====================================================================
-%% Peers
-%%====================================================================
-
-%% @doc Set total peer count
--spec set_peers_total(non_neg_integer()) -> ok.
-set_peers_total(Count) ->
-    case instrument_meter:get_instrument(barrel_peers_total) of
-        undefined -> ok;
-        Instrument -> instrument_meter:set(Instrument, Count, #{})
-    end,
-    ok.
-
-%% @doc Set active peer count
--spec set_peers_active(non_neg_integer()) -> ok.
-set_peers_active(Count) ->
-    case instrument_meter:get_instrument(barrel_peers_active) of
-        undefined -> ok;
-        Instrument -> instrument_meter:set(Instrument, Count, #{})
-    end,
-    ok.
-
-%%====================================================================
-%% Federation
-%%====================================================================
-
-%% @doc Increment federation query counter
--spec inc_federation_queries(binary()) -> ok.
-inc_federation_queries(Federation) ->
-    Attrs = #{federation => Federation},
-    case instrument_meter:get_instrument(barrel_federation_queries) of
-        undefined -> ok;
-        Instrument -> instrument_meter:add(Instrument, 1, Attrs)
-    end,
-    ok.
-
-%% @doc Record federation query latency
--spec observe_federation_latency(binary(), number()) -> ok.
-observe_federation_latency(Federation, DurationMs) ->
-    Attrs = #{federation => Federation},
-    case instrument_meter:get_instrument(barrel_federation_query_duration_seconds) of
         undefined -> ok;
         Instrument -> instrument_meter:record(Instrument, DurationMs / 1000, Attrs)
     end,

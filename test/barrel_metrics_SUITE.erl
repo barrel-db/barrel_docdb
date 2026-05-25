@@ -27,23 +27,20 @@
     counter_doc_ops_increment/1,
     counter_query_ops/1,
     counter_http_requests/1,
-    counter_replication/1,
-    counter_federation/1
+    counter_replication/1
 ]).
 
 %% Test cases - gauges
 -export([
     gauge_db_stats/1,
-    gauge_replication/1,
-    gauge_peers/1
+    gauge_replication/1
 ]).
 
 %% Test cases - histograms
 -export([
     histogram_doc_latency/1,
     histogram_query_latency/1,
-    histogram_http_latency/1,
-    histogram_federation_latency/1
+    histogram_http_latency/1
 ]).
 
 %% Test cases - export
@@ -71,19 +68,16 @@ groups() ->
             counter_doc_ops_increment,
             counter_query_ops,
             counter_http_requests,
-            counter_replication,
-            counter_federation
+            counter_replication
         ]},
         {gauges, [sequence], [
             gauge_db_stats,
-            gauge_replication,
-            gauge_peers
+            gauge_replication
         ]},
         {histograms, [sequence], [
             histogram_doc_latency,
             histogram_query_latency,
-            histogram_http_latency,
-            histogram_federation_latency
+            histogram_http_latency
         ]},
         {export, [sequence], [
             export_format,
@@ -281,11 +275,7 @@ all_metrics_registered(_Config) ->
         barrel_db_size_bytes,
         barrel_db_attachments_total,
         barrel_http_requests,
-        barrel_http_request_duration_seconds,
-        barrel_peers_total,
-        barrel_peers_active,
-        barrel_federation_queries,
-        barrel_federation_query_duration_seconds
+        barrel_http_request_duration_seconds
     ],
 
     lists:foreach(fun(Name) ->
@@ -352,16 +342,6 @@ counter_replication(_Config) ->
     assert_counter_with_attrs(barrel_replication_errors, 1.0, #{task_id => <<"task-1">>}),
     ok.
 
-counter_federation(_Config) ->
-    %% Test federation counter
-    barrel_metrics:inc_federation_queries(<<"fed-1">>),
-    barrel_metrics:inc_federation_queries(<<"fed-1">>),
-    barrel_metrics:inc_federation_queries(<<"fed-2">>),
-
-    assert_counter_with_attrs(barrel_federation_queries, 2.0, #{federation => <<"fed-1">>}),
-    assert_counter_with_attrs(barrel_federation_queries, 1.0, #{federation => <<"fed-2">>}),
-    ok.
-
 %%====================================================================
 %% Test Cases - Gauges
 %%====================================================================
@@ -388,22 +368,6 @@ gauge_replication(_Config) ->
     %% Test setting to false
     barrel_metrics:set_rep_active(<<"task-1">>, false),
     assert_gauge_with_attrs(barrel_replication_active, 0.0, #{task_id => <<"task-1">>}),
-    ok.
-
-gauge_peers(_Config) ->
-    %% Test peer gauges
-    barrel_metrics:set_peers_total(10),
-    barrel_metrics:set_peers_active(8),
-
-    instrument_test:assert_gauge(barrel_peers_total, 10.0),
-    instrument_test:assert_gauge(barrel_peers_active, 8.0),
-
-    %% Test updating values
-    barrel_metrics:set_peers_total(12),
-    barrel_metrics:set_peers_active(10),
-
-    instrument_test:assert_gauge(barrel_peers_total, 12.0),
-    instrument_test:assert_gauge(barrel_peers_active, 10.0),
     ok.
 
 %%====================================================================
@@ -457,15 +421,6 @@ histogram_http_latency(_Config) ->
     assert_histogram_with_attrs(barrel_http_request_duration_seconds, 1, 0.050, #{method => <<"GET">>, path => <<"/db/doc">>}),
     ok.
 
-histogram_federation_latency(_Config) ->
-    %% Test federation latency histogram
-    barrel_metrics:observe_federation_latency(<<"fed-1">>, 200.0),
-    barrel_metrics:observe_federation_latency(<<"fed-1">>, 300.0),
-
-    %% Count is 2, sum is (200+300)/1000 = 0.500 seconds
-    assert_histogram_with_attrs(barrel_federation_query_duration_seconds, 2, 0.500, #{federation => <<"fed-1">>}),
-    ok.
-
 %%====================================================================
 %% Test Cases - Export
 %%====================================================================
@@ -500,7 +455,7 @@ export_format(_Config) ->
 export_values(_Config) ->
     %% Record metrics with known values
     barrel_metrics:inc_doc_ops(<<"db">>, put, 5),
-    barrel_metrics:set_peers_total(42),
+    barrel_metrics:set_db_docs(<<"db">>, 42),
 
     %% Export
     Output = barrel_metrics:export_text(),
@@ -510,7 +465,7 @@ export_values(_Config) ->
     ?assertNotEqual(nomatch, binary:match(Output, <<"5">>)),
 
     %% Verify gauge name and value in export
-    ?assertNotEqual(nomatch, binary:match(Output, <<"barrel_peers_total">>)),
+    ?assertNotEqual(nomatch, binary:match(Output, <<"barrel_db_documents_total">>)),
     ?assertNotEqual(nomatch, binary:match(Output, <<"42">>)),
 
     ok.

@@ -153,13 +153,6 @@ build_dispatch() ->
             %% Prometheus metrics endpoint
             {"/metrics", barrel_http_handler, #{action => metrics}},
 
-            %% Discovery endpoint (Mastodon-like node info)
-            {"/.well-known/barrel", barrel_http_handler, #{action => node_info}},
-
-            %% Peer management
-            {"/_peers", barrel_http_handler, #{action => peers}},
-            {"/_peers/:peer_url", barrel_http_handler, #{action => peer}},
-
             %% API key management (admin only)
             {"/keys", barrel_http_handler, #{action => keys}},
             {"/keys/:key_prefix", barrel_http_handler, #{action => key}},
@@ -167,32 +160,6 @@ build_dispatch() ->
             %% Admin usage endpoints
             {"/admin/usage", barrel_http_handler, #{action => admin_usage}},
             {"/admin/databases/:db/usage", barrel_http_handler, #{action => admin_db_usage}},
-
-            %% Federation endpoints
-            {"/_federation", barrel_http_handler, #{action => federations}},
-            {"/_federation/:name", barrel_http_handler, #{action => federation}},
-            {"/_federation/:name/members/:member", barrel_http_handler, #{action => federation_member}},
-            {"/_federation/:name/_find", barrel_http_handler, #{action => federation_find}},
-
-            %% Replication policy endpoints
-            {"/_policies", barrel_http_handler, #{action => policies}},
-            {"/_policies/:name", barrel_http_handler, #{action => policy}},
-            {"/_policies/:name/_enable", barrel_http_handler, #{action => policy_enable}},
-            {"/_policies/:name/_disable", barrel_http_handler, #{action => policy_disable}},
-            {"/_policies/:name/_status", barrel_http_handler, #{action => policy_status}},
-
-            %% VDB (Virtual Database / Sharded Database) endpoints
-            {"/vdb", barrel_http_handler, #{action => vdb_list}},
-            {"/vdb/:vdb", barrel_http_handler, #{action => vdb_info}},
-            {"/vdb/:vdb/_shards", barrel_http_handler, #{action => vdb_shards}},
-            {"/vdb/:vdb/_replication", barrel_http_handler, #{action => vdb_replication}},
-            {"/vdb/:vdb/_changes", barrel_http_handler, #{action => vdb_changes}},
-            {"/vdb/:vdb/_bulk_docs", barrel_http_handler, #{action => vdb_bulk_docs}},
-            {"/vdb/:vdb/_find", barrel_http_handler, #{action => vdb_find}},
-            {"/vdb/:vdb/_import", barrel_http_handler, #{action => vdb_import}},
-            {"/vdb/:vdb/_shards/:shard/_split", barrel_http_handler, #{action => vdb_shard_split}},
-            {"/vdb/:vdb/_shards/:shard/_merge", barrel_http_handler, #{action => vdb_shard_merge}},
-            {"/vdb/:vdb/:doc_id", barrel_http_handler, #{action => vdb_doc}},
 
             %% Database operations
             {"/db/:db", barrel_http_handler, #{action => db_info}},
