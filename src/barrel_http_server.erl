@@ -176,12 +176,6 @@ build_dispatch() ->
             %% Query endpoint
             {"/db/:db/_find", barrel_http_handler, #{action => find}},
 
-            %% Materialized views
-            {"/db/:db/_views", barrel_http_handler, #{action => views}},
-            {"/db/:db/_views/:view_id", barrel_http_handler, #{action => view}},
-            {"/db/:db/_views/:view_id/_query", barrel_http_handler, #{action => view_query}},
-            {"/db/:db/_views/:view_id/_refresh", barrel_http_handler, #{action => view_refresh}},
-
             %% Replication endpoints
             {"/db/:db/_replicate", barrel_http_handler, #{action => replicate}},
             {"/db/:db/_revsdiff", barrel_http_handler, #{action => revsdiff}},
