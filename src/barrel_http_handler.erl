@@ -85,6 +85,9 @@ maybe_authenticate(health, _Req) ->
 maybe_authenticate(metrics, _Req) ->
     %% Metrics endpoint is always public (for Prometheus scraping)
     ok;
+maybe_authenticate(node_info, _Req) ->
+    %% Node identity is public
+    ok;
 maybe_authenticate(Action, Req) when Action =:= keys; Action =:= key;
                                      Action =:= admin_usage; Action =:= admin_db_usage ->
     %% Key management and admin endpoints require admin authentication
@@ -215,6 +218,11 @@ handle_action(metrics, <<"GET">>, Req) ->
     MetricsText = barrel_metrics:export_text(),
     Headers = #{<<"content-type">> => <<"text/plain; version=0.0.4; charset=utf-8">>},
     {200, Headers, MetricsText, Req};
+
+%% Node identity (no discovery/federation, just this node's id and version)
+handle_action(node_info, <<"GET">>, Req) ->
+    Body = encode_response(node_info_map(), Req),
+    {200, response_headers(Req), Body, Req};
 
 %% Database info
 handle_action(db_info, <<"GET">>, Req) ->
@@ -1441,6 +1449,27 @@ sanitize_value(V) when is_list(V) ->
     lists:map(fun sanitize_value/1, V);
 sanitize_value(V) ->
     V.
+
+%%====================================================================
+%% Node identity
+%%====================================================================
+
+%% @doc Build the node identity map served at /.well-known/barrel.
+%% Includes the persistent node id, the release version, and (when peer
+%% auth is initialized) the Ed25519 public key. No discovery/federation.
+node_info_map() ->
+    Version = case application:get_key(barrel_docdb, vsn) of
+        {ok, Vsn} -> list_to_binary(Vsn);
+        undefined -> <<"dev">>
+    end,
+    Base = #{
+        <<"node_id">> => barrel_docdb:node_id(),
+        <<"version">> => Version
+    },
+    case barrel_peer_auth:get_public_key_base64() of
+        {ok, PubKeyB64} -> Base#{<<"public_key">> => PubKeyB64};
+        _ -> Base
+    end.
 
 %%====================================================================
 %% Health Check

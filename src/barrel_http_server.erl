@@ -153,6 +153,9 @@ build_dispatch() ->
             %% Prometheus metrics endpoint
             {"/metrics", barrel_http_handler, #{action => metrics}},
 
+            %% Node identity (node_id, version, public key)
+            {"/.well-known/barrel", barrel_http_handler, #{action => node_info}},
+
             %% API key management (admin only)
             {"/keys", barrel_http_handler, #{action => keys}},
             {"/keys/:key_prefix", barrel_http_handler, #{action => key}},

@@ -36,9 +36,9 @@ setup() ->
     ok = filelib:ensure_dir(filename:join(TestDataDir, "dummy")),
     application:set_env(barrel_docdb, data_dir, TestDataDir),
 
-    %% Mock node id (stored as a system doc by barrel_peer_auth:get_local_peer_id/0)
+    %% Mock the node identity used by barrel_peer_auth:get_local_peer_id/0
     meck:new(barrel_docdb, [passthrough, non_strict]),
-    meck:expect(barrel_docdb, get_system_doc, fun(_) -> {ok, #{<<"node_id">> => <<"test-node-123">>}} end),
+    meck:expect(barrel_docdb, node_id, fun() -> <<"test-node-123">> end),
 
     %% Start peer auth
     {ok, Pid} = barrel_peer_auth:start_link(),
@@ -227,7 +227,7 @@ canonical_string_test() ->
     application:set_env(barrel_docdb, data_dir, TestDataDir),
 
     meck:new(barrel_docdb, [passthrough, non_strict]),
-    meck:expect(barrel_docdb, get_system_doc, fun(_) -> {ok, #{<<"node_id">> => <<"canonical-test-node">>}} end),
+    meck:expect(barrel_docdb, node_id, fun() -> <<"canonical-test-node">> end),
 
     {ok, Pid} = barrel_peer_auth:start_link(),
     ok = barrel_peer_auth:init_keys(),
@@ -272,7 +272,7 @@ verify_with_lookup_fun_test() ->
     application:set_env(barrel_docdb, data_dir, TestDataDir),
 
     meck:new(barrel_docdb, [passthrough, non_strict]),
-    meck:expect(barrel_docdb, get_system_doc, fun(_) -> {ok, #{<<"node_id">> => <<"lookup-test-node">>}} end),
+    meck:expect(barrel_docdb, node_id, fun() -> <<"lookup-test-node">> end),
 
     {ok, Pid} = barrel_peer_auth:start_link(),
     ok = barrel_peer_auth:init_keys(),
@@ -321,7 +321,7 @@ proplist_headers_test() ->
     application:set_env(barrel_docdb, data_dir, TestDataDir),
 
     meck:new(barrel_docdb, [passthrough, non_strict]),
-    meck:expect(barrel_docdb, get_system_doc, fun(_) -> {ok, #{<<"node_id">> => <<"proplist-test-node">>}} end),
+    meck:expect(barrel_docdb, node_id, fun() -> <<"proplist-test-node">> end),
 
     {ok, Pid} = barrel_peer_auth:start_link(),
     ok = barrel_peer_auth:init_keys(),
