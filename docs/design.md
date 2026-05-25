@@ -637,15 +637,19 @@ barrel_docdb_sup (one_for_one)
 ## Future Considerations
 
 ### Planned Features
-- Continuous replication
-- HTTP transport for replication
-- Reduce functions for views
 - Conflict resolution helpers
+- External tiering layer built on the changes feed, metrics, and the reserved `created_at`/`expires_at`/`tier` entity columns
+- External sharding and cluster coordination built on the replication engine and system documents
 
 ### Extension Points
+
+barrel_docdb is a document-database building block. Higher-level capabilities
+(sharding, tiering, clustering) are meant to be built on top of its public API
+rather than baked in:
+
 - Custom storage backends (via behaviour)
-- Custom replication transports
-- View behaviours for different index types
+- Custom replication transports (via the `barrel_rep_transport` behaviour)
+- Cluster/tiering substrate: changes feed, revision primitives (`put_rev`/`revsdiff`), HLC, system and local documents, and store/index introspection (`get_db_size`, range scans, snapshots)
 
 ## File Structure
 
@@ -670,7 +674,6 @@ src/
 ├── barrel_changes_stream.erl   # Streaming changes
 │
 ├── barrel_sub.erl              # Path subscriptions manager
-├── barrel_sub_sup.erl          # Subscription supervisor
 ├── barrel_query_sub.erl        # Query subscriptions manager
 │
 ├── barrel_query.erl            # Declarative query compiler & executor
