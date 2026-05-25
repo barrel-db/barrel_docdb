@@ -31,7 +31,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --no-build    Skip Docker build"
             echo "  --cleanup     Remove containers and volumes after tests"
-            echo "  --test NAME   Run specific test (http_api, replication, tiered)"
+            echo "  --test NAME   Run specific test (http_api, replication)"
             exit 0
             ;;
         *)
@@ -73,7 +73,6 @@ run_test() {
 
 run_test "http_api" "test_http_api.sh"
 run_test "replication" "test_replication.sh"
-run_test "tiered" "test_tiered.sh"
 
 echo "=========================================="
 echo -e "  ${GREEN}All Tests Completed${NC}"

@@ -35,13 +35,6 @@
     changes_stream_with_doc_ids/1,
     changes_stream_with_query/1,
     bulk_docs/1,
-    %% Tier tests
-    tier_config_set/1,
-    tier_config_get/1,
-    tier_capacity/1,
-    tier_doc_get/1,
-    tier_doc_ttl/1,
-    tier_run_migration/1,
     %% Usage tests
     admin_usage_all/1,
     admin_usage_single_db/1,
@@ -57,7 +50,7 @@
 %%====================================================================
 
 all() ->
-    [{group, http_tests}, {group, tier_tests}, {group, usage_tests}].
+    [{group, http_tests}, {group, usage_tests}].
 
 groups() ->
     [
@@ -82,14 +75,6 @@ groups() ->
             changes_stream_with_doc_ids,
             changes_stream_with_query,
             bulk_docs
-        ]},
-        {tier_tests, [sequence], [
-            tier_config_set,
-            tier_config_get,
-            tier_capacity,
-            tier_doc_get,
-            tier_doc_ttl,
-            tier_run_migration
         ]},
         {usage_tests, [sequence], [
             admin_usage_all,
@@ -123,11 +108,6 @@ init_per_group(http_tests, Config) ->
     %% Create test database
     {ok, _} = barrel_docdb:create_db(<<"testdb">>),
     Config;
-init_per_group(tier_tests, Config) ->
-    %% Create test databases for tier tests
-    {ok, _} = barrel_docdb:create_db(<<"tier_test_db">>),
-    {ok, _} = barrel_docdb:create_db(<<"tier_warm_db">>),
-    Config;
 init_per_group(usage_tests, Config) ->
     %% Create test database for usage tests
     {ok, _} = barrel_docdb:create_db(<<"usage_http_test_db">>),
@@ -140,11 +120,6 @@ auth_header(Config) ->
 
 end_per_group(http_tests, _Config) ->
     barrel_docdb:delete_db(<<"testdb">>),
-    ok;
-end_per_group(tier_tests, _Config) ->
-    %% Clean up tier test databases
-    barrel_docdb:delete_db(<<"tier_test_db">>),
-    barrel_docdb:delete_db(<<"tier_warm_db">>),
     ok;
 end_per_group(usage_tests, _Config) ->
     %% Clean up usage test database
@@ -880,131 +855,6 @@ bulk_docs(Config) ->
         end,
         Results
     ),
-    ok.
-
-%%====================================================================
-%% Tier HTTP API Tests
-%%====================================================================
-
-%% @doc Test setting tier configuration via HTTP
-tier_config_set(Config) ->
-    Auth = auth_header(Config),
-    TierConfig = #{
-        <<"enabled">> => true,
-        <<"warm_db">> => <<"tier_warm_db">>,
-        <<"hot_threshold">> => 3600,
-        <<"warm_threshold">> => 86400
-    },
-    ReqBody = iolist_to_binary(json:encode(TierConfig)),
-
-    {ok, 200, _Headers, Body} = hackney:post(
-        ?BASE_URL ++ "/db/tier_test_db/_tier/config",
-        [Auth,
-         {<<"Content-Type">>, <<"application/json">>},
-         {<<"Accept">>, <<"application/json">>}],
-        ReqBody,
-        []
-    ),
-    #{<<"ok">> := true} = json:decode(Body),
-    ok.
-
-%% @doc Test getting tier configuration via HTTP
-tier_config_get(Config) ->
-    Auth = auth_header(Config),
-
-    {ok, 200, _Headers, Body} = hackney:get(
-        ?BASE_URL ++ "/db/tier_test_db/_tier/config",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    TierConfig = json:decode(Body),
-    true = maps:get(<<"enabled">>, TierConfig),
-    <<"tier_warm_db">> = maps:get(<<"warm_db">>, TierConfig),
-    ok.
-
-%% @doc Test getting capacity info via HTTP
-tier_capacity(Config) ->
-    Auth = auth_header(Config),
-
-    {ok, 200, _Headers, Body} = hackney:get(
-        ?BASE_URL ++ "/db/tier_test_db/_tier/capacity",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    CapacityInfo = json:decode(Body),
-    %% Should have size_bytes or similar field
-    true = is_map(CapacityInfo),
-    ok.
-
-%% @doc Test getting document tier via HTTP
-tier_doc_get(Config) ->
-    Auth = auth_header(Config),
-
-    %% First create a document
-    Doc = #{<<"_id">> => <<"tier_test_doc">>, <<"value">> => <<"test">>},
-    DocBody = iolist_to_binary(json:encode(Doc)),
-    {ok, 201, _, _PutBody} = hackney:put(
-        ?BASE_URL ++ "/db/tier_test_db/tier_test_doc",
-        [Auth,
-         {<<"Content-Type">>, <<"application/json">>},
-         {<<"Accept">>, <<"application/json">>}],
-        DocBody,
-        []
-    ),
-
-    %% Get document tier
-    {ok, 200, _Headers, Body} = hackney:get(
-        ?BASE_URL ++ "/db/tier_test_db/tier_test_doc/_tier",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    TierInfo = json:decode(Body),
-    <<"tier_test_doc">> = maps:get(<<"doc_id">>, TierInfo),
-    ok.
-
-%% @doc Test setting and getting document TTL via HTTP
-tier_doc_ttl(Config) ->
-    Auth = auth_header(Config),
-
-    %% Set TTL
-    TTLSpec = #{<<"ttl">> => 3600},
-    TTLBody = iolist_to_binary(json:encode(TTLSpec)),
-    {ok, 200, _Headers, SetBody} = hackney:post(
-        ?BASE_URL ++ "/db/tier_test_db/tier_test_doc/_tier/ttl",
-        [Auth,
-         {<<"Content-Type">>, <<"application/json">>},
-         {<<"Accept">>, <<"application/json">>}],
-        TTLBody,
-        []
-    ),
-    #{<<"ok">> := true} = json:decode(SetBody),
-
-    %% Get TTL
-    {ok, 200, _Headers2, GetBody} = hackney:get(
-        ?BASE_URL ++ "/db/tier_test_db/tier_test_doc/_tier/ttl",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    TTLInfo = json:decode(GetBody),
-    true = is_map(TTLInfo),
-    ok.
-
-%% @doc Test running migration via HTTP
-tier_run_migration(Config) ->
-    Auth = auth_header(Config),
-
-    {ok, 200, _Headers, Body} = hackney:post(
-        ?BASE_URL ++ "/db/tier_test_db/_tier/run_migration",
-        [Auth, {<<"Accept">>, <<"application/json">>}],
-        <<>>,
-        []
-    ),
-    Result = json:decode(Body),
-    true = maps:get(<<"ok">>, Result),
     ok.
 
 %%====================================================================

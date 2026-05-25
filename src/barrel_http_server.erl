@@ -195,14 +195,6 @@ build_dispatch() ->
             {"/db/:db/:doc_id/_attachments", barrel_http_handler, #{action => attachments}},
             {"/db/:db/:doc_id/_attachments/:att_name", barrel_http_handler, #{action => attachment}},
 
-            %% Tier management endpoints
-            {"/db/:db/_tier/config", barrel_http_handler, #{action => tier_config}},
-            {"/db/:db/_tier/capacity", barrel_http_handler, #{action => tier_capacity}},
-            {"/db/:db/_tier/migrate", barrel_http_handler, #{action => tier_migrate}},
-            {"/db/:db/_tier/run_migration", barrel_http_handler, #{action => tier_run_migration}},
-            {"/db/:db/:doc_id/_tier/ttl", barrel_http_handler, #{action => doc_tier_ttl}},
-            {"/db/:db/:doc_id/_tier", barrel_http_handler, #{action => doc_tier}},
-
             %% Document operations (variable path - must be last)
             {"/db/:db/:doc_id", barrel_http_handler, #{action => doc}}
         ]}
