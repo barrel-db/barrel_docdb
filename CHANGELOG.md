@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-05-26
+
+### Added
+- `GET /.well-known/barrel` node identity endpoint returning `node_id`, `version`, and (when peer auth is initialized) `public_key`, with no dependency on discovery or federation
+- Public `barrel_docdb:node_id/0` seam (persistent `_node_id` system document) for an external discovery or cluster layer
 
 ### Removed
 - **Virtual Database (VDB) and sharding**: removed `barrel_vdb*`, `barrel_shard_map`, and `barrel_shard_rebalance` with the `/vdb` HTTP endpoints
@@ -17,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Reduced scope to a document-database core: CRUD with MVCC, declarative queries, changes feed, attachments, pub/sub, and the replication engine. Sharding, tiering, and clustering can be built on top via the public API (changes feed, revision primitives, HLC, system and local documents, store/index introspection, and metrics).
 - `barrel_peer_auth` is retained (used by the HTTP replication transport); its node id now persists in a `_node_id` system document.
+- Upgraded the instrument dependency to v1.1.2.
+
+### Fixed
+- Metrics exemplar reservoir table is no longer lost on an application stop/start. It is initialized in `barrel_metrics:setup/0`, which previously caused `barrel_rep_tasks` to crash on restart when the first histogram value was recorded.
 
 ## [0.5.0] - 2026-04-04
 
