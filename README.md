@@ -206,7 +206,7 @@ In your `sys.config`:
 
 ## Requirements
 
-- Erlang/OTP 27+
+- Erlang/OTP 28+
 - RocksDB (via rocksdb hex package)
 
 ## Installation
