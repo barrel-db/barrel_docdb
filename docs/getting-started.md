@@ -4,7 +4,7 @@ This guide walks you through installing and using Barrel DocDB. You'll have a wo
 
 ## Prerequisites
 
-- **Erlang/OTP 27+** (for embedded use or building from source)
+- **Erlang/OTP 28+** (for embedded use or building from source)
 - **Docker** (optional, for standalone deployment)
 
 ## Installation

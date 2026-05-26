@@ -6,7 +6,7 @@ Thank you for your interest in contributing to Barrel DocDB!
 
 ### Prerequisites
 
-- Erlang/OTP 27+
+- Erlang/OTP 28+
 - Git
 - RocksDB development libraries
 

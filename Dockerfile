@@ -2,7 +2,7 @@
 # Multi-stage build for minimal runtime image
 
 # Build stage - use official Debian-based Erlang image
-FROM erlang:27 AS builder
+FROM erlang:28 AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
