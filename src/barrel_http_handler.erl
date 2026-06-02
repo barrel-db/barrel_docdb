@@ -856,15 +856,26 @@ handle_put_rev(Req0) ->
 handle_sync_hlc(Req0) ->
     DbName = cowboy_req:binding(db, Req0),
     {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
-    #{<<"hlc">> := HlcBin} = decode_request_body(ReqBody, Req1),
-    RemoteHlc = parse_hlc(HlcBin),
+    case decode_request_body(ReqBody, Req1) of
+        #{<<"hlc">> := HlcBin} when is_binary(HlcBin) ->
+            case parse_hlc(HlcBin) of
+                {ok, RemoteHlc} ->
+                    do_sync_hlc(DbName, RemoteHlc, Req1);
+                {error, invalid_hlc} ->
+                    throw({error, 400, <<"Invalid hlc value">>})
+            end;
+        _ ->
+            throw({error, 400, <<"Missing hlc field">>})
+    end.
+
+do_sync_hlc(DbName, RemoteHlc, Req) ->
     case barrel_docdb:sync_hlc(RemoteHlc) of
         {ok, LocalHlc} ->
             Response = #{<<"hlc">> => format_hlc(LocalHlc), <<"db">> => DbName},
-            Body = encode_response(Response, Req1),
-            {200, response_headers(Req1), Body, Req1};
-        {error, Reason} ->
-            throw({error, 500, format_error(Reason)})
+            Body = encode_response(Response, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, clock_skew} ->
+            throw({error, 409, <<"Clock skew rejected">>})
     end.
 
 %%====================================================================
@@ -1194,7 +1205,11 @@ parse_changes_opts(Req) ->
         <<"0">> -> first;
         <<"first">> -> first;
         <<"now">> -> now;  %% Signal to fetch current HLC
-        HlcBin -> parse_hlc(HlcBin)
+        HlcBin ->
+            case parse_hlc(HlcBin) of
+                {ok, Hlc} -> Hlc;
+                {error, invalid_hlc} -> first
+            end
     end,
     %% Parse feed type (normal or longpoll)
     Feed = case proplists:get_value(<<"feed">>, Qs) of
@@ -1260,14 +1275,24 @@ format_hlc(Hlc) when is_tuple(Hlc) ->
 format_hlc(Hlc) ->
     Hlc.
 
+%% @doc Parse an HLC binary in Erlang term syntax (e.g. <<"{timestamp,1,1}">>).
+%% Returns {ok, Term} on a valid {timestamp, W, L} tuple, {error, invalid_hlc}
+%% otherwise. Earlier versions of this function returned the sentinel atom
+%% `first` on any failure, which laundered bad input into a value the rest
+%% of the system treated as legitimate.
 parse_hlc(HlcBin) when is_binary(HlcBin) ->
-    %% Try to parse as Erlang term
     try
         {ok, Tokens, _} = erl_scan:string(binary_to_list(HlcBin) ++ "."),
         {ok, Term} = erl_parse:parse_term(Tokens),
-        Term
+        case Term of
+            {timestamp, W, L} when is_integer(W), is_integer(L),
+                                   W >= 0, L >= 0 ->
+                {ok, Term};
+            _ ->
+                {error, invalid_hlc}
+        end
     catch
-        _:_ -> first
+        _:_ -> {error, invalid_hlc}
     end.
 
 %% @doc Resolve 'now' to the current HLC for the database

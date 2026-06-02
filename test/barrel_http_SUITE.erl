@@ -36,6 +36,9 @@
     changes_stream_with_doc_ids/1,
     changes_stream_with_query/1,
     bulk_docs/1,
+    sync_hlc_missing_field/1,
+    sync_hlc_invalid_value/1,
+    sync_hlc_valid/1,
     %% Usage tests
     admin_usage_all/1,
     admin_usage_single_db/1,
@@ -76,7 +79,10 @@ groups() ->
             changes_stream_include_docs,
             changes_stream_with_doc_ids,
             changes_stream_with_query,
-            bulk_docs
+            bulk_docs,
+            sync_hlc_missing_field,
+            sync_hlc_invalid_value,
+            sync_hlc_valid
         ]},
         {usage_tests, [sequence], [
             admin_usage_all,
@@ -867,6 +873,52 @@ bulk_docs(Config) ->
         end,
         Results
     ),
+    ok.
+
+%% @doc Sending an empty body to _sync_hlc must return 400, not crash.
+sync_hlc_missing_field(Config) ->
+    Auth = auth_header(Config),
+    {ok, 400, _Headers, Body} = hackney:post(
+        ?BASE_URL ++ "/db/testdb/_sync_hlc",
+        [Auth,
+         {<<"Content-Type">>, <<"application/json">>},
+         {<<"Accept">>, <<"application/json">>}],
+        <<"{}">>,
+        []
+    ),
+    #{<<"error">> := <<"Missing hlc field">>} = json:decode(Body),
+    %% Global clock must still be alive after the rejection.
+    {ok, 200, _, _} = hackney:get(?BASE_URL ++ "/health", [], <<>>, []),
+    ok.
+
+%% @doc An unparseable hlc value must return 400, not crash the clock.
+sync_hlc_invalid_value(Config) ->
+    Auth = auth_header(Config),
+    {ok, 400, _Headers, Body} = hackney:post(
+        ?BASE_URL ++ "/db/testdb/_sync_hlc",
+        [Auth,
+         {<<"Content-Type">>, <<"application/json">>},
+         {<<"Accept">>, <<"application/json">>}],
+        <<"{\"hlc\":\"not-a-timestamp\"}">>,
+        []
+    ),
+    #{<<"error">> := <<"Invalid hlc value">>} = json:decode(Body),
+    {ok, 200, _, _} = hackney:get(?BASE_URL ++ "/health", [], <<>>, []),
+    ok.
+
+%% @doc A well-formed {timestamp,W,L} value updates the clock and returns 200.
+sync_hlc_valid(Config) ->
+    Auth = auth_header(Config),
+    {ok, 200, _Headers, Body} = hackney:post(
+        ?BASE_URL ++ "/db/testdb/_sync_hlc",
+        [Auth,
+         {<<"Content-Type">>, <<"application/json">>},
+         {<<"Accept">>, <<"application/json">>}],
+        <<"{\"hlc\":\"{timestamp,1,1}\"}">>,
+        []
+    ),
+    #{<<"hlc">> := Hlc, <<"db">> := <<"testdb">>} = json:decode(Body),
+    true = is_binary(Hlc),
     ok.
 
 %%====================================================================
