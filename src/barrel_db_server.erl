@@ -501,6 +501,35 @@ do_put_doc(StoreRef, DbName, Doc, Opts) ->
             {undefined, undefined, #{}, undefined, undefined}
     end,
 
+    %% MVCC check: the client must supply the current winning revision
+    %% when updating an existing document via the regular put_doc API.
+    %% The replication path (bulk_docs with explicit `history`) carries
+    %% no `hash` field on the doc record and is exempt here; conflict
+    %% detection happens in the revtree merge.
+    case mvcc_check(OldRev, Revs, DocRecord) of
+        ok ->
+            do_put_doc_apply(StoreRef, DbName, DocId, Revs, NewRev, Deleted,
+                             DocBody, OldHlc, OldRev, OldRevTree, OldDocBody,
+                             OldDocBodyCbor, Opts);
+        {error, conflict} ->
+            {error, conflict}
+    end.
+
+%% @doc MVCC pre-check for the regular (non-replication) put path.
+%% - DocRecord without a `hash` key came through the bulk `history`
+%%   constructor (replication / put_rev). Skip the check.
+%% - No existing doc: accept regardless.
+%% - Existing doc + supplied parent rev matches winner: accept.
+%% - Otherwise: conflict.
+mvcc_check(_OldRev, _Revs, DocRecord) when not is_map_key(hash, DocRecord) -> ok;
+mvcc_check(undefined, _Revs, _DocRecord) -> ok;
+mvcc_check(OldRev, [_NewRev, ParentRev | _], _DocRecord) when ParentRev =:= OldRev -> ok;
+mvcc_check(_OldRev, _Revs, _DocRecord) -> {error, conflict}.
+
+do_put_doc_apply(StoreRef, DbName, DocId, Revs, NewRev, Deleted, DocBody,
+                 OldHlc, OldRev, OldRevTree, OldDocBody, OldDocBodyCbor, Opts) ->
+    DocEntityKey = barrel_store_keys:doc_entity(DbName, DocId),
+
     %% Build revision tree (merge with existing)
     RevTree = case length(Revs) of
         1 ->
@@ -702,6 +731,16 @@ prepare_doc_ops(StoreRef, DbName, Doc) ->
                 {ExistingHlc, ExistingRev, OldTree, OldBody, OldCbor, TierMeta};
             not_found ->
                 {undefined, undefined, #{}, undefined, undefined, {<<>>, 0, 0}}
+        end,
+
+        %% MVCC check: bulk_docs without explicit `history` is treated
+        %% as the regular update path and must supply the current winning
+        %% _rev when overwriting an existing document. Bulk entries that
+        %% carry `history` (replication) are exempt — DocRecord lacks the
+        %% `hash` key in that case.
+        case mvcc_check(OldRev, Revs, DocRecord) of
+            ok -> ok;
+            {error, conflict} -> throw(conflict)
         end,
 
         %% Build revision tree (merge with existing)

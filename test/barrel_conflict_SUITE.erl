@@ -17,7 +17,8 @@
 all() ->
     [
         {group, conflict_detection},
-        {group, conflict_resolution}
+        {group, conflict_resolution},
+        {group, mvcc}
     ].
 
 groups() ->
@@ -34,6 +35,12 @@ groups() ->
             resolve_conflict_merge,
             resolve_conflict_no_conflicts_error,
             resolve_conflict_invalid_rev_error
+        ]},
+        {mvcc, [sequence], [
+            mvcc_first_write_no_rev,
+            mvcc_update_without_rev_rejected,
+            mvcc_update_with_stale_rev_rejected,
+            mvcc_update_with_current_rev_accepted
         ]}
     ].
 
@@ -356,4 +363,49 @@ resolve_conflict_invalid_rev_error(_Config) ->
     {error, {invalid_rev, _}} = barrel_docdb:resolve_conflict(DbName, DocId, Winner,
                                                               {choose, <<"2-doesnotexist">>}),
 
+    ok.
+
+
+%%====================================================================
+%% MVCC strict _rev tests
+%%====================================================================
+
+mvcc_first_write_no_rev(_Config) ->
+    DbName = <<"conflict_test_db">>,
+    DocId = <<"mvcc_first">>,
+    %% First write without _rev: accepted (no existing doc).
+    {ok, _} = barrel_docdb:put_doc(DbName, #{<<"id">> => DocId, <<"v">> => 1}),
+    ok.
+
+mvcc_update_without_rev_rejected(_Config) ->
+    DbName = <<"conflict_test_db">>,
+    DocId = <<"mvcc_no_rev">>,
+    {ok, _} = barrel_docdb:put_doc(DbName, #{<<"id">> => DocId, <<"v">> => 1}),
+    %% Second write without _rev: must be rejected as conflict.
+    ?assertEqual({error, conflict},
+                 barrel_docdb:put_doc(DbName, #{<<"id">> => DocId, <<"v">> => 2})),
+    ok.
+
+mvcc_update_with_stale_rev_rejected(_Config) ->
+    DbName = <<"conflict_test_db">>,
+    DocId = <<"mvcc_stale">>,
+    {ok, #{<<"rev">> := Rev1}} = barrel_docdb:put_doc(
+        DbName, #{<<"id">> => DocId, <<"v">> => 1}),
+    {ok, _} = barrel_docdb:put_doc(
+        DbName, #{<<"id">> => DocId, <<"_rev">> => Rev1, <<"v">> => 2}),
+    %% Using the old Rev1 now is stale.
+    ?assertEqual({error, conflict},
+                 barrel_docdb:put_doc(
+                   DbName,
+                   #{<<"id">> => DocId, <<"_rev">> => Rev1, <<"v">> => 3})),
+    ok.
+
+mvcc_update_with_current_rev_accepted(_Config) ->
+    DbName = <<"conflict_test_db">>,
+    DocId = <<"mvcc_current">>,
+    {ok, #{<<"rev">> := Rev1}} = barrel_docdb:put_doc(
+        DbName, #{<<"id">> => DocId, <<"v">> => 1}),
+    {ok, #{<<"rev">> := Rev2}} = barrel_docdb:put_doc(
+        DbName, #{<<"id">> => DocId, <<"_rev">> => Rev1, <<"v">> => 2}),
+    true = Rev2 =/= Rev1,
     ok.

@@ -214,14 +214,22 @@ handle_action(db_info, <<"PUT">>, Req) ->
             {201, response_headers(Req), Body, Req};
         {error, already_exists} ->
             throw({error, 409, <<"Database already exists">>});
+        {error, invalid_db_name} ->
+            throw({error, 400, <<"Invalid database name">>});
         {error, Reason} ->
             throw({error, 500, format_error(Reason)})
     end;
 handle_action(db_info, <<"DELETE">>, Req) ->
     DbName = cowboy_req:binding(db, Req),
-    ok = barrel_docdb:delete_db(DbName),
-    Body = encode_response(#{ok => true}, Req),
-    {200, response_headers(Req), Body, Req};
+    case barrel_docdb:delete_db(DbName) of
+        ok ->
+            Body = encode_response(#{ok => true}, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, invalid_db_name} ->
+            throw({error, 400, <<"Invalid database name">>});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end;
 handle_action(db_info, <<"POST">>, Req) ->
     handle_post_doc(Req);
 
