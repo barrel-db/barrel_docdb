@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] - 2026-06-02
+
+### Security
+- **MVCC: stale or missing `_rev` on update is now rejected with `{error, conflict}` (HTTP 409).** Previously, `barrel_docdb:put_doc/2,3` and the bulk path silently overwrote the stored body and reported a different winning rev — a classic lost-update bug. The replication path (`put_rev`, bulk entries carrying explicit `history`) is unchanged: the revtree merge handles conflict detection there.
+- **Database names are validated.** `barrel_docdb:create_db/1,2` and `delete_db/1` reject anything that does not match `[a-z0-9_-]{1,63}` (system databases keep their leading `_`). HTTP 400 is returned for invalid names at `PUT /db/:db` and `DELETE /db/:db`. Prevents filesystem traversal via the data directory.
+- **`delete_db/1` no longer shells out.** Replaces `os:cmd("rm -rf " ++ DbPath)` with `file:del_dir_r/1`. Removes the shell-injection surface that depended on whatever ended up in `DbPath`.
+
 ## [0.6.2] - 2026-06-02
 
 ### Removed

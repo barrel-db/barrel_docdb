@@ -209,12 +209,40 @@ create_db(Name) ->
 %% @returns `{ok, Pid}' on success, `{error, already_exists}' if database exists
 -spec create_db(binary(), map()) -> {ok, pid()} | {error, term()}.
 create_db(Name, Opts) when is_binary(Name) ->
-    case get_db(Name) of
-        {ok, _Pid} ->
-            {error, already_exists};
-        {error, not_found} ->
-            barrel_db_sup:start_db(Name, Opts)
+    case validate_db_name(Name) of
+        ok ->
+            case get_db(Name) of
+                {ok, _Pid} ->
+                    {error, already_exists};
+                {error, not_found} ->
+                    barrel_db_sup:start_db(Name, Opts)
+            end;
+        {error, _} = Err ->
+            Err
     end.
+
+%% @doc Validate a database name.
+%% Accepts: lowercase alphanumerics, underscore, hyphen. First char must
+%% be alphanumeric. Length 1..63. Internal system databases (prefix `_')
+%% are accepted to support `_barrel_system' and similar.
+-spec validate_db_name(binary()) -> ok | {error, invalid_db_name}.
+validate_db_name(<<"_", Rest/binary>>) ->
+    validate_db_name_chars(Rest);
+validate_db_name(Name) when is_binary(Name) ->
+    Size = byte_size(Name),
+    if
+        Size < 1; Size > 63 -> {error, invalid_db_name};
+        true -> validate_db_name_chars(Name)
+    end.
+
+validate_db_name_chars(<<>>) -> ok;
+validate_db_name_chars(<<C, Rest/binary>>) when
+        (C >= $a andalso C =< $z);
+        (C >= $0 andalso C =< $9);
+        C =:= $_; C =:= $- ->
+    validate_db_name_chars(Rest);
+validate_db_name_chars(_) ->
+    {error, invalid_db_name}.
 
 %% @doc Open an existing database.
 %%
@@ -272,14 +300,25 @@ close_db(Pid) when is_pid(Pid) ->
 %% @returns `ok' on success (also returns `ok' if database doesn't exist)
 -spec delete_db(binary()) -> ok | {error, term()}.
 delete_db(Name) when is_binary(Name) ->
+    case validate_db_name(Name) of
+        ok ->
+            do_delete_db(Name);
+        {error, _} = Err ->
+            Err
+    end.
+
+do_delete_db(Name) ->
     case get_db(Name) of
         {ok, Pid} ->
             {ok, Info} = barrel_db_server:info(Pid),
             DbPath = maps:get(db_path, Info),
             barrel_db_server:stop(Pid),
-            %% Remove data directory
-            _ = try os:cmd("rm -rf " ++ DbPath) catch _:_ -> ok end,
-            ok;
+            %% Remove data directory via stdlib (no shell, no injection).
+            case file:del_dir_r(DbPath) of
+                ok -> ok;
+                {error, enoent} -> ok;
+                {error, _} = Err -> Err
+            end;
         {error, not_found} ->
             ok
     end.
