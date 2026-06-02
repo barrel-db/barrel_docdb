@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.4] - 2026-06-02
+
+### Security
+- **API key permissions are now enforced.** Before 0.6.4 the `permissions` field on an `#api_key` record was stored and returned but discarded by the HTTP handler, so a key declared as `[<<"read">>]` could still write, delete, replicate, or bulk-update. A new `authorize/3` step in `barrel_http_handler` maps each `(action, method)` pair to a required permission (`read` / `write` / `admin`) and returns 403 when missing. `is_admin = true` and the "no keys configured yet" mode short-circuit. Admin-gated endpoints (`/keys/*`, `/admin/*`) are unchanged.
+- **Chunked attachment metadata no longer goes through `binary_to_term`.** The writer now stores chunked metadata as `<<"BARREL_CHUNK_V1:", json:encode(Meta)/binary>>`; the reader pattern-matches on the tag and falls back to the legacy `term_to_binary` blob via `binary_to_term/2` with `[safe]` for one release (with a warning log). Removes a path that decoded user-controlled bytes as Erlang terms.
+- **Query-op whitelist.** `convert_op/1` in the HTTP handler used to call `binary_to_atom/1` on any unrecognized binary, which could exhaust the atom table. The function now accepts only the documented set (`eq`/`==`, `ne`/`!=`/`=/=`, `gt`/`>`, `gte`/`>=`, `lt`/`<`, `lte`/`<=`/`=<`) and rejects everything else with HTTP 400.
+
+### Deprecated
+- Legacy `term_to_binary` chunked-attachment metadata. Attachments created on 0.6.3 or earlier are still readable in 0.6.4 with a warning; the fallback will be removed in 0.7.0.
+
 ## [0.6.3] - 2026-06-02
 
 ### Security
