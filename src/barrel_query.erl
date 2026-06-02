@@ -1007,10 +1007,8 @@ verify_conditions_v2(StoreRef, DbName, DocIds, [Cond | Rest]) ->
     verify_conditions_v2(StoreRef, DbName, FilteredDocIds, Rest).
 
 %% @private Release snapshot if present
-maybe_release_snapshot(undefined) -> ok;
 maybe_release_snapshot(Snapshot) ->
-    catch barrel_store_rocksdb:release_snapshot(Snapshot),
-    ok.
+    barrel_store_rocksdb:safe_release_snapshot(Snapshot).
 
 %% @private Convert cursor record to map for pattern matching
 cursor_to_map(Cursor) ->

@@ -7,8 +7,6 @@
 #   ./run_bench.sh 1000 1000           # Run with custom num_docs and iterations
 #   ./run_bench.sh doc_types           # Run document type comparison benchmark
 #   ./run_bench.sh doc_types 500 200   # Doc types with custom num_docs and iterations
-#   ./run_bench.sh vdb                 # Run VDB vs non-sharded comparison
-#   ./run_bench.sh vdb 5000 100        # VDB with custom num_docs and iterations
 #   ./run_bench.sh http                # Run HTTP API vs Direct API comparison
 #   ./run_bench.sh http 1000 100       # HTTP with custom num_docs and iterations
 #
@@ -29,15 +27,6 @@ case "$1" in
             -pa ../_build/default/lib/*/ebin \
             -noshell \
             -eval "barrel_bench:run_doc_types(#{num_docs => $NUM_DOCS, iterations => $ITERATIONS}), halt()."
-        ;;
-    vdb)
-        NUM_DOCS=${2:-5000}
-        ITERATIONS=${3:-5000}
-        echo "Running VDB benchmark with num_docs=$NUM_DOCS, iterations=$ITERATIONS..."
-        erl -pa _build/default/lib/*/ebin \
-            -pa ../_build/default/lib/*/ebin \
-            -noshell \
-            -eval "barrel_bench:run_vdb(#{num_docs => $NUM_DOCS, iterations => $ITERATIONS}), halt()."
         ;;
     http)
         NUM_DOCS=${2:-1000}

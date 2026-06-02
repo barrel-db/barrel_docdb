@@ -12,8 +12,6 @@
 -export([run_query/0, run_query/1]).
 -export([run_changes/0, run_changes/1]).
 -export([run_doc_types/0, run_doc_types/1]).
--export([run_vdb/0, run_vdb/1]).
--export([run_vdb_scaling/0, run_vdb_scaling/1]).
 -export([run_http/0, run_http/1]).
 
 -define(DEFAULT_NUM_DOCS, 10000).
@@ -183,68 +181,6 @@ run_changes(Config) ->
     print_workload_result(changes, Result),
     Result.
 
-%% @doc Run VDB vs non-sharded comparison benchmark
--spec run_vdb() -> map().
-run_vdb() ->
-    run_vdb(#{}).
-
--spec run_vdb(map()) -> map().
-run_vdb(Config) ->
-    NumDocs = maps:get(num_docs, Config, 5000),
-    Iterations = maps:get(iterations, Config, 5000),
-    ShardCount = maps:get(shard_count, Config, 4),
-
-    io:format("~n=== VDB Benchmark ===~n"),
-    io:format("Documents: ~p, Iterations: ~p, Shards: ~p~n~n",
-              [NumDocs, Iterations, ShardCount]),
-
-    Result = barrel_bench_vdb:run_comparison(#{
-        num_docs => NumDocs,
-        iterations => Iterations,
-        shard_count => ShardCount
-    }),
-
-    %% Save results
-    Output = #{
-        timestamp => timestamp(),
-        config => #{num_docs => NumDocs, iterations => Iterations, shard_count => ShardCount},
-        results => Result
-    },
-    save_results(Output, "vdb"),
-
-    Result.
-
-%% @doc Run VDB shard scaling benchmark
--spec run_vdb_scaling() -> map().
-run_vdb_scaling() ->
-    run_vdb_scaling(#{}).
-
--spec run_vdb_scaling(map()) -> map().
-run_vdb_scaling(Config) ->
-    NumDocs = maps:get(num_docs, Config, 5000),
-    Iterations = maps:get(iterations, Config, 5000),
-    ShardCounts = maps:get(shard_counts, Config, [1, 2, 4, 8]),
-
-    io:format("~n=== VDB Shard Scaling Benchmark ===~n"),
-    io:format("Documents: ~p, Iterations: ~p~n", [NumDocs, Iterations]),
-    io:format("Testing shard counts: ~p~n~n", [ShardCounts]),
-
-    Result = barrel_bench_vdb:run_shard_scaling(#{
-        num_docs => NumDocs,
-        iterations => Iterations,
-        shard_counts => ShardCounts
-    }),
-
-    %% Save results
-    Output = #{
-        timestamp => timestamp(),
-        config => #{num_docs => NumDocs, iterations => Iterations, shard_counts => ShardCounts},
-        results => Result
-    },
-    save_results(Output, "vdb_scaling"),
-
-    Result.
-
 %% @doc Run HTTP API vs Direct API comparison benchmark
 -spec run_http() -> map().
 run_http() ->
@@ -254,22 +190,18 @@ run_http() ->
 run_http(Config) ->
     NumDocs = maps:get(num_docs, Config, 1000),
     Iterations = maps:get(iterations, Config, 1000),
-    ShardCount = maps:get(shard_count, Config, 4),
 
     io:format("~n=== HTTP API Benchmark ===~n"),
-    io:format("Documents: ~p, Iterations: ~p, Shards: ~p~n~n",
-              [NumDocs, Iterations, ShardCount]),
+    io:format("Documents: ~p, Iterations: ~p~n~n", [NumDocs, Iterations]),
 
     Result = barrel_bench_http:run_comparison(#{
         num_docs => NumDocs,
-        iterations => Iterations,
-        shard_count => ShardCount
+        iterations => Iterations
     }),
 
-    %% Save results
     Output = #{
         timestamp => timestamp(),
-        config => #{num_docs => NumDocs, iterations => Iterations, shard_count => ShardCount},
+        config => #{num_docs => NumDocs, iterations => Iterations},
         results => Result
     },
     save_results(Output, "http"),

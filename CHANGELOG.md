@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-06-02
+
+### Removed
+- JWT authentication (`barrel_docdb_jwt`, `console_public_key` config, `bdb_` token branches in the HTTP handler) and the `jose` dependency. API key auth (`ak_*`) is the only bearer-token scheme.
+- Dead VDB benchmark code (`bench/src/workloads/barrel_bench_vdb.erl`, `barrel_bench:run_vdb*`, VDB portions of the HTTP bench) referencing the long-removed `barrel_vdb` module.
+- Stale `test/docker/CHECKPOINT.md` referencing removed `barrel_rep_policy` work.
+
+### Changed
+- Bumped `instrument` to v1.1.3 for Erlang/OTP 29 compatibility (replaces deprecated `catch Expr` with `try ... catch`).
+- Replaced deprecated `catch Expr` patterns in `barrel_docdb`, `barrel_db_server`, `barrel_query`, `barrel_query_cursor`, and the affected test suites; added `barrel_store_rocksdb:safe_release_snapshot/1` helper.
+- Updated docs to drop references to removed modules (`run_vdb` benchmark; "Sharding Strategy" renamed to "Bucketing Strategy" for the time-bucketed posting list).
+
 ## [0.6.1] - 2026-06-01
 
 ### Changed

@@ -205,7 +205,7 @@ init_per_group(_, Config) ->
     Config.
 
 end_per_group(http_transport, _Config) ->
-    catch barrel_docdb:delete_db(<<"http_test">>),
+    _ = try barrel_docdb:delete_db(<<"http_test">>) catch _:_ -> ok end,
     %% Don't stop HTTP server - may be used by other groups
     ok;
 
@@ -220,15 +220,15 @@ end_per_group(tasks, _Config) ->
     ok;
 
 end_per_group(keys, _Config) ->
-    catch barrel_docdb:delete_db(<<"key_test_db">>),
+    _ = try barrel_docdb:delete_db(<<"key_test_db">>) catch _:_ -> ok end,
     ok;
 
 end_per_group(attachments, _Config) ->
-    catch barrel_docdb:delete_db(<<"att_test_db">>),
+    _ = try barrel_docdb:delete_db(<<"att_test_db">>) catch _:_ -> ok end,
     ok;
 
 end_per_group(query, _Config) ->
-    catch barrel_docdb:delete_db(<<"query_test_db">>),
+    _ = try barrel_docdb:delete_db(<<"query_test_db">>) catch _:_ -> ok end,
     ok;
 
 end_per_group(_, _Config) ->

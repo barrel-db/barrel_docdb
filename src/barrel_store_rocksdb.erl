@@ -18,7 +18,7 @@
 -export([fold_range_limit/6]).  %% Auto-selects read profile based on limit
 
 %% Additional utilities
--export([snapshot/1, release_snapshot/1]).
+-export([snapshot/1, release_snapshot/1, safe_release_snapshot/1]).
 -export([get_with_snapshot/3, multi_get_with_snapshot/3]).
 -export([fold_range_posting_with_snapshot/6]).
 
@@ -327,6 +327,17 @@ snapshot(#{ref := Ref}) ->
 -spec release_snapshot(snapshot()) -> ok.
 release_snapshot(Snapshot) ->
     rocksdb:release_snapshot(Snapshot).
+
+%% @doc Release a snapshot, swallowing any error.
+%% Use on cleanup paths where the handle may already be gone (process
+%% termination, cursor expiry) and crashing is undesirable.
+-spec safe_release_snapshot(snapshot() | undefined) -> ok.
+safe_release_snapshot(undefined) -> ok;
+safe_release_snapshot(Snapshot) ->
+    _ = try rocksdb:release_snapshot(Snapshot)
+        catch _:_ -> ok
+        end,
+    ok.
 
 %% @doc Get with a snapshot for consistent reads
 -spec get_with_snapshot(db_ref(), binary(), snapshot()) ->

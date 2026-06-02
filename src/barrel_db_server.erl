@@ -402,7 +402,10 @@ terminate(_Reason, #state{name = Name, store_ref = StoreRef, att_ref = AttRef,
     _ = 
       case FilterPid of
           undefined -> ok;
-          _ -> catch exit(FilterPid, shutdown)
+          _ ->
+              try exit(FilterPid, shutdown)
+              catch _:_ -> ok
+              end
       end,
     %% Close attachment store
     _ = 

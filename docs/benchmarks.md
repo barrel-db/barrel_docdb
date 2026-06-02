@@ -194,7 +194,6 @@ barrel_bench:run(#{num_docs => 5000, iterations => 100}).
 barrel_bench:run_crud(#{num_docs => 1000}).
 barrel_bench:run_query(#{num_docs => 5000, iterations => 100}).
 barrel_bench:run_changes(#{num_docs => 1000}).
-barrel_bench:run_vdb(#{num_docs => 5000, iterations => 100}).
 barrel_bench:run_http(#{num_docs => 1000, iterations => 100}).
 ```
 

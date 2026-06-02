@@ -824,11 +824,13 @@ receive_sse_doc_ids(Ref, Acc, Timeout) ->
             %% Try to extract doc ID from change event
             case parse_sse_change_event(Chunk) of
                 {ok, JsonData} ->
-                    case catch json:decode(JsonData) of
+                    try json:decode(JsonData) of
                         #{<<"id">> := Id} ->
                             receive_sse_doc_ids(Ref, [Id | Acc], Timeout);
                         _ ->
                             receive_sse_doc_ids(Ref, Acc, Timeout)
+                    catch _:_ ->
+                        receive_sse_doc_ids(Ref, Acc, Timeout)
                     end;
                 _ ->
                     receive_sse_doc_ids(Ref, Acc, Timeout)

@@ -25,10 +25,6 @@ start(_StartType, _StartArgs) ->
     ok = configure_metrics(),
     ok = configure_logging(),
     logger:info("Starting barrel_docdb application"),
-    %% Configure jose JSON module (use OTP json)
-    jose:json_module(json),
-    %% Initialize JWT validation (loads console public key if configured)
-    _ = barrel_docdb_jwt:init(),
     barrel_docdb_sup:start_link().
 
 %% @doc Stop the barrel_docdb application

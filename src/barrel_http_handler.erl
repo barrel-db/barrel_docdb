@@ -110,38 +110,23 @@ get_db_from_action(health, _Req) -> undefined;
 get_db_from_action(_Action, Req) ->
     cowboy_req:binding(db, Req, undefined).
 
-%% @doc Authenticate request via bearer token
-%% Supports both API keys (ak_*) and JWT tokens (bdb_*)
+%% @doc Authenticate request via bearer token (API keys, ak_*)
 authenticate(Req, DbName) ->
     case extract_bearer_token(Req) of
         undefined ->
             throw({error, 401, <<"Authorization required">>});
         Token ->
-            Result = validate_token(Token, DbName),
-            case Result of
+            case validate_token(Token, DbName) of
                 {ok, _AuthContext} ->
                     ok;
                 {error, invalid_key} ->
                     throw({error, 401, <<"Invalid API key">>});
-                {error, invalid_signature} ->
-                    throw({error, 401, <<"Invalid token signature">>});
-                {error, token_expired} ->
-                    throw({error, 401, <<"Token expired">>});
-                {error, {invalid_type, _}} ->
-                    throw({error, 401, <<"Invalid token type for this service">>});
-                {error, {missing_claims, _}} ->
-                    throw({error, 401, <<"Token missing required claims">>});
-                {error, jwt_not_configured} ->
-                    throw({error, 401, <<"JWT authentication not configured">>});
                 {error, access_denied} ->
-                    throw({error, 403, <<"Access denied to this database">>});
-                {error, _} ->
-                    throw({error, 401, <<"Invalid token">>})
+                    throw({error, 403, <<"Access denied to this database">>})
             end
     end.
 
-%% @doc Authenticate request requiring admin privileges
-%% Supports both API keys (ak_*) and JWT tokens (bdb_*)
+%% @doc Authenticate request requiring admin privileges (API keys, ak_*)
 authenticate_admin(Req) ->
     case extract_bearer_token(Req) of
         undefined ->
@@ -153,34 +138,19 @@ authenticate_admin(Req) ->
                 {ok, _} ->
                     throw({error, 403, <<"Admin access required">>});
                 {error, invalid_key} ->
-                    throw({error, 401, <<"Invalid API key">>});
-                {error, invalid_signature} ->
-                    throw({error, 401, <<"Invalid token signature">>});
-                {error, token_expired} ->
-                    throw({error, 401, <<"Token expired">>});
-                {error, jwt_not_configured} ->
-                    throw({error, 401, <<"JWT authentication not configured">>});
-                {error, _} ->
-                    throw({error, 401, <<"Invalid token">>})
+                    throw({error, 401, <<"Invalid API key">>})
             end
     end.
 
-%% @doc Validate a token by routing to appropriate validator based on prefix
 validate_token(<<"ak_", _/binary>> = Token, undefined) ->
     barrel_http_api_keys:validate_key(Token);
 validate_token(<<"ak_", _/binary>> = Token, DbName) ->
     barrel_http_api_keys:validate_key(Token, DbName);
-validate_token(<<"bdb_", _/binary>> = Token, DbName) ->
-    barrel_docdb_jwt:validate_token(Token, DbName);
 validate_token(_, _) ->
-    %% Unknown token prefix - try as API key for backwards compatibility
     {error, invalid_key}.
 
-%% @doc Validate a token for admin access
 validate_token_admin(<<"ak_", _/binary>> = Token) ->
     barrel_http_api_keys:validate_key(Token);
-validate_token_admin(<<"bdb_", _/binary>> = Token) ->
-    barrel_docdb_jwt:validate_token(Token);
 validate_token_admin(_) ->
     {error, invalid_key}.
 
