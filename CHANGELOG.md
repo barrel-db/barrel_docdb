@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-06-01
+
+### Changed
+- Moved to Erlang/OTP 28 (CI containers, Dockerfile builder, and docs).
+
+### Fixed
+- Docker image now boots on OTP 28: the runtime stage uses `debian:trixie-slim` to match the `erlang:28` builder's glibc (it was left on `bookworm-slim`, so ERTS failed with `GLIBC_2.38 not found`).
+- Release CI job builds in the `erlang` container instead of installing Erlang from `packages.erlang-solutions.com`, which had failed the v0.6.0 release.
+- The relx release version was hardcoded `0.4.2`; it now matches the application version.
+
 ## [0.6.0] - 2026-05-26
 
 ### Added
