@@ -278,7 +278,7 @@ delete_db(Name) when is_binary(Name) ->
             DbPath = maps:get(db_path, Info),
             barrel_db_server:stop(Pid),
             %% Remove data directory
-            _ = (catch os:cmd("rm -rf " ++ DbPath)),
+            _ = try os:cmd("rm -rf " ++ DbPath) catch _:_ -> ok end,
             ok;
         {error, not_found} ->
             ok

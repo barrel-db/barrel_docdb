@@ -79,7 +79,7 @@ end_per_suite(_Config) ->
 init_per_group(lifecycle, Config) ->
     %% Ensure clean state - stop application to prevent supervisor restart
     application:stop(barrel_docdb),
-    catch gen_server:stop(barrel_cache),
+    _ = try gen_server:stop(barrel_cache) catch _:_ -> ok end,
     timer:sleep(100),
     Config;
 init_per_group(block_opts, Config) ->
@@ -89,7 +89,7 @@ init_per_group(block_opts, Config) ->
 init_per_group(fallback, Config) ->
     %% Ensure cache is NOT running for fallback tests
     application:stop(barrel_docdb),
-    catch gen_server:stop(barrel_cache),
+    _ = try gen_server:stop(barrel_cache) catch _:_ -> ok end,
     timer:sleep(50),
     Config;
 init_per_group(integration, Config) ->
@@ -98,7 +98,7 @@ init_per_group(integration, Config) ->
     [{started_apps, Apps} | Config].
 
 end_per_group(lifecycle, _Config) ->
-    catch gen_server:stop(barrel_cache),
+    _ = try gen_server:stop(barrel_cache) catch _:_ -> ok end,
     ok;
 end_per_group(block_opts, _Config) ->
     application:stop(barrel_docdb),

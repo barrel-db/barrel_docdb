@@ -155,10 +155,14 @@ increase(barrel_replication_docs_total[1m])
 
 ## Configuration
 
-Metrics are enabled by default. To disable:
+Metrics are always recorded internally. Set the exporter to `none` (the
+default) to suppress external export, or to `console` / `otlp` to push them
+out. See [Observability](observability.md) for details.
 
 ```erlang
 {barrel_docdb, [
-    {metrics_enabled, false}
+    {metrics, [
+        {exporter, none}  %% or console | otlp
+    ]}
 ]}.
 ```

@@ -172,28 +172,13 @@ Output:
 < x-barrel-hlc: AAAB1aBcdefghijklmnopqrs==
 ```
 
-### Manual Clock Sync
+### Automatic Clock Sync
 
-For explicit clock synchronization between nodes, use the `_sync_hlc` endpoint:
-
-```bash
-# Get current HLC from node A
-HLC_A=$(curl -s http://node-a:8080/health -D - -o /dev/null | grep -i x-barrel-hlc | cut -d' ' -f2 | tr -d '\r')
-
-# Sync node B with node A's clock
-curl -X POST "http://node-b:8080/db/mydb/_sync_hlc" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $API_KEY" \
-  -d "{\"hlc\": \"$HLC_A\"}"
-```
-
-Response:
-```json
-{
-  "hlc": "{timestamp,1736500000000,42}",
-  "db": "mydb"
-}
-```
+HLC synchronization happens automatically during replication: every
+exchange between peers piggybacks the current clock value, so causal
+ordering across nodes is preserved without an explicit sync step. The
+`X-Barrel-HLC` response header on every HTTP reply exposes the local
+clock for diagnostics.
 
 ### Why HLC Matters
 

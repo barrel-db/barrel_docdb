@@ -338,22 +338,6 @@ Get changes since an HLC timestamp.
 {ok, Changes, _} = barrel_docdb:get_changes(<<"mydb">>, first, #{limit => 100}).
 ```
 
-### barrel_changes:fold/4
-
-Fold over changes since a sequence.
-
-```erlang
--spec fold(Db, Since, Fun, Acc) -> {ok, Acc, LastSeq} | {error, term()}.
-```
-
-**Example:**
-```erlang
-{ok, Changes, LastSeq} = barrel_changes:fold(<<"mydb">>, first,
-    fun(Change, Acc) -> {ok, [Change | Acc]} end,
-    []
-).
-```
-
 ---
 
 ## Replication Primitives

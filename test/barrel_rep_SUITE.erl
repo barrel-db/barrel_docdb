@@ -732,8 +732,8 @@ direction_pull(_Config) ->
     Target = <<"test_target">>,
 
     %% Clear any existing docs first
-    catch barrel_docdb:delete_doc(Source, <<"pull_doc_1">>, #{}),
-    catch barrel_docdb:delete_doc(Target, <<"pull_doc_1">>, #{}),
+    _ = try barrel_docdb:delete_doc(Source, <<"pull_doc_1">>, #{}) catch _:_ -> ok end,
+    _ = try barrel_docdb:delete_doc(Target, <<"pull_doc_1">>, #{}) catch _:_ -> ok end,
     timer:sleep(100),
 
     %% Create document in TARGET (we will pull from target to source)

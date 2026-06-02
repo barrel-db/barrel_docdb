@@ -109,7 +109,7 @@ release(CursorId) ->
             case Cursor#cursor.snapshot of
                 undefined -> ok;
                 Snapshot ->
-                    catch barrel_store_rocksdb:release_snapshot(Snapshot)
+                    barrel_store_rocksdb:safe_release_snapshot(Snapshot)
             end,
             true = ets:delete(?TABLE, CursorId),
             ok;
@@ -152,7 +152,8 @@ terminate(_Reason, _State) ->
     ets:foldl(fun({_Id, Cursor}, Acc) ->
         case Cursor#cursor.snapshot of
             undefined -> ok;
-            Snapshot -> catch barrel_store_rocksdb:release_snapshot(Snapshot)
+            Snapshot ->
+                barrel_store_rocksdb:safe_release_snapshot(Snapshot)
         end,
         Acc
     end, ok, ?TABLE),

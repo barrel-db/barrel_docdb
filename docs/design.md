@@ -372,7 +372,7 @@ PREFIX_CHANGES (0x1B) | encoded_db | prefix | 0x00 | bucket (4 bytes BE)
 Each entry: << HLC:12/binary, DocId/binary, Rev/binary, Deleted:1 >>
 ```
 
-**Sharding Strategy:**
+**Bucketing Strategy:**
 - Bucket = `wall_time div 3600` (1-hour granularity)
 - Bounds posting list growth for high-write workloads
 - Range scan discovers only existing buckets (no empty iteration)

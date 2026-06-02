@@ -129,8 +129,10 @@ now() ->
     hlc:now(?GLOBAL_CLOCK).
 
 %% @doc Update the global clock with a remote timestamp.
+%% Rejects non-timestamp input at the API boundary so a misuse cannot
+%% crash the global `barrel_hlc_clock' gen_server.
 -spec update(timestamp()) -> {ok, timestamp()} | {error, clock_skew}.
-update(RemoteTS) ->
+update(#timestamp{} = RemoteTS) ->
     case hlc:update(?GLOBAL_CLOCK, RemoteTS) of
         {ok, NewTS} ->
             {ok, NewTS};
