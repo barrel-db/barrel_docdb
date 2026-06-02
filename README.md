@@ -215,7 +215,7 @@ Add to your `rebar.config`:
 
 ```erlang
 {deps, [
-    {barrel_docdb, "0.6.0"}
+    {barrel_docdb, "0.6.1"}
 ]}.
 ```
 

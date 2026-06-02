@@ -38,7 +38,7 @@ RUN git init && \
 RUN rebar3 as prod release
 
 # Runtime stage - use Debian slim for better compatibility
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
