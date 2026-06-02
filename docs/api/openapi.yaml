@@ -9,7 +9,6 @@ info:
 
     Most endpoints require authentication via Bearer token:
     - API Key: `Authorization: Bearer ak_<key>`
-    - JWT Token: `Authorization: Bearer bdb_<jwt>`
 
     ## Content Types
 
@@ -527,7 +526,7 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: API key (ak_*) or JWT token (bdb_*)
+      description: API key (ak_* prefix)
 
   parameters:
     DatabaseName:
