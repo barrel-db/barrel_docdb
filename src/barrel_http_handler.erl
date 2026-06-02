@@ -35,8 +35,10 @@ init(Req0, State) ->
         %% Wrap request handling in an HTTP span
         barrel_trace:with_http_span(Method, Path, fun() ->
             try
-                %% Authenticate request (unless it's a health check)
-                ok = maybe_authenticate(Action, Req0),
+                %% Authenticate request (unless it's a public endpoint).
+                AuthContext = maybe_authenticate(Action, Req0),
+                %% Permission check (no-op for public/admin-gated actions).
+                ok = authorize(Action, Method, AuthContext),
                 case handle_action(Action, Method, Req0) of
                     {Status, Headers, Body, Req1} ->
                         %% Set response status on span
@@ -76,49 +78,104 @@ init(Req0, State) ->
 %% Authentication
 %%====================================================================
 
-%% @doc Check authentication for request
-%% Health endpoint is always public.
-%% Other endpoints require valid bearer token when API keys are configured.
+%% @doc Check authentication for request. Returns the auth context map
+%% used by authorize/3 for permission enforcement.
+%% - Public endpoints (health, metrics, node_info) return `public'.
+%% - Admin-gated endpoints (keys, admin/*) return `admin' after
+%%   verifying `is_admin = true'.
+%% - Everything else returns the validated key map.
 maybe_authenticate(health, _Req) ->
-    %% Health check is always public
-    ok;
+    public;
 maybe_authenticate(metrics, _Req) ->
-    %% Metrics endpoint is always public (for Prometheus scraping)
-    ok;
+    public;
 maybe_authenticate(node_info, _Req) ->
-    %% Node identity is public
-    ok;
+    public;
 maybe_authenticate(Action, Req) when Action =:= keys; Action =:= key;
                                      Action =:= admin_usage; Action =:= admin_db_usage ->
-    %% Key management and admin endpoints require admin authentication
-    authenticate_admin(Req);
+    authenticate_admin(Req),
+    admin;
 maybe_authenticate(Action, Req) ->
-    %% Check if any API keys are configured
     case barrel_http_api_keys:has_any_keys() of
         false ->
-            %% No keys configured - allow all requests
-            ok;
+            %% No keys configured: allow but apply default-admin context
+            %% so authorize/3 doesn't gate the actions either.
+            unconfigured;
         true ->
-            %% Keys exist - require authentication
-            %% Get database name for per-database auth (if applicable)
             DbName = get_db_from_action(Action, Req),
             authenticate(Req, DbName)
     end.
+
+%% @doc Permission check.
+%% AuthContext is one of:
+%%   - public     : public endpoint (no perm needed).
+%%   - admin      : admin-gated endpoint (is_admin already verified).
+%%   - unconfigured : keys not configured yet (legacy mode, allow all).
+%%   - #{...}     : validated key map with `permissions' and `is_admin'.
+authorize(_Action, _Method, public) -> ok;
+authorize(_Action, _Method, admin) -> ok;
+authorize(_Action, _Method, unconfigured) -> ok;
+authorize(_Action, _Method, #{is_admin := true}) -> ok;
+authorize(Action, Method, #{permissions := Perms}) ->
+    case required_perm(Action, Method) of
+        none ->
+            ok;
+        Required when is_binary(Required) ->
+            case lists:member(Required, Perms) of
+                true ->
+                    ok;
+                false ->
+                    throw({error, 403,
+                           <<"Permission denied: requires ",
+                             Required/binary>>})
+            end
+    end;
+authorize(_Action, _Method, _Other) ->
+    %% Defensive: unrecognized context shape.
+    throw({error, 403, <<"Permission denied">>}).
+
+%% @doc Map (Action, Method) to the API-key permission string needed.
+%% Returns `none' for actions whose auth is already covered upstream
+%% (e.g. admin_* via `authenticate_admin').
+required_perm(db_info, <<"GET">>) -> <<"read">>;
+required_perm(doc, <<"GET">>) -> <<"read">>;
+required_perm(changes, _) -> <<"read">>;
+required_perm(find, _) -> <<"read">>;
+required_perm(attachments, <<"GET">>) -> <<"read">>;
+required_perm(attachment, <<"GET">>) -> <<"read">>;
+required_perm(local_doc, <<"GET">>) -> <<"read">>;
+required_perm(revsdiff, _) -> <<"read">>;
+required_perm(db_info, <<"PUT">>) -> <<"write">>;
+required_perm(db_info, <<"POST">>) -> <<"write">>;
+required_perm(db_info, <<"DELETE">>) -> <<"write">>;
+required_perm(doc, <<"PUT">>) -> <<"write">>;
+required_perm(doc, <<"DELETE">>) -> <<"write">>;
+required_perm(bulk_docs, _) -> <<"write">>;
+required_perm(attachment, <<"PUT">>) -> <<"write">>;
+required_perm(attachment, <<"DELETE">>) -> <<"write">>;
+required_perm(local_doc, <<"PUT">>) -> <<"write">>;
+required_perm(local_doc, <<"DELETE">>) -> <<"write">>;
+required_perm(put_rev, _) -> <<"write">>;
+required_perm(sync_hlc, _) -> <<"write">>;
+required_perm(replicate, _) -> <<"write">>;
+%% Admin-gated actions reach authorize/3 only through the
+%% `admin' context, which short-circuits above.
+required_perm(_Action, _Method) -> none.
 
 %% @doc Get database name from action and request
 get_db_from_action(health, _Req) -> undefined;
 get_db_from_action(_Action, Req) ->
     cowboy_req:binding(db, Req, undefined).
 
-%% @doc Authenticate request via bearer token (API keys, ak_*)
+%% @doc Authenticate request via bearer token (API keys, ak_*).
+%% Returns the validated key map for downstream permission checks.
 authenticate(Req, DbName) ->
     case extract_bearer_token(Req) of
         undefined ->
             throw({error, 401, <<"Authorization required">>});
         Token ->
             case validate_token(Token, DbName) of
-                {ok, _AuthContext} ->
-                    ok;
+                {ok, KeyMap} ->
+                    KeyMap;
                 {error, invalid_key} ->
                     throw({error, 401, <<"Invalid API key">>});
                 {error, access_denied} ->
@@ -703,13 +760,27 @@ convert_where_clause(#{<<"path">> := Path, <<"op">> := <<"contains">>, <<"value"
 convert_where_clause(_) ->
     {error, invalid_clause}.
 
-convert_op(<<"ne">>) -> '=/=';
-convert_op(<<"gt">>) -> '>';
+%% @doc Map a JSON `op' value to the internal atom.
+%% Whitelist-only: any other binary is rejected as 400. The previous
+%% catch-all `binary_to_atom/1' on user input could exhaust the atom
+%% table. The set here must match `barrel_query:compare_op()'.
+convert_op(<<"eq">>)  -> '==';
+convert_op(<<"==">>)  -> '==';
+convert_op(<<"ne">>)  -> '=/=';
+convert_op(<<"!=">>)  -> '=/=';
+convert_op(<<"=/=">>) -> '=/=';
+convert_op(<<"gt">>)  -> '>';
+convert_op(<<">">>)   -> '>';
 convert_op(<<"gte">>) -> '>=';
-convert_op(<<"lt">>) -> '<';
+convert_op(<<">=">>)  -> '>=';
+convert_op(<<"lt">>)  -> '<';
+convert_op(<<"<">>)   -> '<';
 convert_op(<<"lte">>) -> '=<';
-convert_op(Op) when is_binary(Op) -> binary_to_atom(Op);
-convert_op(Op) -> Op.
+convert_op(<<"<=">>)  -> '=<';
+convert_op(<<"=<">>)  -> '=<';
+convert_op(Op) when is_binary(Op) ->
+    throw({error, 400, <<"Unsupported query operator: ", Op/binary>>});
+convert_op(Op) when is_atom(Op) -> Op.
 
 convert_order_by(Orders) when is_list(Orders) ->
     lists:map(fun convert_order_spec/1, Orders);

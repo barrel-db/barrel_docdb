@@ -136,8 +136,7 @@ put_chunked(#{ref := Ref}, DbName, DocId, AttName, Data, ContentType, Digest, Ch
 
     %% Store metadata first
     MetaKey = make_key(DbName, DocId, AttName),
-    MetaValue = term_to_binary(#{
-        chunked => true,
+    MetaValue = encode_chunk_meta(#{
         chunk_size => ChunkSize,
         chunk_count => ChunkCount,
         length => DataSize,
@@ -210,16 +209,81 @@ get(#{ref := Ref} = AttRef, DbName, DocId, AttName) ->
             Error
     end.
 
-%% @private Check if value is chunked metadata
-is_chunked_metadata(Value) ->
-    try
-        case binary_to_term(Value) of
-            #{chunked := true} = Meta -> {true, Meta};
-            _ -> false
-        end
+%% Chunked-metadata wire format.
+%%
+%% Tagged prefix avoids decoding user-controlled attachment bytes as an
+%% Erlang term (binary_to_term used to crash and could allocate
+%% arbitrary terms / create atoms). New format:
+%%
+%%   <<"BARREL_CHUNK_V1:", JsonMeta/binary>>
+%%
+%% where JsonMeta is `json:encode/1` of the metadata map. Old chunked
+%% attachments (written by 0.6.3 and earlier as `term_to_binary/1`)
+%% are still decoded for one release via `binary_to_term/2` with the
+%% `[safe]` flag; the fallback path will be removed in 0.7.0.
+-define(CHUNK_META_TAG, <<"BARREL_CHUNK_V1:">>).
+-define(CHUNK_META_TAG_SIZE, 16).
+
+encode_chunk_meta(Meta) when is_map(Meta) ->
+    %% json keys must be binaries; convert atom keys for the wire.
+    JsonMap = #{
+        <<"chunked">> => true,
+        <<"chunk_size">> => maps:get(chunk_size, Meta),
+        <<"chunk_count">> => maps:get(chunk_count, Meta),
+        <<"length">> => maps:get(length, Meta),
+        <<"content_type">> => maps:get(content_type, Meta),
+        <<"digest">> => maps:get(digest, Meta)
+    },
+    <<?CHUNK_META_TAG/binary, (iolist_to_binary(json:encode(JsonMap)))/binary>>.
+
+%% @private Check if value is chunked metadata. Recognizes the tagged
+%% v1 format and (transitionally) the legacy term_to_binary blob.
+is_chunked_metadata(Value) when is_binary(Value),
+                                byte_size(Value) > ?CHUNK_META_TAG_SIZE ->
+    case Value of
+        <<Tag:?CHUNK_META_TAG_SIZE/binary, Json/binary>>
+          when Tag =:= ?CHUNK_META_TAG ->
+            decode_chunk_meta(Json);
+        _ ->
+            legacy_is_chunked_metadata(Value)
+    end;
+is_chunked_metadata(Value) when is_binary(Value) ->
+    legacy_is_chunked_metadata(Value).
+
+decode_chunk_meta(Json) ->
+    try json:decode(Json) of
+        #{<<"chunked">> := true} = Decoded -> {true, normalize_meta(Decoded)};
+        _ -> false
     catch
         _:_ -> false
     end.
+
+%% @private Legacy term_to_binary path. Restricted with `[safe]' so
+%% only existing atoms are accepted. Will be removed in 0.7.0.
+legacy_is_chunked_metadata(Value) ->
+    try binary_to_term(Value, [safe]) of
+        #{chunked := true} = Meta ->
+            logger:warning(
+              "Reading legacy term_to_binary chunked attachment metadata; "
+              "this format is deprecated and will be unsupported in 0.7.0"),
+            {true, Meta};
+        _ ->
+            false
+    catch
+        _:_ -> false
+    end.
+
+%% Convert JSON-decoded string keys back to the atom-keyed shape the
+%% rest of this module pattern-matches on.
+normalize_meta(#{<<"chunked">> := Chunked} = M) ->
+    #{
+        chunked => Chunked,
+        chunk_size => maps:get(<<"chunk_size">>, M),
+        chunk_count => maps:get(<<"chunk_count">>, M),
+        length => maps:get(<<"length">>, M),
+        content_type => maps:get(<<"content_type">>, M),
+        digest => maps:get(<<"digest">>, M)
+    }.
 
 %% @private Read and assemble chunked attachment
 get_chunked(AttRef, DbName, DocId, AttName, #{chunk_count := ChunkCount}) ->
@@ -540,8 +604,7 @@ finish_stream(#{type := write, att_ref := #{ref := Ref}, db_name := DbName,
 
     %% Write metadata
     MetaKey = make_key(DbName, DocId, AttName),
-    MetaValue = term_to_binary(#{
-        chunked => true,
+    MetaValue = encode_chunk_meta(#{
         chunk_size => ChunkSize,
         chunk_count => FinalChunkIndex,
         length => FinalLen,
