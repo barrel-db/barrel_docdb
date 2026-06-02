@@ -122,19 +122,33 @@ Sends spans to an OpenTelemetry Collector or compatible backend (Jaeger, Zipkin,
 
 **Docker Compose example with Jaeger:**
 
+Tracing is configured in `sys.config`. Mount a custom config into the
+container and point barrel at it.
+
 ```yaml
 services:
   barrel:
     image: barrel/barrel_docdb
-    environment:
-      - BARREL_TRACING_EXPORTER=otlp
-      - BARREL_OTLP_ENDPOINT=http://jaeger:4318
+    volumes:
+      - ./sys.config:/app/releases/0.6.2/sys.config:ro
 
   jaeger:
     image: jaegertracing/all-in-one:latest
     ports:
       - "16686:16686"  # Jaeger UI
       - "4318:4318"    # OTLP HTTP
+```
+
+With `sys.config`:
+
+```erlang
+[{barrel_docdb, [
+    {tracing, [
+        {enabled, true},
+        {exporter, otlp},
+        {otlp_endpoint, "http://jaeger:4318"}
+    ]}
+]}].
 ```
 
 #### Custom Exporter

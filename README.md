@@ -68,11 +68,10 @@ receive {barrel_change, _, Change} -> io:format("~p~n", [Change]) end.
 
 ## HTTP API
 
-Start the HTTP server (port 8080 by default):
-
-```erlang
-{ok, _} = barrel_http_server:start([]).
-```
+The HTTP server starts automatically with the application when
+`{http_enabled, true}` is set (the default). Port defaults to 8080;
+override via the `http_port` config key or the `BARREL_HTTP_PORT`
+environment variable. See [Configuration](#configuration) below.
 
 ### Basic Operations
 
@@ -206,7 +205,7 @@ In your `sys.config`:
 
 ## Requirements
 
-- Erlang/OTP 28+
+- Erlang/OTP 28 or 29
 - RocksDB (via rocksdb hex package)
 
 ## Installation
@@ -215,7 +214,7 @@ Add to your `rebar.config`:
 
 ```erlang
 {deps, [
-    {barrel_docdb, "0.6.1"}
+    {barrel_docdb, "0.6.2"}
 ]}.
 ```
 
@@ -223,16 +222,20 @@ Add to your `rebar.config`:
 
 ```
 barrel_docdb_sup
-├── barrel_metrics         (Prometheus metrics)
+├── barrel_metrics         (OpenTelemetry metrics)
 ├── barrel_cache           (RocksDB block cache)
 ├── barrel_hlc_clock       (Hybrid Logical Clock)
 ├── barrel_sub             (Path subscriptions)
 ├── barrel_query_sub       (Query subscriptions)
+├── barrel_path_dict       (Path interning for posting lists)
+├── barrel_query_cursor    (Chunked query cursors)
+├── barrel_parallel        (Worker pool for parallel queries)
 ├── barrel_db_sup          (Database supervisor)
 │   └── barrel_db_server   (Per-database process)
 ├── barrel_rep_tasks       (Replication task manager)
 ├── barrel_http_api_keys   (HTTP API key management)
-└── barrel_peer_auth       (HTTP replication auth)
+├── barrel_peer_auth       (HTTP replication auth)
+└── barrel_http_server     (HTTP/2 server, when http_enabled=true)
 ```
 
 ## API Reference

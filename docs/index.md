@@ -180,7 +180,7 @@ Query documents using path-based conditions with automatic indexing. No need to 
 
     ```erlang
     {deps, [
-        {barrel_docdb, "0.4.1"}
+        {barrel_docdb, "0.6.2"}
     ]}.
     ```
 
