@@ -17,6 +17,8 @@
 -export([
     health_check/1,
     node_info/1,
+    openapi_json/1,
+    redoc_html/1,
     get_doc_not_found/1,
     put_and_get_doc_json/1,
     put_and_get_doc_cbor/1,
@@ -61,6 +63,8 @@ groups() ->
         {http_tests, [sequence], [
             health_check,
             node_info,
+            openapi_json,
+            redoc_html,
             get_doc_not_found,
             put_and_get_doc_json,
             put_and_get_doc_cbor,
@@ -156,6 +160,35 @@ node_info(_Config) ->
     #{<<"node_id">> := NodeId, <<"version">> := Version} = json:decode(Body),
     true = is_binary(NodeId) andalso byte_size(NodeId) > 0,
     true = is_binary(Version),
+    ok.
+
+%% @doc /openapi.json returns a valid OpenAPI 3.1 doc generated from
+%% the route table. Public endpoint (no auth).
+openapi_json(_Config) ->
+    {ok, 200, _Headers, Body} =
+        hackney:get(?BASE_URL ++ "/openapi.json", [], <<>>, []),
+    Doc = json:decode(Body),
+    #{<<"openapi">>  := <<"3.1.0">>,
+      <<"info">>     := #{<<"title">> := _, <<"version">> := _},
+      <<"paths">>    := Paths} = Doc,
+    %% A representative subset of the routes must appear.
+    true = maps:is_key(<<"/health">>, Paths),
+    true = maps:is_key(<<"/db/{db}">>, Paths),
+    true = maps:is_key(<<"/db/{db}/_find">>, Paths),
+    true = maps:is_key(<<"/db/{db}/_changes/stream">>, Paths),
+    %% Each path is a map of lowercase methods to operation objects.
+    #{<<"get">> := GetOp} = maps:get(<<"/health">>, Paths),
+    true = is_binary(maps:get(<<"summary">>, GetOp)),
+    ok.
+
+%% @doc /docs returns the Redoc HTML page (loads the spec via JS).
+redoc_html(_Config) ->
+    {ok, 200, Headers, Body} =
+        hackney:get(?BASE_URL ++ "/docs", [], <<>>, []),
+    %% Content-Type is text/html (with optional charset).
+    <<"text/html", _/binary>> = proplists:get_value(<<"content-type">>, Headers),
+    %% The page references the spec URL it should load.
+    {_, _} = binary:match(Body, <<"/openapi.json">>),
     ok.
 
 %% @doc Test getting a non-existent document

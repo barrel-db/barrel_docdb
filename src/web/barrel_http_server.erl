@@ -169,62 +169,168 @@ base_service_opts() ->
 -define(H(Action),
         (fun(__Req) -> barrel_http_handler:handle(Action, __Req) end)).
 
+%% Compile the route table into a livery router. `/openapi.json' and
+%% `/docs' are appended at the end so they're served alongside the
+%% real routes (the OpenAPI doc is built from `routes/0' itself).
 router() ->
-    livery_router:compile([
-        %% Public endpoints. `/metrics' is served by livery_metrics
-        %% which renders the shared `instrument' registry as
-        %% Prometheus text - same wire format the previous
-        %% barrel_metrics:export_text/0 handler produced, just
-        %% wired one layer up.
-        {<<"GET">>, <<"/health">>,                ?H(health)},
-        {<<"GET">>, <<"/metrics">>,               livery_metrics:handler()},
-        {<<"GET">>, <<"/.well-known/barrel">>,    ?H(node_info)},
+    OpenApiDoc = openapi_doc(),
+    Routes = routes() ++ [
+        {<<"GET">>, <<"/openapi.json">>,
+         livery_openapi:handler(OpenApiDoc),
+         #{tags => [<<"Meta">>], operation_id => <<"openapi_spec">>,
+           summary => <<"OpenAPI 3.1 document for this service">>}},
+        {<<"GET">>, <<"/docs">>,
+         livery_openapi:redoc_handler(),
+         #{tags => [<<"Meta">>], operation_id => <<"docs">>,
+           summary => <<"Redoc UI for the OpenAPI document">>}}
+    ],
+    livery_router:compile(Routes).
 
-        %% API key management (admin only)
-        {<<"GET">>,    <<"/keys">>,               ?H(keys)},
-        {<<"POST">>,   <<"/keys">>,               ?H(keys)},
-        {<<"GET">>,    <<"/keys/:key_prefix">>,   ?H(key)},
-        {<<"DELETE">>, <<"/keys/:key_prefix">>,   ?H(key)},
+%% Build an OpenAPI 3.1 document from the route table. Called once
+%% per service start; the result is captured in the `/openapi.json'
+%% handler closure.
+openapi_doc() ->
+    Vsn = case application:get_key(barrel_docdb, vsn) of
+        {ok, V} -> list_to_binary(V);
+        undefined -> <<"0.0.0">>
+    end,
+    livery_openapi:build(#{
+        info => #{
+            title => <<"barrel_docdb HTTP API">>,
+            version => Vsn,
+            description => <<"Document database with MVCC, queries, ",
+                             "changes feed, attachments, and replication. ",
+                             "Authentication is via Bearer API keys (ak_*).">>
+        },
+        routes => routes()
+    }).
 
-        %% Admin usage
-        {<<"GET">>, <<"/admin/usage">>,                  ?H(admin_usage)},
-        {<<"GET">>, <<"/admin/databases/:db/usage">>,    ?H(admin_db_usage)},
+%% The route table is a list of `{Method, Path, Handler, Meta}'.
+%% `Meta' carries OpenAPI annotations (`operation_id', `summary',
+%% `tags', `parameters', `request_body', `responses') that
+%% `livery_openapi:build/1' consumes. The `livery_router:match/3'
+%% path only reads `Meta.middleware', so adding documentation
+%% fields is transparent to dispatch.
+routes() ->
+    [
+        %% Meta / public
+        {<<"GET">>, <<"/health">>, ?H(health),
+         #{tags => [<<"Meta">>], operation_id => <<"health">>,
+           summary => <<"Service health check">>}},
+        {<<"GET">>, <<"/metrics">>, livery_metrics:handler(),
+         #{tags => [<<"Meta">>], operation_id => <<"metrics">>,
+           summary => <<"Prometheus metrics scrape endpoint">>}},
+        {<<"GET">>, <<"/.well-known/barrel">>, ?H(node_info),
+         #{tags => [<<"Meta">>], operation_id => <<"node_info">>,
+           summary => <<"Node identity (id, version, peer public key)">>}},
+
+        %% Admin: API keys
+        {<<"GET">>, <<"/keys">>, ?H(keys),
+         #{tags => [<<"Admin">>], operation_id => <<"list_keys">>,
+           summary => <<"List API keys (admin only)">>}},
+        {<<"POST">>, <<"/keys">>, ?H(keys),
+         #{tags => [<<"Admin">>], operation_id => <<"create_key">>,
+           summary => <<"Create an API key (admin only)">>}},
+        {<<"GET">>, <<"/keys/:key_prefix">>, ?H(key),
+         #{tags => [<<"Admin">>], operation_id => <<"get_key">>,
+           summary => <<"Get API key by prefix (admin only)">>}},
+        {<<"DELETE">>, <<"/keys/:key_prefix">>, ?H(key),
+         #{tags => [<<"Admin">>], operation_id => <<"delete_key">>,
+           summary => <<"Delete API key by prefix (admin only)">>}},
+
+        %% Admin: usage stats
+        {<<"GET">>, <<"/admin/usage">>, ?H(admin_usage),
+         #{tags => [<<"Admin">>], operation_id => <<"admin_usage">>,
+           summary => <<"Per-database usage stats (admin only)">>}},
+        {<<"GET">>, <<"/admin/databases/:db/usage">>, ?H(admin_db_usage),
+         #{tags => [<<"Admin">>], operation_id => <<"admin_db_usage">>,
+           summary => <<"Usage stats for one database (admin only)">>}},
 
         %% Database lifecycle
-        {<<"GET">>,    <<"/db/:db">>, ?H(db_info)},
-        {<<"PUT">>,    <<"/db/:db">>, ?H(db_info)},
-        {<<"DELETE">>, <<"/db/:db">>, ?H(db_info)},
-        {<<"POST">>,   <<"/db/:db">>, ?H(db_info)},
+        {<<"GET">>, <<"/db/:db">>, ?H(db_info),
+         #{tags => [<<"Database">>], operation_id => <<"db_info">>,
+           summary => <<"Get database information">>}},
+        {<<"PUT">>, <<"/db/:db">>, ?H(db_info),
+         #{tags => [<<"Database">>], operation_id => <<"create_db">>,
+           summary => <<"Create a database">>}},
+        {<<"DELETE">>, <<"/db/:db">>, ?H(db_info),
+         #{tags => [<<"Database">>], operation_id => <<"delete_db">>,
+           summary => <<"Delete a database and all its data">>}},
+        {<<"POST">>, <<"/db/:db">>, ?H(db_info),
+         #{tags => [<<"Documents">>], operation_id => <<"post_doc">>,
+           summary => <<"Create a document with an auto-generated id">>}},
 
-        %% Changes feed + SSE stream
-        {<<"GET">>,  <<"/db/:db/_changes">>,         ?H(changes)},
-        {<<"POST">>, <<"/db/:db/_changes">>,         ?H(changes)},
-        {<<"GET">>,  <<"/db/:db/_changes/stream">>,  fun barrel_http_changes_stream:handle/1},
-        {<<"POST">>, <<"/db/:db/_changes/stream">>,  fun barrel_http_changes_stream:handle/1},
+        %% Changes feed + SSE
+        {<<"GET">>, <<"/db/:db/_changes">>, ?H(changes),
+         #{tags => [<<"Changes">>], operation_id => <<"get_changes">>,
+           summary => <<"Poll the changes feed">>}},
+        {<<"POST">>, <<"/db/:db/_changes">>, ?H(changes),
+         #{tags => [<<"Changes">>], operation_id => <<"post_changes">>,
+           summary => <<"Poll the changes feed with a filter body">>}},
+        {<<"GET">>, <<"/db/:db/_changes/stream">>,
+         fun barrel_http_changes_stream:handle/1,
+         #{tags => [<<"Changes">>], operation_id => <<"changes_stream">>,
+           summary => <<"Stream the changes feed via Server-Sent Events">>}},
+        {<<"POST">>, <<"/db/:db/_changes/stream">>,
+         fun barrel_http_changes_stream:handle/1,
+         #{tags => [<<"Changes">>], operation_id => <<"changes_stream_post">>,
+           summary => <<"Stream changes via SSE with a filter body">>}},
 
         %% Bulk + query
-        {<<"POST">>, <<"/db/:db/_bulk_docs">>, ?H(bulk_docs)},
-        {<<"POST">>, <<"/db/:db/_find">>,      ?H(find)},
+        {<<"POST">>, <<"/db/:db/_bulk_docs">>, ?H(bulk_docs),
+         #{tags => [<<"Documents">>], operation_id => <<"bulk_docs">>,
+           summary => <<"Bulk create/update documents">>}},
+        {<<"POST">>, <<"/db/:db/_find">>, ?H(find),
+         #{tags => [<<"Queries">>], operation_id => <<"find">>,
+           summary => <<"Query documents">>}},
 
         %% Replication primitives
-        {<<"POST">>, <<"/db/:db/_replicate">>, ?H(replicate)},
-        {<<"POST">>, <<"/db/:db/_revsdiff">>,  ?H(revsdiff)},
-        {<<"POST">>, <<"/db/:db/_put_rev">>,   ?H(put_rev)},
-        {<<"POST">>, <<"/db/:db/_sync_hlc">>,  ?H(sync_hlc)},
+        {<<"POST">>, <<"/db/:db/_replicate">>, ?H(replicate),
+         #{tags => [<<"Replication">>], operation_id => <<"replicate">>,
+           summary => <<"Trigger a one-shot replication">>}},
+        {<<"POST">>, <<"/db/:db/_revsdiff">>, ?H(revsdiff),
+         #{tags => [<<"Replication">>], operation_id => <<"revsdiff">>,
+           summary => <<"Compute missing revisions (replication primitive)">>}},
+        {<<"POST">>, <<"/db/:db/_put_rev">>, ?H(put_rev),
+         #{tags => [<<"Replication">>], operation_id => <<"put_rev">>,
+           summary => <<"Insert a document with explicit history (replication primitive)">>}},
+        {<<"POST">>, <<"/db/:db/_sync_hlc">>, ?H(sync_hlc),
+         #{tags => [<<"Replication">>], operation_id => <<"sync_hlc">>,
+           summary => <<"Synchronise the hybrid logical clock with a peer">>}},
 
         %% Local documents (checkpoints)
-        {<<"GET">>,    <<"/db/:db/_local/:doc_id">>, ?H(local_doc)},
-        {<<"PUT">>,    <<"/db/:db/_local/:doc_id">>, ?H(local_doc)},
-        {<<"DELETE">>, <<"/db/:db/_local/:doc_id">>, ?H(local_doc)},
+        {<<"GET">>, <<"/db/:db/_local/:doc_id">>, ?H(local_doc),
+         #{tags => [<<"Local">>], operation_id => <<"get_local_doc">>,
+           summary => <<"Get a local (non-replicated) document">>}},
+        {<<"PUT">>, <<"/db/:db/_local/:doc_id">>, ?H(local_doc),
+         #{tags => [<<"Local">>], operation_id => <<"put_local_doc">>,
+           summary => <<"Put a local (non-replicated) document">>}},
+        {<<"DELETE">>, <<"/db/:db/_local/:doc_id">>, ?H(local_doc),
+         #{tags => [<<"Local">>], operation_id => <<"delete_local_doc">>,
+           summary => <<"Delete a local document">>}},
 
         %% Attachments (more specific paths first)
-        {<<"GET">>,    <<"/db/:db/:doc_id/_attachments">>,            ?H(attachments)},
-        {<<"GET">>,    <<"/db/:db/:doc_id/_attachments/:att_name">>,  ?H(attachment)},
-        {<<"PUT">>,    <<"/db/:db/:doc_id/_attachments/:att_name">>,  ?H(attachment)},
-        {<<"DELETE">>, <<"/db/:db/:doc_id/_attachments/:att_name">>,  ?H(attachment)},
+        {<<"GET">>, <<"/db/:db/:doc_id/_attachments">>, ?H(attachments),
+         #{tags => [<<"Attachments">>], operation_id => <<"list_attachments">>,
+           summary => <<"List attachments on a document">>}},
+        {<<"GET">>, <<"/db/:db/:doc_id/_attachments/:att_name">>, ?H(attachment),
+         #{tags => [<<"Attachments">>], operation_id => <<"get_attachment">>,
+           summary => <<"Download an attachment">>}},
+        {<<"PUT">>, <<"/db/:db/:doc_id/_attachments/:att_name">>, ?H(attachment),
+         #{tags => [<<"Attachments">>], operation_id => <<"put_attachment">>,
+           summary => <<"Upload an attachment">>}},
+        {<<"DELETE">>, <<"/db/:db/:doc_id/_attachments/:att_name">>, ?H(attachment),
+         #{tags => [<<"Attachments">>], operation_id => <<"delete_attachment">>,
+           summary => <<"Delete an attachment">>}},
 
         %% Document operations (variable path - keep last)
-        {<<"GET">>,    <<"/db/:db/:doc_id">>, ?H(doc)},
-        {<<"PUT">>,    <<"/db/:db/:doc_id">>, ?H(doc)},
-        {<<"DELETE">>, <<"/db/:db/:doc_id">>, ?H(doc)}
-    ]).
+        {<<"GET">>, <<"/db/:db/:doc_id">>, ?H(doc),
+         #{tags => [<<"Documents">>], operation_id => <<"get_doc">>,
+           summary => <<"Get a document">>}},
+        {<<"PUT">>, <<"/db/:db/:doc_id">>, ?H(doc),
+         #{tags => [<<"Documents">>], operation_id => <<"put_doc">>,
+           summary => <<"Create or update a document">>}},
+        {<<"DELETE">>, <<"/db/:db/:doc_id">>, ?H(doc),
+         #{tags => [<<"Documents">>], operation_id => <<"delete_doc">>,
+           summary => <<"Delete a document">>}}
+    ].

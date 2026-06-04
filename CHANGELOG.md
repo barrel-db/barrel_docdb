@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] - 2026-06-04
+
+### Changed
+- The OpenAPI 3.1 document is now generated at boot from the route
+  table in `barrel_http_server` and served live at
+  `GET /openapi.json`. A Redoc UI is at `GET /docs`. Both are public
+  (no API key required) so SDK generators and importers can pull
+  the spec without credentials.
+- Per-route OpenAPI metadata (`operation_id`, `summary`, `tags`,
+  optional `parameters` / `request_body` / `responses`) lives next
+  to each route in `barrel_http_server:routes/0`. To update the doc,
+  edit the route metadata; the next service start picks it up.
+
+### Removed
+- `docs/api/openapi.yaml` (hand-maintained spec) and the stale
+  `openapi.yaml` at the repo root (0.5.0, referenced the JWT
+  scheme we removed in 0.6.2). Replaced by the live endpoint.
+- `docs/api/openapi.md` rewritten to point at `/openapi.json` and
+  `/docs` instead of the deleted YAML file.
+
 ## [0.7.3] - 2026-06-04
 
 ### Changed
