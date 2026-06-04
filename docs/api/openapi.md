@@ -1,105 +1,52 @@
 # OpenAPI Specification
 
-The Barrel DocDB HTTP API is documented using OpenAPI 3.0.
+The Barrel DocDB HTTP API is described by an OpenAPI 3.1 document
+generated at boot from the route table in
+`src/web/barrel_http_server.erl`. The doc is **not** hand-maintained;
+the running service is always the source of truth.
 
-## Interactive Documentation
+## Endpoints
 
-<div id="swagger-ui"></div>
+- `GET /openapi.json` — the OpenAPI 3.1 document (JSON).
+- `GET /docs` — a [Redoc](https://github.com/Redocly/redoc) browser UI
+  that loads the spec from `/openapi.json`.
 
-<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
-<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
-
-<style>
-  /* Dark theme adjustments for Material theme */
-  .swagger-ui {
-    background: transparent;
-  }
-  .swagger-ui .topbar {
-    display: none;
-  }
-  .swagger-ui .info {
-    margin: 20px 0;
-  }
-  .swagger-ui .scheme-container {
-    background: transparent;
-    box-shadow: none;
-  }
-  [data-md-color-scheme="slate"] .swagger-ui,
-  [data-md-color-scheme="slate"] .swagger-ui .info .title,
-  [data-md-color-scheme="slate"] .swagger-ui .info p,
-  [data-md-color-scheme="slate"] .swagger-ui .info li,
-  [data-md-color-scheme="slate"] .swagger-ui table thead tr th,
-  [data-md-color-scheme="slate"] .swagger-ui table tbody tr td,
-  [data-md-color-scheme="slate"] .swagger-ui .opblock-tag,
-  [data-md-color-scheme="slate"] .swagger-ui .opblock .opblock-summary-description,
-  [data-md-color-scheme="slate"] .swagger-ui .opblock .opblock-section-header h4,
-  [data-md-color-scheme="slate"] .swagger-ui .opblock-description-wrapper p,
-  [data-md-color-scheme="slate"] .swagger-ui .response-col_status,
-  [data-md-color-scheme="slate"] .swagger-ui .response-col_description,
-  [data-md-color-scheme="slate"] .swagger-ui .parameter__name,
-  [data-md-color-scheme="slate"] .swagger-ui .parameter__type,
-  [data-md-color-scheme="slate"] .swagger-ui .model-title,
-  [data-md-color-scheme="slate"] .swagger-ui section.models h4 {
-    color: #fff;
-  }
-  [data-md-color-scheme="slate"] .swagger-ui .opblock .opblock-section-header {
-    background: rgba(255,255,255,0.05);
-  }
-  [data-md-color-scheme="slate"] .swagger-ui section.models {
-    border-color: rgba(255,255,255,0.1);
-  }
-  [data-md-color-scheme="slate"] .swagger-ui section.models.is-open h4 {
-    border-color: rgba(255,255,255,0.1);
-  }
-</style>
-
-<script>
-  window.onload = function() {
-    SwaggerUIBundle({
-      url: "../openapi.yaml",
-      dom_id: '#swagger-ui',
-      deepLinking: true,
-      presets: [
-        SwaggerUIBundle.presets.apis,
-        SwaggerUIBundle.SwaggerUIStandalonePreset
-      ],
-      layout: "BaseLayout",
-      defaultModelsExpandDepth: 1,
-      defaultModelExpandDepth: 1,
-      docExpansion: "list",
-      filter: true,
-      showExtensions: true,
-      showCommonExtensions: true
-    });
-  };
-</script>
+Both endpoints are public (no API key required) so tooling can pull
+the spec without provisioning credentials.
 
 ## Download
 
-- [openapi.yaml](https://github.com/barrel-db/barrel_docdb/blob/main/openapi.yaml) - OpenAPI 3.0 specification
-
-## Using the Specification
-
-### Generate Client SDKs
-
-Use [OpenAPI Generator](https://openapi-generator.tech/) to generate client libraries:
-
 ```bash
-# Python client
-openapi-generator generate -i openapi.yaml -g python -o ./python-client
-
-# JavaScript/TypeScript client
-openapi-generator generate -i openapi.yaml -g typescript-fetch -o ./ts-client
-
-# Go client
-openapi-generator generate -i openapi.yaml -g go -o ./go-client
+curl http://localhost:8080/openapi.json > barrel_docdb.openapi.json
 ```
 
-### Import into Tools
+## Generate client SDKs
 
-The specification can be imported into:
+Use [OpenAPI Generator](https://openapi-generator.tech/) against the
+live endpoint or a downloaded snapshot:
 
-- **Postman** - Import > File > openapi.yaml
-- **Insomnia** - Import/Export > Import Data > From File
-- **Bruno** - Import Collection > OpenAPI
-- **curl** - Use with tools like [openapi2curl](https://github.com/openapi-generator/openapi-generator)
+```bash
+# Python
+openapi-generator generate -i http://localhost:8080/openapi.json -g python -o ./python-client
+
+# TypeScript / fetch
+openapi-generator generate -i http://localhost:8080/openapi.json -g typescript-fetch -o ./ts-client
+
+# Go
+openapi-generator generate -i http://localhost:8080/openapi.json -g go -o ./go-client
+```
+
+## Import into tools
+
+- **Postman**: Import → Link → paste `http://localhost:8080/openapi.json`.
+- **Insomnia**: Import/Export → Import Data → From URL.
+- **Bruno**: Import Collection → OpenAPI.
+- **curl**: use with tools like
+  [openapi2curl](https://github.com/openapi-generator/openapi-generator).
+
+## Updating the document
+
+Edit the route metadata in `src/web/barrel_http_server.erl:routes/0`
+(per-route `Meta` map: `tags`, `summary`, `operation_id`,
+`parameters`, `request_body`, `responses`). The next service start
+serves the updated document; no separate doc file to keep in sync.

@@ -62,6 +62,8 @@ call(Req, Next, _State) ->
 classify(<<"/health">>,             _)        -> public;
 classify(<<"/metrics">>,            _)        -> public;
 classify(<<"/.well-known/barrel">>, _)        -> public;
+classify(<<"/openapi.json">>,       _)        -> public;
+classify(<<"/docs">>,               _)        -> public;
 classify(<<"/keys", _/binary>>,     _)        -> admin;
 classify(<<"/admin/", _/binary>>,   _)        -> admin;
 classify(<<"/db/", Rest/binary>>,   Method)   -> db_class(Rest, Method);
