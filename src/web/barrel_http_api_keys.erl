@@ -121,8 +121,7 @@ generate_admin_key() ->
 %%====================================================================
 
 init([]) ->
-    %% Get data path from application config
-    DataPath = application:get_env(barrel_docdb, data_path, "data/barrel_docdb"),
+    DataPath = data_dir(),
     KeysFile = filename:join(DataPath, "api_keys.dets"),
 
     %% Ensure directory exists
@@ -183,6 +182,26 @@ terminate(_Reason, _State) ->
 %%====================================================================
 %% Internal functions
 %%====================================================================
+
+%% @private Resolve the data directory. Prefers the canonical
+%% `data_dir' config key; for backward compatibility with older
+%% configs that set `data_path' instead, fall back to it and warn.
+%% The legacy alias is documented as scheduled for removal in 0.8.0.
+data_dir() ->
+    case application:get_env(barrel_docdb, data_dir, undefined) of
+        undefined ->
+            case application:get_env(barrel_docdb, data_path, undefined) of
+                undefined ->
+                    "data/barrel_docdb";
+                Legacy ->
+                    logger:warning(
+                      "barrel_docdb: `data_path' config key is deprecated; "
+                      "use `data_dir' instead. Scheduled for removal in 0.8.0."),
+                    Legacy
+            end;
+        Dir ->
+            Dir
+    end.
 
 maybe_bootstrap_admin_key(_State) ->
     %% Check for environment variable override

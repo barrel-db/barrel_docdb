@@ -191,14 +191,14 @@ init([]) ->
 %%====================================================================
 
 %% @private
-%% Build HTTP server options from application environment
+%% Build HTTP server options from application environment.
+%% Note: `http_acceptors', `http_max_connections', and `http_protocols'
+%% from the cowboy-era config are not consumed any more - livery's
+%% own defaults govern those concerns; per-request limits are
+%% enforced by middleware in barrel_http_server.
 build_http_opts() ->
-    %% Basic options
     Opts0 = #{
-        port => application:get_env(barrel_docdb, http_port, 8080),
-        num_acceptors => application:get_env(barrel_docdb, http_acceptors, 100),
-        max_connections => application:get_env(barrel_docdb, http_max_connections, infinity),
-        protocols => application:get_env(barrel_docdb, http_protocols, [http2, http])
+        port => application:get_env(barrel_docdb, http_port, 8080)
     },
 
     %% TLS options (only add if TLS is enabled and cert/key are provided)
