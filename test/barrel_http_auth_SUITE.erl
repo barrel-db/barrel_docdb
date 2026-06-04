@@ -42,7 +42,7 @@ all() ->
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(barrel_docdb),
-    {ok, _} = application:ensure_all_started(cowboy),
+    {ok, _} = application:ensure_all_started(livery),
     {ok, _} = application:ensure_all_started(hackney),
     {ok, HttpPid} = barrel_http_server:start_link(#{port => ?PORT}),
     unlink(HttpPid),

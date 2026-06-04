@@ -115,7 +115,7 @@ groups() ->
 
 init_per_suite(Config) ->
     application:ensure_all_started(barrel_docdb),
-    application:ensure_all_started(cowboy),
+    application:ensure_all_started(livery),
     application:ensure_all_started(hackney),
     %% Start HTTP server at suite level
     %% Unlink so it survives process changes between init/end_per_suite
