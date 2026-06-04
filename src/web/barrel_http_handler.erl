@@ -25,11 +25,14 @@
 %% Called by livery for every routed request. The route table in
 %% `barrel_http_server' wraps each route with a closure that hands
 %% the action atom in as the first argument.
+%% Authentication and per-action authorisation run in the
+%% `barrel_docdb_auth' livery middleware attached to every route
+%% in `barrel_http_server'. The validated key map is available to
+%% handler clauses via `livery_req:meta(auth_ctx, Req, _)' if they
+%% need it. By the time we get here the request is authorised.
 handle(Action, Req0) ->
     Method = livery_req:method(Req0),
     try
-        AuthContext = maybe_authenticate(Action, Req0),
-        ok = authorize(Action, Method, AuthContext),
         build_response(handle_action(Action, Method, Req0))
     catch
         throw:{error, ErrStatus, Message} ->
@@ -92,154 +95,16 @@ parse_qs(Req) ->
         Raw  -> uri_string:dissect_query(Raw)
     end.
 
-%%====================================================================
-%% Authentication
-%%====================================================================
-
-%% @doc Check authentication for request. Returns the auth context map
-%% used by authorize/3 for permission enforcement.
-%% - Public endpoints (health, metrics, node_info) return `public'.
-%% - Admin-gated endpoints (keys, admin/*) return `admin' after
-%%   verifying `is_admin = true'.
-%% - Everything else returns the validated key map.
-maybe_authenticate(health, _Req) ->
-    public;
-maybe_authenticate(metrics, _Req) ->
-    public;
-maybe_authenticate(node_info, _Req) ->
-    public;
-maybe_authenticate(Action, Req) when Action =:= keys; Action =:= key;
-                                     Action =:= admin_usage; Action =:= admin_db_usage ->
-    authenticate_admin(Req),
-    admin;
-maybe_authenticate(Action, Req) ->
-    case barrel_http_api_keys:has_any_keys() of
-        false ->
-            %% No keys configured: allow but apply default-admin context
-            %% so authorize/3 doesn't gate the actions either.
-            unconfigured;
-        true ->
-            DbName = get_db_from_action(Action, Req),
-            authenticate(Req, DbName)
-    end.
-
-%% @doc Permission check.
-%% AuthContext is one of:
-%%   - public     : public endpoint (no perm needed).
-%%   - admin      : admin-gated endpoint (is_admin already verified).
-%%   - unconfigured : keys not configured yet (legacy mode, allow all).
-%%   - #{...}     : validated key map with `permissions' and `is_admin'.
-authorize(_Action, _Method, public) -> ok;
-authorize(_Action, _Method, admin) -> ok;
-authorize(_Action, _Method, unconfigured) -> ok;
-authorize(_Action, _Method, #{is_admin := true}) -> ok;
-authorize(Action, Method, #{permissions := Perms}) ->
-    case required_perm(Action, Method) of
-        none ->
-            ok;
-        Required when is_binary(Required) ->
-            case lists:member(Required, Perms) of
-                true ->
-                    ok;
-                false ->
-                    throw({error, 403,
-                           <<"Permission denied: requires ",
-                             Required/binary>>})
-            end
-    end;
-authorize(_Action, _Method, _Other) ->
-    %% Defensive: unrecognized context shape.
-    throw({error, 403, <<"Permission denied">>}).
-
-%% @doc Map (Action, Method) to the API-key permission string needed.
-%% Returns `none' for actions whose auth is already covered upstream
-%% (e.g. admin_* via `authenticate_admin').
-required_perm(db_info, <<"GET">>) -> <<"read">>;
-required_perm(doc, <<"GET">>) -> <<"read">>;
-required_perm(changes, _) -> <<"read">>;
-required_perm(find, _) -> <<"read">>;
-required_perm(attachments, <<"GET">>) -> <<"read">>;
-required_perm(attachment, <<"GET">>) -> <<"read">>;
-required_perm(local_doc, <<"GET">>) -> <<"read">>;
-required_perm(revsdiff, _) -> <<"read">>;
-required_perm(db_info, <<"PUT">>) -> <<"write">>;
-required_perm(db_info, <<"POST">>) -> <<"write">>;
-required_perm(db_info, <<"DELETE">>) -> <<"write">>;
-required_perm(doc, <<"PUT">>) -> <<"write">>;
-required_perm(doc, <<"DELETE">>) -> <<"write">>;
-required_perm(bulk_docs, _) -> <<"write">>;
-required_perm(attachment, <<"PUT">>) -> <<"write">>;
-required_perm(attachment, <<"DELETE">>) -> <<"write">>;
-required_perm(local_doc, <<"PUT">>) -> <<"write">>;
-required_perm(local_doc, <<"DELETE">>) -> <<"write">>;
-required_perm(put_rev, _) -> <<"write">>;
-required_perm(sync_hlc, _) -> <<"write">>;
-required_perm(replicate, _) -> <<"write">>;
-%% Admin-gated actions reach authorize/3 only through the
-%% `admin' context, which short-circuits above.
-required_perm(_Action, _Method) -> none.
-
-%% @doc Get database name from action and request
-get_db_from_action(health, _Req) -> undefined;
-get_db_from_action(_Action, Req) ->
-    livery_req:binding(<<"db">>, Req, undefined).
-
-%% @doc Authenticate request via bearer token (API keys, ak_*).
-%% Returns the validated key map for downstream permission checks.
-authenticate(Req, DbName) ->
-    case extract_bearer_token(Req) of
-        undefined ->
-            throw({error, 401, <<"Authorization required">>});
-        Token ->
-            case validate_token(Token, DbName) of
-                {ok, KeyMap} ->
-                    KeyMap;
-                {error, invalid_key} ->
-                    throw({error, 401, <<"Invalid API key">>});
-                {error, access_denied} ->
-                    throw({error, 403, <<"Access denied to this database">>})
-            end
-    end.
-
-%% @doc Authenticate request requiring admin privileges (API keys, ak_*)
-authenticate_admin(Req) ->
-    case extract_bearer_token(Req) of
-        undefined ->
-            throw({error, 401, <<"Authorization required">>});
-        Token ->
-            case validate_token_admin(Token) of
-                {ok, #{is_admin := true}} ->
-                    ok;
-                {ok, _} ->
-                    throw({error, 403, <<"Admin access required">>});
-                {error, invalid_key} ->
-                    throw({error, 401, <<"Invalid API key">>})
-            end
-    end.
-
-validate_token(<<"ak_", _/binary>> = Token, undefined) ->
-    barrel_http_api_keys:validate_key(Token);
-validate_token(<<"ak_", _/binary>> = Token, DbName) ->
-    barrel_http_api_keys:validate_key(Token, DbName);
-validate_token(_, _) ->
-    {error, invalid_key}.
-
-validate_token_admin(<<"ak_", _/binary>> = Token) ->
-    barrel_http_api_keys:validate_key(Token);
-validate_token_admin(_) ->
-    {error, invalid_key}.
-
-%% @doc Extract bearer token from Authorization header
-extract_bearer_token(Req) ->
+%% Reach into the inbound Authorization header. Used only by the
+%% replicate handler to forward the caller's bearer token to a
+%% remote replication target when the body doesn't explicitly
+%% set `target_auth'.
+inherit_bearer_token(Req) ->
     case livery_req:header(<<"authorization">>, Req) of
-        undefined ->
-            undefined;
-        <<"Bearer ", Token/binary>> ->
-            Token;
-        <<"bearer ", Token/binary>> ->
-            Token;
-        _ ->
-            undefined
+        undefined                  -> undefined;
+        <<"Bearer ", Token/binary>> -> Token;
+        <<"bearer ", Token/binary>> -> Token;
+        _                          -> undefined
     end.
 
 %%====================================================================
@@ -841,7 +706,7 @@ handle_replicate(Req0) ->
             AuthToken = case maps:get(<<"target_auth">>, Spec, undefined) of
                 undefined ->
                     %% Inherit current request's auth token
-                    extract_bearer_token(Req1);
+                    inherit_bearer_token(Req1);
                 Token ->
                     Token
             end,

@@ -155,6 +155,7 @@ base_service_opts() ->
         {livery_request_id,        #{}},
         {livery_instrument_trace,  #{tracer => <<"barrel_docdb">>}},
         {livery_instrument_metrics, #{meter => <<"barrel_docdb">>}},
+        {barrel_docdb_auth,        #{}},
         {livery_access_log,        #{}}
     ]}.
 
@@ -195,7 +196,7 @@ router() ->
         {<<"DELETE">>, <<"/db/:db">>, ?H(db_info)},
         {<<"POST">>,   <<"/db/:db">>, ?H(db_info)},
 
-        %% Changes feed + SSE stream (separate handler module for SSE)
+        %% Changes feed + SSE stream
         {<<"GET">>,  <<"/db/:db/_changes">>,         ?H(changes)},
         {<<"POST">>, <<"/db/:db/_changes">>,         ?H(changes)},
         {<<"GET">>,  <<"/db/:db/_changes/stream">>,  fun barrel_http_changes_stream:handle/1},

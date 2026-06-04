@@ -15,7 +15,7 @@ info:
     The API supports:
     - `application/json` (default)
     - `application/cbor` (binary, more efficient)
-  version: 0.7.2
+  version: 0.7.3
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
