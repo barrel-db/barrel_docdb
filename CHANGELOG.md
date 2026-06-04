@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-06-04
+
+### Changed
+- **HTTP layer migrated from cowboy to [livery](https://github.com/benoitc/livery).** All HTTP endpoints, headers, and response shapes are unchanged; the framework swap is internal. The dep graph drops `cowboy` / `cowlib` / `ranch` and adds `livery` (and its transitive `h1` / `h2` / `quic` / `ws` / `webtransport` / `barrel_mcp`). Consumers building a release from source need `livery` in their build environment.
+- HTTP/2 is supported out of the box (livery serves H1 and H2 from one listener via h2c upgrade or prior knowledge). HTTP/3 is available via livery and can be enabled in a follow-up.
+- HTTP modules are now grouped under `src/web/` (rebar3 `src_dirs` extended).
+- `instrument` is now consumed from hex (`1.1.3`) instead of the git pin, matching livery.
+
+### Internal
+- `barrel_http_server` calls `livery:start_service/1` + `livery_router:compile/1` instead of cowboy's listener / dispatch APIs.
+- `barrel_http_handler` returns value-based responses via `livery_resp:new/3`, `livery_resp:stream/3`. Per-action `handle_action/3` clauses keep the same internal tuple shape; conversion is centralized in `handle/2`.
+- `barrel_http_changes_stream` uses `livery_resp:sse/3` with a producer closure that owns the poll/heartbeat loop.
+
 ## [0.6.4] - 2026-06-02
 
 ### Security
