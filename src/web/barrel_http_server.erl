@@ -144,19 +144,36 @@ service_opts(Port, true, Router, Opts) ->
     (base_service_opts())#{https => HttpsListener, router => Router}.
 
 %% Service-level middleware shared by HTTP and HTTPS listeners.
-%% Order follows livery's `log-requests' guide: request_id first so
-%% every downstream layer can correlate, then the OpenTelemetry
-%% middleware (trace + metrics) which wraps the handler, then access
-%% log so it records the final status. instrument trace + metrics
-%% feed the same `instrument' registry that barrel_metrics writes
-%% domain metrics into; the `/metrics' route renders both surfaces.
+%% Ordering:
+%%   1. request_id        - generate/propagate correlation id first
+%%                          so every later layer can log/trace it.
+%%   2. instrument_trace  - W3C trace context + OTel server span;
+%%      instrument_metrics  records http.server.active_requests +
+%%                          http.server.request.duration.
+%%   3. body_limit        - 413 for oversize buffered bodies; runs
+%%                          BEFORE auth so attackers can't waste
+%%                          key-validation cycles on huge payloads.
+%%      concurrency        - 503 load-shed above the in-flight cap.
+%%   4. barrel_docdb_auth - bearer + permission gate.
+%%   5. access_log        - records final status, last in the
+%%                          stack so it sees the response code.
+%%
+%% `livery_body_limit' only enforces against buffered bodies; the
+%% streaming attachment uploads bypass it (they're chunked by
+%% design). Per-request idle / request timeouts come from livery's
+%% defaults (60s request, 300s idle) - no config knob needed for
+%% those today.
 base_service_opts() ->
+    MaxBody = application:get_env(barrel_docdb, http_max_body_bytes, 4 * 1024 * 1024),
+    MaxInFlight = application:get_env(barrel_docdb, http_max_in_flight, 1000),
     #{middleware => [
-        {livery_request_id,        #{}},
-        {livery_instrument_trace,  #{tracer => <<"barrel_docdb">>}},
+        {livery_request_id,         #{}},
+        {livery_instrument_trace,   #{tracer => <<"barrel_docdb">>}},
         {livery_instrument_metrics, #{meter => <<"barrel_docdb">>}},
-        {barrel_docdb_auth,        #{}},
-        {livery_access_log,        #{}}
+        {livery_body_limit,         #{max => MaxBody}},
+        {livery_concurrency,        livery_concurrency:limiter(MaxInFlight)},
+        {barrel_docdb_auth,         #{}},
+        {livery_access_log,         #{}}
     ]}.
 
 %%====================================================================

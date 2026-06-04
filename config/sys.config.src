@@ -5,11 +5,14 @@
         %% HTTP server configuration
         {http_enabled, ${BARREL_HTTP_ENABLED:-true}},
         {http_port, ${BARREL_HTTP_PORT:-8080}},
-        {http_acceptors, ${BARREL_HTTP_ACCEPTORS:-100}},
-        {http_max_connections, ${BARREL_HTTP_MAX_CONNECTIONS:-infinity}},
-        %% HTTP/2 and TLS configuration
-        %% BARREL_HTTP_PROTOCOLS: comma-separated list (http2,http | http2 | http)
-        {http_protocols, [http2, http]},
+        %% Request-body size cap (buffered bodies only - streamed
+        %% attachment uploads bypass this by design). 413 on
+        %% oversize. Override via BARREL_HTTP_MAX_BODY_BYTES.
+        {http_max_body_bytes, ${BARREL_HTTP_MAX_BODY_BYTES:-4194304}},
+        %% Maximum concurrent in-flight requests; over the cap the
+        %% server sheds load with 503. Override via
+        %% BARREL_HTTP_MAX_IN_FLIGHT.
+        {http_max_in_flight, ${BARREL_HTTP_MAX_IN_FLIGHT:-1000}},
         %% TLS configuration (enables HTTPS with HTTP/2 ALPN)
         %% Set BARREL_HTTP_TLS_ENABLED=true and provide cert/key paths
         {http_tls_enabled, ${BARREL_HTTP_TLS_ENABLED:-false}},

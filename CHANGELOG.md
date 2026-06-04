@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5] - 2026-06-04
+
+### Added
+- HTTP request body size cap and in-flight request cap via livery's
+  middleware stack. Buffered bodies above `http_max_body_bytes`
+  (default 4 MiB) return 413; concurrent requests above
+  `http_max_in_flight` (default 1000) shed with 503. Both tunable via
+  `BARREL_HTTP_MAX_BODY_BYTES` / `BARREL_HTTP_MAX_IN_FLIGHT`.
+  Streamed attachment uploads bypass the body cap by design.
+
+### Changed
+- `barrel_http_api_keys` now reads the canonical `data_dir` config
+  key, with a deprecation-warning fallback to legacy `data_path`.
+  The fallback is scheduled for removal in 0.8.0.
+
+### Removed
+- Dead cowboy-era config keys `http_acceptors`,
+  `http_max_connections`, and `http_protocols`. Livery's defaults
+  (60s request timeout, 300s idle timeout) replace them; per-request
+  caps are enforced by middleware.
+
 ## [0.7.4] - 2026-06-04
 
 ### Changed
