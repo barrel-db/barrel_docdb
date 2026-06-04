@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-06-04
+
+### Changed
+- Switch `livery` from a git pin against `main` to the hex package
+  `0.2.0`.
+- **Replace `hackney` with `livery_client` for outbound replication
+  HTTP**. `barrel_rep_transport_http` now uses
+  `livery_client:request/4` for the `_changes`/`_put_rev`/
+  `_revsdiff`/`_sync_hlc` calls, giving outbound replication the
+  same composable middleware stack the server side has. The
+  underlying transport remains hackney (via livery's
+  `livery_client_hackney` adapter), but is no longer a direct
+  barrel dep.
+- Drop `hackney` from `rebar.config` deps, `barrel_docdb.app.src`
+  applications, and the relx release list. It still arrives as a
+  transitive dependency of livery.
+
 ## [0.7.0] - 2026-06-04
 
 ### Changed

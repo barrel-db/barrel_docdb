@@ -242,39 +242,38 @@ sync_hlc(Endpoint, LocalHlc) ->
 %%====================================================================
 
 http_get(Endpoint, Url) ->
-    Path = extract_path(Url),
-    Headers = request_headers(Endpoint, <<"GET">>, Path, <<>>),
-    Opts = request_options(Endpoint),
-    case hackney:get(Url, Headers, <<>>, Opts) of
-        {ok, Status, RespHeaders, Body} ->
-            _ = barrel_hlc:maybe_sync_from_header(
-                proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
-            {ok, Status, RespHeaders, Body};
-        {error, _} = Error ->
-            Error
-    end.
+    http_request(Endpoint, <<"GET">>, Url, <<>>).
 
 http_post(Endpoint, Url, ReqBody) ->
-    Path = extract_path(Url),
     Body = encode_body(Endpoint, ReqBody),
-    Headers = request_headers(Endpoint, <<"POST">>, Path, Body),
-    Opts = request_options(Endpoint),
-    case hackney:post(Url, Headers, Body, Opts) of
-        {ok, Status, RespHeaders, RespBody} ->
-            _ = barrel_hlc:maybe_sync_from_header(
-                proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
-            {ok, Status, RespHeaders, RespBody};
-        {error, _} = Error ->
-            Error
-    end.
+    http_request(Endpoint, <<"POST">>, Url, Body).
 
 http_put(Endpoint, Url, ReqBody) ->
-    Path = extract_path(Url),
     Body = encode_body(Endpoint, ReqBody),
-    Headers = request_headers(Endpoint, <<"PUT">>, Path, Body),
-    Opts = request_options(Endpoint),
-    case hackney:put(Url, Headers, Body, Opts) of
-        {ok, Status, RespHeaders, RespBody} ->
+    http_request(Endpoint, <<"PUT">>, Url, Body).
+
+http_delete(Endpoint, Url) ->
+    http_request(Endpoint, <<"DELETE">>, Url, <<>>).
+
+%% Single dispatch path through livery_client. The client is built
+%% per call: the stack carries a request timeout, the adapter opts
+%% carry SSL settings and forward to the underlying adapter
+%% (`livery_client_hackney' for now). For the canonical reply shape
+%% we extract status/headers/body explicitly.
+http_request(Endpoint, MethodBin, Url, Body) ->
+    Path = extract_path(Url),
+    Headers = request_headers(Endpoint, MethodBin, Path, Body),
+    Client = build_client(Endpoint),
+    Opts0 = #{headers => Headers},
+    Opts = case Body of
+        <<>> -> Opts0;
+        _    -> Opts0#{body => Body}
+    end,
+    case livery_client:request(Client, MethodBin, Url, Opts) of
+        {ok, Resp} ->
+            Status = livery_client:status(Resp),
+            RespHeaders = livery_client:headers(Resp),
+            RespBody = response_body(Resp),
             _ = barrel_hlc:maybe_sync_from_header(
                 proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
             {ok, Status, RespHeaders, RespBody};
@@ -282,18 +281,29 @@ http_put(Endpoint, Url, ReqBody) ->
             Error
     end.
 
-http_delete(Endpoint, Url) ->
-    Path = extract_path(Url),
-    Headers = request_headers(Endpoint, <<"DELETE">>, Path, <<>>),
-    Opts = request_options(Endpoint),
-    case hackney:delete(Url, Headers, <<>>, Opts) of
-        {ok, Status, RespHeaders, Body} ->
-            _ = barrel_hlc:maybe_sync_from_header(
-                proplists:get_value(<<"x-barrel-hlc">>, RespHeaders)),
-            {ok, Status, RespHeaders, Body};
-        {error, _} = Error ->
-            Error
+%% Drain the response body into a binary. We never request streaming
+%% (no `stream => true' in Opts), so the body should always be
+%% `{full, _}'; tolerate `{stream, _}' defensively.
+response_body(Resp) ->
+    case livery_client:body(Resp) of
+        {full, Bin} -> Bin;
+        {stream, Reader} ->
+            case livery_client:read_body(Reader) of
+                {ok, Bin}      -> Bin;
+                {error, _}     -> <<>>
+            end
     end.
+
+build_client(Endpoint) ->
+    Timeout = maps:get(timeout, Endpoint, ?DEFAULT_TIMEOUT),
+    %% SSL options come through the adapter escape hatch. The
+    %% built-in `livery_client_hackney' adapter accepts a `hackney'
+    %% key whose value is a verbatim hackney-style opt list.
+    HackneyOpts = ssl_options(Endpoint, []),
+    livery_client:new(#{
+        stack => [livery_client:timeout(Timeout)],
+        adapter_opts => #{hackney => HackneyOpts}
+    }).
 
 %% Build request headers including authentication and peer signing
 request_headers(Endpoint, Method, Path, Body) ->
@@ -347,12 +357,6 @@ extract_path(Url) when is_binary(Url) ->
                     Url
             end
     end.
-
-%% Build request options including SSL and timeout
-request_options(Endpoint) ->
-    Timeout = maps:get(timeout, Endpoint, ?DEFAULT_TIMEOUT),
-    BaseOpts = [{recv_timeout, Timeout}],
-    ssl_options(Endpoint, BaseOpts).
 
 %% Add SSL options if needed
 ssl_options(#{ssl_options := SslOpts}, BaseOpts) when is_list(SslOpts) ->
