@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3] - 2026-06-04
+
+### Changed
+- Authentication and authorisation moved into a livery middleware. New module `barrel_docdb_auth` is a service-level middleware (one entry in `barrel_http_server`'s middleware stack) that classifies every request by `(path, method)` into `public` / `admin` / `{data, DbName, ReadOrWrite}`, runs the API-key check, and 401/403s before the handler ever runs. Handlers no longer call `maybe_authenticate` / `authorize` / `required_perm` — those lived inside `barrel_http_handler` and have been removed.
+- Routes stay 3-tuples; there's no per-route auth decoration. The middleware parses the database name and required permission from the raw path (service-level middleware runs before livery's router sets path bindings, so we can't rely on `livery_req:binding/2` there).
+- `barrel_http_api_keys` (DETS-backed key store) and `barrel_peer_auth` (replication Ed25519 signing) are unchanged. The validated key map is attached to the request via `livery_req:set_meta(auth_ctx, _, _)` for handlers that want to inspect the caller.
+
 ## [0.7.2] - 2026-06-04
 
 ### Changed
