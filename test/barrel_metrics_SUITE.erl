@@ -26,7 +26,6 @@
     counter_doc_ops/1,
     counter_doc_ops_increment/1,
     counter_query_ops/1,
-    counter_http_requests/1,
     counter_replication/1
 ]).
 
@@ -39,8 +38,7 @@
 %% Test cases - histograms
 -export([
     histogram_doc_latency/1,
-    histogram_query_latency/1,
-    histogram_http_latency/1
+    histogram_query_latency/1
 ]).
 
 %% Test cases - export
@@ -67,7 +65,6 @@ groups() ->
             counter_doc_ops,
             counter_doc_ops_increment,
             counter_query_ops,
-            counter_http_requests,
             counter_replication
         ]},
         {gauges, [sequence], [
@@ -76,8 +73,7 @@ groups() ->
         ]},
         {histograms, [sequence], [
             histogram_doc_latency,
-            histogram_query_latency,
-            histogram_http_latency
+            histogram_query_latency
         ]},
         {export, [sequence], [
             export_format,
@@ -273,9 +269,7 @@ all_metrics_registered(_Config) ->
         barrel_replication_active,
         barrel_db_documents_total,
         barrel_db_size_bytes,
-        barrel_db_attachments_total,
-        barrel_http_requests,
-        barrel_http_request_duration_seconds
+        barrel_db_attachments_total
     ],
 
     lists:foreach(fun(Name) ->
@@ -316,18 +310,6 @@ counter_query_ops(_Config) ->
     barrel_metrics:inc_query_ops(<<"testdb">>),
 
     assert_counter_with_attrs(barrel_query_operations, 2.0, #{db => <<"testdb">>}),
-    ok.
-
-counter_http_requests(_Config) ->
-    %% Test HTTP request counter
-    barrel_metrics:inc_http_requests(<<"GET">>, <<"/db">>, 200),
-    barrel_metrics:inc_http_requests(<<"POST">>, <<"/db/doc">>, 201),
-    barrel_metrics:inc_http_requests(<<"GET">>, <<"/db/doc">>, 404),
-
-    %% Each method/path/status combination is a separate data point
-    assert_counter_with_attrs(barrel_http_requests, 1.0, #{method => <<"GET">>, path => <<"/db">>, status => <<"200">>}),
-    assert_counter_with_attrs(barrel_http_requests, 1.0, #{method => <<"POST">>, path => <<"/db/doc">>, status => <<"201">>}),
-    assert_counter_with_attrs(barrel_http_requests, 1.0, #{method => <<"GET">>, path => <<"/db/doc">>, status => <<"404">>}),
     ok.
 
 counter_replication(_Config) ->
@@ -407,18 +389,6 @@ histogram_query_latency(_Config) ->
     ResultMetrics = [M || M <- Metrics,
                           name_matches_prefix(maps:get(name, M), <<"barrel_query_results_count">>)],
     ?assert(length(ResultMetrics) >= 1),
-    ok.
-
-histogram_http_latency(_Config) ->
-    %% Test HTTP latency histogram
-    barrel_metrics:observe_http_latency(<<"GET">>, <<"/db">>, 25.0),
-    barrel_metrics:observe_http_latency(<<"POST">>, <<"/db/doc">>, 100.0),
-    barrel_metrics:observe_http_latency(<<"GET">>, <<"/db/doc">>, 50.0),
-
-    %% Each method/path combination has its own data point
-    assert_histogram_with_attrs(barrel_http_request_duration_seconds, 1, 0.025, #{method => <<"GET">>, path => <<"/db">>}),
-    assert_histogram_with_attrs(barrel_http_request_duration_seconds, 1, 0.100, #{method => <<"POST">>, path => <<"/db/doc">>}),
-    assert_histogram_with_attrs(barrel_http_request_duration_seconds, 1, 0.050, #{method => <<"GET">>, path => <<"/db/doc">>}),
     ok.
 
 %%====================================================================

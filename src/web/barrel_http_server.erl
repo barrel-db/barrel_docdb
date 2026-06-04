@@ -124,7 +124,7 @@ terminate(_Reason, _State) ->
 %%====================================================================
 
 service_opts(Port, false, Router, _Opts) ->
-    #{http => #{port => Port}, router => Router};
+    (base_service_opts())#{http => #{port => Port}, router => Router};
 service_opts(Port, true, Router, Opts) ->
     HttpsListener0 = #{
         port => Port,
@@ -141,7 +141,22 @@ service_opts(Port, true, Router, Opts) ->
         _ ->
             HttpsListener1
     end,
-    #{https => HttpsListener, router => Router}.
+    (base_service_opts())#{https => HttpsListener, router => Router}.
+
+%% Service-level middleware shared by HTTP and HTTPS listeners.
+%% Order follows livery's `log-requests' guide: request_id first so
+%% every downstream layer can correlate, then the OpenTelemetry
+%% middleware (trace + metrics) which wraps the handler, then access
+%% log so it records the final status. instrument trace + metrics
+%% feed the same `instrument' registry that barrel_metrics writes
+%% domain metrics into; the `/metrics' route renders both surfaces.
+base_service_opts() ->
+    #{middleware => [
+        {livery_request_id,        #{}},
+        {livery_instrument_trace,  #{tracer => <<"barrel_docdb">>}},
+        {livery_instrument_metrics, #{meter => <<"barrel_docdb">>}},
+        {livery_access_log,        #{}}
+    ]}.
 
 %%====================================================================
 %% Internal: routes
@@ -155,9 +170,13 @@ service_opts(Port, true, Router, Opts) ->
 
 router() ->
     livery_router:compile([
-        %% Public endpoints
+        %% Public endpoints. `/metrics' is served by livery_metrics
+        %% which renders the shared `instrument' registry as
+        %% Prometheus text - same wire format the previous
+        %% barrel_metrics:export_text/0 handler produced, just
+        %% wired one layer up.
         {<<"GET">>, <<"/health">>,                ?H(health)},
-        {<<"GET">>, <<"/metrics">>,               ?H(metrics)},
+        {<<"GET">>, <<"/metrics">>,               livery_metrics:handler()},
         {<<"GET">>, <<"/.well-known/barrel">>,    ?H(node_info)},
 
         %% API key management (admin only)

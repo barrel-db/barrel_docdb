@@ -27,38 +27,30 @@
 %% the action atom in as the first argument.
 handle(Action, Req0) ->
     Method = livery_req:method(Req0),
-    Path   = livery_req:path(Req0),
-    HeadersList = livery_req:headers(Req0),
-    barrel_trace:with_extracted_context(HeadersList, fun() ->
-        barrel_trace:with_http_span(Method, Path, fun() ->
-            try
-                AuthContext = maybe_authenticate(Action, Req0),
-                ok = authorize(Action, Method, AuthContext),
-                build_response(handle_action(Action, Method, Req0))
-            catch
-                throw:{error, ErrStatus, Message} ->
-                    barrel_trace:set_attribute(<<"http.response.status_code">>, ErrStatus),
-                    barrel_trace:record_error(Message),
-                    error_response(ErrStatus, Message, Req0);
-                Class:Reason:Stack ->
-                    logger:error("HTTP handler error: ~p:~p~n~p",
-                                 [Class, Reason, Stack]),
-                    barrel_trace:set_attribute(<<"http.response.status_code">>, 500),
-                    barrel_trace:record_error(Reason, #{stacktrace => Stack}),
-                    error_response(500, <<"Internal server error">>, Req0)
-            end
-        end)
-    end).
+    try
+        AuthContext = maybe_authenticate(Action, Req0),
+        ok = authorize(Action, Method, AuthContext),
+        build_response(handle_action(Action, Method, Req0))
+    catch
+        throw:{error, ErrStatus, Message} ->
+            error_response(ErrStatus, Message, Req0);
+        Class:Reason:Stack ->
+            logger:error("HTTP handler error: ~p:~p~n~p",
+                         [Class, Reason, Stack]),
+            error_response(500, <<"Internal server error">>, Req0)
+    end.
 
 %% Map the per-action `{Status, Headers, Body, _Req}' /
 %% `{stream, Status, Headers, EmitFun, _Req}' tuples to a livery
 %% response value. Plain bodies become a generic typed response;
 %% streamed bodies hand the Emit callback to the action's producer.
+%% Per-request HTTP trace spans and metrics are recorded by the
+%% livery middleware stack (`livery_instrument_trace' and
+%% `livery_instrument_metrics' in `barrel_http_server'); no manual
+%% wrapping needed here.
 build_response({Status, Headers, Body, _Req}) ->
-    barrel_trace:set_attribute(<<"http.response.status_code">>, Status),
     new_resp(Status, Headers, Body);
 build_response({stream, Status, Headers, EmitFun, _Req}) ->
-    barrel_trace:set_attribute(<<"http.response.status_code">>, Status),
     livery_resp:stream(Status, header_list(Headers), EmitFun).
 
 error_response(Status, Message, Req) ->
@@ -266,11 +258,8 @@ handle_action(health, <<"GET">>, Req) ->
     end,
     {Status, response_headers(Req), Body, Req};
 
-%% Prometheus metrics endpoint
-handle_action(metrics, <<"GET">>, Req) ->
-    MetricsText = barrel_metrics:export_text(),
-    Headers = [{<<"content-type">>, <<"text/plain; version=0.0.4; charset=utf-8">>}],
-    {200, Headers, MetricsText, Req};
+%% Note: GET /metrics is now served directly by `livery_metrics:handler/0'
+%% wired in `barrel_http_server:router/0'; no `metrics' action here.
 
 %% Node identity (no discovery/federation, just this node's id and version)
 handle_action(node_info, <<"GET">>, Req) ->

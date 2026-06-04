@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-06-04
+
+### Changed
+- **HTTP observability moves into livery middleware.** `barrel_http_server` now wires `livery_request_id`, `livery_instrument_trace`, `livery_instrument_metrics`, and `livery_access_log` into the service stack. Every request gets a W3C `traceparent` propagation, an OpenTelemetry server span with semantic-convention attributes, the standard `http.server.active_requests` + `http.server.request.duration` metrics, and an access log line.
+- `/metrics` is now served by `livery_metrics:handler/0`. The Prometheus exposition format is unchanged; both livery's HTTP middleware and `barrel_metrics`'s domain registrations feed the same `instrument` registry.
+- `barrel_http_handler:handle/2` no longer wraps requests in `barrel_trace:with_extracted_context/2` + `with_http_span/3` — the middleware does it.
+
+### Removed
+- HTTP-shaped entries from `barrel_metrics`: `barrel_http_requests` (counter), `barrel_http_request_duration_seconds` (histogram), and the `inc_http_requests/3` + `observe_http_latency/3` helpers. Replaced by livery's OTel-semantic-convention names (`http.server.active_requests`, `http.server.request.duration`). **Dashboards or alerts referencing the old names need updating.**
+
+### Kept
+- Domain metrics (doc ops, query ops, replication, db gauges) and the `barrel_trace:*` helpers — they're used by domain code, not HTTP plumbing.
+
 ## [0.7.1] - 2026-06-04
 
 ### Changed
