@@ -43,11 +43,7 @@
     %% Storage
     set_db_docs/2,
     set_db_size/2,
-    set_db_attachments/2,
-
-    %% HTTP
-    inc_http_requests/3,
-    observe_http_latency/3
+    set_db_attachments/2
 ]).
 
 %% Export function
@@ -113,16 +109,12 @@
 
     %% Database attachment count gauge
     {gauge, barrel_db_attachments_total,
-     <<"Total number of attachments in database">>},
+     <<"Total number of attachments in database">>}
 
-    %% HTTP request counter
-    {counter, barrel_http_requests,
-     <<"Total HTTP requests">>},
-
-    %% HTTP latency histogram
-    {histogram, barrel_http_request_duration_seconds,
-     <<"HTTP request duration in seconds">>,
-     [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]}
+    %% HTTP request/duration metrics live in the livery middleware
+    %% (`livery_instrument_metrics' wired in barrel_http_server).
+    %% Both surfaces feed the same `instrument' registry that
+    %% `livery_metrics:handler/0' renders at /metrics.
 ]).
 
 %%====================================================================
@@ -281,30 +273,6 @@ set_db_attachments(Db, Count) ->
     case instrument_meter:get_instrument(barrel_db_attachments_total) of
         undefined -> ok;
         Instrument -> instrument_meter:set(Instrument, Count, Attrs)
-    end,
-    ok.
-
-%%====================================================================
-%% HTTP
-%%====================================================================
-
-%% @doc Increment HTTP request counter
--spec inc_http_requests(binary(), binary(), integer()) -> ok.
-inc_http_requests(Method, Path, Status) ->
-    Attrs = #{method => Method, path => Path, status => Status},
-    case instrument_meter:get_instrument(barrel_http_requests) of
-        undefined -> ok;
-        Instrument -> instrument_meter:add(Instrument, 1, Attrs)
-    end,
-    ok.
-
-%% @doc Record HTTP request latency
--spec observe_http_latency(binary(), binary(), number()) -> ok.
-observe_http_latency(Method, Path, DurationMs) ->
-    Attrs = #{method => Method, path => Path},
-    case instrument_meter:get_instrument(barrel_http_request_duration_seconds) of
-        undefined -> ok;
-        Instrument -> instrument_meter:record(Instrument, DurationMs / 1000, Attrs)
     end,
     ok.
 
