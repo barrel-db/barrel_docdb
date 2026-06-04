@@ -13,6 +13,7 @@
         match_trie,
         cowboy,
         hackney,
+        livery,
         instrument
     ]},
     {env, [

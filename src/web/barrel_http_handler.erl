@@ -12,67 +12,93 @@
 %%%-------------------------------------------------------------------
 -module(barrel_http_handler).
 
--export([init/2]).
+-export([handle/2]).
 
 %% Content types
 -define(CT_JSON, <<"application/json">>).
 -define(CT_CBOR, <<"application/cbor">>).
 
 %%====================================================================
-%% Cowboy Handler
+%% Livery handler entry
 %%====================================================================
 
-init(Req0, State) ->
-    #{action := Action} = State,
-    Method = cowboy_req:method(Req0),
-    Path = cowboy_req:path(Req0),
-
-    %% Extract trace context from incoming request headers (properly scoped)
-    ReqHeaders = cowboy_req:headers(Req0),
-    HeadersList = maps:to_list(ReqHeaders),
-
+%% Called by livery for every routed request. The route table in
+%% `barrel_http_server' wraps each route with a closure that hands
+%% the action atom in as the first argument.
+handle(Action, Req0) ->
+    Method = livery_req:method(Req0),
+    Path   = livery_req:path(Req0),
+    HeadersList = livery_req:headers(Req0),
     barrel_trace:with_extracted_context(HeadersList, fun() ->
-        %% Wrap request handling in an HTTP span
         barrel_trace:with_http_span(Method, Path, fun() ->
             try
-                %% Authenticate request (unless it's a public endpoint).
                 AuthContext = maybe_authenticate(Action, Req0),
-                %% Permission check (no-op for public/admin-gated actions).
                 ok = authorize(Action, Method, AuthContext),
-                case handle_action(Action, Method, Req0) of
-                    {Status, Headers, Body, Req1} ->
-                        %% Set response status on span
-                        barrel_trace:set_attribute(<<"http.response.status_code">>, Status),
-                        %% Normal response
-                        Req2 = cowboy_req:reply(Status, Headers, Body, Req1),
-                        {ok, Req2, State};
-                    {stream, Status, Headers, StreamFun, Req1} ->
-                        %% Set response status on span
-                        barrel_trace:set_attribute(<<"http.response.status_code">>, Status),
-                        %% Streaming response - StreamFun sends the body
-                        Req2 = cowboy_req:stream_reply(Status, Headers, Req1),
-                        StreamFun(Req2),
-                        {ok, Req2, State}
-                end
+                build_response(handle_action(Action, Method, Req0))
             catch
                 throw:{error, ErrStatus, Message} ->
                     barrel_trace:set_attribute(<<"http.response.status_code">>, ErrStatus),
                     barrel_trace:record_error(Message),
-                    ErrorBody = encode_error(Message, Req0),
-                    ErrHeaders = response_headers(Req0),
-                    ErrReq = cowboy_req:reply(ErrStatus, ErrHeaders, ErrorBody, Req0),
-                    {ok, ErrReq, State};
+                    error_response(ErrStatus, Message, Req0);
                 Class:Reason:Stack ->
-                    logger:error("HTTP handler error: ~p:~p~n~p", [Class, Reason, Stack]),
+                    logger:error("HTTP handler error: ~p:~p~n~p",
+                                 [Class, Reason, Stack]),
                     barrel_trace:set_attribute(<<"http.response.status_code">>, 500),
                     barrel_trace:record_error(Reason, #{stacktrace => Stack}),
-                    ErrorBody = encode_error(<<"Internal server error">>, Req0),
-                    ErrHeaders = response_headers(Req0),
-                    ErrReq = cowboy_req:reply(500, ErrHeaders, ErrorBody, Req0),
-                    {ok, ErrReq, State}
+                    error_response(500, <<"Internal server error">>, Req0)
             end
         end)
     end).
+
+%% Map the per-action `{Status, Headers, Body, _Req}' /
+%% `{stream, Status, Headers, EmitFun, _Req}' tuples to a livery
+%% response value. Plain bodies become a generic typed response;
+%% streamed bodies hand the Emit callback to the action's producer.
+build_response({Status, Headers, Body, _Req}) ->
+    barrel_trace:set_attribute(<<"http.response.status_code">>, Status),
+    new_resp(Status, Headers, Body);
+build_response({stream, Status, Headers, EmitFun, _Req}) ->
+    barrel_trace:set_attribute(<<"http.response.status_code">>, Status),
+    livery_resp:stream(Status, header_list(Headers), EmitFun).
+
+error_response(Status, Message, Req) ->
+    Body = encode_error(Message, Req),
+    new_resp(Status, response_headers(Req), Body).
+
+new_resp(Status, Headers, Body) ->
+    livery_resp:new(Status, header_list(Headers), {full, iolist_to_binary(Body)}).
+
+%% Header coercion: all handler clauses now build lists, so this is
+%% effectively the identity. Kept as a single function so future
+%% inputs that arrive as maps stay tolerated without touching the
+%% callers.
+header_list(H) -> H.
+
+%% Read the full request body. Used by the handler clauses that
+%% mirror the old `{ok, Body, Req1} = cowboy_req:read_body/1' pattern;
+%% in livery the request value is immutable so we just return the
+%% same Req back.
+read_full_body(Req) ->
+    case livery_req:body(Req) of
+        empty ->
+            {<<>>, Req};
+        {buffered, IoData} ->
+            {iolist_to_binary(IoData), Req};
+        {stream, Reader} ->
+            case livery_body:read_all(Reader) of
+                {ok, Bin, _} -> {Bin, Req};
+                {error, _, _} -> {<<>>, Req}
+            end
+    end.
+
+%% Parse the request query string as a proplist. Mirrors
+%% `cowboy_req:parse_qs/1' so the existing query-handling code can
+%% stay unchanged.
+parse_qs(Req) ->
+    case livery_req:query(Req) of
+        <<>> -> [];
+        Raw  -> uri_string:dissect_query(Raw)
+    end.
 
 %%====================================================================
 %% Authentication
@@ -164,7 +190,7 @@ required_perm(_Action, _Method) -> none.
 %% @doc Get database name from action and request
 get_db_from_action(health, _Req) -> undefined;
 get_db_from_action(_Action, Req) ->
-    cowboy_req:binding(db, Req, undefined).
+    livery_req:binding(<<"db">>, Req, undefined).
 
 %% @doc Authenticate request via bearer token (API keys, ak_*).
 %% Returns the validated key map for downstream permission checks.
@@ -213,7 +239,7 @@ validate_token_admin(_) ->
 
 %% @doc Extract bearer token from Authorization header
 extract_bearer_token(Req) ->
-    case cowboy_req:header(<<"authorization">>, Req) of
+    case livery_req:header(<<"authorization">>, Req) of
         undefined ->
             undefined;
         <<"Bearer ", Token/binary>> ->
@@ -243,7 +269,7 @@ handle_action(health, <<"GET">>, Req) ->
 %% Prometheus metrics endpoint
 handle_action(metrics, <<"GET">>, Req) ->
     MetricsText = barrel_metrics:export_text(),
-    Headers = #{<<"content-type">> => <<"text/plain; version=0.0.4; charset=utf-8">>},
+    Headers = [{<<"content-type">>, <<"text/plain; version=0.0.4; charset=utf-8">>}],
     {200, Headers, MetricsText, Req};
 
 %% Node identity (no discovery/federation, just this node's id and version)
@@ -253,7 +279,7 @@ handle_action(node_info, <<"GET">>, Req) ->
 
 %% Database info
 handle_action(db_info, <<"GET">>, Req) ->
-    DbName = cowboy_req:binding(db, Req),
+    DbName = livery_req:binding(<<"db">>, Req),
     case barrel_docdb:db_info(DbName) of
         {ok, Info} ->
             %% Sanitize info for JSON/CBOR encoding (remove pid, format atom keys)
@@ -264,7 +290,7 @@ handle_action(db_info, <<"GET">>, Req) ->
             throw({error, 404, <<"Database not found">>})
     end;
 handle_action(db_info, <<"PUT">>, Req) ->
-    DbName = cowboy_req:binding(db, Req),
+    DbName = livery_req:binding(<<"db">>, Req),
     case barrel_docdb:create_db(DbName) of
         {ok, _Pid} ->
             Body = encode_response(#{ok => true, name => DbName}, Req),
@@ -277,7 +303,7 @@ handle_action(db_info, <<"PUT">>, Req) ->
             throw({error, 500, format_error(Reason)})
     end;
 handle_action(db_info, <<"DELETE">>, Req) ->
-    DbName = cowboy_req:binding(db, Req),
+    DbName = livery_req:binding(<<"db">>, Req),
     case barrel_docdb:delete_db(DbName) of
         ok ->
             Body = encode_response(#{ok => true}, Req),
@@ -371,9 +397,9 @@ handle_action(_Action, _Method, _Req) ->
 %%====================================================================
 
 handle_get_doc(Req) ->
-    DbName = cowboy_req:binding(db, Req),
-    DocId = cowboy_req:binding(doc_id, Req),
-    Qs = cowboy_req:parse_qs(Req),
+    DbName = livery_req:binding(<<"db">>, Req),
+    DocId = livery_req:binding(<<"doc_id">>, Req),
+    Qs = parse_qs(Req),
     Opts0 = parse_doc_opts(Qs),
     %% For CBOR responses, request raw body for zero-copy
     {Opts, IsCbor} = case response_content_type(Req) of
@@ -395,9 +421,9 @@ handle_get_doc(Req) ->
     end.
 
 handle_put_doc(Req0) ->
-    DbName = cowboy_req:binding(db, Req0),
-    DocId = cowboy_req:binding(doc_id, Req0),
-    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    DbName = livery_req:binding(<<"db">>, Req0),
+    DocId = livery_req:binding(<<"doc_id">>, Req0),
+    {ReqBody, Req1} = read_full_body(Req0),
     Doc0 = decode_request_body(ReqBody, Req1),
     %% Ensure doc has the ID from URL
     Doc = Doc0#{<<"id">> => DocId},
@@ -414,8 +440,8 @@ handle_put_doc(Req0) ->
 %% @doc Create a document with auto-generated ID.
 %% POST /db/:db
 handle_post_doc(Req0) ->
-    DbName = cowboy_req:binding(db, Req0),
-    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    DbName = livery_req:binding(<<"db">>, Req0),
+    {ReqBody, Req1} = read_full_body(Req0),
     Doc = decode_request_body(ReqBody, Req1),
     %% Don't set ID - let barrel_docdb auto-generate it
     case barrel_docdb:put_doc(DbName, Doc) of
@@ -429,9 +455,9 @@ handle_post_doc(Req0) ->
     end.
 
 handle_delete_doc(Req) ->
-    DbName = cowboy_req:binding(db, Req),
-    DocId = cowboy_req:binding(doc_id, Req),
-    Qs = cowboy_req:parse_qs(Req),
+    DbName = livery_req:binding(<<"db">>, Req),
+    DocId = livery_req:binding(<<"doc_id">>, Req),
+    Qs = parse_qs(Req),
     Rev = proplists:get_value(<<"rev">>, Qs, <<>>),
     case barrel_docdb:delete_doc(DbName, DocId, #{rev => Rev}) of
         {ok, Result} ->
@@ -450,14 +476,14 @@ handle_delete_doc(Req) ->
 %%====================================================================
 
 handle_get_changes(Req0) ->
-    DbName = cowboy_req:binding(db, Req0),
+    DbName = livery_req:binding(<<"db">>, Req0),
     {Since0, Feed, FilterPattern, Opts0} = parse_changes_opts(Req0),
     Timeout = maps:get(timeout, Opts0, 60000),
 
     %% Read POST body for doc_ids and query filters
-    {Opts1, Req1} = case cowboy_req:method(Req0) of
+    {Opts1, Req1} = case livery_req:method(Req0) of
         <<"POST">> ->
-            {ok, Body, Req} = cowboy_req:read_body(Req0),
+            {Body, Req} = read_full_body(Req0),
             {merge_body_opts(Body, Opts0), Req};
         _ ->
             {Opts0, Req0}
@@ -611,8 +637,8 @@ filter_changes(Changes, FilterFun) ->
 %%====================================================================
 
 handle_bulk_docs(Req0) ->
-    DbName = cowboy_req:binding(db, Req0),
-    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    DbName = livery_req:binding(<<"db">>, Req0),
+    {ReqBody, Req1} = read_full_body(Req0),
     #{<<"docs">> := Docs} = decode_request_body(ReqBody, Req1),
     Results = lists:map(
         fun(Doc) ->
@@ -634,8 +660,8 @@ handle_bulk_docs(Req0) ->
 %%====================================================================
 
 handle_find(Req0) ->
-    DbName = cowboy_req:binding(db, Req0),
-    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    DbName = livery_req:binding(<<"db">>, Req0),
+    {ReqBody, Req1} = read_full_body(Req0),
     QuerySpec0 = decode_request_body(ReqBody, Req1),
     %% Convert binary keys to atoms for internal API
     QuerySpec = convert_query_spec(QuerySpec0),
@@ -804,8 +830,8 @@ convert_order_spec(_) ->
 %% POST /db/:db/_replicate
 %% Body: {"target": "http://...", "filter": {...}, "target_auth": "..."}
 handle_replicate(Req0) ->
-    DbName = cowboy_req:binding(db, Req0),
-    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    DbName = livery_req:binding(<<"db">>, Req0),
+    {ReqBody, Req1} = read_full_body(Req0),
     Spec = decode_request_body(ReqBody, Req1),
     TargetUrl = maps:get(<<"target">>, Spec),
     %% Build replication options
@@ -889,8 +915,8 @@ format_seq_for_rep(_) ->
     <<"unknown">>.
 
 handle_revsdiff(Req0) ->
-    DbName = cowboy_req:binding(db, Req0),
-    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    DbName = livery_req:binding(<<"db">>, Req0),
+    {ReqBody, Req1} = read_full_body(Req0),
     RequestBody = decode_request_body(ReqBody, Req1),
     %% Support both single-doc and batch formats:
     %% Single-doc: {"id": DocId, "revs": [RevIds]}
@@ -919,8 +945,8 @@ handle_revsdiff(Req0) ->
     end.
 
 handle_put_rev(Req0) ->
-    DbName = cowboy_req:binding(db, Req0),
-    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    DbName = livery_req:binding(<<"db">>, Req0),
+    {ReqBody, Req1} = read_full_body(Req0),
     #{<<"doc">> := Doc, <<"history">> := History} = Body0 = decode_request_body(ReqBody, Req1),
     Deleted = maps:get(<<"deleted">>, Body0, false),
     case barrel_docdb:put_rev(DbName, Doc, History, Deleted) of
@@ -933,8 +959,8 @@ handle_put_rev(Req0) ->
     end.
 
 handle_sync_hlc(Req0) ->
-    DbName = cowboy_req:binding(db, Req0),
-    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    DbName = livery_req:binding(<<"db">>, Req0),
+    {ReqBody, Req1} = read_full_body(Req0),
     case decode_request_body(ReqBody, Req1) of
         #{<<"hlc">> := HlcBin} when is_binary(HlcBin) ->
             case parse_hlc(HlcBin) of
@@ -962,8 +988,8 @@ do_sync_hlc(DbName, RemoteHlc, Req) ->
 %%====================================================================
 
 handle_get_local_doc(Req) ->
-    DbName = cowboy_req:binding(db, Req),
-    DocId = cowboy_req:binding(doc_id, Req),
+    DbName = livery_req:binding(<<"db">>, Req),
+    DocId = livery_req:binding(<<"doc_id">>, Req),
     case barrel_docdb:get_local_doc(DbName, DocId) of
         {ok, Doc} ->
             Body = encode_response(Doc, Req),
@@ -973,9 +999,9 @@ handle_get_local_doc(Req) ->
     end.
 
 handle_put_local_doc(Req0) ->
-    DbName = cowboy_req:binding(db, Req0),
-    DocId = cowboy_req:binding(doc_id, Req0),
-    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    DbName = livery_req:binding(<<"db">>, Req0),
+    DocId = livery_req:binding(<<"doc_id">>, Req0),
+    {ReqBody, Req1} = read_full_body(Req0),
     Doc = decode_request_body(ReqBody, Req1),
     case barrel_docdb:put_local_doc(DbName, DocId, Doc) of
         ok ->
@@ -987,8 +1013,8 @@ handle_put_local_doc(Req0) ->
     end.
 
 handle_delete_local_doc(Req) ->
-    DbName = cowboy_req:binding(db, Req),
-    DocId = cowboy_req:binding(doc_id, Req),
+    DbName = livery_req:binding(<<"db">>, Req),
+    DocId = livery_req:binding(<<"doc_id">>, Req),
     case barrel_docdb:delete_local_doc(DbName, DocId) of
         ok ->
             Response = #{<<"ok">> => true},
@@ -1003,33 +1029,33 @@ handle_delete_local_doc(Req) ->
 %%====================================================================
 
 handle_list_attachments(Req) ->
-    DbName = cowboy_req:binding(db, Req),
-    DocId = cowboy_req:binding(doc_id, Req),
+    DbName = livery_req:binding(<<"db">>, Req),
+    DocId = livery_req:binding(<<"doc_id">>, Req),
     Attachments = barrel_docdb:list_attachments(DbName, DocId),
     Body = encode_response(Attachments, Req),
     {200, response_headers(Req), Body, Req}.
 
 handle_get_attachment(Req) ->
-    DbName = cowboy_req:binding(db, Req),
-    DocId = cowboy_req:binding(doc_id, Req),
-    AttName = cowboy_req:binding(att_name, Req),
+    DbName = livery_req:binding(<<"db">>, Req),
+    DocId = livery_req:binding(<<"doc_id">>, Req),
+    AttName = livery_req:binding(<<"att_name">>, Req),
     %% First get attachment info to decide streaming vs direct
     case barrel_docdb:get_attachment_info(DbName, DocId, AttName) of
         {ok, #{chunked := true, content_type := ContentType, length := Length} = _Info} ->
             %% Large/chunked attachment - stream it
-            Headers = #{
-                <<"content-type">> => ContentType,
-                <<"content-length">> => integer_to_binary(Length)
-            },
-            StreamFun = fun(StreamReq) ->
-                stream_attachment(DbName, DocId, AttName, StreamReq)
+            Headers = [
+                {<<"content-type">>, ContentType},
+                {<<"content-length">>, integer_to_binary(Length)}
+            ],
+            StreamFun = fun(Emit) ->
+                stream_attachment(DbName, DocId, AttName, Emit)
             end,
             {stream, 200, Headers, StreamFun, Req};
         {ok, #{content_type := ContentType}} ->
             %% Small attachment - return directly
             case barrel_docdb:get_attachment(DbName, DocId, AttName) of
                 {ok, Data} ->
-                    Headers = #{<<"content-type">> => ContentType},
+                    Headers = [{<<"content-type">>, ContentType}],
                     {200, Headers, Data, Req};
                 {error, Reason} ->
                     throw({error, 500, format_error(Reason)})
@@ -1038,31 +1064,37 @@ handle_get_attachment(Req) ->
             throw({error, 404, <<"Attachment not found">>})
     end.
 
-%% @private Stream attachment chunks to HTTP response
-stream_attachment(DbName, DocId, AttName, Req) ->
+%% @private Stream attachment chunks via the livery Emit callback.
+stream_attachment(DbName, DocId, AttName, Emit) ->
     case barrel_docdb:open_attachment_stream(DbName, DocId, AttName) of
         {ok, Stream} ->
-            stream_attachment_loop(Stream, Req);
+            stream_attachment_loop(Stream, Emit);
         {error, Reason} ->
-            logger:error("Failed to open attachment stream: ~p", [Reason])
+            logger:error("Failed to open attachment stream: ~p", [Reason]),
+            ok
     end.
 
-stream_attachment_loop(Stream, Req) ->
+stream_attachment_loop(Stream, Emit) ->
     case barrel_docdb:read_attachment_chunk(Stream) of
         {ok, Chunk, NewStream} ->
-            cowboy_req:stream_body(Chunk, nofin, Req),
-            stream_attachment_loop(NewStream, Req);
+            case Emit(Chunk) of
+                ok ->
+                    stream_attachment_loop(NewStream, Emit);
+                {error, _} ->
+                    %% Client disconnected; stop and release the stream.
+                    barrel_docdb:close_attachment_stream(NewStream)
+            end;
         eof ->
-            cowboy_req:stream_body(<<>>, fin, Req),
-            barrel_docdb:close_attachment_stream(Stream)
+            barrel_docdb:close_attachment_stream(Stream),
+            ok
     end.
 
 handle_put_attachment(Req0) ->
-    DbName = cowboy_req:binding(db, Req0),
-    DocId = cowboy_req:binding(doc_id, Req0),
-    AttName = cowboy_req:binding(att_name, Req0),
-    ContentType = cowboy_req:header(<<"content-type">>, Req0, <<"application/octet-stream">>),
-    ContentLength = cowboy_req:header(<<"content-length">>, Req0),
+    DbName = livery_req:binding(<<"db">>, Req0),
+    DocId = livery_req:binding(<<"doc_id">>, Req0),
+    AttName = livery_req:binding(<<"att_name">>, Req0),
+    ContentType = livery_req:header(<<"content-type">>, Req0, <<"application/octet-stream">>),
+    ContentLength = livery_req:header(<<"content-length">>, Req0),
 
     %% Use streaming upload for large files (> 64KB) or when content-length not provided
     UseStreaming = case ContentLength of
@@ -1076,7 +1108,7 @@ handle_put_attachment(Req0) ->
             handle_put_attachment_stream(DbName, DocId, AttName, ContentType, Req0);
         false ->
             %% Small file - read all at once
-            {ok, Data, Req1} = cowboy_req:read_body(Req0),
+            {Data, Req1} = read_full_body(Req0),
             case barrel_docdb:put_attachment(DbName, DocId, AttName, Data) of
                 {ok, Info} ->
                     Response = format_attachment_response(Info),
@@ -1110,26 +1142,39 @@ handle_put_attachment_stream(DbName, DocId, AttName, ContentType, Req0) ->
             throw({error, 500, format_error(Reason)})
     end.
 
-%% @private Read body in chunks and write to attachment writer
+%% @private Read body in chunks and write to attachment writer.
+%% For buffered/empty bodies the data is already in memory, so we
+%% just hand it to the writer in one call. For streamed bodies we
+%% drain `livery_body:read/2' chunk by chunk.
 stream_upload_body(Req, Writer) ->
-    %% Read body in 64KB chunks
-    case cowboy_req:read_body(Req, #{length => 65536}) of
-        {ok, Data, Req1} ->
-            %% Last chunk
-            case barrel_docdb:write_attachment_chunk(Writer, Data) of
-                {ok, FinalWriter} ->
-                    {ok, FinalWriter, Req1};
+    case livery_req:body(Req) of
+        empty ->
+            finalize_chunk(Writer, <<>>, Req);
+        {buffered, IoData} ->
+            finalize_chunk(Writer, iolist_to_binary(IoData), Req);
+        {stream, Reader} ->
+            stream_upload_loop(Reader, Writer, Req)
+    end.
+
+finalize_chunk(Writer, Bin, Req) ->
+    case barrel_docdb:write_attachment_chunk(Writer, Bin) of
+        {ok, FinalWriter} -> {ok, FinalWriter, Req};
+        {error, Reason}    -> {error, Reason, Writer}
+    end.
+
+stream_upload_loop(Reader, Writer, Req) ->
+    case livery_body:read(Reader, 5000) of
+        {ok, Chunk, Reader1} ->
+            case barrel_docdb:write_attachment_chunk(Writer, Chunk) of
+                {ok, NewWriter} ->
+                    stream_upload_loop(Reader1, NewWriter, Req);
                 {error, Reason} ->
                     {error, Reason, Writer}
             end;
-        {more, Data, Req1} ->
-            %% More data coming
-            case barrel_docdb:write_attachment_chunk(Writer, Data) of
-                {ok, NewWriter} ->
-                    stream_upload_body(Req1, NewWriter);
-                {error, Reason} ->
-                    {error, Reason, Writer}
-            end
+        {done, _Reader1} ->
+            {ok, Writer, Req};
+        {error, Reason, _Reader1} ->
+            {error, Reason, Writer}
     end.
 
 %% @private Format attachment info for response
@@ -1150,9 +1195,9 @@ format_attachment_response(Info) ->
     ).
 
 handle_delete_attachment(Req) ->
-    DbName = cowboy_req:binding(db, Req),
-    DocId = cowboy_req:binding(doc_id, Req),
-    AttName = cowboy_req:binding(att_name, Req),
+    DbName = livery_req:binding(<<"db">>, Req),
+    DocId = livery_req:binding(<<"doc_id">>, Req),
+    AttName = livery_req:binding(<<"att_name">>, Req),
     case barrel_docdb:delete_attachment(DbName, DocId, AttName) of
         ok ->
             Response = #{<<"ok">> => true},
@@ -1170,7 +1215,7 @@ handle_delete_attachment(Req) ->
 
 %% Determine response content type based on Accept header
 response_content_type(Req) ->
-    case cowboy_req:header(<<"accept">>, Req) of
+    case livery_req:header(<<"accept">>, Req) of
         undefined ->
             ?CT_JSON;
         Accept ->
@@ -1182,7 +1227,7 @@ response_content_type(Req) ->
 
 %% Get request content type
 request_content_type(Req) ->
-    case cowboy_req:header(<<"content-type">>, Req) of
+    case livery_req:header(<<"content-type">>, Req) of
         ?CT_CBOR -> cbor;
         _ -> json
     end.
@@ -1191,13 +1236,13 @@ request_content_type(Req) ->
 response_headers(Req) ->
     Hlc = barrel_hlc:get_hlc(),
     HlcBin = barrel_hlc:encode(Hlc),
-    BaseHeaders = #{
-        <<"content-type">> => response_content_type(Req),
-        <<"x-barrel-hlc">> => base64:encode(HlcBin)
-    },
-    %% Add trace context headers for distributed tracing
+    Base = [
+        {<<"content-type">>, response_content_type(Req)},
+        {<<"x-barrel-hlc">>, base64:encode(HlcBin)}
+    ],
+    %% Trace context headers for distributed tracing.
     TraceHeaders = barrel_trace:inject_headers([]),
-    lists:foldl(fun({K, V}, Acc) -> maps:put(K, V, Acc) end, BaseHeaders, TraceHeaders).
+    Base ++ TraceHeaders.
 
 %%====================================================================
 %% Encoding/Decoding
@@ -1279,7 +1324,7 @@ parse_doc_opts(Qs) ->
     ).
 
 parse_changes_opts(Req) ->
-    Qs = cowboy_req:parse_qs(Req),
+    Qs = parse_qs(Req),
     Since = case proplists:get_value(<<"since">>, Qs, <<"0">>) of
         <<"0">> -> first;
         <<"first">> -> first;
@@ -1402,7 +1447,7 @@ handle_list_keys(Req) ->
     {200, response_headers(Req), Body, Req}.
 
 handle_create_key(Req0) ->
-    {ok, ReqBody, Req1} = cowboy_req:read_body(Req0),
+    {ReqBody, Req1} = read_full_body(Req0),
     Opts0 = decode_request_body(ReqBody, Req1),
     %% Convert binary keys to atom keys for internal use
     Opts = maps:fold(
@@ -1427,7 +1472,7 @@ handle_create_key(Req0) ->
     end.
 
 handle_get_key(Req) ->
-    KeyPrefix = cowboy_req:binding(key_prefix, Req),
+    KeyPrefix = livery_req:binding(<<"key_prefix">>, Req),
     {ok, Keys} = barrel_http_api_keys:list_keys(),
     case lists:filter(
         fun(#{key_prefix := P}) -> P =:= KeyPrefix end,
@@ -1441,7 +1486,7 @@ handle_get_key(Req) ->
     end.
 
 handle_delete_key(Req) ->
-    KeyPrefix = cowboy_req:binding(key_prefix, Req),
+    KeyPrefix = livery_req:binding(<<"key_prefix">>, Req),
     case barrel_http_api_keys:delete_key(KeyPrefix) of
         ok ->
             Body = encode_response(#{<<"ok">> => true}, Req),
@@ -1470,7 +1515,7 @@ handle_admin_usage(Req) ->
 
 %% @doc Get usage statistics for a specific database
 handle_admin_db_usage(Req) ->
-    DbName = cowboy_req:binding(db, Req),
+    DbName = livery_req:binding(<<"db">>, Req),
     case barrel_docdb_usage:get_db_usage(DbName) of
         {ok, Stats} ->
             Body = encode_response(Stats, Req),
