@@ -79,6 +79,7 @@ When running as a release, configure the HTTP server via environment variables:
 | `BARREL_HTTP_PORT` | `8080` | Listen port |
 | `BARREL_HTTP_MAX_BODY_BYTES` | `4194304` | Cap on buffered request body size (413 on oversize). Streamed attachment uploads bypass this by design. |
 | `BARREL_HTTP_MAX_IN_FLIGHT` | `1000` | Maximum concurrent in-flight requests (503 above the cap). |
+| `BARREL_QUERY_TIMEOUT_MS` | `30000` | Per-query deadline for the document-fetch pipeline. On expiry the API returns 504 with a structured `query_timeout` payload. |
 | `BARREL_HTTP_TLS_ENABLED` | `false` | Enable HTTPS with HTTP/2 ALPN |
 | `BARREL_HTTP_CERTFILE` | - | Path to TLS certificate |
 | `BARREL_HTTP_KEYFILE` | - | Path to TLS private key |

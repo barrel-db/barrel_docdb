@@ -37,11 +37,20 @@ handle(Action, Req0) ->
     catch
         throw:{error, ErrStatus, Message} ->
             error_response(ErrStatus, Message, Req0);
+        error:{query_timeout, Info} ->
+            query_timeout_response(Info, Req0);
         Class:Reason:Stack ->
             logger:error("HTTP handler error: ~p:~p~n~p",
                          [Class, Reason, Stack]),
             error_response(500, <<"Internal server error">>, Req0)
     end.
+
+%% Map a `{query_timeout, Info}' error from the query pipeline to a
+%% 504 Gateway Timeout with a structured JSON payload so the caller
+%% can tell the result was aborted rather than empty.
+query_timeout_response(Info, Req) ->
+    Body = encode_response(Info#{<<"error">> => <<"query_timeout">>}, Req),
+    new_resp(504, response_headers(Req), Body).
 
 %% Map the per-action `{Status, Headers, Body, _Req}' /
 %% `{stream, Status, Headers, EmitFun, _Req}' tuples to a livery
