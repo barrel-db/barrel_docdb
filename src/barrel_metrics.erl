@@ -33,6 +33,7 @@
     inc_query_ops/1,
     observe_query_latency/2,
     observe_query_results/2,
+    inc_query_timeouts/0,
 
     %% Replication
     inc_rep_docs/2,
@@ -82,6 +83,10 @@
     {histogram, barrel_query_results_count,
      <<"Number of results returned per query">>,
      [1, 10, 50, 100, 500, 1000, 5000]},
+
+    %% Query timeout counter (pipeline / pool deadline exceeded)
+    {counter, barrel_query_timeouts,
+     <<"Total query operations aborted due to timeout">>},
 
     %% Replication document counter
     {counter, barrel_replication_docs,
@@ -194,6 +199,15 @@ observe_query_results(Db, Count) ->
     case instrument_meter:get_instrument(barrel_query_results_count) of
         undefined -> ok;
         Instrument -> instrument_meter:record(Instrument, Count, Attrs)
+    end,
+    ok.
+
+%% @doc Increment the query timeout counter (pipeline/pool deadline exceeded).
+-spec inc_query_timeouts() -> ok.
+inc_query_timeouts() ->
+    case instrument_meter:get_instrument(barrel_query_timeouts) of
+        undefined -> ok;
+        Instrument -> instrument_meter:add(Instrument, 1, #{})
     end,
     ok.
 

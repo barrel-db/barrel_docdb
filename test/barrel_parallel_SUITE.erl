@@ -26,6 +26,7 @@
     pmap_custom_workers/1,
     pmap_handles_worker_error/1,
     pmap_handles_worker_crash/1,
+    pmap_raises_query_timeout/1,
 
     %% pfiltermap tests
     pfiltermap_empty_list/1,
@@ -68,7 +69,8 @@ groups() ->
             pmap_preserves_order,
             pmap_custom_workers,
             pmap_handles_worker_error,
-            pmap_handles_worker_crash
+            pmap_handles_worker_crash,
+            pmap_raises_query_timeout
         ]},
         {pfiltermap, [sequence], [
             pfiltermap_empty_list,
@@ -89,6 +91,9 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
+    %% Load barrel_docdb so application:set_env in tests is visible to
+    %% the pool's collect_pool_results env lookup.
+    _ = application:load(barrel_docdb),
     %% Start the worker pool for tests (may already be started by application)
     case barrel_parallel:start_link() of
         {ok, _Pid} -> ok;
@@ -153,6 +158,38 @@ pmap_handles_worker_crash(_Config) ->
           end,
     %% exit/1 is caught and re-raised as exit
     ?assertExit(crash, barrel_parallel:pmap(Fun, Items)).
+
+%% When workers exceed `query_timeout_ms', collect_pool_results must
+%% raise `error({query_timeout, Info})' instead of returning a partial
+%% result silently. Deterministic: workers sleep past the deadline.
+pmap_raises_query_timeout(_Config) ->
+    Prev = application:get_env(barrel_docdb, query_timeout_ms),
+    application:set_env(barrel_docdb, query_timeout_ms, 50),
+    ?assertEqual({ok, 50}, application:get_env(barrel_docdb, query_timeout_ms)),
+    try
+        %% Spawn-fallback path collects per-batch (one batch of
+        %% MaxWorkers items at a time), so `total' in the error map
+        %% is the batch size, not the original 20. Pool path tracks
+        %% the full submission. Either way, the error must include
+        %% the timeout, a non-zero pending count, and the configured
+        %% deadline.
+        Items = lists:seq(1, 20),
+        Fun = fun(_) -> timer:sleep(2000), ok end,
+        try
+            Res = barrel_parallel:pmap(Fun, Items),
+            ct:fail({"expected query_timeout error, got result", Res})
+        catch
+            error:{query_timeout, Info} ->
+                ?assertEqual(50, maps:get(timeout_ms, Info)),
+                ?assert(maps:get(total, Info) > 0),
+                ?assert(maps:get(missing_batches, Info) > 0)
+        end
+    after
+        case Prev of
+            undefined -> application:unset_env(barrel_docdb, query_timeout_ms);
+            {ok, V}   -> application:set_env(barrel_docdb, query_timeout_ms, V)
+        end
+    end.
 
 %%====================================================================
 %% pfiltermap Tests

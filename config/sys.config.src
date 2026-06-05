@@ -13,6 +13,10 @@
         %% server sheds load with 503. Override via
         %% BARREL_HTTP_MAX_IN_FLIGHT.
         {http_max_in_flight, ${BARREL_HTTP_MAX_IN_FLIGHT:-1000}},
+        %% Query pipeline deadline (ms). On expiry the API returns
+        %% 504 with a structured `query_timeout' payload instead of
+        %% silently truncating. Override via BARREL_QUERY_TIMEOUT_MS.
+        {query_timeout_ms, ${BARREL_QUERY_TIMEOUT_MS:-30000}},
         %% TLS configuration (enables HTTPS with HTTP/2 ALPN)
         %% Set BARREL_HTTP_TLS_ENABLED=true and provide cert/key paths
         {http_tls_enabled, ${BARREL_HTTP_TLS_ENABLED:-false}},

@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.6] - 2026-06-05
+
+### Changed (breaking)
+- Query timeout now hard-fails instead of silently truncating.
+  When the document-fetch pipeline (or the `barrel_parallel` worker
+  pool) does not finish within `query_timeout_ms` (default 30000ms,
+  override via `BARREL_QUERY_TIMEOUT_MS`), the call raises
+  `error({query_timeout, Info})`. The HTTP `/_find` endpoint maps
+  this to **504 Gateway Timeout** with a JSON/CBOR body of
+  `{"error":"query_timeout","completed":N,"total":T,
+  "missing_batches":M,"timeout_ms":Ms}`. Callers that previously
+  received a partial `{ok, Results, Meta}` with no signal must now
+  handle the 504.
+
+### Added
+- `barrel_query_timeouts` counter (Prometheus / OTel) records every
+  pipeline or pool deadline expiry.
+- Configurable global deadline `query_timeout_ms` shared by
+  `barrel_query` and `barrel_parallel`. Replaces the previous
+  hardcoded 30s and 60s splits.
+
+### Fixed
+- `barrel_parallel:pmap/2,3` spawn-fallback path used a bare
+  `receive` with no deadline, so a stuck worker would hang the
+  caller forever. Now bounded by the same `query_timeout_ms`.
+
 ## [0.7.5] - 2026-06-04
 
 ### Added

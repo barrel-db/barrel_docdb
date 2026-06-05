@@ -206,6 +206,7 @@ spawn_filtermap_worker(Fun, Index, Item, Parent, Ref) ->
 collect_results([], _Ref, Acc) ->
     Acc;
 collect_results(WorkerRefs, Ref, Acc) ->
+    Timeout = application:get_env(barrel_docdb, query_timeout_ms, 30000),
     receive
         {Ref, Index, {ok, Result}} ->
             WorkerRefs2 = lists:keydelete(Index, 1, WorkerRefs),
@@ -221,12 +222,25 @@ collect_results(WorkerRefs, Ref, Acc) ->
                 _ ->
                     collect_results(WorkerRefs, Ref, Acc)
             end
+    after Timeout ->
+        Pending = length(WorkerRefs),
+        Done = length(Acc),
+        Total = Pending + Done,
+        cleanup_workers(WorkerRefs, undefined),
+        logger:warning("barrel_parallel: spawn pool timed out after ~pms; "
+                       "~p/~p tasks completed", [Timeout, Done, Total]),
+        barrel_metrics:inc_query_timeouts(),
+        error({query_timeout, #{completed => Done,
+                                total => Total,
+                                missing_batches => Pending,
+                                timeout_ms => Timeout}})
     end.
 
 %% @private Collect filtermap results
 collect_filtermap_results([], _Ref, Acc) ->
     Acc;
 collect_filtermap_results(WorkerRefs, Ref, Acc) ->
+    Timeout = application:get_env(barrel_docdb, query_timeout_ms, 30000),
     receive
         {Ref, Index, {ok, false}} ->
             WorkerRefs2 = lists:keydelete(Index, 1, WorkerRefs),
@@ -248,6 +262,18 @@ collect_filtermap_results(WorkerRefs, Ref, Acc) ->
                 _ ->
                     collect_filtermap_results(WorkerRefs, Ref, Acc)
             end
+    after Timeout ->
+        Pending = length(WorkerRefs),
+        Done = length(Acc),
+        Total = Pending + Done,
+        cleanup_workers(WorkerRefs, undefined),
+        logger:warning("barrel_parallel: spawn pool timed out after ~pms; "
+                       "~p/~p tasks completed", [Timeout, Done, Total]),
+        barrel_metrics:inc_query_timeouts(),
+        error({query_timeout, #{completed => Done,
+                                total => Total,
+                                missing_batches => Pending,
+                                timeout_ms => Timeout}})
     end.
 
 %% @private Clean up remaining workers
@@ -371,6 +397,7 @@ execute_on_workers(Type, Fun, Items, Workers) ->
 collect_pool_results(_Type, _Ref, 0, Acc) ->
     Acc;
 collect_pool_results(Type, Ref, Remaining, Acc) ->
+    Timeout = application:get_env(barrel_docdb, query_timeout_ms, 30000),
     receive
         {Ref, Index, {ok, Result}} ->
             NewAcc = case Type of
@@ -386,6 +413,14 @@ collect_pool_results(Type, Ref, Remaining, Acc) ->
             collect_pool_results(Type, Ref, Remaining - 1, NewAcc);
         {Ref, _Index, {error, {Class, Reason, Stack}}} ->
             erlang:raise(Class, Reason, Stack)
-    after 60000 ->
-        error({timeout, Remaining, Acc})
+    after Timeout ->
+        Completed = length(Acc),
+        Total = Completed + Remaining,
+        logger:warning("barrel_parallel: pool timed out after ~pms; "
+                       "~p/~p tasks completed", [Timeout, Completed, Total]),
+        barrel_metrics:inc_query_timeouts(),
+        error({query_timeout, #{completed => Completed,
+                                total => Total,
+                                missing_batches => Remaining,
+                                timeout_ms => Timeout}})
     end.

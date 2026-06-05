@@ -3627,13 +3627,12 @@ collect_bounded_results([], [], _FetchCtx, Results, NumBatches) ->
         maps:get(N, Results, [])
     end, lists:seq(1, NumBatches));
 collect_bounded_results(InFlight, Remaining, FetchCtx, Results, NumBatches) ->
+    Timeout = application:get_env(barrel_docdb, query_timeout_ms, 30000),
     receive
         {pipeline_result, Ref, BatchNum, BatchResults} ->
             case lists:keytake(Ref, 1, InFlight) of
                 {value, _, RestInFlight} ->
-                    %% Add results
                     NewResults = Results#{BatchNum => BatchResults},
-                    %% Spawn next batch if available
                     case Remaining of
                         [] ->
                             collect_bounded_results(RestInFlight, [], FetchCtx, NewResults, NumBatches);
@@ -3642,14 +3641,19 @@ collect_bounded_results(InFlight, Remaining, FetchCtx, Results, NumBatches) ->
                             collect_bounded_results(NewRefs ++ RestInFlight, RestRemaining, FetchCtx, NewResults, NumBatches)
                     end;
                 false ->
-                    %% Unknown ref, ignore
                     collect_bounded_results(InFlight, Remaining, FetchCtx, Results, NumBatches)
             end
-    after 30000 ->
-        %% Timeout - return what we have
-        lists:flatmap(fun(N) ->
-            maps:get(N, Results, [])
-        end, lists:seq(1, NumBatches))
+    after Timeout ->
+        Completed = maps:size(Results),
+        Missing = NumBatches - Completed,
+        logger:warning("barrel_query: pipeline timed out after ~pms; "
+                       "~p/~p batches completed, ~p still in flight",
+                       [Timeout, Completed, NumBatches, length(InFlight) + length(Remaining)]),
+        barrel_metrics:inc_query_timeouts(),
+        error({query_timeout, #{completed => Completed,
+                                total => NumBatches,
+                                missing_batches => Missing,
+                                timeout_ms => Timeout}})
     end.
 
 %% @doc Split list into batches of specified size.
