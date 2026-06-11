@@ -17,6 +17,11 @@
         %% 504 with a structured `query_timeout' payload instead of
         %% silently truncating. Override via BARREL_QUERY_TIMEOUT_MS.
         {query_timeout_ms, ${BARREL_QUERY_TIMEOUT_MS:-30000}},
+        %% Require /_replicate targets and inbound replication
+        %% requests to come from a registered peer (Ed25519-signed).
+        %% Default `true' closes the SSRF surface. Flip to `false'
+        %% during migration; scheduled for removal in 0.8.0.
+        {replication_require_registered_peer, ${BARREL_REPLICATION_REQUIRE_REGISTERED_PEER:-true}},
         %% TLS configuration (enables HTTPS with HTTP/2 ALPN)
         %% Set BARREL_HTTP_TLS_ENABLED=true and provide cert/key paths
         {http_tls_enabled, ${BARREL_HTTP_TLS_ENABLED:-false}},

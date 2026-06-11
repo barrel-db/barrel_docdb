@@ -65,6 +65,7 @@ classify(<<"/.well-known/barrel">>, _)        -> public;
 classify(<<"/openapi.json">>,       _)        -> public;
 classify(<<"/docs">>,               _)        -> public;
 classify(<<"/keys", _/binary>>,     _)        -> admin;
+classify(<<"/peers", _/binary>>,    _)        -> admin;
 classify(<<"/admin/", _/binary>>,   _)        -> admin;
 classify(<<"/db/", Rest/binary>>,   Method)   -> db_class(Rest, Method);
 classify(_Path,                     _)        -> throw({error, 404, <<"Not found">>}).

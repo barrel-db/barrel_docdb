@@ -235,6 +235,16 @@ handle_action(key, <<"GET">>, Req) ->
 handle_action(key, <<"DELETE">>, Req) ->
     handle_delete_key(Req);
 
+%% Replication peer registry (admin only)
+handle_action(peers, <<"GET">>, Req) ->
+    handle_list_peers(Req);
+handle_action(peers, <<"POST">>, Req) ->
+    handle_register_peer(Req);
+handle_action(peer, <<"GET">>, Req) ->
+    handle_get_peer(Req);
+handle_action(peer, <<"DELETE">>, Req) ->
+    handle_delete_peer(Req);
+
 %% Admin usage endpoints (admin only)
 handle_action(admin_usage, <<"GET">>, Req) ->
     handle_admin_usage(Req);
@@ -696,7 +706,6 @@ handle_replicate(Req0) ->
     DbName = livery_req:binding(<<"db">>, Req0),
     {ReqBody, Req1} = read_full_body(Req0),
     Spec = decode_request_body(ReqBody, Req1),
-    TargetUrl = maps:get(<<"target">>, Spec),
     %% Build replication options
     Opts0 = #{},
     Opts1 = case maps:get(<<"filter">>, Spec, undefined) of
@@ -707,26 +716,14 @@ handle_replicate(Req0) ->
         Filter when is_map(Filter) ->
             Opts0#{filter => Filter}
     end,
-    %% Determine if target is a URL (remote) or local db name
-    {FinalTarget, Opts} = case is_url(TargetUrl) of
-        true ->
-            %% For remote targets, build endpoint with auth
-            %% Use target_auth from body, or inherit current auth token
-            AuthToken = case maps:get(<<"target_auth">>, Spec, undefined) of
-                undefined ->
-                    %% Inherit current request's auth token
-                    inherit_bearer_token(Req1);
-                Token ->
-                    Token
-            end,
-            TargetEndpoint = case AuthToken of
-                undefined -> #{url => TargetUrl};
-                _ -> #{url => TargetUrl, bearer_token => AuthToken}
-            end,
-            {TargetEndpoint, Opts1#{target_transport => barrel_rep_transport_http}};
-        false ->
-            {TargetUrl, Opts1}
-    end,
+    %% Resolve the target. Either:
+    %%   - `peer_id': an exact registry hit, URL pulled from the
+    %%     registered entry (no URL in the request body at all);
+    %%   - `target': must match a registered peer's canonical URL.
+    %% Anything else is rejected (closes SSRF: only registered hosts
+    %% are reachable). Local-db replication (`target' = a plain db
+    %% name) is unchanged.
+    {FinalTarget, Opts} = resolve_replicate_target(Spec, Req1, Opts1),
     %% Execute one-shot replication
     case barrel_rep:replicate(DbName, FinalTarget, Opts) of
         {ok, Result} ->
@@ -744,6 +741,74 @@ handle_replicate(Req0) ->
 is_url(<<"http://", _/binary>>) -> true;
 is_url(<<"https://", _/binary>>) -> true;
 is_url(_) -> false.
+
+%% Resolve `/_replicate' target into either:
+%%   - `{Endpoint, Opts}' for a registered remote peer
+%%     (Endpoint = #{url, bearer_token, peer_auth => true}); or
+%%   - `{LocalDbName, Opts}' when the request is local-db
+%%     replication (target is a plain db name, no URL).
+%% Rejects unregistered URLs with a 403 — that's the SSRF gate.
+%% Operators can flip `replication_require_registered_peer' to
+%% `false' for migration, in which case the legacy free-form target
+%% URL behaviour returns.
+resolve_replicate_target(Spec, Req, Opts) ->
+    Strict = application:get_env(barrel_docdb,
+                                 replication_require_registered_peer,
+                                 true),
+    case maps:get(<<"peer_id">>, Spec, undefined) of
+        undefined ->
+            resolve_by_target(Spec, Req, Opts, Strict);
+        PeerId when is_binary(PeerId) ->
+            case barrel_peer_registry:get(PeerId) of
+                {ok, #{url := Url}} ->
+                    {build_remote_endpoint(Url, target_bearer(Spec, Req)),
+                     Opts#{target_transport => barrel_rep_transport_http}};
+                {error, not_found} ->
+                    throw({error, 403,
+                           <<"unregistered_peer: unknown peer_id">>})
+            end
+    end.
+
+resolve_by_target(Spec, Req, Opts, Strict) ->
+    case maps:get(<<"target">>, Spec, undefined) of
+        undefined ->
+            throw({error, 400, <<"missing target or peer_id">>});
+        Target ->
+            case is_url(Target) of
+                false ->
+                    %% Local-db replication (target is a db name).
+                    {Target, Opts};
+                true ->
+                    case Strict of
+                        true ->
+                            case barrel_peer_registry:lookup_by_url(Target) of
+                                {ok, #{url := Url}} ->
+                                    {build_remote_endpoint(Url, target_bearer(Spec, Req)),
+                                     Opts#{target_transport => barrel_rep_transport_http}};
+                                {error, not_found} ->
+                                    throw({error, 403,
+                                           <<"unregistered_peer: target URL is not in the peer registry">>})
+                            end;
+                        false ->
+                            %% Migration escape hatch. Legacy
+                            %% behaviour: trust whatever URL the
+                            %% caller asked for.
+                            {build_remote_endpoint(Target, target_bearer(Spec, Req)),
+                             Opts#{target_transport => barrel_rep_transport_http}}
+                    end
+            end
+    end.
+
+target_bearer(Spec, Req) ->
+    case maps:get(<<"target_auth">>, Spec, undefined) of
+        undefined -> inherit_bearer_token(Req);
+        Token     -> Token
+    end.
+
+build_remote_endpoint(Url, undefined) ->
+    #{url => Url, peer_auth => true};
+build_remote_endpoint(Url, Token) when is_binary(Token) ->
+    #{url => Url, bearer_token => Token, peer_auth => true}.
 
 %% Format replication result for JSON response
 format_rep_result(Result) when is_map(Result) ->
@@ -780,6 +845,7 @@ format_seq_for_rep(_) ->
 handle_revsdiff(Req0) ->
     DbName = livery_req:binding(<<"db">>, Req0),
     {ReqBody, Req1} = read_full_body(Req0),
+    ok = require_peer_signature(<<"POST">>, Req1, ReqBody),
     RequestBody = decode_request_body(ReqBody, Req1),
     %% Support both single-doc and batch formats:
     %% Single-doc: {"id": DocId, "revs": [RevIds]}
@@ -810,6 +876,7 @@ handle_revsdiff(Req0) ->
 handle_put_rev(Req0) ->
     DbName = livery_req:binding(<<"db">>, Req0),
     {ReqBody, Req1} = read_full_body(Req0),
+    ok = require_peer_signature(<<"POST">>, Req1, ReqBody),
     #{<<"doc">> := Doc, <<"history">> := History} = Body0 = decode_request_body(ReqBody, Req1),
     Deleted = maps:get(<<"deleted">>, Body0, false),
     case barrel_docdb:put_rev(DbName, Doc, History, Deleted) of
@@ -824,6 +891,7 @@ handle_put_rev(Req0) ->
 handle_sync_hlc(Req0) ->
     DbName = livery_req:binding(<<"db">>, Req0),
     {ReqBody, Req1} = read_full_body(Req0),
+    ok = require_peer_signature(<<"POST">>, Req1, ReqBody),
     case decode_request_body(ReqBody, Req1) of
         #{<<"hlc">> := HlcBin} when is_binary(HlcBin) ->
             case parse_hlc(HlcBin) of
@@ -845,6 +913,53 @@ do_sync_hlc(DbName, RemoteHlc, Req) ->
         {error, clock_skew} ->
             throw({error, 409, <<"Clock skew rejected">>})
     end.
+
+%% @private Require a valid Ed25519 signature from a registered
+%% peer on inbound replication-receiving requests. The API-key gate
+%% has already run in `barrel_docdb_auth' middleware; this is the
+%% additional peer-trust check that scopes who may push data in.
+%% Disabled when `replication_require_registered_peer' is `false'.
+require_peer_signature(Method, Req, Body) ->
+    Strict = application:get_env(barrel_docdb,
+                                 replication_require_registered_peer,
+                                 true),
+    case Strict of
+        false -> ok;
+        true  ->
+            Path = livery_req:path(Req),
+            Headers = livery_req:headers(Req),
+            LookupFun = fun barrel_peer_registry:lookup/1,
+            case barrel_peer_auth:verify_request(LookupFun, Method, Path,
+                                                 Body, Headers, #{}) of
+                ok ->
+                    case maps:get(<<"x-peer-id">>,
+                                  normalise_headers(Headers), undefined) of
+                        undefined -> ok;
+                        PeerId    ->
+                            barrel_peer_registry:touch_last_used(PeerId),
+                            ok
+                    end;
+                {error, missing_peer_id} ->
+                    throw({error, 401, <<"peer_signature_required">>});
+                {error, missing_timestamp} ->
+                    throw({error, 401, <<"peer_signature_required">>});
+                {error, missing_signature} ->
+                    throw({error, 401, <<"peer_signature_required">>});
+                {error, not_found} ->
+                    throw({error, 401, <<"unregistered_peer">>});
+                {error, timestamp_expired} ->
+                    throw({error, 401, <<"peer_signature_expired">>});
+                {error, invalid_signature} ->
+                    throw({error, 401, <<"invalid_peer_signature">>});
+                {error, _Reason} ->
+                    throw({error, 401, <<"peer_signature_required">>})
+            end
+    end.
+
+normalise_headers(Headers) when is_list(Headers) ->
+    lists:foldl(fun({K, V}, Acc) ->
+                        maps:put(string:lowercase(K), V, Acc)
+                end, #{}, Headers).
 
 %%====================================================================
 %% Local Document Handlers
@@ -1360,6 +1475,77 @@ handle_delete_key(Req) ->
             throw({error, 400, <<"Cannot delete the last admin key">>});
         {error, Reason} ->
             throw({error, 500, format_error(Reason)})
+    end.
+
+%%====================================================================
+%% Replication Peer Registry Handlers
+%%====================================================================
+
+handle_list_peers(Req) ->
+    {ok, Peers} = barrel_peer_registry:list(),
+    Body = encode_response(Peers, Req),
+    {200, response_headers(Req), Body, Req}.
+
+handle_register_peer(Req0) ->
+    {ReqBody, Req1} = read_full_body(Req0),
+    Spec0 = decode_request_body(ReqBody, Req1),
+    %% Translate binary keys to the atom keys
+    %% `barrel_peer_registry:register_peer/1' expects.
+    Spec = maps:fold(
+             fun(<<"name">>, V, Acc)          -> Acc#{name => V};
+                (<<"url">>, V, Acc)           -> Acc#{url => V};
+                (<<"public_key">>, V, Acc)    -> Acc#{public_key => V};
+                (<<"peer_id">>, V, Acc)       -> Acc#{peer_id => V};
+                (<<"discover">>, true, Acc)   ->
+                     Acc#{discover_from => maps:get(<<"url">>, Spec0, undefined)};
+                (<<"databases">>, <<"all">>, Acc) -> Acc#{databases => all};
+                (<<"databases">>, V, Acc) when is_list(V) -> Acc#{databases => V};
+                (_, _, Acc) -> Acc
+             end, #{}, Spec0),
+    case barrel_peer_registry:register_peer(Spec) of
+        {ok, PeerInfo} ->
+            Body = encode_response(PeerInfo, Req1),
+            {201, response_headers(Req1), Body, Req1};
+        {error, missing_name} ->
+            throw({error, 400, <<"missing field: name">>});
+        {error, missing_url} ->
+            throw({error, 400, <<"missing field: url">>});
+        {error, missing_public_key_or_discover} ->
+            throw({error, 400, <<"missing field: public_key or discover">>});
+        {error, missing_peer_id} ->
+            throw({error, 400, <<"missing field: peer_id (required when public_key is supplied directly)">>});
+        {error, invalid_public_key} ->
+            throw({error, 400, <<"invalid public_key">>});
+        {error, well_known_invalid_json} ->
+            throw({error, 502, <<"discover: remote /.well-known/barrel did not return JSON">>});
+        {error, well_known_missing_fields} ->
+            throw({error, 502, <<"discover: remote /.well-known/barrel missing node_id or public_key">>});
+        {error, {discover_status, Status}} ->
+            throw({error, 502, iolist_to_binary(io_lib:format("discover: remote returned status ~p", [Status]))});
+        {error, {discover_failed, _} = R} ->
+            throw({error, 502, format_error(R)});
+        {error, Reason} ->
+            throw({error, 500, format_error(Reason)})
+    end.
+
+handle_get_peer(Req) ->
+    PeerId = livery_req:binding(<<"peer_id">>, Req),
+    case barrel_peer_registry:get(PeerId) of
+        {ok, PeerInfo} ->
+            Body = encode_response(PeerInfo, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Peer not found">>})
+    end.
+
+handle_delete_peer(Req) ->
+    PeerId = livery_req:binding(<<"peer_id">>, Req),
+    case barrel_peer_registry:delete(PeerId) of
+        ok ->
+            Body = encode_response(#{<<"ok">> => true}, Req),
+            {200, response_headers(Req), Body, Req};
+        {error, not_found} ->
+            throw({error, 404, <<"Peer not found">>})
     end.
 
 %%====================================================================

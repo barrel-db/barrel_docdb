@@ -80,6 +80,7 @@ When running as a release, configure the HTTP server via environment variables:
 | `BARREL_HTTP_MAX_BODY_BYTES` | `4194304` | Cap on buffered request body size (413 on oversize). Streamed attachment uploads bypass this by design. |
 | `BARREL_HTTP_MAX_IN_FLIGHT` | `1000` | Maximum concurrent in-flight requests (503 above the cap). |
 | `BARREL_QUERY_TIMEOUT_MS` | `30000` | Per-query deadline for the document-fetch pipeline. On expiry the API returns 504 with a structured `query_timeout` payload. |
+| `BARREL_REPLICATION_REQUIRE_REGISTERED_PEER` | `true` | When set, `/_replicate` only allows targets present in the peer registry and inbound `_revsdiff` / `_put_rev` / `_sync_hlc` require an Ed25519-signed request from a registered peer. Set to `false` only during migration. Scheduled for removal in 0.8.0. |
 | `BARREL_HTTP_TLS_ENABLED` | `false` | Enable HTTPS with HTTP/2 ALPN |
 | `BARREL_HTTP_CERTFILE` | - | Path to TLS certificate |
 | `BARREL_HTTP_KEYFILE` | - | Path to TLS private key |
