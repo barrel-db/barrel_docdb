@@ -206,8 +206,11 @@ fold_local_docs(Pid, Prefix, Fun, Acc) ->
 init([Name, Config]) ->
     process_flag(trap_exit, true),
 
-    %% Get data directory from config
-    DataDir = maps:get(data_dir, Config, "/tmp/barrel_data"),
+    %% Get data directory from config. Fall back to the `data_dir' app env so a
+    %% node can relocate ALL of its dbs (including internal ones created with no
+    %% opts) off the shared default - lets two local nodes use distinct dirs.
+    DefaultDataDir = application:get_env(barrel_docdb, data_dir, "/tmp/barrel_data"),
+    DataDir = maps:get(data_dir, Config, DefaultDataDir),
     DbPath = filename:join([DataDir, binary_to_list(Name)]),
 
     %% Start compaction filter handler BEFORE opening RocksDB
