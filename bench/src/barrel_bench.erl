@@ -12,7 +12,6 @@
 -export([run_query/0, run_query/1]).
 -export([run_changes/0, run_changes/1]).
 -export([run_doc_types/0, run_doc_types/1]).
--export([run_http/0, run_http/1]).
 
 -define(DEFAULT_NUM_DOCS, 10000).
 -define(DEFAULT_ITERATIONS, 10000).
@@ -179,33 +178,6 @@ run_changes(Config) ->
     cleanup_db(),
 
     print_workload_result(changes, Result),
-    Result.
-
-%% @doc Run HTTP API vs Direct API comparison benchmark
--spec run_http() -> map().
-run_http() ->
-    run_http(#{}).
-
--spec run_http(map()) -> map().
-run_http(Config) ->
-    NumDocs = maps:get(num_docs, Config, 1000),
-    Iterations = maps:get(iterations, Config, 1000),
-
-    io:format("~n=== HTTP API Benchmark ===~n"),
-    io:format("Documents: ~p, Iterations: ~p~n~n", [NumDocs, Iterations]),
-
-    Result = barrel_bench_http:run_comparison(#{
-        num_docs => NumDocs,
-        iterations => Iterations
-    }),
-
-    Output = #{
-        timestamp => timestamp(),
-        config => #{num_docs => NumDocs, iterations => Iterations},
-        results => Result
-    },
-    save_results(Output, "http"),
-
     Result.
 
 %%====================================================================

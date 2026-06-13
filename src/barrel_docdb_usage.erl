@@ -132,8 +132,4 @@ get_sst_files_size(DbRef) ->
 %% @private
 %% Safely convert binary to integer.
 safe_to_integer(Bin) when is_binary(Bin) ->
-    try
-        binary_to_integer(Bin)
-    catch
-        _:_ -> 0
-    end.
+    barrel_lib:safe(fun() -> binary_to_integer(Bin) end, 0).

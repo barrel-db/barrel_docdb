@@ -114,14 +114,12 @@ new_hlc() ->
 maybe_sync_from_header(undefined) ->
     ok;
 maybe_sync_from_header(HlcBase64) ->
-    try
+    barrel_lib:safe(fun() ->
         HlcBin = base64:decode(HlcBase64),
         Hlc = decode(HlcBin),
         _ = sync_hlc(Hlc),
         ok
-    catch
-        _:_ -> ok
-    end.
+    end, ok).
 
 %% @doc Generate a new timestamp for a local event using global clock.
 -spec now() -> timestamp().
@@ -230,13 +228,11 @@ to_string(#timestamp{wall_time = WallTime, logical = Logical}) ->
 from_string(Bin) when is_binary(Bin) ->
     case binary:split(Bin, <<":">>) of
         [WallBin, LogicalBin] ->
-            try
+            barrel_lib:safe(fun() ->
                 WallTime = binary_to_integer(WallBin),
                 Logical = binary_to_integer(LogicalBin),
                 #timestamp{wall_time = WallTime, logical = Logical}
-            catch
-                _:_ -> {error, invalid_timestamp}
-            end;
+            end, {error, invalid_timestamp});
         _ ->
             {error, invalid_timestamp}
     end;

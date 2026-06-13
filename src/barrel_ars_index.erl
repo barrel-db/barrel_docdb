@@ -345,11 +345,9 @@ fold_path(StoreRef, DbName, PathPrefix, Fun, Acc0, _Profile) ->
         ),
         {ok, NewAcc}
     end,
-    try
+    barrel_lib:safe_fold(fun() ->
         barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, FoldFun, Acc0)
-    catch
-        throw:{stop, Result} -> Result
-    end.
+    end).
 
 %% @doc Fold over path index entries in reverse order.
 %% Iterates from last to first; useful for building sorted lists with prepend.
@@ -379,11 +377,9 @@ fold_path_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0, _Profile) ->
         ),
         {ok, NewAcc}
     end,
-    try
+    barrel_lib:safe_fold(fun() ->
         barrel_store_rocksdb:fold_range_posting_reverse(StoreRef, StartKey, EndKey, FoldFun, Acc0)
-    catch
-        throw:{stop, Result} -> Result
-    end.
+    end).
 
 %% @doc Fold over path index entries in chunks for efficient batch processing.
 %% Collects DocIds into chunks of ChunkSize, calling Fun with each chunk.
@@ -473,11 +469,9 @@ fold_path_range(StoreRef, _DbName, StartKey, EndKey, Fun, Acc0, _Profile) ->
         ),
         {ok, NewAcc}
     end,
-    try
+    barrel_lib:safe_fold(fun() ->
         barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, FoldFun, Acc0)
-    catch
-        throw:{stop, Result} -> Result
-    end.
+    end).
 
 %% @doc Fold over all values for a path in ascending order.
 %% Useful for ORDER BY path ASC with early termination.
@@ -507,11 +501,9 @@ fold_path_values(StoreRef, DbName, PathPrefix, Fun, Acc0, _Profile) ->
         ),
         {ok, NewAcc}
     end,
-    try
+    barrel_lib:safe_fold(fun() ->
         barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, FoldFun, Acc0)
-    catch
-        throw:{stop, Result} -> Result
-    end.
+    end).
 
 %% @doc Fold over all values for a path in descending order.
 %% Useful for ORDER BY path DESC with early termination.
@@ -541,11 +533,9 @@ fold_path_values_reverse(StoreRef, DbName, PathPrefix, Fun, Acc0, _Profile) ->
         ),
         {ok, NewAcc}
     end,
-    try
+    barrel_lib:safe_fold(fun() ->
         barrel_store_rocksdb:fold_range_posting_reverse(StoreRef, StartKey, EndKey, FoldFun, Acc0)
-    catch
-        throw:{stop, Result} -> Result
-    end.
+    end).
 
 %% @doc Fold over path values matching a comparison operator.
 %% Supports: '&gt;' | '&lt;' | '&gt;=' | '=&lt;' for range queries.
@@ -571,12 +561,10 @@ fold_path_values_compare(StoreRef, DbName, Path, Op, Value, Fun, Acc0) ->
         ),
         {ok, NewAcc}
     end,
-    try
+    barrel_lib:safe_fold(fun() ->
         %% Use compare-optimized fold with bloom filter
         barrel_store_rocksdb:fold_range_posting_compare(StoreRef, StartKey, EndKey, FoldFun, Acc0)
-    catch
-        throw:{stop, Result} -> Result
-    end.
+    end).
 
 %% @doc Fold over DocIds matching a comparison operator (no path decoding).
 %% Optimized for pure range queries where only DocIds are needed.
@@ -598,11 +586,9 @@ fold_compare_docids(StoreRef, DbName, Path, Op, Value, Fun, Acc0) ->
         ),
         {ok, NewAcc}
     end,
-    try
+    barrel_lib:safe_fold(fun() ->
         barrel_store_rocksdb:fold_range_posting_compare(StoreRef, StartKey, EndKey, FoldFun, Acc0)
-    catch
-        throw:{stop, Result} -> Result
-    end.
+    end).
 
 %% @doc Fold over DocIds matching a comparison operator with snapshot.
 %% Same as fold_compare_docids but uses a snapshot for consistent reads.
@@ -624,12 +610,10 @@ fold_compare_docids_with_snapshot(StoreRef, DbName, Path, Op, Value, Fun, Acc0, 
         ),
         {ok, NewAcc}
     end,
-    try
+    barrel_lib:safe_fold(fun() ->
         barrel_store_rocksdb:fold_range_posting_compare_with_snapshot(
             StoreRef, StartKey, EndKey, FoldFun, Acc0, Snapshot)
-    catch
-        throw:{stop, Result} -> Result
-    end.
+    end).
 
 %% @private Compute range keys for compare operators
 compare_range_keys(DbName, Path, '>', Value) ->
@@ -688,11 +672,9 @@ fold_prefix(StoreRef, DbName, Path, Prefix, Fun, Acc0, _Profile) when is_binary(
         ),
         {ok, NewAcc}
     end,
-    try
+    barrel_lib:safe_fold(fun() ->
         barrel_store_rocksdb:fold_range_posting(StoreRef, StartKey, EndKey, FoldFun, Acc0)
-    catch
-        throw:{stop, Result} -> Result
-    end.
+    end).
 
 %% @doc Fold over posting lists matching a path prefix.
 %% The callback receives a list of DocIds from each posting list entry.
