@@ -1029,15 +1029,41 @@ abort_attachment_writer(Writer) ->
 %% paths are automatically indexed, enabling ad-hoc queries without
 %% predefined views.
 %%
+%% Note: top-level fields whose key begins with `_' (e.g. `&lt;&lt;"_meta"&gt;&gt;') are
+%% reserved metadata. They are stripped before storage and are neither
+%% persisted nor indexed, so they cannot be queried. Use a non-`_' top-level
+%% namespace for application data.
+%%
 %% == Query Specification ==
 %% <ul>
-%%   <li>`where' - List of conditions (required)</li>
+%%   <li>`where' - List of conditions (required, unless an id scan is used)</li>
 %%   <li>`select' - Fields to return (optional, defaults to full doc)</li>
 %%   <li>`order_by' - Field or variable to sort by (optional)</li>
 %%   <li>`limit' - Maximum results (optional)</li>
 %%   <li>`offset' - Skip first N results (optional)</li>
 %%   <li>`include_docs' - Include full documents (optional, default true)</li>
+%%   <li>`flat' - When true (with `include_docs'), return flat documents
+%%       `Doc#{&lt;&lt;"id"&gt;&gt;}' instead of `#{&lt;&lt;"id"&gt;&gt;, &lt;&lt;"doc"&gt;&gt;}' wrappers
+%%       (optional, default false)</li>
 %% </ul>
+%%
+%% == Id scans (primary key) ==
+%% Standalone scans over the document id, ordered, O(matches), without a
+%% `where' clause (the id is not in the path index):
+%% <ul>
+%%   <li>`id_prefix' - binary; all docs whose id starts with the prefix</li>
+%%   <li>`id_range' - `{Start, End}'; docs with `Start =&lt; id &lt; End'
+%%       (half-open). `Start'/`End' may be `undefined' for an open bound</li>
+%% </ul>
+%% Hierarchical/scannable keys should be modelled in the id (e.g.
+%% `&lt;&lt;"user:123"&gt;&gt;'); other fields use `where'.
+%%
+%% == Result shape ==
+%% With `include_docs => true' (the default), each result is a wrapper
+%% `#{&lt;&lt;"id"&gt;&gt; => Id, &lt;&lt;"doc"&gt;&gt; => Doc}' (use `flat => true' for the flat
+%% document; flat docs carry `&lt;&lt;"id"&gt;&gt;' but not `&lt;&lt;"_rev"&gt;&gt;' - use
+%% {@link get_doc/2} if the rev is needed). With `include_docs => false'
+%% each result is `#{&lt;&lt;"id"&gt;&gt; => Id}'.
 %%
 %% == Conditions ==
 %% <ul>

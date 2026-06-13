@@ -29,12 +29,56 @@ A query specification is a map with these keys:
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `where` | list | **Required.** List of conditions to match |
+| `where` | list | **Required** (unless an id scan is used). List of conditions to match |
 | `select` | list | Fields or variables to return |
 | `order_by` | term | Field or variable for sorting |
 | `limit` | integer | Maximum results |
 | `offset` | integer | Skip first N results |
 | `include_docs` | boolean | Include full documents (default: true) |
+| `flat` | boolean | Return flat docs instead of `{id, doc}` wrappers (default: false) |
+| `id_prefix` | binary | Standalone id prefix scan (no `where`) |
+| `id_range` | `{Start, End}` | Standalone id range scan `Start =< id < End` (no `where`) |
+
+### Result shape
+
+With `include_docs => true` (the default), each result is a wrapper
+`#{<<"id">> => Id, <<"doc">> => Doc}`. Pass `flat => true` to get the flat
+document `Doc#{<<"id">>}` instead (matching `get_doc/2`'s id; flat docs carry
+`<<"id">>` but not `<<"_rev">>` — use `get_doc/2` if you need the rev). With
+`include_docs => false`, each result is `#{<<"id">> => Id}`.
+
+```erlang
+%% Wrapper (default)
+{ok, [#{<<"id">> := <<"u1">>, <<"doc">> := Doc}], _} =
+    barrel_docdb:find(Db, #{where => [{path, [<<"type">>], <<"user">>}]}).
+
+%% Flat
+{ok, [#{<<"id">> := <<"u1">>, <<"type">> := <<"user">>}], _} =
+    barrel_docdb:find(Db, #{where => [{path, [<<"type">>], <<"user">>}],
+                            flat => true}).
+```
+
+### Id scans (primary key)
+
+The document id is not in the path index. To scan by id, use the standalone,
+ordered `id_prefix` / `id_range` options (no `where` clause). These run as a
+range scan over the entity keyspace — O(matches), tombstones skipped, and
+cursor-friendly. Model hierarchical/scannable keys in the id itself.
+
+```erlang
+%% All ids starting with "user:"
+{ok, Rows, _} = barrel_docdb:find(Db, #{id_prefix => <<"user:">>}).
+
+%% Ids in [a, n)
+{ok, Rows, _} = barrel_docdb:find(Db, #{id_range => {<<"a">>, <<"n">>}}).
+```
+
+### Reserved fields
+
+Top-level fields whose key begins with `_` (e.g. `<<"_meta">>`) are reserved
+metadata. They are stripped before storage and are **neither persisted nor
+indexed**, so they cannot be queried. Put application data under a non-`_`
+top-level namespace.
 
 ## Conditions
 

@@ -77,12 +77,15 @@
 -type order_spec() :: logic_var() | path() | {logic_var() | path(), asc | desc}.
 
 -type query_spec() :: #{
-    where := [condition()],
+    where => [condition()],
     select => [projection()],
     order_by => order_spec() | [order_spec()],
     limit => pos_integer(),
     offset => non_neg_integer(),
     include_docs => boolean(),
+    flat => boolean(),
+    id_prefix => binary(),
+    id_range => {binary() | undefined, binary() | undefined},
     doc_format => binary | map | json,
     decoder_fun => fun((binary()) -> term())
 }.
@@ -107,7 +110,14 @@
     %% Custom decoder function for documents
     decoder_fun :: undefined | fun((binary()) -> term()),
     %% Index strategy hint
-    strategy :: index_seek | index_scan | multi_index | full_scan
+    strategy :: index_seek | index_scan | multi_index | full_scan,
+    %% Return flat documents (Doc#{<<"id">>}) instead of #{id, doc} wrappers
+    flat = false :: boolean(),
+    %% Primary-key scan over the entity keyspace by document id:
+    %% undefined | {prefix, binary()} | {range, Start, End}
+    %% (Start/End are binary() | undefined). Bypasses the ARS index.
+    id_scan = undefined :: undefined | {prefix, binary()}
+                         | {range, binary() | undefined, binary() | undefined}
 }).
 
 -type query_plan() :: #query_plan{}.
@@ -210,7 +220,14 @@ compile(_) ->
 %% Returns ok or {error, Reason}.
 -spec validate_spec(query_spec()) -> ok | {error, term()}.
 validate_spec(Spec) when is_map(Spec) ->
+    HasIdScan = maps:is_key(id_prefix, Spec) orelse maps:is_key(id_range, Spec),
     case maps:get(where, Spec, undefined) of
+        undefined when HasIdScan ->
+            %% Standalone id_prefix / id_range scan - no where clause required.
+            case compile_id_scan(Spec) of
+                {error, _} = Error -> Error;
+                _ -> ok
+            end;
         undefined ->
             {error, {missing_clause, where}};
         Where when is_list(Where) ->
@@ -231,19 +248,21 @@ validate_spec(_) ->
     {ok, [map()], seq()} | {error, term()}.
 execute(StoreRef, DbName, #query_plan{include_docs = true, limit = undefined} = Plan) ->
     %% Unbounded include_docs query - auto-paginate to avoid memory issues
-    barrel_trace:with_db_span(query_execute, DbName, fun() ->
+    Result = barrel_trace:with_db_span(query_execute, DbName, fun() ->
         execute_with_auto_pagination(StoreRef, DbName, Plan)
-    end);
+    end),
+    maybe_flatten_result(Result, Plan);
 execute(StoreRef, DbName, #query_plan{} = Plan) ->
     %% Bounded query or pure index query - execute directly
-    barrel_trace:with_db_span(query_execute, DbName, fun() ->
+    Result = barrel_trace:with_db_span(query_execute, DbName, fun() ->
         {ok, Snapshot} = barrel_store_rocksdb:snapshot(StoreRef),
         try
             execute_with_snapshot(StoreRef, DbName, Plan, Snapshot)
         after
             barrel_store_rocksdb:release_snapshot(Snapshot)
         end
-    end).
+    end),
+    maybe_flatten_result(Result, Plan).
 
 %% @private Execute unbounded include_docs query with automatic pagination
 %% Collects results in chunks to avoid memory pressure from large MultiGet
@@ -311,7 +330,7 @@ collect_all_chunks(StoreRef, DbName, Plan, Token, AccResults) when is_binary(Tok
 -spec execute(barrel_store_rocksdb:db_ref(), db_name(), query_plan(), chunk_opts()) ->
     {ok, [map()], result_meta()} | {error, term()}.
 execute(StoreRef, DbName, #query_plan{} = Plan, Opts) when is_map(Opts) ->
-    barrel_trace:with_db_span(query_execute, DbName, fun() ->
+    Result = barrel_trace:with_db_span(query_execute, DbName, fun() ->
         case maps:get(continuation, Opts, undefined) of
             undefined ->
                 %% Fresh query - create new snapshot
@@ -320,7 +339,20 @@ execute(StoreRef, DbName, #query_plan{} = Plan, Opts) when is_map(Opts) ->
                 %% Resume from cursor
                 execute_chunked_resume(StoreRef, DbName, Plan, Token, Opts)
         end
-    end).
+    end),
+    maybe_flatten_result(Result, Plan).
+
+%% @private Apply `flat => true' to a query result: replace #{id, doc} wrappers
+%% with the flat document Doc#{<<"id">>}. Other shapes pass through.
+maybe_flatten_result({ok, Results, Meta}, #query_plan{flat = true, include_docs = true}) ->
+    {ok, [flatten_one(R) || R <- Results], Meta};
+maybe_flatten_result(Result, _Plan) ->
+    Result.
+
+flatten_one(#{<<"doc">> := Doc, <<"id">> := Id}) when is_map(Doc) ->
+    Doc#{<<"id">> => Id};
+flatten_one(Other) ->
+    Other.
 
 %%====================================================================
 %% Chunked Execution Implementation
@@ -367,6 +399,11 @@ execute_chunked_resume(StoreRef, DbName, Plan, Token, Opts) ->
     end.
 
 %% @private Execute chunked query with snapshot
+execute_chunked_with_snapshot(StoreRef, DbName, #query_plan{id_scan = IdScan} = Plan,
+                              ChunkSize, StartKey, Snapshot)
+  when IdScan =/= undefined ->
+    %% Primary-key scan over the entity keyspace by document id.
+    execute_id_scan_chunked(StoreRef, DbName, IdScan, Plan, ChunkSize, StartKey, Snapshot);
 execute_chunked_with_snapshot(StoreRef, DbName, Plan, ChunkSize, StartKey, Snapshot) ->
     #query_plan{conditions = Conditions} = Plan,
 
@@ -536,8 +573,14 @@ execute_pure_prefix_chunked(StoreRef, DbName, Path, Prefix, Plan, ChunkSize, Sta
             <<Key/binary, 0>>
     end,
 
-    %% End key for prefix scan: path + prefix + 0xFF
-    EndKey = barrel_store_keys:path_posting_end(DbName, FullPath),
+    %% End key for prefix scan. The value is the last path component and is
+    %% encoded with a 0x00 0x00 terminator, so we must append 0xFF *inside*
+    %% the value component (before the terminator) to bracket all values that
+    %% start with Prefix. Using path_posting_end(FullPath) would place 0xFF
+    %% after the terminator and wrongly exclude longer values like
+    %% "Hello World" (see fold_prefix/6).
+    EndKey = barrel_store_keys:path_posting_prefix(
+               DbName, Path ++ [<<Prefix/binary, 16#FF>>]),
 
     MaxCollect = ChunkSize + 1,
 
@@ -579,6 +622,104 @@ execute_pure_prefix_chunked(StoreRef, DbName, Path, Prefix, Plan, ChunkSize, Sta
         false ->
             maybe_release_snapshot(ActualSnapshot),
             {ok, FinalResults, #{last_seq => LastSeq, has_more => false}}
+    end.
+
+%% @private Execute a primary-key (document id) range scan over the entity
+%% keyspace. Skips tombstones; supports include_docs/flat/limit/offset and
+%% cursor continuation. O(matches in range), ordered by id.
+execute_id_scan_chunked(StoreRef, DbName, IdScan, Plan, ChunkSize, StartKey, Snapshot) ->
+    #query_plan{offset = Offset, include_docs = IncludeDocs, decoder_fun = DecoderFun} = Plan,
+    EntityPrefix = barrel_store_keys:doc_entity_prefix(DbName),
+    PrefixLen = byte_size(EntityPrefix),
+    {RangeStart, RangeEnd} = id_scan_range(DbName, IdScan),
+    ActualStartKey = case StartKey of
+        undefined -> RangeStart;
+        Key -> <<Key/binary, 0>>
+    end,
+    ActualSnapshot = case Snapshot of
+        undefined ->
+            {ok, S} = barrel_store_rocksdb:snapshot(StoreRef),
+            S;
+        S -> S
+    end,
+    MaxCollect = ChunkSize + 1,
+    FoldFun = fun(Key, _Value, {Count, Acc}) ->
+        case entity_live(StoreRef, Key) of
+            true ->
+                DocId = binary:part(Key, PrefixLen, byte_size(Key) - PrefixLen),
+                NewCount = Count + 1,
+                NewAcc = [DocId | Acc],
+                case NewCount >= MaxCollect of
+                    true -> {stop, {NewCount, NewAcc}};
+                    false -> {ok, {NewCount, NewAcc}}
+                end;
+            false ->
+                {ok, {Count, Acc}}
+        end
+    end,
+    {CollectedCount, DocIdsRev} = barrel_store_rocksdb:fold_range_with_snapshot(
+        StoreRef, ActualStartKey, RangeEnd, FoldFun, {0, []}, ActualSnapshot),
+
+    HasMore = CollectedCount > ChunkSize,
+    AllDocIds = lists:reverse(DocIdsRev),
+    ReturnedDocIds = lists:sublist(AllDocIds, ChunkSize),
+    FinalDocIds = apply_offset_limit(ReturnedDocIds, Offset, ChunkSize),
+
+    FinalResults = maybe_fetch_docs_chunked(DbName, FinalDocIds, IncludeDocs, DecoderFun),
+    LastSeq = barrel_changes:get_last_seq(StoreRef, DbName),
+
+    case HasMore andalso ReturnedDocIds =/= [] of
+        true ->
+            LastDocId = lists:last(ReturnedDocIds),
+            LastKey = barrel_store_keys:doc_entity(DbName, LastDocId),
+            Token = barrel_query_cursor:create(StoreRef, DbName, id_scan, LastKey, ActualSnapshot),
+            {ok, FinalResults, #{last_seq => LastSeq, has_more => true, continuation => Token}};
+        false ->
+            maybe_release_snapshot(ActualSnapshot),
+            {ok, FinalResults, #{last_seq => LastSeq, has_more => false}}
+    end.
+
+%% @private Compute the entity-keyspace [Start, End) range for an id_scan.
+id_scan_range(DbName, {prefix, P}) ->
+    Prefix = barrel_store_keys:doc_entity_prefix(DbName),
+    Start = <<Prefix/binary, P/binary>>,
+    End = case bin_increment(P) of
+        overflow -> barrel_store_keys:doc_entity_end(DbName);
+        NextP -> <<Prefix/binary, NextP/binary>>
+    end,
+    {Start, End};
+id_scan_range(DbName, {range, StartId, EndId}) ->
+    Prefix = barrel_store_keys:doc_entity_prefix(DbName),
+    Start = case StartId of
+        undefined -> Prefix;
+        _ -> <<Prefix/binary, StartId/binary>>
+    end,
+    End = case EndId of
+        undefined -> barrel_store_keys:doc_entity_end(DbName);
+        _ -> <<Prefix/binary, EndId/binary>>
+    end,
+    {Start, End}.
+
+%% @private Smallest binary greater than all binaries having Bin as a prefix.
+%% Returns `overflow' when Bin is empty or all 0xFF (scan to keyspace end).
+bin_increment(Bin) ->
+    case bin_increment_rev(lists:reverse(binary_to_list(Bin))) of
+        overflow -> overflow;
+        Rev -> list_to_binary(lists:reverse(Rev))
+    end.
+
+bin_increment_rev([]) -> overflow;
+bin_increment_rev([16#FF | Rest]) -> bin_increment_rev(Rest);
+bin_increment_rev([B | Rest]) -> [B + 1 | Rest].
+
+%% @private A document entity is live (not a tombstone) when its `del' column
+%% is not <<"true">>.
+entity_live(StoreRef, EntityKey) ->
+    case barrel_store_rocksdb:get_entity(StoreRef, EntityKey) of
+        {ok, Columns} ->
+            proplists:get_value(<<"del">>, Columns, <<"false">>) =/= <<"true">>;
+        _ ->
+            false
     end.
 
 %% @private Process DocIds for chunked exists query
@@ -1196,7 +1337,37 @@ path_to_pattern(Path) ->
 %%====================================================================
 
 do_compile(Spec) ->
-    Where = maps:get(where, Spec),
+    case compile_id_scan(Spec) of
+        {error, _} = Err -> Err;
+        IdScan -> do_compile(Spec, IdScan)
+    end.
+
+%% @private Parse id_prefix / id_range spec options into an id_scan plan field.
+compile_id_scan(Spec) ->
+    case {maps:get(id_prefix, Spec, undefined), maps:get(id_range, Spec, undefined)} of
+        {undefined, undefined} ->
+            undefined;
+        {P, undefined} when is_binary(P) ->
+            {prefix, P};
+        {undefined, {S, E}} when (is_binary(S) orelse S =:= undefined),
+                                 (is_binary(E) orelse E =:= undefined) ->
+            {range, S, E};
+        _ ->
+            {error, {invalid_id_scan, maps:with([id_prefix, id_range], Spec)}}
+    end.
+
+do_compile(Spec, IdScan) ->
+    Where = maps:get(where, Spec, []),
+    %% id_scan is a standalone primary-key scan; it does not combine with where.
+    case {IdScan, Where} of
+        {Scan, [_ | _]} when Scan =/= undefined ->
+            {error, {id_scan_with_where, Where}};
+        _ ->
+            do_compile(Spec, IdScan, Where)
+    end.
+
+do_compile(Spec, IdScan, Where) ->
+    Flat = maps:get(flat, Spec, false),
     Select = maps:get(select, Spec, ['*']),
     OrderBy = maps:get(order_by, Spec, undefined),
     Limit = maps:get(limit, Spec, undefined),
@@ -1236,7 +1407,9 @@ do_compile(Spec) ->
         include_docs = IncludeDocs,
         doc_format = DocFormat,
         decoder_fun = DecoderFun,
-        strategy = Strategy
+        strategy = Strategy,
+        flat = Flat,
+        id_scan = IdScan
     },
     {ok, Plan}.
 
@@ -2655,46 +2828,16 @@ intersect_lazy_with_limit(StoreRef, DbName, Conditions, MaxCollect) ->
         [SingleNonEq] ->
             %% One non-equality condition - iterate it, verify equalities
             iterate_with_lazy_verify(StoreRef, DbName, SingleNonEq, EqConds, MaxCollect);
-        MultipleNonEq ->
-            %% Multiple non-equality conditions - pick smallest to iterate
-            %% Others go to verification (may need doc_paths, but rare)
-            {IterCond, RestNonEq} = pick_smallest_non_eq(StoreRef, DbName, MultipleNonEq),
-            VerifyConds = EqConds ++ RestNonEq,
-            iterate_with_lazy_verify(StoreRef, DbName, IterCond, VerifyConds, MaxCollect)
+        _MultipleNonEq ->
+            %% Two or more non-equality conditions. Per-docid verification of a
+            %% second range/compare via doc_paths is unreliable, so collect each
+            %% condition's docid set and intersect (the proven non-lazy path),
+            %% then truncate to the limit. Returns a sorted list, consistent with
+            %% the continuation path.
+            lists:sublist(
+                intersect_docid_sets_v2(StoreRef, DbName, Conditions), MaxCollect)
     end.
 
-%% @private Pick the non-equality condition with smallest estimated cardinality
-pick_smallest_non_eq(StoreRef, DbName, NonEqConds) ->
-    WithCardinality = lists:map(fun(Cond) ->
-        Card = estimate_non_eq_cardinality(StoreRef, DbName, Cond),
-        {Card, Cond}
-    end, NonEqConds),
-
-    Sorted = lists:keysort(1, WithCardinality),
-    [{_, Smallest} | Rest] = Sorted,
-    {Smallest, [C || {_, C} <- Rest]}.
-
-%% @private Estimate cardinality for non-equality conditions
-estimate_non_eq_cardinality(StoreRef, DbName, {compare, Path, _Op, _Value}) ->
-    %% For compare, estimate based on total docs with this field
-    %% Assume ~50% match a typical range condition
-    case barrel_ars_index:get_posting_cardinality(StoreRef, DbName, Path) of
-        {ok, C} -> C div 2;
-        _ -> 500000  %% Default estimate if unknown
-    end;
-estimate_non_eq_cardinality(StoreRef, DbName, {exists, Path}) ->
-    case barrel_ars_index:get_posting_cardinality(StoreRef, DbName, Path) of
-        {ok, C} -> C;
-        _ -> 500000
-    end;
-estimate_non_eq_cardinality(StoreRef, DbName, {prefix, Path, _Prefix}) ->
-    %% Assume ~10% match a prefix
-    case barrel_ars_index:get_posting_cardinality(StoreRef, DbName, Path) of
-        {ok, C} -> C div 10;
-        _ -> 50000
-    end;
-estimate_non_eq_cardinality(_StoreRef, _DbName, _) ->
-    500000.
 
 %% @private Pick the equality condition with smallest cardinality to iterate
 pick_smallest_equality(StoreRef, DbName, EqConds) ->
