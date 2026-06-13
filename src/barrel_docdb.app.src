@@ -11,7 +11,6 @@
         rocksdb,
         hlc,
         match_trie,
-        livery,
         instrument
     ]},
     {env, [

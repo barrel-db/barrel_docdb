@@ -2,33 +2,10 @@
     {barrel_docdb, [
         {data_dir, "${BARREL_DATA_DIR:-data/barrel_docdb}"},
         {default_store, barrel_store_rocksdb},
-        %% HTTP server configuration
-        {http_enabled, ${BARREL_HTTP_ENABLED:-true}},
-        {http_port, ${BARREL_HTTP_PORT:-8080}},
-        %% Request-body size cap (buffered bodies only - streamed
-        %% attachment uploads bypass this by design). 413 on
-        %% oversize. Override via BARREL_HTTP_MAX_BODY_BYTES.
-        {http_max_body_bytes, ${BARREL_HTTP_MAX_BODY_BYTES:-4194304}},
-        %% Maximum concurrent in-flight requests; over the cap the
-        %% server sheds load with 503. Override via
-        %% BARREL_HTTP_MAX_IN_FLIGHT.
-        {http_max_in_flight, ${BARREL_HTTP_MAX_IN_FLIGHT:-1000}},
-        %% Query pipeline deadline (ms). On expiry the API returns
-        %% 504 with a structured `query_timeout' payload instead of
-        %% silently truncating. Override via BARREL_QUERY_TIMEOUT_MS.
+        %% Query pipeline deadline (ms). On expiry queries return a
+        %% structured `query_timeout' error instead of silently
+        %% truncating. Override via BARREL_QUERY_TIMEOUT_MS.
         {query_timeout_ms, ${BARREL_QUERY_TIMEOUT_MS:-30000}},
-        %% Require /_replicate targets and inbound replication
-        %% requests to come from a registered peer (Ed25519-signed).
-        %% Default `true' closes the SSRF surface. Flip to `false'
-        %% during migration; scheduled for removal in 0.8.0.
-        {replication_require_registered_peer, ${BARREL_REPLICATION_REQUIRE_REGISTERED_PEER:-true}},
-        %% TLS configuration (enables HTTPS with HTTP/2 ALPN)
-        %% Set BARREL_HTTP_TLS_ENABLED=true and provide cert/key paths
-        {http_tls_enabled, ${BARREL_HTTP_TLS_ENABLED:-false}},
-        {http_certfile, "${BARREL_HTTP_CERTFILE:-}"},
-        {http_keyfile, "${BARREL_HTTP_KEYFILE:-}"},
-        {http_cacertfile, "${BARREL_HTTP_CACERTFILE:-}"},
-        {http_verify, ${BARREL_HTTP_VERIFY:-verify_none}},
         %% Zone configuration for multi-datacenter deployments
         {zone, "${BARREL_ZONE:-}"}
     ]},
