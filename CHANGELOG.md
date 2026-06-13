@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.7] - 2026-06-11
+
+### Changed (breaking)
+- `/_replicate` now refuses to call out to anything not in the new
+  peer registry. The request body must carry either `peer_id` (a
+  registered peer's id, URL pulled from the registry) or a `target`
+  URL that matches a registered peer's canonical URL. Anything else
+  is rejected with **403 `unregistered_peer`**. Closes the SSRF
+  surface (security-review #6): an authenticated key holder can no
+  longer aim outbound replication at `127.0.0.1`,
+  `169.254.169.254`, RFC1918, or any unregistered host.
+- The inbound replication-receiving endpoints (`_revsdiff`,
+  `_put_rev`, `_sync_hlc`) now require a valid Ed25519 signature
+  from a registered peer (`X-Peer-Id`, `X-Peer-Timestamp`,
+  `X-Peer-Signature` headers) in addition to the existing API key.
+  Missing or invalid signatures return **401**
+  `peer_signature_required` / `unregistered_peer` /
+  `invalid_peer_signature`.
+- Outbound replication calls now always include `peer_auth => true`,
+  i.e. every request between registered peers is signed.
+
+### Added
+- New module `barrel_peer_registry` (DETS-backed, file
+  `<data_dir>/peers.dets`). Schema: `peer_id`, `name`, canonical
+  `url`, `public_key`, `databases`, `created_at`, `last_used`.
+- Admin HTTP routes:
+  - `GET /peers` — list registered peers.
+  - `POST /peers` — register a peer. Body: `{"name": "...",
+    "url": "...", "public_key": "<base64>", "peer_id": "..."}` for an
+    explicit registration, or `{"name": "...", "url": "...",
+    "discover": true}` to TOFU-fetch the remote's
+    `/.well-known/barrel` pubkey.
+  - `GET /peers/:peer_id` — fetch one entry.
+  - `DELETE /peers/:peer_id` — revoke.
+  All four routes require an admin API key.
+- Config knob `replication_require_registered_peer` (default
+  `true`), `BARREL_REPLICATION_REQUIRE_REGISTERED_PEER`. Setting it
+  to `false` re-enables the legacy free-form target URL behaviour as
+  a migration escape hatch — scheduled for removal in 0.8.0.
+
+### Migration
+- Existing replication clients that call `/_replicate` with a raw
+  `target` URL must register the target first
+  (`POST /peers {..., "discover": true}` is the easy path on
+  trusted networks), then either continue calling `/_replicate`
+  with the same URL or switch to `peer_id`.
+- Inbound endpoints will start returning 401 to any caller that
+  isn't a registered peer. Make sure both ends of every replication
+  link register each other before deploying this version.
+
 ## [0.7.6] - 2026-06-05
 
 ### Changed (breaking)

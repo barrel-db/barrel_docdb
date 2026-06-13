@@ -163,6 +163,16 @@ init([]) ->
         modules => [barrel_peer_auth]
     },
 
+    %% Persistent registry of trusted replication peers
+    PeerRegistry = #{
+        id => barrel_peer_registry,
+        start => {barrel_peer_registry, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
+        modules => [barrel_peer_registry]
+    },
+
     %% HTTP server for REST API (optional, controlled by http_enabled config)
     HttpEnabled = application:get_env(barrel_docdb, http_enabled, false),
     HttpOpts = build_http_opts(),
@@ -176,7 +186,7 @@ init([]) ->
     },
 
     %% Base child specs (always started)
-    BaseSpecs = [Metrics, Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, ApiKeys, PeerAuth],
+    BaseSpecs = [Metrics, Cache, Hlc, Sub, QuerySub, PathDict, QueryCursor, Parallel, DbSup, RepTasks, ApiKeys, PeerAuth, PeerRegistry],
 
     %% Conditionally add HTTP server
     ChildSpecs = case HttpEnabled of

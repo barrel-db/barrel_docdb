@@ -100,6 +100,14 @@ init_per_suite(Config) ->
     application:ensure_all_started(barrel_docdb),
     application:ensure_all_started(livery),
     application:ensure_all_started(hackney),
+    %% This suite predates the peer-registry SSRF gate. It runs
+    %% replication endpoints with plain API keys (no Ed25519
+    %% signatures). Disable strict-peer mode here so the legacy
+    %% fixtures still exercise the handlers; dedicated tests for the
+    %% strict path live in `barrel_peer_registry_SUITE'.
+    PrevStrict = application:get_env(barrel_docdb,
+                                     replication_require_registered_peer),
+    application:set_env(barrel_docdb, replication_require_registered_peer, false),
     %% Start HTTP server at suite level (stopped in end_per_suite)
     %% Unlink so it survives process changes between init/end_per_suite
     {ok, HttpPid} = barrel_http_server:start_link(#{port => ?PORT}),
@@ -110,9 +118,15 @@ init_per_suite(Config) ->
         permissions => [<<"read">>, <<"write">>, <<"admin">>],
         is_admin => true
     }),
-    [{api_key, ApiKey} | Config].
+    [{api_key, ApiKey}, {prev_strict_peer, PrevStrict} | Config].
 
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
+    case proplists:get_value(prev_strict_peer, Config) of
+        undefined ->
+            application:unset_env(barrel_docdb, replication_require_registered_peer);
+        {ok, V} ->
+            application:set_env(barrel_docdb, replication_require_registered_peer, V)
+    end,
     barrel_http_server:stop(),
     ok.
 

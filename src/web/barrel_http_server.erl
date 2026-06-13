@@ -255,6 +255,20 @@ routes() ->
          #{tags => [<<"Admin">>], operation_id => <<"delete_key">>,
            summary => <<"Delete API key by prefix (admin only)">>}},
 
+        %% Admin: replication peer registry
+        {<<"GET">>, <<"/peers">>, ?H(peers),
+         #{tags => [<<"Admin">>], operation_id => <<"list_peers">>,
+           summary => <<"List registered replication peers (admin only)">>}},
+        {<<"POST">>, <<"/peers">>, ?H(peers),
+         #{tags => [<<"Admin">>], operation_id => <<"register_peer">>,
+           summary => <<"Register a replication peer (admin only)">>}},
+        {<<"GET">>, <<"/peers/:peer_id">>, ?H(peer),
+         #{tags => [<<"Admin">>], operation_id => <<"get_peer">>,
+           summary => <<"Get a registered peer (admin only)">>}},
+        {<<"DELETE">>, <<"/peers/:peer_id">>, ?H(peer),
+         #{tags => [<<"Admin">>], operation_id => <<"delete_peer">>,
+           summary => <<"Delete a registered peer (admin only)">>}},
+
         %% Admin: usage stats
         {<<"GET">>, <<"/admin/usage">>, ?H(admin_usage),
          #{tags => [<<"Admin">>], operation_id => <<"admin_usage">>,

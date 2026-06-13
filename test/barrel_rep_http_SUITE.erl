@@ -117,6 +117,10 @@ init_per_suite(Config) ->
     application:ensure_all_started(barrel_docdb),
     application:ensure_all_started(livery),
     application:ensure_all_started(hackney),
+    %% This suite exercises the HTTP replication transport with bearer-token
+    %% auth, not the signed-peer path (covered by barrel_peer_registry_SUITE).
+    %% Disable the registered-peer gate so put_rev/revsdiff are accepted.
+    application:set_env(barrel_docdb, replication_require_registered_peer, false),
     %% Start HTTP server at suite level
     %% Unlink so it survives process changes between init/end_per_suite
     {ok, HttpPid} = barrel_http_server:start_link(#{port => ?HTTP_PORT}),
@@ -131,6 +135,7 @@ init_per_suite(Config) ->
 
 end_per_suite(_Config) ->
     barrel_http_server:stop(),
+    application:set_env(barrel_docdb, replication_require_registered_peer, true),
     ok.
 
 init_per_group(http_transport, Config) ->
