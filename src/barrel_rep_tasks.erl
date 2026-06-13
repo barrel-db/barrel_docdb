@@ -541,8 +541,8 @@ verify_at_targets(Docs, Targets, Retries, Delay) ->
 %% @doc Get the appropriate transport for a target
 get_transport_for_target(Target) when is_binary(Target) ->
     barrel_rep_transport_local;
-get_transport_for_target(#{url := _}) ->
-    barrel_rep_transport_http;
+get_transport_for_target(#{url := _} = Target) ->
+    error({http_transport_removed, Target});
 get_transport_for_target(_) ->
     barrel_rep_transport_local.
 
@@ -745,7 +745,7 @@ get_transport(source, Config) ->
         Url when is_binary(Url), byte_size(Url) > 0 ->
             case binary:match(Url, <<"://">>) of
                 nomatch -> maps:get(source_transport, Config, barrel_rep_transport_local);
-                _ -> barrel_rep_transport_http
+                _ -> error({http_transport_removed, Url})
             end;
         _ ->
             maps:get(source_transport, Config, barrel_rep_transport_local)
@@ -755,7 +755,7 @@ get_transport(target, Config) ->
         Url when is_binary(Url), byte_size(Url) > 0 ->
             case binary:match(Url, <<"://">>) of
                 nomatch -> maps:get(target_transport, Config, barrel_rep_transport_local);
-                _ -> barrel_rep_transport_http
+                _ -> error({http_transport_removed, Url})
             end;
         _ ->
             maps:get(target_transport, Config, barrel_rep_transport_local)

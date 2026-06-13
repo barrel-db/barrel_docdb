@@ -115,11 +115,6 @@
     %% Database attachment count gauge
     {gauge, barrel_db_attachments_total,
      <<"Total number of attachments in database">>}
-
-    %% HTTP request/duration metrics live in the livery middleware
-    %% (`livery_instrument_metrics' wired in barrel_http_server).
-    %% Both surfaces feed the same `instrument' registry that
-    %% `livery_metrics:handler/0' renders at /metrics.
 ]).
 
 %%====================================================================

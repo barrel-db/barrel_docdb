@@ -481,7 +481,6 @@ wait_for_sync_replication(DocId, Rev, Targets, Retries, Delay) ->
             Transport = get_transport_for_target(Target),
             case Transport:get_doc(Target, DocId, #{}) of
                 {ok, _Doc, #{<<"rev">> := TargetRev}} when TargetRev =:= Rev -> ok;
-                {ok, _Doc, #{rev := TargetRev}} when TargetRev =:= Rev -> ok;
                 {ok, _, _} -> revision_mismatch;
                 {error, not_found} -> not_found;
                 {error, _} -> error
@@ -500,8 +499,8 @@ wait_for_sync_replication(DocId, Rev, Targets, Retries, Delay) ->
 %% @doc Get transport module for a target
 get_transport_for_target(Target) when is_binary(Target) ->
     barrel_rep_transport_local;
-get_transport_for_target(#{url := _}) ->
-    barrel_rep_transport_http;
+get_transport_for_target(#{url := _} = Target) ->
+    error({http_transport_removed, Target});
 get_transport_for_target(_) ->
     barrel_rep_transport_local.
 
