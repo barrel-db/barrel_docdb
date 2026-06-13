@@ -206,8 +206,11 @@ fold_local_docs(Pid, Prefix, Fun, Acc) ->
 init([Name, Config]) ->
     process_flag(trap_exit, true),
 
-    %% Get data directory from config
-    DataDir = maps:get(data_dir, Config, "/tmp/barrel_data"),
+    %% Get data directory from config. Fall back to the `data_dir' app env so a
+    %% node can relocate ALL of its dbs (including internal ones created with no
+    %% opts) off the shared default - lets two local nodes use distinct dirs.
+    DefaultDataDir = application:get_env(barrel_docdb, data_dir, "/tmp/barrel_data"),
+    DataDir = maps:get(data_dir, Config, DefaultDataDir),
     DbPath = filename:join([DataDir, binary_to_list(Name)]),
 
     %% Start compaction filter handler BEFORE opening RocksDB
@@ -606,8 +609,16 @@ do_put_doc_apply(StoreRef, DbName, DocId, Revs, NewRev, Deleted, DocBody,
             %% New document - index all paths
             barrel_ars_index:index_doc_ops(DbName, DocId, DocBody);
         false ->
-            %% Update document - compute diff and update paths
-            barrel_ars_index:update_doc_ops(DbName, DocId, OldDocBody, DocBody)
+            case was_tombstone(OldRev, OldRevTree) of
+                true ->
+                    %% Re-creating a deleted document. Delete only removed the
+                    %% path index, not the body CF, so a body diff would see no
+                    %% change and never re-add the paths. Index from scratch.
+                    barrel_ars_index:index_doc_ops(DbName, DocId, DocBody);
+                false ->
+                    %% Update document - compute diff and update paths
+                    barrel_ars_index:update_doc_ops(DbName, DocId, OldDocBody, DocBody)
+            end
     end,
 
     %% Change entry operations
@@ -798,7 +809,14 @@ prepare_doc_ops(StoreRef, DbName, Doc) ->
             false when OldDocBody =:= undefined ->
                 barrel_ars_index:index_doc_ops(DbName, DocId, DocBody);
             false ->
-                barrel_ars_index:update_doc_ops(DbName, DocId, OldDocBody, DocBody)
+                case was_tombstone(OldRev, OldRevTree) of
+                    true ->
+                        %% Re-creating a deleted document: delete removed the
+                        %% path index but not the body CF, so index from scratch.
+                        barrel_ars_index:index_doc_ops(DbName, DocId, DocBody);
+                    false ->
+                        barrel_ars_index:update_doc_ops(DbName, DocId, OldDocBody, DocBody)
+                end
         end,
 
         ChangeInfo = DocInfo#{doc => DocBody},
@@ -1099,6 +1117,7 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
         not_found ->
             {#{}, undefined, undefined, undefined, undefined}
     end,
+    OldRevTree = ExistingRevTree,
 
     %% Build revision tree from history
     NewRevTree = build_revtree_from_history(History, Deleted, ExistingRevTree),
@@ -1145,8 +1164,16 @@ do_put_rev(StoreRef, DbName, Doc, History, Deleted) ->
             %% New document - index all paths
             barrel_ars_index:index_doc_ops(DbName, DocId, DocBody);
         false ->
-            %% Update document - compute diff and update paths
-            barrel_ars_index:update_doc_ops(DbName, DocId, OldDocBody, DocBody)
+            case was_tombstone(OldRev, OldRevTree) of
+                true ->
+                    %% Re-creating a deleted document. Delete only removed the
+                    %% path index, not the body CF, so a body diff would see no
+                    %% change and never re-add the paths. Index from scratch.
+                    barrel_ars_index:index_doc_ops(DbName, DocId, DocBody);
+                false ->
+                    %% Update document - compute diff and update paths
+                    barrel_ars_index:update_doc_ops(DbName, DocId, OldDocBody, DocBody)
+            end
     end,
 
     %% Change entry operations
@@ -1364,6 +1391,17 @@ notify_subscribers(DbName, DocId, Rev, Hlc, Deleted, DocBody) ->
 -spec deleted_to_bin(boolean()) -> binary().
 deleted_to_bin(true) -> <<"true">>;
 deleted_to_bin(false) -> <<"false">>.
+
+%% @doc Whether the prior winning revision was a tombstone (deleted). Used
+%% on the live put path to decide between a body diff and a full re-index
+%% when re-creating a previously deleted document.
+-spec was_tombstone(binary() | undefined, map()) -> boolean().
+was_tombstone(undefined, _RevTree) -> false;
+was_tombstone(OldRev, RevTree) ->
+    case maps:find(OldRev, RevTree) of
+        {ok, #{deleted := Deleted}} -> Deleted =:= true;
+        _ -> false
+    end.
 
 %% @doc Convert binary back to boolean from wide column storage
 -spec bin_to_deleted(binary()) -> boolean().
