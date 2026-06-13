@@ -249,15 +249,28 @@ docid_has_value(StoreRef, DbName, Path, Value, DocId) ->
 docid_get_value(StoreRef, DbName, DocId, Path) ->
     case get_doc_paths(StoreRef, DbName, DocId) of
         {ok, PathValues} ->
-            case lists:keyfind(Path, 1, PathValues) of
-                {Path, Value} -> {ok, Value};
-                false -> not_found
-            end;
+            %% Stored entries are {FieldPath ++ [Value], <<>>} (the analyzer
+            %% appends the value as the last path element), so the value at
+            %% Path is the last element of the entry whose field path == Path.
+            find_path_value(Path, PathValues);
         not_found ->
             not_found;
         {error, _} = Error ->
             Error
     end.
+
+%% @private Find the value stored at a field path in the reverse index.
+%% Entries are {FieldPath ++ [Value], _}; match on the field path and return
+%% the trailing value. Returns the first match (arrays use the set-based path).
+find_path_value(_Path, []) ->
+    not_found;
+find_path_value(Path, [{[_ | _] = Full, _} | Rest]) ->
+    case lists:droplast(Full) of
+        Path -> {ok, lists:last(Full)};
+        _ -> find_path_value(Path, Rest)
+    end;
+find_path_value(Path, [_ | Rest]) ->
+    find_path_value(Path, Rest).
 
 %% @doc Check if a DocId's value at a path satisfies a comparison.
 %% Op is one of: '&gt;' | '&lt;' | '&gt;=' | '=&lt;' | '=/=' | '=='
