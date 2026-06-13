@@ -179,26 +179,14 @@ pfiltermap_batches(Fun, Items, MaxWorkers, Parent, Ref, Acc) ->
 %% @private Spawn a worker process for pmap
 spawn_worker(Fun, Index, Item, Parent, Ref) ->
     {_Pid, MonRef} = spawn_monitor(fun() ->
-        try
-            Result = Fun(Item),
-            Parent ! {Ref, Index, {ok, Result}}
-        catch
-            Class:Reason:Stack ->
-                Parent ! {Ref, Index, {error, {Class, Reason, Stack}}}
-        end
+        Parent ! {Ref, Index, barrel_lib:safe_apply(fun() -> Fun(Item) end)}
     end),
     {Index, MonRef}.
 
 %% @private Spawn a worker for filtermap
 spawn_filtermap_worker(Fun, Index, Item, Parent, Ref) ->
     {_Pid, MonRef} = spawn_monitor(fun() ->
-        try
-            Result = Fun(Item),
-            Parent ! {Ref, Index, {ok, Result}}
-        catch
-            Class:Reason:Stack ->
-                Parent ! {Ref, Index, {error, {Class, Reason, Stack}}}
-        end
+        Parent ! {Ref, Index, barrel_lib:safe_apply(fun() -> Fun(Item) end)}
     end),
     {Index, MonRef}.
 
@@ -307,12 +295,8 @@ handle_call({execute, Type, Fun, Items, MaxWorkers}, _From, State) ->
     ActiveWorkers = lists:sublist(Workers, UseWorkers),
 
     %% Execute and catch any errors - return them as tuples to avoid crashing gen_server
-    Result = try
-        {ok, execute_on_workers(Type, Fun, Items, ActiveWorkers)}
-    catch
-        Class:Reason:Stack ->
-            {error, {Class, Reason, Stack}}
-    end,
+    Result = barrel_lib:safe_apply(
+        fun() -> execute_on_workers(Type, Fun, Items, ActiveWorkers) end),
     {reply, Result, State};
 
 handle_call(_Request, _From, State) ->
@@ -352,13 +336,7 @@ spawn_pool_worker() ->
 pool_worker_loop(Pool) ->
     receive
         {work, Caller, Ref, Index, Fun, Item} ->
-            _ = try
-                Result = Fun(Item),
-                Caller ! {Ref, Index, {ok, Result}}
-            catch
-                Class:Reason:Stack ->
-                    Caller ! {Ref, Index, {error, {Class, Reason, Stack}}}
-            end,
+            _ = Caller ! {Ref, Index, barrel_lib:safe_apply(fun() -> Fun(Item) end)},
             pool_worker_loop(Pool);
         stop ->
             ok

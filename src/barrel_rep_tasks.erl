@@ -712,13 +712,11 @@ format_seq(Seq) -> Seq.
 
 parse_seq(<<"first">>) -> first;
 parse_seq(Bin) when is_binary(Bin) ->
-    try
+    barrel_lib:safe(fun() ->
         {ok, Tokens, _} = erl_scan:string(binary_to_list(Bin) ++ "."),
         {ok, Term} = erl_parse:parse_term(Tokens),
         Term
-    catch
-        _:_ -> first
-    end.
+    end, first).
 
 format_reason(normal) -> <<"completed">>;
 format_reason(shutdown) -> <<"stopped">>;
