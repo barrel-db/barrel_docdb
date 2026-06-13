@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-06-14
+
+### Removed (breaking)
+- The HTTP server and its REST/SSE/admin API are gone. barrel_docdb is now
+  embedded-only: use it as an Erlang library via the `barrel_docdb` module.
+  This drops the `livery` dependency, the API-key store, the signed-peer
+  registry, and the HTTP replication transport. Replicate in-process with
+  `barrel_rep_transport_local` or your own `barrel_rep_transport` behaviour
+  (URL replication targets now raise `{http_transport_removed, _}`).
+
+### Fixed
+- `find/2,3`: an AND of two or more `{compare, ...}` conditions no longer
+  returns the empty set.
+- `find/2,3`: `{prefix, Path, Prefix}` works as a sole condition.
+- Documents re-created over a tombstone are re-indexed, so `find` returns them.
+
+### Added
+- `find/2,3` id scans: `#{id_prefix => P}` and `#{id_range => {Start, End}}`
+  ordered primary-key range scans over the document id.
+- `find/2,3` `flat => true` returns flat documents (`Doc#{<<"id">>}`) instead of
+  the `#{<<"id">>, <<"doc">>}` wrapper.
+
+### Changed
+- OTP 29: dropped the deprecated prefix-`catch` operator reliance; added
+  `barrel_lib` with reusable `safe_*` helpers.
+- Bumped `rocksdb` to 3.0.0 and `instrument` to 1.1.4.
+
+### Notes
+- Top-level fields whose key begins with `_` are reserved metadata: they are
+  not stored or indexed, so they cannot be queried.
+
 ## [0.7.7] - 2026-06-11
 
 ### Changed (breaking)
